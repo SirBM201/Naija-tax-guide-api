@@ -1,12 +1,8 @@
 # app/services/subscriptions_service.py
-from __future__ import annotations
-
 from typing import Optional, Dict, Any, Tuple
 from datetime import datetime, timedelta, timezone
 
 from ..core.supabase_client import supabase
-from ..services.credits_service import init_credits_for_plan
-from ..services.subscription_status_service import get_subscription_status as _status_only
 
 
 # -----------------------------
@@ -23,81 +19,80 @@ def _parse_iso(value: str) -> Optional[datetime]:
     except Exception:
         return None
 
-# ---- Backward-compat alias (do not remove) ----
-# Some routes still import this name.
-try:
-    manual_activate_subscription  # noqa: F401
-except NameError:
-    def manual_activate_subscription(*args, **kwargs):
-        return activate_subscription_now(*args, **kwargs)
 
 def _iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _normalize_provider(provider: Optional[str]) -> Optional[str]:
-    if not provider:
-        return None
-    p = provider.strip().lower()
-    if p in ("whatsapp", "wa"):
-        return "wa"
-    if p in ("telegram", "tg"):
-        return "tg"
-    if p in ("web", "site", "website"):
-        return "web"
-    return p
-
-
 # -----------------------------
 # Lookups
 # -----------------------------
-def _find_account_id(account_id: Optional[str], provider: Optional[str], provider_user_id: Optional[str]) -> Optional[str]:
+def _find_account_id(
+    account_id: Optional[str],
+    provider: Optional[str],
+    provider_user_id: Optional[str],
+) -> Optional[str]:
+    """
+    If account_id is given -> use it.
+    Else try to find account by (provider, provider_user_id) from accounts table.
+    """
     if account_id:
         return account_id.strip() or None
 
-    provider = _normalize_provider(provider)
     if not provider or not provider_user_id:
         return None
 
-    db = supabase()
-    got = (
-        db.table("accounts")
+    r = (
+        supabase()
+        .table("accounts")
         .select("id")
         .eq("provider", provider)
         .eq("provider_user_id", provider_user_id)
         .limit(1)
         .execute()
     )
-    if got.data:
-        return got.data[0]["id"]
-    return None
+    rows = r.data or []
+    return rows[0]["id"] if rows else None
 
 
-def _get_plan(plan_code: str) -> Optional[Dict[str, Any]]:
-    plan_code = (plan_code or "").strip().lower()
-    if not plan_code:
-        return None
-    db = supabase()
-    res = db.table("plans").select("*").eq("plan_code", plan_code).limit(1).execute()
-    return res.data[0] if res.data else None
-
-
-def _get_active_sub_row(account_id: str) -> Optional[Dict[str, Any]]:
-    db = supabase()
-    res = (
-        db.table("user_subscriptions")
+def _get_active_subscription_row(account_id: str) -> Optional[Dict[str, Any]]:
+    r = (
+        supabase()
+        .table("user_subscriptions")
         .select("*")
         .eq("account_id", account_id)
-        .eq("is_active", True)
         .order("created_at", desc=True)
         .limit(1)
         .execute()
     )
-    return res.data[0] if res.data else None
+    rows = r.data or []
+    return rows[0] if rows else None
+
+
+def _get_plan_row(plan_code: str) -> Optional[Dict[str, Any]]:
+    r = (
+        supabase()
+        .table("plans")
+        .select("*")
+        .eq("plan_code", plan_code)
+        .eq("active", True)
+        .limit(1)
+        .execute()
+    )
+    rows = r.data or []
+    return rows[0] if rows else None
+
+
+def _build_expiry_from_plan(plan: Dict[str, Any]) -> datetime:
+    days = int(plan.get("duration_days") or 0)
+    if days <= 0:
+        # safe fallback: 30 days
+        days = 30
+    return _now_utc() + timedelta(days=days)
 
 
 # -----------------------------
-# Public API (Back-compat)
+# Public API used by routes
 # -----------------------------
 def get_subscription_status(
     account_id: Optional[str] = None,
@@ -105,195 +100,153 @@ def get_subscription_status(
     provider_user_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    BACKWARD-COMPAT:
-    - Some routes call get_subscription_status(account_id=...)
-    - Some older code calls get_subscription_status(account_id, provider, provider_user_id)
-
-    We normalize to account_id then delegate to subscription_status_service (single truth).
+    Returns:
+      {
+        account_id, active, expires_at, grace_until, plan_code, reason, state
+      }
+    state: "none" | "active" | "grace" | "expired"
     """
-    aid = _find_account_id(account_id, provider, provider_user_id)
-    if not aid:
+    acc_id = _find_account_id(account_id, provider, provider_user_id)
+    if not acc_id:
         return {
-            "active": False,
-            "state": "none",
             "account_id": None,
-            "plan_code": None,
+            "active": False,
             "expires_at": None,
             "grace_until": None,
-            "reason": "account_not_found",
+            "plan_code": None,
+            "reason": "no_account",
+            "state": "none",
         }
 
-    s = _status_only(aid)
+    row = _get_active_subscription_row(acc_id)
+    if not row:
+        return {
+            "account_id": acc_id,
+            "active": False,
+            "expires_at": None,
+            "grace_until": None,
+            "plan_code": None,
+            "reason": "no_subscription",
+            "state": "none",
+        }
+
+    now = _now_utc()
+    expires_at = _parse_iso(row.get("expires_at") or "")
+    grace_until = _parse_iso(row.get("grace_until") or "")
+
+    if expires_at and expires_at > now:
+        return {
+            "account_id": acc_id,
+            "active": True,
+            "expires_at": _iso(expires_at),
+            "grace_until": _iso(grace_until) if grace_until else None,
+            "plan_code": row.get("plan_code"),
+            "reason": "active",
+            "state": "active",
+        }
+
+    # expired
+    if grace_until and grace_until > now:
+        return {
+            "account_id": acc_id,
+            "active": True,
+            "expires_at": _iso(expires_at) if expires_at else None,
+            "grace_until": _iso(grace_until),
+            "plan_code": row.get("plan_code"),
+            "reason": "grace",
+            "state": "grace",
+        }
+
     return {
-        "active": bool(s.get("active")),
-        "state": s.get("state") or "none",
-        "account_id": aid,
-        "plan_code": s.get("plan_code"),
-        "expires_at": s.get("expires_at"),
-        "grace_until": s.get("grace_until"),
-        "reason": s.get("reason") or "ok",
+        "account_id": acc_id,
+        "active": False,
+        "expires_at": _iso(expires_at) if expires_at else None,
+        "grace_until": _iso(grace_until) if grace_until else None,
+        "plan_code": row.get("plan_code"),
+        "reason": "expired",
+        "state": "expired",
     }
 
 
-# -----------------------------
-# Core mutations
-# -----------------------------
-def _deactivate_any_active(account_id: str, reason: str = "replaced") -> None:
-    db = supabase()
-    cur = _get_active_sub_row(account_id)
-    if not cur:
-        return
-    try:
-        db.table("user_subscriptions").update(
-            {"is_active": False, "status": reason, "updated_at": _iso(_now_utc())}
-        ).eq("id", cur["id"]).execute()
-    except Exception:
-        try:
-            db.table("user_subscriptions").update({"is_active": False}).eq("id", cur["id"]).execute()
-        except Exception:
-            pass
+def activate_subscription_now(
+    account_id: str,
+    plan_code: str,
+    source: str = "manual",
+    reference: Optional[str] = None,
+) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+    """
+    Creates/updates subscription immediately.
+    """
+    plan = _get_plan_row(plan_code)
+    if not plan:
+        return False, "invalid_plan", None
 
-
-def _build_expiry_from_plan(plan_code: str, starts_at: datetime) -> datetime:
-    plan = _get_plan(plan_code)
-    duration_days = 30
-    if plan:
-        try:
-            duration_days = int(plan.get("duration_days") or 30)
-        except Exception:
-            duration_days = 30
-    return starts_at + timedelta(days=duration_days)
-
-
-def _reset_ai_credits_best_effort(account_id: str, plan_code: str) -> None:
-    try:
-        init_credits_for_plan(account_id=account_id, plan_code=plan_code)
-    except Exception:
-        pass
-
-
-def activate_subscription_now(account_id: str, plan_code: str, *, status: str = "active") -> Dict[str, Any]:
-    account_id = (account_id or "").strip()
-    plan_code = (plan_code or "").strip().lower()
-    if not account_id or not plan_code:
-        raise ValueError("account_id and plan_code are required")
-
-    starts = _now_utc()
-    expires = _build_expiry_from_plan(plan_code, starts)
-
-    _deactivate_any_active(account_id, reason="replaced")
+    expires = _build_expiry_from_plan(plan)
 
     payload = {
         "account_id": account_id,
         "plan_code": plan_code,
-        "status": status,
-        "started_at": _iso(starts),
+        "status": "active",
+        "source": source,
+        "reference": reference,
+        "started_at": _iso(_now_utc()),
         "expires_at": _iso(expires),
-        "is_active": True,
-        "pending_plan_code": None,
-        "pending_starts_at": None,
+        "grace_until": None,
         "updated_at": _iso(_now_utc()),
     }
 
-    db = supabase()
-    ins = db.table("user_subscriptions").insert(payload).execute()
-    row = ins.data[0] if ins.data else payload
-
-    _reset_ai_credits_best_effort(account_id, plan_code)
-    return row
+    r = supabase().table("user_subscriptions").insert(payload).execute()
+    row = (r.data or [None])[0]
+    return True, "ok", row
 
 
-def schedule_plan_change_at_expiry(account_id: str, next_plan_code: str) -> Dict[str, Any]:
-    account_id = (account_id or "").strip()
-    next_plan_code = (next_plan_code or "").strip().lower()
-    if not account_id or not next_plan_code:
-        raise ValueError("account_id and next_plan_code are required")
+def schedule_plan_change_at_expiry(
+    account_id: str,
+    next_plan_code: str,
+    effective_at_iso: str,
+) -> Tuple[bool, str]:
+    """
+    Store a scheduled plan change.
+    You can implement as a row in a table, or a column on subscription row.
+    Here we store on latest subscription row for simplicity.
+    """
+    acc_row = _get_active_subscription_row(account_id)
+    if not acc_row:
+        return False, "no_subscription"
 
-    db = supabase()
-    cur = _get_active_sub_row(account_id)
-    if not cur:
-        return activate_subscription_now(account_id, next_plan_code, status="active")
+    plan = _get_plan_row(next_plan_code)
+    if not plan:
+        return False, "invalid_plan"
 
-    exp_dt = _parse_iso(cur.get("expires_at") or "") if isinstance(cur.get("expires_at"), str) else None
-    if not exp_dt:
-        return activate_subscription_now(account_id, next_plan_code, status="active")
+    upd = {
+        "next_plan_code": next_plan_code,
+        "next_plan_effective_at": effective_at_iso,
+        "updated_at": _iso(_now_utc()),
+    }
 
-    upd = (
-        db.table("user_subscriptions")
-        .update(
-            {
-                "pending_plan_code": next_plan_code,
-                "pending_starts_at": _iso(exp_dt),
-                "updated_at": _iso(_now_utc()),
-            }
-        )
-        .eq("id", cur["id"])
-        .execute()
-    )
-    return upd.data[0] if upd.data else cur
+    supabase().table("user_subscriptions").update(upd).eq("id", acc_row["id"]).execute()
+    return True, "ok"
 
 
-def apply_scheduled_change_if_due(account_id: str) -> Optional[Dict[str, Any]]:
-    account_id = (account_id or "").strip()
-    if not account_id:
-        return None
+def start_trial_if_eligible(account_id: str) -> Tuple[bool, str]:
+    """
+    Optional: start a trial if user has no subscription.
+    If you don't want trials, keep it returning (False, "disabled").
+    """
+    row = _get_active_subscription_row(account_id)
+    if row:
+        return False, "already_has_subscription"
 
-    db = supabase()
-    cur = _get_active_sub_row(account_id)
-    if not cur:
-        return None
+    # If you want a trial plan, create a plan_code like "trial_7d" in plans table.
+    trial_plan_code = "trial_7d"
+    plan = _get_plan_row(trial_plan_code)
+    if not plan:
+        return False, "trial_plan_not_configured"
 
-    pending_plan = (cur.get("pending_plan_code") or "").strip().lower()
-    pending_starts_at = cur.get("pending_starts_at")
-
-    if not pending_plan or not pending_starts_at:
-        return None
-
-    starts_dt = _parse_iso(pending_starts_at) if isinstance(pending_starts_at, str) else None
-    if not starts_dt:
-        return None
-
-    if _now_utc() < starts_dt:
-        return None
-
-    try:
-        db.table("user_subscriptions").update(
-            {"pending_plan_code": None, "pending_starts_at": None, "updated_at": _iso(_now_utc())}
-        ).eq("id", cur["id"]).execute()
-    except Exception:
-        pass
-
-    return activate_subscription_now(account_id, pending_plan, status="active")
+    ok, msg, _ = activate_subscription_now(account_id, trial_plan_code, source="trial")
+    return ok, msg
 
 
-# -----------------------------
-# Expiry maintenance (Cron job)
-# -----------------------------
-def expire_overdue_subscriptions(*, batch_limit: int = 1000) -> Dict[str, Any]:
-    db = supabase()
-    now_iso = _iso(_now_utc())
-
-    res = (
-        db.table("user_subscriptions")
-        .select("id")
-        .eq("is_active", True)
-        .lt("expires_at", now_iso)
-        .limit(int(batch_limit))
-        .execute()
-    )
-
-    ids = [r.get("id") for r in (res.data or []) if r.get("id")]
-    if not ids:
-        return {"ok": True, "expired": 0}
-
-    try:
-        db.table("user_subscriptions").update(
-            {"is_active": False, "status": "expired", "updated_at": now_iso}
-        ).in_("id", ids).execute()
-    except Exception:
-        try:
-            db.table("user_subscriptions").update({"is_active": False}).in_("id", ids).execute()
-        except Exception:
-            return {"ok": False, "expired": 0, "error": "update_failed"}
-
-    return {"ok": True, "expired": len(ids)}
+def manual_activate_subscription(account_id: str, plan_code: str) -> Tuple[bool, str]:
+    ok, msg, _ = activate_subscription_now(account_id, plan_code, source="manual")
+    return ok, msg
