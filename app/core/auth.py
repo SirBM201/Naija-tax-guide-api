@@ -2,107 +2,122 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime, timezone
 from functools import wraps
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Any, Callable, Optional, Tuple
 
-from flask import g, jsonify, request
+from flask import request, jsonify, g
 
-from app.core.supabase_client import supabase
+from .supabase_client import supabase
 
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _parse_iso(value: Optional[str]) -> Optional[datetime]:
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except Exception:
-        return None
+def _sha256_hex(value: str) -> str:
+    return hashlib.sha256((value or "").encode("utf-8")).hexdigest()
 
 
-def _sha256_hex(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
-def _validate_web_token(token: str) -> Optional[str]:
+def _extract_bearer_token() -> str:
     """
-    Validates a web session token.
-
-    IMPORTANT:
-    - verify-otp creates sessions in `web_sessions`
-    - token is stored hashed as token_hash (sha256 hex)
+    Accepts:
+      Authorization: Bearer <token>
     """
-    t = (token or "").strip()
-    if not t:
-        return None
+    auth = (request.headers.get("Authorization") or "").strip()
+    if not auth:
+        return ""
+    parts = auth.split(" ", 1)
+    if len(parts) != 2:
+        return ""
+    scheme, token = parts[0].strip().lower(), parts[1].strip()
+    if scheme != "bearer":
+        return ""
+    return token
 
-    token_hash = _sha256_hex(t)
 
-    # supabase() returns the client (singleton)
-    sb = supabase()
+def _validate_web_token(token: str) -> Tuple[bool, Optional[str], str]:
+    """
+    Validates token against public.web_sessions:
+      - token_hash matches sha256(token)
+      - revoked_at IS NULL
+      - expires_at > now()
+    Returns: (ok, account_id, reason)
+    """
+    token = (token or "").strip()
+    if not token:
+        return False, None, "missing_token"
+
+    token_hash = _sha256_hex(token)
 
     try:
-        resp = (
-            sb.table("web_sessions")
+        res = (
+            supabase()
+            .table("web_sessions")
             .select("account_id, expires_at, revoked_at")
             .eq("token_hash", token_hash)
             .limit(1)
             .execute()
         )
-        row = (resp.data or [None])[0]
-    except Exception:
-        # If anything goes wrong, treat as invalid token
-        return None
+        rows = getattr(res, "data", None) or []
+        if not rows:
+            return False, None, "not_found"
 
-    if not row:
-        return None
+        row = rows[0]
+        if row.get("revoked_at"):
+            return False, None, "revoked"
 
-    # revoked?
-    if row.get("revoked_at"):
-        return None
+        expires_at = row.get("expires_at")
+        if expires_at:
+            # Supabase returns ISO strings; accept Z form
+            try:
+                exp = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+                if exp <= _now_utc():
+                    return False, None, "expired"
+            except Exception:
+                # If we can't parse expires_at, treat as invalid (safer)
+                return False, None, "bad_expires_at"
 
-    # expired?
-    exp = _parse_iso(row.get("expires_at"))
-    if exp and exp <= _now_utc():
-        return None
-
-    account_id = row.get("account_id")
-    if not account_id:
-        return None
-
-    # Best-effort "touch" last_seen_at (do not block request if it fails)
-    try:
-        sb.table("web_sessions").update(
-            {"last_seen_at": _now_utc().isoformat().replace("+00:00", "Z")}
-        ).eq("token_hash", token_hash).execute()
-    except Exception:
-        pass
-
-    return account_id
-
-
-def require_auth_plus(fn):
-    """
-    Checks Authorization: Bearer <token>
-    Sets g.account_id if valid, otherwise returns 401.
-    """
-
-    @wraps(fn)
-    def wrapper(*args, **kwargs):
-        auth = request.headers.get("Authorization") or ""
-        token = ""
-        if auth.lower().startswith("bearer "):
-            token = auth.split(" ", 1)[1].strip()
-
-        account_id = _validate_web_token(token)
+        account_id = row.get("account_id")
         if not account_id:
-            return jsonify({"ok": False, "error": "invalid_token"}), 401
+            return False, None, "missing_account_id"
+
+        # Optional: touch session last_seen_at (best-effort)
+        try:
+            supabase().table("web_sessions").update(
+                {"last_seen_at": _now_utc().isoformat().replace("+00:00", "Z")}
+            ).eq("token_hash", token_hash).execute()
+        except Exception:
+            pass
+
+        return True, str(account_id), "ok"
+
+    except Exception:
+        return False, None, "server_error"
+
+
+def require_web_auth(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """
+    Flask decorator:
+      - Validates Bearer token (Authorization header)
+      - Attaches g.account_id
+    """
+    @wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any):
+        token = _extract_bearer_token()
+        ok, account_id, reason = _validate_web_token(token)
+
+        if not ok or not account_id:
+            return jsonify({"ok": False, "error": "invalid_token", "reason": reason}), 401
 
         g.account_id = account_id
         return fn(*args, **kwargs)
 
     return wrapper
+
+
+def get_authed_account_id() -> Optional[str]:
+    """
+    Helper for endpoints to read auth result.
+    """
+    return getattr(g, "account_id", None)
