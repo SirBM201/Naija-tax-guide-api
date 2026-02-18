@@ -26,8 +26,11 @@ from app.routes.web_session import bp as web_session_bp
 # ✅ web ask endpoint
 from app.routes.web_ask import bp as web_ask_bp
 
-# ✅ billing endpoint (NEW)
+# ✅ billing endpoint
 from app.routes.billing import bp as billing_bp
+
+# ✅ web chat endpoints (NEW)
+from app.routes.web_chat import bp as web_chat_bp
 
 from app.routes.paystack import paystack_bp
 from app.routes.paystack_webhook import bp as paystack_webhook_bp
@@ -87,12 +90,15 @@ def create_app() -> Flask:
     # ✅ Token-protected web ask
     app.register_blueprint(web_ask_bp, url_prefix=api_prefix)
 
+    # ✅ Web chat API (sessions + messages)
+    app.register_blueprint(web_chat_bp, url_prefix=api_prefix)
+
     # ✅ Billing route needed by frontend: /api/billing/me
     app.register_blueprint(billing_bp, url_prefix=api_prefix)
 
     app.register_blueprint(webhooks_bp, url_prefix=api_prefix)
     app.register_blueprint(plans_bp, url_prefix=api_prefix)
-    
+
     app.register_blueprint(link_tokens_bp, url_prefix=api_prefix)
     app.register_blueprint(whatsapp_bp, url_prefix=api_prefix)
     if telegram_bp:
