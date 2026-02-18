@@ -1,3 +1,4 @@
+# app/routes/web_chat.py
 from __future__ import annotations
 
 from flask import Blueprint, jsonify, request
@@ -5,76 +6,66 @@ from flask import Blueprint, jsonify, request
 from ..core.auth import require_auth_plus
 from ..services.web_chat_service import (
     create_session,
-    get_messages,
-    get_session,
     list_sessions,
-    send_user_message,
+    list_messages,
+    get_session,
+    chat_send,
 )
 
-web_chat = Blueprint("web_chat", __name__)
+bp = Blueprint("web_chat", __name__)
 
+def _json() -> dict:
+    try:
+        return request.get_json(force=True) or {}
+    except Exception:
+        return {}
 
-@web_chat.get("/web/chat/sessions")
+@bp.post("/web/chat/sessions")
+@require_auth_plus
+def create_chat_session():
+    account_id = getattr(request, "account_id", None)
+    if not account_id:
+        return jsonify({"ok": False, "error": "missing_account_id"}), 401
+
+    data = _json()
+    title = (data.get("title") or "").strip() or None
+    sess = create_session(account_id=account_id, title=title)
+    return jsonify({"ok": True, "session": sess})
+
+@bp.get("/web/chat/sessions")
+@require_auth_plus
 def list_chat_sessions():
-    ctx = require_auth_plus()
-    limit = int(request.args.get("limit", "50") or "50")
-    limit = max(1, min(limit, 200))
-    rows = list_sessions(ctx.account_id, limit=limit)
+    account_id = getattr(request, "account_id", None)
+    if not account_id:
+        return jsonify({"ok": False, "error": "missing_account_id"}), 401
+
+    limit = int((request.args.get("limit") or "50").strip() or "50")
+    rows = list_sessions(account_id=account_id, limit=limit)
     return jsonify({"ok": True, "sessions": rows})
 
-
-@web_chat.post("/web/chat/sessions")
-def create_chat_session():
-    ctx = require_auth_plus()
-    data = request.get_json(silent=True) or {}
-    title = (data.get("title") or "").strip() or "New chat"
-    row = create_session(ctx.account_id, title=title)
-    return jsonify({"ok": True, "session": {"id": row.get("id"), "title": row.get("title"), "created_at": row.get("created_at")}})
-
-
-@web_chat.get("/web/chat/sessions/<session_id>")
+@bp.get("/web/chat/sessions/<session_id>")
+@require_auth_plus
 def get_chat_session(session_id: str):
-    ctx = require_auth_plus()
-    limit = int(request.args.get("limit", "50") or "50")
-    limit = max(1, min(limit, 500))
+    account_id = getattr(request, "account_id", None)
+    if not account_id:
+        return jsonify({"ok": False, "error": "missing_account_id"}), 401
 
-    session = get_session(ctx.account_id, session_id)
-    if not session:
+    sess = get_session(account_id=account_id, session_id=session_id)
+    if not sess:
         return jsonify({"ok": False, "error": "session_not_found"}), 404
 
-    messages = get_messages(ctx.account_id, session_id, limit=limit)
-    return jsonify(
-        {
-            "ok": True,
-            "session": {"id": session.get("id"), "title": session.get("title"), "created_at": session.get("created_at"), "updated_at": session.get("updated_at")},
-            "messages": messages,
-        }
-    )
+    msgs = list_messages(account_id=account_id, session_id=session_id, limit=200)
+    return jsonify({"ok": True, "session": sess, "messages": msgs})
 
-
-@web_chat.post("/web/chat/sessions/<session_id>/messages")
+@bp.post("/web/chat/sessions/<session_id>/messages")
+@require_auth_plus
 def post_chat_message(session_id: str):
-    ctx = require_auth_plus()
-    data = request.get_json(silent=True) or {}
-    content = (data.get("content") or "").strip()
-    if not content:
-        return jsonify({"ok": False, "error": "message_required"}), 400
+    account_id = getattr(request, "account_id", None)
+    if not account_id:
+        return jsonify({"ok": False, "error": "missing_account_id"}), 401
 
-    history_limit = int(data.get("history_limit", 12) or 12)
-    history_limit = max(2, min(history_limit, 50))
-
-    try:
-        res = send_user_message(
-            account_id=ctx.account_id,
-            session_id=session_id,
-            content=content,
-            history_limit=history_limit,
-        )
-        return jsonify(res)
-    except ValueError as e:
-        msg = str(e)
-        if msg == "session_not_found":
-            return jsonify({"ok": False, "error": "session_not_found"}), 404
-        return jsonify({"ok": False, "error": msg}), 400
-    except Exception:
-        return jsonify({"ok": False, "error": "chat_failed"}), 500
+    data = _json()
+    text = (data.get("message") or "").strip()
+    out = chat_send(account_id=account_id, session_id=session_id, user_text=text)
+    status = 200 if out.get("ok") else 400
+    return jsonify(out), status
