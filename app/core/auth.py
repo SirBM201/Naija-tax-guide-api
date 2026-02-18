@@ -1,133 +1,137 @@
 # app/core/auth.py
+
 from __future__ import annotations
 
 import hashlib
 from functools import wraps
 from datetime import datetime, timezone
-from typing import Any, Callable, Optional, Tuple, Dict
+from typing import Callable, Any, Dict
 
 from flask import request, jsonify, g
 
 from .supabase_client import supabase
 
 
+# ---------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------
+
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _sha256_hex(value: str) -> str:
-    return hashlib.sha256((value or "").encode("utf-8")).hexdigest()
+def _hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
 
 
-def _extract_bearer_token() -> str:
-    auth = (request.headers.get("Authorization") or "").strip()
-    if not auth:
-        return ""
-    parts = auth.split(" ", 1)
+def _extract_bearer_token() -> str | None:
+    """
+    Canonical token extractor.
+
+    Handles:
+    - Bearer <token>
+    - whitespace
+    - casing
+    - accidental newlines
+    """
+
+    auth_header = request.headers.get("Authorization", "")
+
+    if not auth_header:
+        return None
+
+    parts = auth_header.strip().split()
+
     if len(parts) != 2:
-        return ""
-    scheme, token = parts[0].strip().lower(), parts[1].strip()
-    if scheme != "bearer":
-        return ""
-    return token
+        return None
+
+    scheme, token = parts
+
+    if scheme.lower() != "bearer":
+        return None
+
+    return token.strip()
 
 
-def _validate_web_token(token: str) -> Tuple[bool, Optional[str], Dict[str, Any], str]:
+def _validate_session(token: str) -> Dict[str, Any] | None:
     """
-    Validates token against public.web_sessions:
-      - token_hash == sha256(token)
-      - revoked_at IS NULL
-      - expires_at > now() (if present)
-
-    Returns:
-      (ok, account_id, token_row, reason)
-    token_row at minimum includes: expires_at, token_hash
+    Validate token against web_sessions table.
     """
-    token = (token or "").strip()
-    if not token:
-        return False, None, {}, "missing_token"
 
-    token_hash = _sha256_hex(token)
+    token_hash = _hash_token(token)
 
-    try:
-        res = (
-            supabase()
-            .table("web_sessions")
-            .select("account_id, expires_at, revoked_at, token_hash")
-            .eq("token_hash", token_hash)
-            .limit(1)
-            .execute()
-        )
+    res = (
+        supabase()
+        .table("web_sessions")
+        .select("account_id, expires_at, revoked_at, token_hash")
+        .eq("token_hash", token_hash)
+        .limit(1)
+        .execute()
+    )
 
-        rows = getattr(res, "data", None) or []
-        if not rows:
-            return False, None, {}, "not_found"
+    if not res.data:
+        return None
 
-        row = rows[0] or {}
+    row = res.data[0]
 
-        if row.get("revoked_at"):
-            return False, None, {"token_hash": token_hash, "expires_at": row.get("expires_at")}, "revoked"
+    if row.get("revoked_at"):
+        return None
 
-        expires_at = row.get("expires_at")
-        if expires_at:
-            try:
-                exp = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
-                if exp <= _now_utc():
-                    return False, None, {"token_hash": token_hash, "expires_at": expires_at}, "expired"
-            except Exception:
-                return False, None, {"token_hash": token_hash, "expires_at": expires_at}, "bad_expires_at"
+    expires_at = row.get("expires_at")
+    if expires_at:
+        exp = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+        if exp < _now_utc():
+            return None
 
-        account_id = row.get("account_id")
-        if not account_id:
-            return False, None, {"token_hash": token_hash, "expires_at": expires_at}, "missing_account_id"
-
-        # touch last_seen_at (best-effort)
-        try:
-            supabase().table("web_sessions").update(
-                {"last_seen_at": _now_utc().isoformat().replace("+00:00", "Z")}
-            ).eq("token_hash", token_hash).execute()
-        except Exception:
-            pass
-
-        token_row = {
-            "token_hash": token_hash,
-            "expires_at": expires_at,
-        }
-        return True, str(account_id), token_row, "ok"
-
-    except Exception:
-        return False, None, {"token_hash": token_hash}, "server_error"
+    return row
 
 
-def require_web_auth(fn: Callable[..., Any]) -> Callable[..., Any]:
+# ---------------------------------------------------------
+# Decorator
+# ---------------------------------------------------------
+
+def require_web_auth(fn: Callable) -> Callable:
     """
-    Flask decorator:
-      - Validates Bearer token via web_sessions
-      - Sets:
-          g.account_id
-          g.auth_token
-          g.token_row  (expires_at, token_hash)
+    Primary auth decorator.
     """
+
     @wraps(fn)
-    def wrapper(*args: Any, **kwargs: Any):
+    def wrapper(*args, **kwargs):
+
         token = _extract_bearer_token()
-        ok, account_id, token_row, reason = _validate_web_token(token)
 
-        if not ok or not account_id:
-            return jsonify({"ok": False, "error": "invalid_token", "reason": reason}), 401
+        if not token:
+            return jsonify({
+                "ok": False,
+                "error": "invalid_token",
+                "reason": "missing_bearer"
+            }), 401
 
-        g.account_id = account_id
+        session_row = _validate_session(token)
+
+        if not session_row:
+            return jsonify({
+                "ok": False,
+                "error": "invalid_token",
+                "reason": "not_found"
+            }), 401
+
+        # Attach to Flask context
+        g.account_id = session_row["account_id"]
         g.auth_token = token
-        g.token_row = token_row or {}
+        g.token_row = session_row
+
         return fn(*args, **kwargs)
 
     return wrapper
 
 
-def get_authed_account_id() -> Optional[str]:
-    return getattr(g, "account_id", None)
+# ---------------------------------------------------------
+# Backward compatibility alias
+# ---------------------------------------------------------
 
-
-# Backward compatibility for your existing imports/routes
-def require_auth_plus(fn: Callable[..., Any]) -> Callable[..., Any]:
+def require_auth_plus(fn: Callable) -> Callable:
+    """
+    Legacy alias used across routes.
+    """
     return require_web_auth(fn)
