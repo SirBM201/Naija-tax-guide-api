@@ -4,7 +4,7 @@ from __future__ import annotations
 import hashlib
 from datetime import datetime, timezone
 from functools import wraps
-from typing import Any, Callable, Optional, Tuple
+from typing import Optional
 
 from flask import g, jsonify, request
 
@@ -19,8 +19,7 @@ def _parse_iso(value: Optional[str]) -> Optional[datetime]:
     if not value:
         return None
     try:
-        v = value.replace("Z", "+00:00")
-        return datetime.fromisoformat(v)
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except Exception:
         return None
 
@@ -29,85 +28,77 @@ def _sha256_hex(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def _get_bearer_token() -> str:
-    """
-    Reads Authorization: Bearer <token>
-    """
-    auth = (request.headers.get("Authorization") or "").strip()
-    if not auth:
-        return ""
-    parts = auth.split(" ", 1)
-    if len(parts) != 2:
-        return ""
-    scheme, token = parts[0].strip().lower(), parts[1].strip()
-    if scheme != "bearer":
-        return ""
-    return token
-
-
 def _validate_web_token(token: str) -> Optional[str]:
     """
-    Validates a web session token by hashing and looking it up in `web_sessions`.
-    Returns account_id if valid else None.
+    Validates a web session token.
+
+    IMPORTANT:
+    - verify-otp creates sessions in `web_sessions`
+    - token is stored hashed as token_hash (sha256 hex)
     """
-    token = (token or "").strip()
-    if not token:
+    t = (token or "").strip()
+    if not t:
         return None
 
-    token_hash = _sha256_hex(token)
-    sb = supabase()  # IMPORTANT: supabase is a callable in this codebase
+    token_hash = _sha256_hex(t)
+
+    # supabase() returns the client (singleton)
+    sb = supabase()
 
     try:
-        res = (
+        resp = (
             sb.table("web_sessions")
             .select("account_id, expires_at, revoked_at")
             .eq("token_hash", token_hash)
             .limit(1)
             .execute()
         )
+        row = (resp.data or [None])[0]
     except Exception:
-        # Let caller treat as invalid (don’t leak internal errors)
+        # If anything goes wrong, treat as invalid token
         return None
 
-    rows = getattr(res, "data", None) or []
-    if not rows:
+    if not row:
         return None
 
-    row = rows[0]
+    # revoked?
+    if row.get("revoked_at"):
+        return None
+
+    # expired?
+    exp = _parse_iso(row.get("expires_at"))
+    if exp and exp <= _now_utc():
+        return None
+
     account_id = row.get("account_id")
-    expires_at = _parse_iso(row.get("expires_at"))
-    revoked_at = _parse_iso(row.get("revoked_at"))
-
     if not account_id:
         return None
-    if revoked_at is not None:
-        return None
-    if expires_at is not None and expires_at <= _now_utc():
-        return None
 
-    # Optional: touch last_seen_at if the column exists (best-effort)
+    # Best-effort "touch" last_seen_at (do not block request if it fails)
     try:
-        sb.table("web_sessions").update({"last_seen_at": _now_utc().isoformat().replace("+00:00", "Z")}).eq(
-            "token_hash", token_hash
-        ).execute()
+        sb.table("web_sessions").update(
+            {"last_seen_at": _now_utc().isoformat().replace("+00:00", "Z")}
+        ).eq("token_hash", token_hash).execute()
     except Exception:
         pass
 
-    return str(account_id)
+    return account_id
 
 
-def require_auth_plus(fn: Callable[..., Any]) -> Callable[..., Any]:
+def require_auth_plus(fn):
     """
-    Protects endpoints using web bearer token.
-    Sets:
-      g.account_id
+    Checks Authorization: Bearer <token>
+    Sets g.account_id if valid, otherwise returns 401.
     """
 
     @wraps(fn)
-    def wrapper(*args: Any, **kwargs: Any):
-        token = _get_bearer_token()
-        account_id = _validate_web_token(token)
+    def wrapper(*args, **kwargs):
+        auth = request.headers.get("Authorization") or ""
+        token = ""
+        if auth.lower().startswith("bearer "):
+            token = auth.split(" ", 1)[1].strip()
 
+        account_id = _validate_web_token(token)
         if not account_id:
             return jsonify({"ok": False, "error": "invalid_token"}), 401
 
