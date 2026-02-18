@@ -1,10 +1,11 @@
+# app/routes/billing.py
 """Billing snapshot for the web UI.
 
 Frontend calls:
   GET /api/billing/me
 
 Source of truth:
-  - Subscription state: public.user_subscriptions (via services/subscriptions_service.py)
+  - Subscription state: public.user_subscriptions
   - Plan metadata: public.plans
   - Credits: public.ai_credit_ledger
 
@@ -36,7 +37,6 @@ def _bearer_token() -> str | None:
 
 @bp.get("/billing/me")
 def billing_me():
-    """Return the logged-in user's billing snapshot."""
     token = _bearer_token()
     if not token:
         return jsonify({"ok": False, "error": "missing_token"}), 401
@@ -47,24 +47,16 @@ def billing_me():
 
     touch_session_best_effort(token)
 
-    # -------------------------
-    # Subscription (SOURCE OF TRUTH = user_subscriptions)
-    # -------------------------
+    # Subscription
     sub = get_subscription_status(account_id=account_id)
-    active = bool(sub.get("active"))
-    state = sub.get("state") or "none"
-    plan_code = sub.get("plan_code")
-    expires_at = sub.get("expires_at")
-    grace_until = sub.get("grace_until")
-    reason_state = sub.get("reason") or "unknown"
 
-    # Optional plan metadata for the UI
+    plan_code = sub.get("plan_code")
     plan = None
     if plan_code:
         try:
-            sb = supabase()
+            db = supabase()
             resp = (
-                sb.table("plans")
+                db.table("plans")
                 .select("plan_code,name,duration_days,active,ai_credits_total,daily_answers_limit,created_at")
                 .eq("plan_code", plan_code)
                 .limit(1)
@@ -75,11 +67,16 @@ def billing_me():
         except Exception:
             plan = None
 
-    # -------------------------
-    # Credits (ai_credit_ledger)
-    # -------------------------
+    # Credits
     credit_row = get_latest_credit_row(account_id)
-    credits = None
+    credits = {
+        "credits_total": 0,
+        "credits_remaining": 0,
+        "daily_answers_limit": None,
+        "daily_answers_used": 0,
+        "daily_day": None,
+        "updated_at": None,
+    }
     if credit_row:
         credits = {
             "credits_total": credit_row.get("credits_total"),
@@ -89,26 +86,17 @@ def billing_me():
             "daily_day": credit_row.get("daily_day"),
             "updated_at": credit_row.get("updated_at"),
         }
-    else:
-        credits = {
-            "credits_total": 0,
-            "credits_remaining": 0,
-            "daily_answers_limit": None,
-            "daily_answers_used": 0,
-            "daily_day": None,
-            "updated_at": None,
-        }
 
     return jsonify(
         {
             "ok": True,
             "account_id": account_id,
-            "active": active,
-            "state": state,  # none | active | grace | expired
+            "active": bool(sub.get("active")),
+            "state": sub.get("state") or "none",
             "plan_code": plan_code,
-            "expires_at": expires_at,
-            "grace_until": grace_until,
-            "reason": reason_state,
+            "expires_at": sub.get("expires_at"),
+            "grace_until": sub.get("grace_until"),
+            "reason": sub.get("reason") or "ok",
             "subscription": sub,
             "plan": plan,
             "credits": credits,
