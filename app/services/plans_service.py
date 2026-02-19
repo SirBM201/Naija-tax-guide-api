@@ -1,113 +1,60 @@
+# app/services/plans_service.py
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
 from app.core.supabase_client import supabase
 
+DEFAULT_PLANS: List[Dict[str, Any]] = [
+    {"plan_code": "monthly", "name": "Monthly Plan", "price": 3000, "duration_days": 30, "active": True},
+    {"plan_code": "quarterly", "name": "Quarterly Plan", "price": 8000, "duration_days": 90, "active": True},
+    {"plan_code": "yearly", "name": "Yearly Plan", "price": 30000, "duration_days": 365, "active": True},
+]
 
-# ---------------------------------------------------------
-# Internal helper
-# ---------------------------------------------------------
 
 def _sb():
-    """
-    Supports both:
-      supabase  (instance)
-      supabase() (factory)
-    """
     return supabase() if callable(supabase) else supabase
 
 
-# ---------------------------------------------------------
-# List plans
-# ---------------------------------------------------------
-
 def list_plans(active_only: bool = True) -> List[Dict[str, Any]]:
     """
-    Reads plans from Supabase table 'plans'.
-
-    Safe fallback:
-      - If table missing
-      - If query fails
-      → returns default plans so UI never breaks.
+    Tries DB table 'plans'. If missing, returns DEFAULT_PLANS.
     """
     try:
-        q = _sb().table("plans").select(
-            "plan_code,name,duration_days,active,price,created_at"
-        )
-
+        q = _sb().table("plans").select("plan_code,name,price,duration_days,active")
         if active_only:
             q = q.eq("active", True)
-
-        res = q.order("duration_days").execute()
-
+        res = q.order("duration_days", desc=False).execute()
         rows = getattr(res, "data", None) or []
-        if rows:
-            return rows
-
+        return rows if rows else DEFAULT_PLANS
     except Exception:
-        pass
+        return DEFAULT_PLANS
 
-    # -------------------------
-    # Safe fallback defaults
-    # -------------------------
-    return [
-        {
-            "plan_code": "monthly",
-            "name": "Monthly Plan",
-            "duration_days": 30,
-            "price": 3000,
-            "active": True,
-        },
-        {
-            "plan_code": "quarterly",
-            "name": "Quarterly Plan",
-            "duration_days": 90,
-            "price": 8000,
-            "active": True,
-        },
-        {
-            "plan_code": "yearly",
-            "name": "Yearly Plan",
-            "duration_days": 365,
-            "price": 30000,
-            "active": True,
-        },
-    ]
-
-
-# ---------------------------------------------------------
-# Single plan
-# ---------------------------------------------------------
 
 def get_plan(plan_code: str) -> Optional[Dict[str, Any]]:
-    plan_code = (plan_code or "").strip()
-    if not plan_code:
+    code = (plan_code or "").strip().lower()
+    if not code:
         return None
 
+    # DB first
     try:
         res = (
             _sb()
             .table("plans")
-            .select(
-                "plan_code,name,duration_days,active,price,created_at"
-            )
-            .eq("plan_code", plan_code)
+            .select("plan_code,name,price,duration_days,active")
+            .eq("plan_code", code)
             .limit(1)
             .execute()
         )
-
         rows = getattr(res, "data", None) or []
         if rows:
             return rows[0]
-
     except Exception:
         pass
 
-    # fallback search in defaults
-    defaults = list_plans(active_only=False)
-    for p in defaults:
-        if p["plan_code"] == plan_code:
+    # fallback
+    for p in DEFAULT_PLANS:
+        if p["plan_code"] == code:
             return p
 
     return None
