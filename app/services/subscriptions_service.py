@@ -64,8 +64,40 @@ def _find_account_id(
     return (rows[0].get("account_id") or "").strip() or None
 
 
+def _safe_select_one(table: str, select: str, **eq_filters) -> Optional[Dict[str, Any]]:
+    """
+    Best-effort select 1 row. If table doesn't exist or any error -> None.
+    """
+    try:
+        sb = _sb()
+        q = sb.table(table).select(select)
+        for k, v in eq_filters.items():
+            q = q.eq(k, v)
+        res = q.limit(1).execute()
+        rows = getattr(res, "data", None) or []
+        return rows[0] if rows else None
+    except Exception:
+        return None
+
+
+def _safe_upsert(table: str, payload: Dict[str, Any], on_conflict: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """
+    Best-effort upsert. If table doesn't exist or any error -> None.
+    """
+    try:
+        sb = _sb()
+        if on_conflict:
+            res = sb.table(table).upsert(payload, on_conflict=on_conflict).execute()
+        else:
+            res = sb.table(table).upsert(payload).execute()
+        rows = getattr(res, "data", None) or []
+        return rows[0] if rows else payload
+    except Exception:
+        return None
+
+
 # -----------------------------
-# Core API
+# Subscription Status
 # -----------------------------
 def get_subscription_status(
     account_id: Optional[str] = None,
@@ -120,7 +152,6 @@ def get_subscription_status(
             out["reason"] = "active"
             return out
 
-        # expired but still in grace window
         if grace and now <= grace:
             out["active"] = True
             out["state"] = "grace"
@@ -137,6 +168,9 @@ def get_subscription_status(
         return out
 
 
+# -----------------------------
+# Activation / Change
+# -----------------------------
 def activate_subscription_now(
     account_id: str,
     plan_code: str,
@@ -171,7 +205,6 @@ def activate_subscription_now(
         "updated_at": _iso(now),
     }
 
-    # upsert by account_id
     res = sb.table("subscriptions").upsert(payload, on_conflict="account_id").execute()
     rows = getattr(res, "data", None) or []
     return rows[0] if rows else payload
@@ -188,7 +221,6 @@ def manual_activate_subscription(
     now = _now_utc()
     exp = _parse_iso(expires_at) if expires_at else None
     if exp is None:
-        # if not provided, default 30 days
         exp = now + timedelta(days=30)
 
     sb = _sb()
@@ -209,7 +241,6 @@ def manual_activate_subscription(
 def start_trial_if_eligible(account_id: str, trial_plan_code: str = "trial") -> Dict[str, Any]:
     """
     Starts a trial only if user has no subscription row yet.
-    (You can tighten this later with a 'trial_used' flag if you want.)
     """
     sb = _sb()
     try:
@@ -233,13 +264,11 @@ def start_trial_if_eligible(account_id: str, trial_plan_code: str = "trial") -> 
 
 def schedule_plan_change_at_expiry(account_id: str, next_plan_code: str) -> Dict[str, Any]:
     """
-    Stores next_plan_code on the subscription row. A cron job (or webhook verification)
-    can later apply it when expires_at is reached.
+    Stores next_plan_code on the subscription row.
     """
     sb = _sb()
     now = _now_utc()
 
-    # Ensure row exists
     res = (
         sb.table("subscriptions")
         .select("account_id, plan_code, status, expires_at, grace_until, next_plan_code")
@@ -249,7 +278,6 @@ def schedule_plan_change_at_expiry(account_id: str, next_plan_code: str) -> Dict
     )
     rows = getattr(res, "data", None) or []
     if not rows:
-        # create a minimal row (inactive) with immediate next_plan_code
         payload = {
             "account_id": account_id,
             "plan_code": None,
@@ -263,7 +291,6 @@ def schedule_plan_change_at_expiry(account_id: str, next_plan_code: str) -> Dict
         data = getattr(up, "data", None) or []
         return data[0] if data else payload
 
-    # update existing
     upd = (
         sb.table("subscriptions")
         .update({"next_plan_code": (next_plan_code or "").strip().lower(), "updated_at": _iso(now)})
@@ -272,3 +299,85 @@ def schedule_plan_change_at_expiry(account_id: str, next_plan_code: str) -> Dict
     )
     data = getattr(upd, "data", None) or []
     return data[0] if data else rows[0]
+
+
+# -----------------------------
+# Webhook Payment Success Handler (FIXES YOUR CRASH)
+# -----------------------------
+def handle_payment_success(
+    *,
+    reference: Optional[str] = None,
+    account_id: Optional[str] = None,
+    provider: Optional[str] = None,
+    provider_user_id: Optional[str] = None,
+    plan_code: Optional[str] = None,
+    amount: Optional[int] = None,
+    currency: Optional[str] = None,
+    paid_at: Optional[str] = None,
+    raw: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    ✅ This function is imported by app/routes/webhooks.py.
+    It must exist or the app will crash at boot.
+
+    What it does:
+    - resolves account_id
+    - idempotency check (best-effort) using 'payments' table if it exists
+    - activates subscription immediately based on plan_code
+    - records payment (best-effort) if payments table exists
+    - returns a clean dict for webhooks.py to jsonify
+
+    NOTE:
+    - This is safe even if you don't yet have payments table; it won't crash.
+    """
+    resolved = _find_account_id(account_id, provider, provider_user_id)
+    if not resolved:
+        return {"ok": False, "error": "no_account", "reference": reference}
+
+    pcode = (plan_code or "").strip().lower() or "monthly"
+    now = _now_utc()
+
+    # ---- Idempotency (best-effort) ----
+    # If you have a payments table with a unique "reference", this prevents double activation.
+    if reference:
+        existing = _safe_select_one("payments", "reference, status, account_id, plan_code, created_at", reference=reference)
+        if existing and (existing.get("status") in ("success", "succeeded", "paid")):
+            # already handled before
+            status = get_subscription_status(account_id=resolved)
+            return {
+                "ok": True,
+                "idempotent": True,
+                "reference": reference,
+                "account_id": resolved,
+                "plan_code": status.get("plan_code"),
+                "expires_at": status.get("expires_at"),
+                "subscription_status": status,
+            }
+
+    # ---- Activate subscription ----
+    sub = activate_subscription_now(account_id=resolved, plan_code=pcode, status="active", duration_days=None)
+
+    # ---- Record payment (best-effort) ----
+    if reference:
+        pay_payload = {
+            "reference": reference,
+            "account_id": resolved,
+            "plan_code": pcode,
+            "amount": amount,
+            "currency": currency or "NGN",
+            "status": "success",
+            "paid_at": paid_at,
+            "created_at": _iso(now),
+            "raw": raw,
+        }
+        # If you have unique on reference: on_conflict="reference"
+        _safe_upsert("payments", pay_payload, on_conflict="reference")
+
+    return {
+        "ok": True,
+        "reference": reference,
+        "account_id": resolved,
+        "plan_code": sub.get("plan_code"),
+        "expires_at": sub.get("expires_at"),
+        "subscription": sub,
+    }
