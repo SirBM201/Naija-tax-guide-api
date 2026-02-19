@@ -1,23 +1,21 @@
+# app/routes/web_ask.py
 from __future__ import annotations
 
-from flask import Blueprint, request, jsonify, g
+from typing import Any, Dict
+from flask import Blueprint, jsonify, request, g
 
-from app.core.auth import require_web_auth
+from app.core.auth import require_auth_plus
 from app.services.ask_service import ask_guarded
 
 bp = Blueprint("web_ask", __name__)
 
-@bp.route("/web/ask", methods=["POST"])
+@bp.post("/web/ask")
+@require_auth_plus
 def web_ask():
-    ok, resp = require_web_auth()
-    if not ok:
-        return resp
+    body: Dict[str, Any] = request.get_json(silent=True) or {}
+    body["account_id"] = getattr(g, "account_id", None)
+    body.setdefault("provider", "web")
+    body.setdefault("provider_user_id", getattr(g, "account_id", None))
 
-    body = request.get_json(silent=True) or {}
-
-    # Inject identity from web session token
-    body["account_id"] = g.account_id
-    body["source"] = "web"
-
-    result, status = ask_guarded(body)
-    return jsonify(result), status
+    res = ask_guarded(body)
+    return jsonify(res), (200 if res.get("ok") else 400)
