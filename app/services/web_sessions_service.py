@@ -1,157 +1,124 @@
 # app/services/web_sessions_service.py
 from __future__ import annotations
 
-import hashlib
-import secrets
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple
 
-from ..core.config import (
-    ACCESS_TOKEN_TTL_SECONDS,
-    WEB_TOKEN_PEPPER,
-    WEB_TOKEN_TABLE,
-    WEB_TOKEN_COL_TOKEN,
-    WEB_TOKEN_COL_ACCOUNT_ID,
-    WEB_TOKEN_COL_EXPIRES_AT,
-    WEB_TOKEN_COL_REVOKED_AT,
-)
 from ..core.supabase_client import supabase
 
+
+# ------------------------------------------------------------
+# Config
+# ------------------------------------------------------------
+
+WEB_SESSION_TTL_DAYS = int((os.getenv("WEB_SESSION_TTL_DAYS", "30") or "30").strip())
+WEB_SESSION_TOUCH_ENABLED = (os.getenv("WEB_SESSION_TOUCH_ENABLED", "1").strip() == "1")
+
+
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
-
 def _iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
+def _parse_iso(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        v = value.replace("Z", "+00:00")
+        return datetime.fromisoformat(v)
+    except Exception:
+        return None
 
-def _sha256_hex(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+def _sb():
+    try:
+        return supabase()
+    except TypeError:
+        return supabase
 
+def _table(name: str):
+    return _sb().table(name)
 
-def _token_hash(token: str) -> str:
-    """
-    Hash token with pepper so DB never stores raw token.
-    """
-    pepper = (WEB_TOKEN_PEPPER or "").strip()
-    return _sha256_hex(f"{pepper}:{token}")
-
-
-def _rows(resp: Any):
-    """
-    supabase-py response adapter
-    """
-    if resp is None:
-        return []
-    data = getattr(resp, "data", None)
-    if data is not None:
-        return data
-    if isinstance(resp, dict):
-        return resp.get("data") or []
-    return []
+def _clean(s: Any) -> str:
+    return (s or "").strip()
 
 
-def create_web_session(account_id: str, ip: Optional[str] = None, user_agent: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Returns: { token, expires_at }
-    """
-    token = secrets.token_urlsafe(32)
-    token_hash = _token_hash(token)
-
-    expires_at = _now_utc() + timedelta(seconds=int(ACCESS_TOKEN_TTL_SECONDS or 2592000))
-    payload = {
-        WEB_TOKEN_COL_ACCOUNT_ID: account_id,
-        WEB_TOKEN_COL_TOKEN: token_hash,
-        WEB_TOKEN_COL_EXPIRES_AT: _iso(expires_at),
-        # optional columns (present in your schema)
-        "ip": ip,
-        "user_agent": user_agent,
-    }
-
-    sb = supabase()
-    sb.table(WEB_TOKEN_TABLE).insert(payload).execute()
-
-    return {"token": token, "expires_at": _iso(expires_at)}
-
+# ------------------------------------------------------------
+# Public API (MUST match app/routes/web_auth.py imports)
+# ------------------------------------------------------------
 
 def validate_web_session(token: str) -> Tuple[bool, Optional[str], str]:
     """
+    Validates web session token.
+
     Returns: (ok, account_id, reason)
-    reason: missing_token | invalid_token | revoked | expired | db_error
+
+    Table recommended: web_sessions
+      - token (text pk)
+      - contact (text)
+      - account_id (text/uuid nullable)
+      - expires_at (timestamptz)
+      - created_at (timestamptz)
+      - last_seen_at (timestamptz)
+      - revoked_at (timestamptz nullable)
     """
+    token = _clean(token)
     if not token:
         return False, None, "missing_token"
 
-    sb = supabase()
-    th = _token_hash(token)
-
+    # Best effort: if table not present, fail closed (safer)
     try:
-        resp = (
-            sb.table(WEB_TOKEN_TABLE)
-            .select(f"{WEB_TOKEN_COL_ACCOUNT_ID},{WEB_TOKEN_COL_EXPIRES_AT},{WEB_TOKEN_COL_REVOKED_AT}")
-            .eq(WEB_TOKEN_COL_TOKEN, th)
+        res = (
+            _table("web_sessions")
+            .select("token, account_id, expires_at, revoked_at")
+            .eq("token", token)
             .limit(1)
             .execute()
         )
-        rows = _rows(resp)
+        rows = getattr(res, "data", None) or []
         if not rows:
-            return False, None, "invalid_token"
+            return False, None, "session_not_found"
 
         row = rows[0]
-        if row.get(WEB_TOKEN_COL_REVOKED_AT):
-            return False, None, "revoked"
+        revoked_at = _parse_iso(row.get("revoked_at"))
+        if revoked_at:
+            return False, None, "session_revoked"
 
-        exp = row.get(WEB_TOKEN_COL_EXPIRES_AT)
-        if not exp:
-            return False, None, "expired"
+        expires_at = _parse_iso(row.get("expires_at"))
+        if not expires_at:
+            return False, None, "session_missing_expiry"
 
-        # parse iso
-        try:
-            exp_dt = datetime.fromisoformat(str(exp).replace("Z", "+00:00"))
-        except Exception:
-            return False, None, "expired"
+        if _now_utc() > expires_at:
+            return False, None, "session_expired"
 
-        if exp_dt <= _now_utc():
-            return False, None, "expired"
+        account_id = _clean(row.get("account_id")) or None
+        # NOTE: if account_id is not yet linked, you can still treat it as logged-in user
+        # by linking contact->account later. For now, your /me expects account_id.
+        if not account_id:
+            return False, None, "session_not_linked"
 
-        return True, row.get(WEB_TOKEN_COL_ACCOUNT_ID), "ok"
+        return True, account_id, "ok"
     except Exception:
-        return False, None, "db_error"
+        return False, None, "session_store_unavailable"
 
 
 def touch_session_best_effort(token: str) -> None:
     """
-    Update last_seen_at; ignore failures.
+    Updates last_seen_at for a session. Never throws.
     """
-    if not token:
-        return
-    sb = supabase()
-    th = _token_hash(token)
-    try:
-        sb.table(WEB_TOKEN_TABLE).update({"last_seen_at": _iso(_now_utc())}).eq(WEB_TOKEN_COL_TOKEN, th).execute()
-    except Exception:
+    if not WEB_SESSION_TOUCH_ENABLED:
         return
 
-
-def revoke_session(token: str) -> bool:
-    """
-    Marks the session revoked_at = now().
-
-    Returns True if any row updated.
-    """
+    token = _clean(token)
     if not token:
-        return False
-    sb = supabase()
-    th = _token_hash(token)
+        return
+
     try:
-        resp = (
-            sb.table(WEB_TOKEN_TABLE)
-            .update({WEB_TOKEN_COL_REVOKED_AT: _iso(_now_utc())})
-            .eq(WEB_TOKEN_COL_TOKEN, th)
-            .execute()
-        )
-        rows = _rows(resp)
-        return bool(rows)
+        _table("web_sessions").update({"last_seen_at": _iso(_now_utc())}).eq("token", token).execute()
     except Exception:
-        return False
+        return
