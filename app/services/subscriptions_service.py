@@ -1,8 +1,18 @@
 # app/services/subscriptions_service.py
-from typing import Optional, Dict, Any, Tuple
-from datetime import datetime, timedelta, timezone
+from __future__ import annotations
 
-from ..core.supabase_client import supabase
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Dict, Any, Tuple
+
+from ..core.supabase_client import supabase as _supabase
+
+
+# -----------------------------
+# Supabase client compat
+# (supports supabase() factory OR supabase client instance)
+# -----------------------------
+def sb():
+    return _supabase() if callable(_supabase) else _supabase
 
 
 # -----------------------------
@@ -37,47 +47,54 @@ def _find_account_id(
     Else try to find account by (provider, provider_user_id) from accounts table.
     """
     if account_id:
-        return account_id.strip() or None
+        return (account_id or "").strip() or None
 
     if not provider or not provider_user_id:
         return None
 
-    rows = (
-        supabase.table("accounts")
-        .select("id")
-        .eq("provider", provider)
-        .eq("provider_user_id", provider_user_id)
-        .limit(1)
-        .execute()
-        .data
-        or []
-    )
-    return rows[0]["id"] if rows else None
-
-
-def _get_active_plan(plan_code: str) -> Optional[Dict[str, Any]]:
-    if not plan_code:
+    try:
+        res = (
+            sb()
+            .table("accounts")
+            .select("account_id")
+            .eq("provider", provider)
+            .eq("provider_user_id", provider_user_id)
+            .limit(1)
+            .execute()
+        )
+        rows = (res.data or []) if hasattr(res, "data") else []
+        return rows[0]["account_id"] if rows else None
+    except Exception:
         return None
-    rows = (
-        supabase.table("plans")
-        .select("plan_code,name,price_ngn,duration_days,active")
-        .eq("plan_code", plan_code)
-        .eq("active", True)
-        .limit(1)
-        .execute()
-        .data
-        or []
-    )
-    return rows[0] if rows else None
 
 
+def _get_active_subscription_row(account_id: str) -> Optional[Dict[str, Any]]:
+    try:
+        res = (
+            sb()
+            .table("user_subscriptions")
+            .select("*")
+            .eq("account_id", account_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = (res.data or []) if hasattr(res, "data") else []
+        return rows[0] if rows else None
+    except Exception:
+        return None
+
+
+# -----------------------------
+# Public: subscription status
+# -----------------------------
 def get_subscription_status(
     account_id: Optional[str] = None,
     provider: Optional[str] = None,
     provider_user_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Returns a normalized view of subscription state.
+    Returns a normalized status used by frontend + enforcement.
     """
     aid = _find_account_id(account_id, provider, provider_user_id)
     if not aid:
@@ -87,21 +104,12 @@ def get_subscription_status(
             "expires_at": None,
             "grace_until": None,
             "plan_code": None,
-            "reason": "no_account",
+            "reason": "missing_account",
             "state": "none",
         }
 
-    rows = (
-        supabase.table("user_subscriptions")
-        .select("account_id,plan_code,active,expires_at,grace_until")
-        .eq("account_id", aid)
-        .limit(1)
-        .execute()
-        .data
-        or []
-    )
-
-    if not rows:
+    row = _get_active_subscription_row(aid)
+    if not row:
         return {
             "account_id": aid,
             "active": False,
@@ -112,34 +120,40 @@ def get_subscription_status(
             "state": "none",
         }
 
-    sub = rows[0]
-    active = bool(sub.get("active"))
-    expires_at = sub.get("expires_at")
-    grace_until = sub.get("grace_until")
-    plan_code = sub.get("plan_code")
-
     now = _now_utc()
-    exp_dt = _parse_iso(expires_at) if expires_at else None
-    grace_dt = _parse_iso(grace_until) if grace_until else None
+    expires_at = _parse_iso(row.get("expires_at") or "") if row.get("expires_at") else None
+    grace_until = _parse_iso(row.get("grace_until") or "") if row.get("grace_until") else None
 
-    if active and exp_dt and exp_dt > now:
+    plan_code = row.get("plan_code")
+    if not expires_at:
+        return {
+            "account_id": aid,
+            "active": False,
+            "expires_at": None,
+            "grace_until": None,
+            "plan_code": plan_code,
+            "reason": "bad_expires_at",
+            "state": "expired",
+        }
+
+    if expires_at > now:
         return {
             "account_id": aid,
             "active": True,
-            "expires_at": expires_at,
-            "grace_until": grace_until,
+            "expires_at": _iso(expires_at),
+            "grace_until": _iso(grace_until) if grace_until else None,
             "plan_code": plan_code,
             "reason": "active",
             "state": "active",
         }
 
-    # expired but still inside grace window
-    if (not active or (exp_dt and exp_dt <= now)) and grace_dt and grace_dt > now:
+    # expired; maybe still in grace
+    if grace_until and grace_until > now:
         return {
             "account_id": aid,
             "active": True,
-            "expires_at": expires_at,
-            "grace_until": grace_until,
+            "expires_at": _iso(expires_at),
+            "grace_until": _iso(grace_until),
             "plan_code": plan_code,
             "reason": "grace",
             "state": "grace",
@@ -148,8 +162,8 @@ def get_subscription_status(
     return {
         "account_id": aid,
         "active": False,
-        "expires_at": expires_at,
-        "grace_until": grace_until,
+        "expires_at": _iso(expires_at),
+        "grace_until": _iso(grace_until) if grace_until else None,
         "plan_code": plan_code,
         "reason": "expired",
         "state": "expired",
@@ -157,157 +171,189 @@ def get_subscription_status(
 
 
 # -----------------------------
-# Trial / Manual activation
+# Trial
 # -----------------------------
-def start_trial_if_eligible(
-    account_id: str,
-    plan_code: str = "trial",
-    duration_days: int = 7,
-) -> Dict[str, Any]:
+def start_trial_if_eligible(account_id: str) -> Tuple[bool, str]:
     """
-    Create/update a subscription row for a trial if:
-    - user_subscriptions row doesn't exist OR is inactive/expired.
+    Lightweight stub: start a trial only if user has no subscription yet.
+    If you already have a more complex trial policy, keep it here.
     """
+    account_id = (account_id or "").strip()
     if not account_id:
-        return {"ok": False, "error": "missing_account_id"}
+        return False, "missing_account_id"
 
-    now = _now_utc()
-    expires = now + timedelta(days=duration_days)
+    existing = _get_active_subscription_row(account_id)
+    if existing:
+        return False, "already_has_subscription"
 
-    # if subscription exists and active, do nothing
-    current = (
-        supabase.table("user_subscriptions")
-        .select("active,expires_at,grace_until,plan_code")
-        .eq("account_id", account_id)
-        .limit(1)
-        .execute()
-        .data
-        or []
-    )
+    # If you have a trial plan in "plans" table, use it; else skip.
+    trial_plan_code = "trial"
+    try:
+        plan = (
+            sb()
+            .table("plans")
+            .select("plan_code, duration_days")
+            .eq("plan_code", trial_plan_code)
+            .eq("active", True)
+            .limit(1)
+            .execute()
+        )
+        prow = (plan.data or []) if hasattr(plan, "data") else []
+        if not prow:
+            return False, "trial_plan_not_configured"
 
-    if current:
-        sub = current[0]
-        if sub.get("active") and (_parse_iso(sub.get("expires_at") or "") or now) > now:
-            return {"ok": True, "status": "already_active"}
+        duration_days = int(prow[0].get("duration_days") or 7)
+        now = _now_utc()
+        expires_at = now + timedelta(days=duration_days)
+        grace_until = expires_at + timedelta(days=2)
 
-        # update to trial
-        supabase.table("user_subscriptions").update(
+        sb().table("user_subscriptions").insert(
             {
-                "plan_code": plan_code,
-                "active": True,
-                "expires_at": _iso(expires),
-                "grace_until": _iso(expires + timedelta(days=3)),
-                "updated_at": _iso(now),
+                "account_id": account_id,
+                "plan_code": trial_plan_code,
+                "expires_at": _iso(expires_at),
+                "grace_until": _iso(grace_until),
+                "status": "active",
+                "source": "trial",
             }
-        ).eq("account_id", account_id).execute()
-        return {"ok": True, "status": "trial_updated"}
+        ).execute()
 
-    # create trial
-    supabase.table("user_subscriptions").insert(
-        {
-            "account_id": account_id,
-            "plan_code": plan_code,
-            "active": True,
-            "expires_at": _iso(expires),
-            "grace_until": _iso(expires + timedelta(days=3)),
-            "created_at": _iso(now),
-            "updated_at": _iso(now),
-        }
-    ).execute()
-
-    return {"ok": True, "status": "trial_created"}
+        return True, "trial_started"
+    except Exception:
+        return False, "trial_start_failed"
 
 
-def manual_activate_subscription(
+# -----------------------------
+# Activation / upgrades
+# -----------------------------
+def activate_subscription_now(
     account_id: str,
     plan_code: str,
-) -> Dict[str, Any]:
+    reference: Optional[str] = None,
+    paid_at: Optional[str] = None,
+    source: str = "paystack",
+) -> Tuple[bool, str]:
     """
-    Admin/manual activation. Sets active = True and expires_at based on plan duration.
+    Activate plan immediately from now (reset expiry from now).
     """
-    if not account_id:
-        return {"ok": False, "error": "missing_account_id"}
-    plan = _get_active_plan(plan_code)
-    if not plan:
-        return {"ok": False, "error": "invalid_plan"}
-
-    now = _now_utc()
-    expires = now + timedelta(days=int(plan.get("duration_days") or 30))
-
-    # upsert subscription row
-    existing = (
-        supabase.table("user_subscriptions")
-        .select("account_id")
-        .eq("account_id", account_id)
-        .limit(1)
-        .execute()
-        .data
-        or []
-    )
-
-    payload = {
-        "account_id": account_id,
-        "plan_code": plan_code,
-        "active": True,
-        "expires_at": _iso(expires),
-        "grace_until": _iso(expires + timedelta(days=3)),
-        "updated_at": _iso(now),
-    }
-
-    if existing:
-        supabase.table("user_subscriptions").update(payload).eq("account_id", account_id).execute()
-    else:
-        payload["created_at"] = _iso(now)
-        supabase.table("user_subscriptions").insert(payload).execute()
-
-    return {"ok": True, "expires_at": _iso(expires), "plan_code": plan_code}
-
-
-# -----------------------------
-# Paystack webhook handler hook
-# -----------------------------
-def handle_payment_success(reference: str) -> Dict[str, Any]:
-    """
-    Called from routes/webhooks.py.
-    Looks up the payment row, then activates subscription accordingly.
-    Your DB tables may differ — adjust selection keys if needed.
-    """
-    ref = (reference or "").strip()
-    if not ref:
-        return {"ok": False, "error": "missing_reference"}
-
-    rows = (
-        supabase.table("payments")
-        .select("id,account_id,plan_code,status,reference")
-        .eq("reference", ref)
-        .limit(1)
-        .execute()
-        .data
-        or []
-    )
-    if not rows:
-        return {"ok": False, "error": "payment_not_found"}
-
-    pay = rows[0]
-    if (pay.get("status") or "").lower() not in ("success", "successful", "paid"):
-        # still allow activation if your system marks success differently
-        # but keep conservative by default:
-        return {"ok": False, "error": "payment_not_success"}
-
-    account_id = pay.get("account_id")
-    plan_code = pay.get("plan_code")
+    account_id = (account_id or "").strip()
+    plan_code = (plan_code or "").strip()
 
     if not account_id or not plan_code:
-        return {"ok": False, "error": "payment_missing_fields"}
+        return False, "missing_account_or_plan"
 
-    act = manual_activate_subscription(account_id=account_id, plan_code=plan_code)
-    if not act.get("ok"):
-        return {"ok": False, "error": "activation_failed", "detail": act}
-
-    # mark payment consumed/processed (optional)
     try:
-        supabase.table("payments").update({"processed": True}).eq("id", pay["id"]).execute()
-    except Exception:
-        pass
+        # fetch plan duration
+        res = (
+            sb()
+            .table("plans")
+            .select("plan_code, duration_days, active")
+            .eq("plan_code", plan_code)
+            .eq("active", True)
+            .limit(1)
+            .execute()
+        )
+        rows = (res.data or []) if hasattr(res, "data") else []
+        if not rows:
+            return False, "plan_not_found_or_inactive"
 
-    return {"ok": True, "activated": act}
+        duration_days = int(rows[0].get("duration_days") or 30)
+        now = _now_utc()
+        expires_at = now + timedelta(days=duration_days)
+        grace_until = expires_at + timedelta(days=2)
+
+        # create a new subscription row (append history)
+        sb().table("user_subscriptions").insert(
+            {
+                "account_id": account_id,
+                "plan_code": plan_code,
+                "expires_at": _iso(expires_at),
+                "grace_until": _iso(grace_until),
+                "status": "active",
+                "source": source,
+                "reference": reference,
+                "paid_at": paid_at,
+            }
+        ).execute()
+
+        return True, "activated"
+    except Exception:
+        return False, "activation_failed"
+
+
+def schedule_plan_change_at_expiry(
+    account_id: str,
+    next_plan_code: str,
+    effective_after: Optional[str] = None,
+) -> Tuple[bool, str]:
+    """
+    Schedules a plan change when current plan expires.
+    Implementation: store "pending_plan_code" on latest subscription row (if column exists),
+    else store into a lightweight table if you have it.
+    """
+    account_id = (account_id or "").strip()
+    next_plan_code = (next_plan_code or "").strip()
+    if not account_id or not next_plan_code:
+        return False, "missing_account_or_plan"
+
+    row = _get_active_subscription_row(account_id)
+    if not row:
+        return False, "no_existing_subscription"
+
+    sub_id = row.get("id")
+    if not sub_id:
+        return False, "bad_subscription_row"
+
+    try:
+        payload = {"pending_plan_code": next_plan_code}
+        if effective_after:
+            payload["pending_effective_after"] = effective_after
+
+        # If the column doesn't exist, this will error; you can later add it.
+        sb().table("user_subscriptions").update(payload).eq("id", sub_id).execute()
+        return True, "scheduled"
+    except Exception:
+        return False, "schedule_failed_add_columns_pending_plan_code"
+
+
+def manual_activate_subscription(account_id: str, plan_code: str) -> Tuple[bool, str]:
+    """
+    Admin/manual activation helper expected by routes/subscriptions.py
+    """
+    return activate_subscription_now(
+        account_id=account_id,
+        plan_code=plan_code,
+        reference="manual",
+        paid_at=_iso(_now_utc()),
+        source="manual",
+    )
+
+
+# -----------------------------
+# Paystack webhook bridge
+# -----------------------------
+def handle_payment_success(payload: Dict[str, Any]) -> Tuple[bool, str]:
+    """
+    Expected by routes/webhooks.py
+    Payload may include:
+      - account_id
+      - plan_code
+      - reference
+      - paid_at
+    """
+    payload = payload or {}
+    account_id = (payload.get("account_id") or "").strip()
+    plan_code = (payload.get("plan_code") or "").strip()
+    reference = (payload.get("reference") or "").strip() or None
+    paid_at = (payload.get("paid_at") or "").strip() or None
+
+    if not account_id or not plan_code:
+        return False, "missing_account_or_plan"
+
+    return activate_subscription_now(
+        account_id=account_id,
+        plan_code=plan_code,
+        reference=reference,
+        paid_at=paid_at,
+        source="paystack",
+    )
