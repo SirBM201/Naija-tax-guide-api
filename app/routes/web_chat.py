@@ -1,150 +1,225 @@
 # app/routes/web_chat.py
 from __future__ import annotations
 
-from flask import Blueprint, request, jsonify, g
+from flask import Blueprint, request, jsonify
+from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone
 
-from app.routes.web_session import require_web_token
+from app.core.auth import require_web_auth
 from app.core.supabase_client import supabase
-from app.services.ai_service import ask_ai_chat
+from app.services.ask_service import ask_guarded
+
 
 bp = Blueprint("web_chat", __name__)
 
-# -----------------------------
-# Sessions
-# -----------------------------
+MAX_CONTEXT_MESSAGES = 12  # last N messages used as context
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _safe_text(v: Any, limit: int = 8000) -> str:
+    s = (v or "").strip()
+    if len(s) > limit:
+        s = s[:limit]
+    return s
+
+
+def _get_messages_for_context(session_id: str, account_id: str, limit: int) -> List[Dict[str, Any]]:
+    rows = (
+        supabase.table("web_chat_messages")
+        .select("role,content,created_at")
+        .eq("session_id", session_id)
+        .eq("account_id", account_id)
+        .order("created_at", desc=False)
+        .limit(limit)
+        .execute()
+        .data
+        or []
+    )
+    return rows
+
+
+def _build_context_text(messages: List[Dict[str, Any]], new_user_text: str) -> str:
+    """
+    We keep it simple: embed last messages as text for ask_ai() (which only accepts a string).
+    """
+    lines: List[str] = []
+    if messages:
+        lines.append("Conversation so far:")
+        for m in messages[-MAX_CONTEXT_MESSAGES:]:
+            role = (m.get("role") or "").strip().lower()
+            content = (m.get("content") or "").strip()
+            if not content:
+                continue
+            if role == "assistant":
+                lines.append(f"Assistant: {content}")
+            elif role == "system":
+                lines.append(f"System: {content}")
+            else:
+                lines.append(f"User: {content}")
+        lines.append("")  # blank line
+
+    lines.append("New user message:")
+    lines.append(new_user_text)
+    lines.append("")
+    lines.append("Reply as a professional Nigerian tax assistant. Be concise and practical.")
+    return "\n".join(lines).strip()
+
+
 @bp.get("/web/chat/sessions")
-@require_web_token
-def list_sessions():
-    account_id = g.account_id
-    r = (
-        supabase()
-        .table("web_chat_sessions")
+@require_web_auth
+def list_sessions(ctx):
+    account_id = ctx["account_id"]
+
+    rows = (
+        supabase.table("web_chat_sessions")
         .select("id,title,created_at,updated_at")
         .eq("account_id", account_id)
         .order("updated_at", desc=True)
         .limit(50)
         .execute()
+        .data
+        or []
     )
-    return jsonify({"ok": True, "sessions": r.data or []})
+    return jsonify({"ok": True, "sessions": rows})
 
 
 @bp.post("/web/chat/sessions")
-@require_web_token
-def create_session():
-    account_id = g.account_id
-    data = request.get_json(silent=True) or {}
-    title = (data.get("title") or "Tax Assistant Chat").strip() or "Tax Assistant Chat"
+@require_web_auth
+def create_session(ctx):
+    account_id = ctx["account_id"]
+    body = request.get_json(silent=True) or {}
+    title = _safe_text(body.get("title") or "", 120) or None
 
-    r = (
-        supabase()
-        .table("web_chat_sessions")
-        .insert({"account_id": account_id, "title": title})
-        .execute()
-    )
-    row = (r.data or [None])[0]
-    return jsonify({"ok": True, "session": row}), 201
+    row = {
+        "account_id": account_id,
+        "title": title,
+        "created_at": _now_iso(),
+        "updated_at": _now_iso(),
+    }
+
+    created = supabase.table("web_chat_sessions").insert(row).execute().data or []
+    if not created:
+        return jsonify({"ok": False, "error": "create_failed"}), 400
+
+    return jsonify({"ok": True, "session": created[0]})
 
 
-# -----------------------------
-# Messages
-# -----------------------------
-@bp.get("/web/chat/sessions/<session_id>/messages")
-@require_web_token
-def get_messages(session_id: str):
-    account_id = g.account_id
+@bp.get("/web/chat/sessions/<session_id>")
+@require_web_auth
+def get_session(ctx, session_id: str):
+    account_id = ctx["account_id"]
 
-    # ensure session belongs to user
     s = (
-        supabase()
-        .table("web_chat_sessions")
-        .select("id")
+        supabase.table("web_chat_sessions")
+        .select("id,title,created_at,updated_at")
         .eq("id", session_id)
         .eq("account_id", account_id)
         .limit(1)
         .execute()
+        .data
+        or []
     )
-    if not (s.data or []):
-        return jsonify({"ok": False, "error": "session_not_found"}), 404
+    if not s:
+        return jsonify({"ok": False, "error": "not_found"}), 404
 
-    r = (
-        supabase()
-        .table("web_chat_messages")
+    msgs = _get_messages_for_context(session_id, account_id, limit=50)
+    return jsonify({"ok": True, "session": s[0], "messages": msgs})
+
+
+@bp.get("/web/chat/sessions/<session_id>/messages")
+@require_web_auth
+def list_messages(ctx, session_id: str):
+    account_id = ctx["account_id"]
+    rows = (
+        supabase.table("web_chat_messages")
         .select("id,role,content,created_at")
         .eq("session_id", session_id)
         .eq("account_id", account_id)
         .order("created_at", desc=False)
         .limit(200)
         .execute()
+        .data
+        or []
     )
-    return jsonify({"ok": True, "messages": r.data or []})
+    return jsonify({"ok": True, "messages": rows})
 
 
 @bp.post("/web/chat/sessions/<session_id>/messages")
-@require_web_token
-def send_message(session_id: str):
-    account_id = g.account_id
-    data = request.get_json(silent=True) or {}
-    user_text = (data.get("message") or "").strip()
-    if not user_text:
-        return jsonify({"ok": False, "error": "missing_message"}), 400
+@require_web_auth
+def send_message(ctx, session_id: str):
+    account_id = ctx["account_id"]
+    body = request.get_json(silent=True) or {}
+    text = _safe_text(body.get("content") or "", 6000)
+    lang = (body.get("lang") or "en").strip() or "en"
 
-    # ensure session belongs to user
+    if not text:
+        return jsonify({"ok": False, "error": "missing_content"}), 400
+
+    # ensure session exists
     s = (
-        supabase()
-        .table("web_chat_sessions")
+        supabase.table("web_chat_sessions")
         .select("id")
         .eq("id", session_id)
         .eq("account_id", account_id)
         .limit(1)
         .execute()
+        .data
+        or []
     )
-    if not (s.data or []):
+    if not s:
         return jsonify({"ok": False, "error": "session_not_found"}), 404
 
-    # insert user message
-    supabase().table("web_chat_messages").insert(
-        {
-            "session_id": session_id,
-            "account_id": account_id,
-            "role": "user",
-            "content": user_text,
-        }
-    ).execute()
+    # store user message
+    user_row = {
+        "session_id": session_id,
+        "account_id": account_id,
+        "role": "user",
+        "content": text,
+        "created_at": _now_iso(),
+    }
+    supabase.table("web_chat_messages").insert(user_row).execute()
 
-    # fetch recent history (last 30 msgs)
-    h = (
-        supabase()
-        .table("web_chat_messages")
-        .select("role,content,created_at")
-        .eq("session_id", session_id)
-        .eq("account_id", account_id)
-        .order("created_at", desc=True)
-        .limit(30)
-        .execute()
+    # load context + ask
+    prior = _get_messages_for_context(session_id, account_id, limit=MAX_CONTEXT_MESSAGES)
+    prompt = _build_context_text(prior, text)
+
+    # IMPORTANT: uses your existing guarded ask flow (credits/caching internally),
+    # but DOES NOT expose credits to frontend.
+    result = ask_guarded(
+        {
+            "account_id": account_id,
+            "provider": None,
+            "provider_user_id": None,
+            "question": prompt,
+            "lang": lang,
+        }
     )
-    history = list(reversed(h.data or []))
 
-    # build chat messages for model
-    messages = [{"role": "system", "content": "You are NaijaTax Guide. Help users with Nigerian tax questions clearly and safely."}]
-    for m in history:
-        r = m.get("role")
-        c = m.get("content")
-        if r in ("user", "assistant", "system") and c:
-            messages.append({"role": r, "content": c})
+    if not result.get("ok"):
+        # store error as assistant message (optional) or just return error
+        return jsonify(result), 400
 
-    assistant_text = ask_ai_chat(messages)
+    answer = (result.get("answer") or "").strip() or "..."
 
-    # insert assistant message
-    supabase().table("web_chat_messages").insert(
+    # store assistant message
+    asst_row = {
+        "session_id": session_id,
+        "account_id": account_id,
+        "role": "assistant",
+        "content": answer,
+        "created_at": _now_iso(),
+    }
+    supabase.table("web_chat_messages").insert(asst_row).execute()
+
+    # bump updated_at
+    supabase.table("web_chat_sessions").update({"updated_at": _now_iso()}).eq("id", session_id).execute()
+
+    return jsonify(
         {
-            "session_id": session_id,
-            "account_id": account_id,
-            "role": "assistant",
-            "content": assistant_text,
+            "ok": True,
+            "assistant": answer,
         }
-    ).execute()
-
-    # update session updated_at
-    supabase().table("web_chat_sessions").update({}).eq("id", session_id).execute()
-
-    return jsonify({"ok": True, "assistant": assistant_text}), 200
+    )
