@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 from app.core.supabase_client import supabase
 
@@ -301,8 +301,122 @@ def schedule_plan_change_at_expiry(account_id: str, next_plan_code: str) -> Dict
     return data[0] if data else rows[0]
 
 
+def _apply_scheduled_plan_change_if_any(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    If subscription is expired AND has next_plan_code, switch plan_code to next_plan_code.
+    Returns updated row if changed, else None.
+    """
+    try:
+        account_id = (row.get("account_id") or "").strip()
+        next_plan = (row.get("next_plan_code") or "").strip().lower()
+        if not account_id or not next_plan:
+            return None
+
+        now = _now_utc()
+        exp = _parse_iso(row.get("expires_at"))
+        grace = _parse_iso(row.get("grace_until"))
+
+        # only apply when truly expired (past exp and past grace if grace exists)
+        if exp and now <= exp:
+            return None
+        if grace and now <= grace:
+            return None
+
+        # apply change by activating new plan from now
+        sub = activate_subscription_now(account_id=account_id, plan_code=next_plan, status="active", duration_days=None)
+
+        # clear next_plan_code
+        sb = _sb()
+        sb.table("subscriptions").update({"next_plan_code": None, "updated_at": _iso(now)}).eq("account_id", account_id).execute()
+        return sub
+    except Exception:
+        return None
+
+
 # -----------------------------
-# Webhook Payment Success Handler (FIXES YOUR CRASH)
+# Cron: Expire overdue subscriptions (FIXES YOUR NEW CRASH)
+# -----------------------------
+def expire_overdue_subscriptions(limit: int = 200) -> Dict[str, Any]:
+    """
+    ✅ This function is imported by app/routes/cron.py.
+    It must exist or the app will crash at boot.
+
+    What it does:
+    - finds subscriptions where expires_at < now AND status is active/grace (best-effort)
+    - marks them expired (status='expired', active=False behavior comes from get_subscription_status)
+    - if next_plan_code exists, it applies scheduled plan change (best-effort)
+
+    Safe behavior:
+    - If columns differ in your DB, worst case: returns ok=False but WILL NOT crash the server.
+    """
+    sb = _sb()
+    now = _now_utc()
+    now_iso = _iso(now)
+
+    try:
+        # pull a batch; we’ll filter in python too (to be resilient to schema differences)
+        res = (
+            sb.table("subscriptions")
+            .select("account_id, plan_code, status, expires_at, grace_until, next_plan_code, updated_at")
+            .limit(limit)
+            .execute()
+        )
+        rows: List[Dict[str, Any]] = getattr(res, "data", None) or []
+    except Exception as e:
+        return {"ok": False, "error": "subscriptions_select_failed", "detail": str(e)}
+
+    expired_count = 0
+    changed_count = 0
+
+    for row in rows:
+        try:
+            account_id = (row.get("account_id") or "").strip()
+            if not account_id:
+                continue
+
+            exp = _parse_iso(row.get("expires_at"))
+            grace = _parse_iso(row.get("grace_until"))
+            status = (row.get("status") or "").strip().lower()
+
+            # only process candidates
+            if status not in ("active", "grace", "trial", "none", ""):
+                # already expired/cancelled etc
+                continue
+
+            # determine expiry
+            is_expired = False
+            if exp and now > exp:
+                # if grace exists and still valid -> not expired
+                if grace and now <= grace:
+                    is_expired = False
+                else:
+                    is_expired = True
+
+            if not is_expired:
+                continue
+
+            # apply scheduled plan change if next_plan_code is set
+            if (row.get("next_plan_code") or "").strip():
+                updated = _apply_scheduled_plan_change_if_any(row)
+                if updated:
+                    changed_count += 1
+                    continue  # don't mark expired if we re-activated
+
+            # mark expired
+            sb.table("subscriptions").update(
+                {"status": "expired", "updated_at": now_iso}
+            ).eq("account_id", account_id).execute()
+            expired_count += 1
+
+        except Exception:
+            # best-effort: never crash cron loop
+            continue
+
+    return {"ok": True, "expired": expired_count, "changed": changed_count, "checked": len(rows), "now": now_iso}
+
+
+# -----------------------------
+# Webhook Payment Success Handler
 # -----------------------------
 def handle_payment_success(
     *,
@@ -317,18 +431,12 @@ def handle_payment_success(
     raw: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    ✅ This function is imported by app/routes/webhooks.py.
-    It must exist or the app will crash at boot.
+    Imported by app/routes/webhooks.py.
 
-    What it does:
     - resolves account_id
     - idempotency check (best-effort) using 'payments' table if it exists
     - activates subscription immediately based on plan_code
     - records payment (best-effort) if payments table exists
-    - returns a clean dict for webhooks.py to jsonify
-
-    NOTE:
-    - This is safe even if you don't yet have payments table; it won't crash.
     """
     resolved = _find_account_id(account_id, provider, provider_user_id)
     if not resolved:
@@ -337,12 +445,10 @@ def handle_payment_success(
     pcode = (plan_code or "").strip().lower() or "monthly"
     now = _now_utc()
 
-    # ---- Idempotency (best-effort) ----
-    # If you have a payments table with a unique "reference", this prevents double activation.
+    # Idempotency (best-effort)
     if reference:
         existing = _safe_select_one("payments", "reference, status, account_id, plan_code, created_at", reference=reference)
         if existing and (existing.get("status") in ("success", "succeeded", "paid")):
-            # already handled before
             status = get_subscription_status(account_id=resolved)
             return {
                 "ok": True,
@@ -354,10 +460,10 @@ def handle_payment_success(
                 "subscription_status": status,
             }
 
-    # ---- Activate subscription ----
+    # Activate subscription
     sub = activate_subscription_now(account_id=resolved, plan_code=pcode, status="active", duration_days=None)
 
-    # ---- Record payment (best-effort) ----
+    # Record payment (best-effort)
     if reference:
         pay_payload = {
             "reference": reference,
@@ -370,7 +476,6 @@ def handle_payment_success(
             "created_at": _iso(now),
             "raw": raw,
         }
-        # If you have unique on reference: on_conflict="reference"
         _safe_upsert("payments", pay_payload, on_conflict="reference")
 
     return {
