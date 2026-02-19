@@ -2,12 +2,19 @@
 from __future__ import annotations
 
 from functools import wraps
-from flask import request, jsonify
+from typing import Callable, Optional, Tuple
 
-from .config import ADMIN_API_KEY
+from flask import jsonify, request
+
+from app.core.config import ADMIN_API_KEY
 
 
-def _extract_key() -> str:
+def _extract_key_from_headers() -> str:
+    """
+    Accept:
+      - X-Admin-Key: <key>
+      - Authorization: Bearer <key>
+    """
     key = (request.headers.get("X-Admin-Key") or "").strip()
     if key:
         return key
@@ -19,46 +26,36 @@ def _extract_key() -> str:
     return ""
 
 
-def _check_admin() -> tuple | None:
+def check_admin_key() -> Tuple[bool, str]:
     """
-    Returns (json, status_code) if unauthorized, else None.
+    Returns (ok, reason).
+    This is useful if you ever want to guard inside a route without decorators.
     """
     if not ADMIN_API_KEY:
-        return jsonify({"ok": False, "error": "admin_key_not_configured"}), 503
+        return False, "admin_key_not_configured"
 
-    key = _extract_key()
+    key = _extract_key_from_headers()
     if not key:
-        return jsonify({"ok": False, "error": "missing_admin_key"}), 401
+        return False, "missing_admin_key"
 
     if key != ADMIN_API_KEY:
-        return jsonify({"ok": False, "error": "invalid_admin_key"}), 401
+        return False, "invalid_admin_key"
 
-    return None
+    return True, "ok"
 
 
-def require_admin_key(fn=None):
+def require_admin_key(fn: Callable):
     """
-    Dual-mode admin protection:
+    ✅ REAL DECORATOR (use as @require_admin_key)
 
-    1) Decorator usage:
-        @require_admin_key
-        def my_route(): ...
-
-    2) Inline guard usage inside a route:
-        guard = require_admin_key()
-        if guard is not None:
-            return guard
+    If ADMIN_API_KEY is empty -> 503 (forces production config).
     """
-    # Inline guard mode
-    if fn is None:
-        return _check_admin()
-
-    # Decorator mode
     @wraps(fn)
     def wrapper(*args, **kwargs):
-        guard = _check_admin()
-        if guard is not None:
-            return guard
+        ok, reason = check_admin_key()
+        if not ok:
+            status = 503 if reason == "admin_key_not_configured" else 401
+            return jsonify({"ok": False, "error": reason}), status
         return fn(*args, **kwargs)
 
     return wrapper
