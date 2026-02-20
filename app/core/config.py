@@ -54,18 +54,27 @@ ADMIN_API_KEY = env("ADMIN_API_KEY", "")
 # -----------------------------
 WEB_AUTH_ENABLED = env_bool("WEB_AUTH_ENABLED", True)
 
-# Pepper used for hashing tokens/otp hashes (keep secret)
+# Session token hashing pepper
 WEB_TOKEN_PEPPER = env("WEB_TOKEN_PEPPER", "dev-pepper-change-me")
+
+# OTP hashing pepper (can be same as token pepper, but can be separate)
+WEB_OTP_PEPPER = env("WEB_OTP_PEPPER", WEB_TOKEN_PEPPER)
 
 # IMPORTANT: match your actual Supabase tables
 WEB_TOKEN_TABLE = env("WEB_TOKEN_TABLE", "web_tokens")
 WEB_OTP_TABLE = env("WEB_OTP_TABLE", "web_otps")
 
-# OTP TTL (keep both, because older code might use seconds)
-WEB_OTP_TTL_MINUTES = int(env("WEB_OTP_TTL_MINUTES", "10") or "10")
-WEB_OTP_TTL_SECONDS = int(env("WEB_OTP_TTL_SECONDS", str(WEB_OTP_TTL_MINUTES * 60)) or str(WEB_OTP_TTL_MINUTES * 60))
-
+# OTP lifetime
+WEB_OTP_TTL_SECONDS = int(env("WEB_OTP_TTL_SECONDS", "600") or "600")  # 10 mins default
+WEB_OTP_TTL_MINUTES = int(env("WEB_OTP_TTL_MINUTES", "10") or "10")    # kept for compatibility
 WEB_OTP_MAX_ATTEMPTS = int(env("WEB_OTP_MAX_ATTEMPTS", "5") or "5")
+
+# Session lifetime
+WEB_SESSION_TTL_DAYS = int(env("WEB_SESSION_TTL_DAYS", "30") or "30")
+
+# Debug
+WEB_AUTH_DEBUG = env_bool("WEB_AUTH_DEBUG", False)
+WEB_DEV_RETURN_OTP = env_bool("WEB_DEV_RETURN_OTP", False) or (ENV.lower() == "dev")
 
 
 # -----------------------------
