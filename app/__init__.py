@@ -28,6 +28,13 @@ from app.routes.paystack_webhook import bp as paystack_webhook_bp
 
 
 def _normalize_api_prefix(v: str) -> str:
+    """
+    Normalize API_PREFIX from config.
+
+    - If empty -> default to "/api"
+    - Always ensure leading "/"
+    - Remove trailing "/"
+    """
     v = (v or "").strip()
     if not v:
         return "/api"
@@ -37,10 +44,19 @@ def _normalize_api_prefix(v: str) -> str:
 
 
 def _parse_origins(origins_raw: str):
+    """
+    Parse CORS origins config.
+
+    Returns:
+      (origins, supports_credentials)
+
+    Rules:
+      - empty -> "*" without credentials
+      - "*" -> "*" without credentials
+      - comma list -> list with credentials enabled
+    """
     raw = (origins_raw or "").strip()
-    if not raw:
-        return "*", False
-    if raw == "*":
+    if not raw or raw == "*":
         return "*", False
     origins = [o.strip() for o in raw.split(",") if o.strip()]
     return origins, True
@@ -49,7 +65,7 @@ def _parse_origins(origins_raw: str):
 def _safe_import_bp(dotted: str, attr: str = "bp"):
     """
     Import a blueprint safely.
-    If missing, return None so the server still boots.
+    If missing OR import fails, return None so the server still boots.
     """
     try:
         mod = __import__(dotted, fromlist=[attr])
@@ -64,21 +80,29 @@ def create_app() -> Flask:
     api_prefix = _normalize_api_prefix(API_PREFIX)
     origins, supports_credentials = _parse_origins(CORS_ORIGINS)
 
+    # CORS: allow requests only under the API prefix
+    # NOTE: also allow "/health" without prefix if you ever hit it directly.
     CORS(
         app,
-        resources={rf"{api_prefix}/*": {"origins": origins}},
+        resources={
+            rf"{api_prefix}/*": {"origins": origins},
+            r"/health": {"origins": origins},
+        },
         supports_credentials=supports_credentials,
         allow_headers=["Content-Type", "Authorization"],
         methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         max_age=86400,
     )
 
+    # -----------------------------
     # Core always-on routes
+    # -----------------------------
     app.register_blueprint(health_bp, url_prefix=api_prefix)
     app.register_blueprint(accounts_bp, url_prefix=api_prefix)
     app.register_blueprint(subs_bp, url_prefix=api_prefix)
     app.register_blueprint(ask_bp, url_prefix=api_prefix)
 
+    # Web auth/session (IMPORTANT: must not crash boot)
     app.register_blueprint(web_auth_bp, url_prefix=api_prefix)
     app.register_blueprint(web_session_bp, url_prefix=api_prefix)
 
@@ -93,14 +117,20 @@ def create_app() -> Flask:
     app.register_blueprint(meta_bp, url_prefix=api_prefix)
     app.register_blueprint(email_link_bp, url_prefix=api_prefix)
 
-    # Cron (no /api prefix usually)
+    # -----------------------------
+    # Cron (intentionally NO /api prefix)
+    # -----------------------------
     app.register_blueprint(cron_bp)
 
+    # -----------------------------
     # Paystack
+    # -----------------------------
     app.register_blueprint(paystack_bp, url_prefix=api_prefix)
     app.register_blueprint(paystack_webhook_bp, url_prefix=api_prefix)
 
+    # -----------------------------
     # OPTIONAL routes (won't crash server if missing)
+    # -----------------------------
     telegram_bp = _safe_import_bp("app.routes.telegram")
     if telegram_bp:
         app.register_blueprint(telegram_bp, url_prefix=api_prefix)
@@ -116,5 +146,12 @@ def create_app() -> Flask:
     billing_bp = _safe_import_bp("app.routes.billing")
     if billing_bp:
         app.register_blueprint(billing_bp, url_prefix=api_prefix)
+
+    # -----------------------------
+    # Root helpers (safe)
+    # -----------------------------
+    @app.get("/")
+    def root():
+        return {"ok": True, "service": "naijatax-api"}
 
     return app
