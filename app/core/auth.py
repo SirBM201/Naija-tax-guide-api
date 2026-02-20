@@ -1,180 +1,87 @@
-# app/core/auth.py
+# app/core/config.py
 from __future__ import annotations
 
-import hashlib
-from datetime import datetime, timezone
-from functools import wraps
-from typing import Any, Callable, Dict, Optional, Tuple
-
-from flask import g, request, jsonify
-
-from app.core.config import WEB_AUTH_ENABLED, WEB_TOKEN_PEPPER, WEB_TOKEN_TABLE
-from app.core.supabase_client import supabase
+import os
 
 
-# -----------------------------
-# Time / helpers
-# -----------------------------
-
-def _now_utc() -> datetime:
-    return datetime.now(timezone.utc)
+def env(name: str, default: str = "") -> str:
+    return (os.getenv(name, default) or "").strip()
 
 
-def _parse_iso(value: str) -> Optional[datetime]:
-    try:
-        v = (value or "").replace("Z", "+00:00")
-        return datetime.fromisoformat(v)
-    except Exception:
-        return None
-
-
-def _sha256_hex(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()
-
-
-def _normalize_bearer(auth_header: str) -> str:
-    """Extract raw token from Authorization: Bearer <token>."""
-    if not auth_header:
-        return ""
-    v = auth_header.strip()
-    if v.lower().startswith("bearer "):
-        return v[7:].strip()
-    return ""
-
-
-def _token_hash(raw_token: str) -> str:
-    """
-    MUST match the hashing scheme used when creating sessions.
-
-    token_hash = sha256(f"{WEB_TOKEN_PEPPER}:{raw_token}")
-    """
-    return _sha256_hex(f"{WEB_TOKEN_PEPPER}:{raw_token}")
-
-
-def _sb():
-    # supabase can be either a client instance OR a callable factory
-    return supabase() if callable(supabase) else supabase
+def env_bool(name: str, default: bool = False) -> bool:
+    v = env(name, "1" if default else "0").lower()
+    return v in ("1", "true", "yes", "y", "on")
 
 
 # -----------------------------
-# Session validation
+# Core
 # -----------------------------
+ENV = env("ENV", "prod")
+PORT = int(env("PORT", "8000") or "8000")
 
-def validate_web_session(raw_token: str) -> Tuple[bool, Optional[str], str]:
-    """
-    Return: (ok, account_id, reason)
+# Routing
+API_PREFIX = env("API_PREFIX", "")  # "" or "/api"
+if API_PREFIX and not API_PREFIX.startswith("/"):
+    API_PREFIX = "/" + API_PREFIX
+API_PREFIX = API_PREFIX.rstrip("/")
 
-    This shape is intentionally stable because multiple routes depend on it.
-    """
-    if not WEB_AUTH_ENABLED:
-        return False, None, "web_auth_disabled"
-
-    if not raw_token:
-        return False, None, "missing_token"
-
-    token_hash = _token_hash(raw_token)
-
-    try:
-        q = (
-            _sb()
-            .table(WEB_TOKEN_TABLE)
-            .select("id, account_id, expires_at, revoked")
-            .eq("token_hash", token_hash)
-            .eq("revoked", False)
-            .limit(1)
-            .execute()
-        )
-        rows = (q.data or []) if hasattr(q, "data") else []
-    except Exception:
-        return False, None, "session_lookup_failed"
-
-    if not rows:
-        return False, None, "invalid_token"
-
-    row = rows[0]
-    account_id = row.get("account_id")
-
-    exp = _parse_iso(row.get("expires_at") or "")
-    if not exp or _now_utc() > exp:
-        # revoke expired session best-effort
-        try:
-            _sb().table(WEB_TOKEN_TABLE).update({"revoked": True}).eq("id", row.get("id")).execute()
-        except Exception:
-            pass
-        return False, None, "token_expired"
-
-    return True, account_id, "ok"
-
-
-def touch_session_best_effort(raw_token: str) -> None:
-    """Best-effort: update last_seen_at without breaking requests."""
-    if not raw_token:
-        return
-    try:
-        token_hash = _token_hash(raw_token)
-        _sb().table(WEB_TOKEN_TABLE).update(
-            {"last_seen_at": _now_utc().isoformat()}
-        ).eq("token_hash", token_hash).execute()
-    except Exception:
-        return
-
-
-# Backward-friendly alias (some files may call touch_session())
-def touch_session(raw_token: str) -> None:
-    touch_session_best_effort(raw_token)
+# CORS
+CORS_ORIGINS = env("CORS_ORIGINS", "*")  # comma-separated or "*"
 
 
 # -----------------------------
-# Decorators
+# Supabase
 # -----------------------------
-
-def require_auth_plus(fn: Callable) -> Callable:
-    """
-    Flask decorator: validates bearer token and sets:
-      g.account_id
-      g.web_token
-    """
-
-    @wraps(fn)
-    def wrapper(*args, **kwargs):
-        auth = request.headers.get("Authorization", "")
-        raw_token = _normalize_bearer(auth)
-
-        ok, account_id, reason = validate_web_session(raw_token)
-        if not ok or not account_id:
-            return jsonify({"ok": False, "error": reason}), 401
-
-        g.web_token = raw_token
-        g.account_id = account_id
-
-        touch_session_best_effort(raw_token)
-
-        return fn(*args, **kwargs)
-
-    return wrapper
+SUPABASE_URL = env("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = env("SUPABASE_SERVICE_ROLE_KEY")
 
 
-def require_web_auth(fn: Callable) -> Callable:
-    """
-    Optional compatibility decorator for modules that previously expected require_web_auth(ctx).
-    This version acts as normal Flask decorator and passes ctx as first arg.
-    """
+# -----------------------------
+# AI / OpenAI
+# -----------------------------
+OPENAI_API_KEY = env("OPENAI_API_KEY")
+OPENAI_MODEL = env("OPENAI_MODEL", "gpt-4o-mini")
 
-    @wraps(fn)
-    def wrapper(*args, **kwargs):
-        auth = request.headers.get("Authorization", "")
-        raw_token = _normalize_bearer(auth)
 
-        ok, account_id, reason = validate_web_session(raw_token)
-        if not ok or not account_id:
-            return jsonify({"ok": False, "error": reason}), 401
+# -----------------------------
+# Admin API protection
+# -----------------------------
+ADMIN_API_KEY = env("ADMIN_API_KEY", "")
 
-        ctx = {"account_id": account_id, "token": raw_token}
-        g.web_token = raw_token
-        g.account_id = account_id
 
-        touch_session_best_effort(raw_token)
+# -----------------------------
+# Web Auth / Web Sessions
+# -----------------------------
+WEB_AUTH_ENABLED = env_bool("WEB_AUTH_ENABLED", True)
 
-        return fn(ctx, *args, **kwargs)
+# Session token hashing pepper
+WEB_TOKEN_PEPPER = env("WEB_TOKEN_PEPPER", "dev-pepper-change-me")
 
-    return wrapper
+# OTP hashing pepper (can be same as token pepper, but can be separate)
+WEB_OTP_PEPPER = env("WEB_OTP_PEPPER", WEB_TOKEN_PEPPER)
+
+# IMPORTANT: match your actual Supabase tables
+WEB_TOKEN_TABLE = env("WEB_TOKEN_TABLE", "web_tokens")
+WEB_OTP_TABLE = env("WEB_OTP_TABLE", "web_otps")
+
+# OTP lifetime
+WEB_OTP_TTL_SECONDS = int(env("WEB_OTP_TTL_SECONDS", "600") or "600")  # 10 mins default
+WEB_OTP_TTL_MINUTES = int(env("WEB_OTP_TTL_MINUTES", "10") or "10")    # kept for compatibility
+WEB_OTP_MAX_ATTEMPTS = int(env("WEB_OTP_MAX_ATTEMPTS", "5") or "5")
+
+# Session lifetime
+WEB_SESSION_TTL_DAYS = int(env("WEB_SESSION_TTL_DAYS", "30") or "30")
+
+# Debug
+WEB_AUTH_DEBUG = env_bool("WEB_AUTH_DEBUG", False)
+WEB_DEV_RETURN_OTP = env_bool("WEB_DEV_RETURN_OTP", False) or (ENV.lower() == "dev")
+
+
+# -----------------------------
+# Paystack
+# -----------------------------
+PAYSTACK_SECRET_KEY = env("PAYSTACK_SECRET_KEY", "")
+PAYSTACK_PUBLIC_KEY = env("PAYSTACK_PUBLIC_KEY", "")
+PAYSTACK_CURRENCY = env("PAYSTACK_CURRENCY", "NGN") or "NGN"
+PAYSTACK_CALLBACK_URL = env("PAYSTACK_CALLBACK_URL", "")
+PAYSTACK_WEBHOOK_TOLERANCE_SECONDS = int(env("PAYSTACK_WEBHOOK_TOLERANCE_SECONDS", "300") or "300")
