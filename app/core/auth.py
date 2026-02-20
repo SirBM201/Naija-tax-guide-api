@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import traceback
 from datetime import datetime, timezone
 from functools import wraps
 from typing import Any, Callable, Optional
@@ -40,69 +41,83 @@ def _get_bearer_token() -> Optional[str]:
     return parts[1].strip() or None
 
 
+def _truthy(v: str | None) -> bool:
+    return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _auth_debug_enabled() -> bool:
+    # Set AUTH_DEBUG=1 on Koyeb to enable debug prints (safe, no raw tokens)
+    return _truthy(os.getenv("AUTH_DEBUG"))
+
+
+def _dbg(msg: str) -> None:
+    if _auth_debug_enabled():
+        print(msg, flush=True)
+
+
 def require_auth_plus(fn: Callable[..., Any]) -> Callable[..., Any]:
     """
     Validates web session tokens stored in WEB_TOKEN_TABLE.
-
-    Expects:
-      Authorization: Bearer <raw_token>
-
     Sets:
-      g.account_id      = <uuid string from web_tokens.account_id>
-      g.web_token_hash  = <hashed token>
-      g.web_token_id    = <row id from web_tokens (if available)>
+      g.account_id = <uuid string from web_tokens.account_id>
+      g.web_token_hash = <hashed token>
     """
     @wraps(fn)
     def wrapper(*args, **kwargs):
         raw = _get_bearer_token()
         if not raw:
+            _dbg("[auth] missing_token: no Authorization: Bearer <token> header")
             return jsonify({"ok": False, "error": "missing_token"}), 401
 
         th = _token_hash(raw)
+        th_prefix = th[:12]  # safe prefix for correlation
 
         try:
-            # Important: explicitly filter revoked=false so we don't accept revoked tokens
+            _dbg(f"[auth] start token_hash_prefix={th_prefix} path={request.path} method={request.method}")
+
             res = (
                 _sb()
                 .table(WEB_TOKEN_TABLE)
-                .select("id, account_id, expires_at, revoked")
+                .select("account_id, expires_at, revoked")
                 .eq("token_hash", th)
-                .eq("revoked", False)
                 .limit(1)
                 .execute()
             )
-
             rows = res.data or []
             if not rows:
+                _dbg(f"[auth] invalid_token: token_hash_prefix={th_prefix} not found in {WEB_TOKEN_TABLE}")
                 return jsonify({"ok": False, "error": "invalid_token"}), 401
 
             row = rows[0]
+            if row.get("revoked") is True:
+                _dbg(f"[auth] token_revoked: token_hash_prefix={th_prefix}")
+                return jsonify({"ok": False, "error": "token_revoked"}), 401
 
-            # Expiry check
             expires_at = row.get("expires_at")
             if expires_at:
                 v = str(expires_at).replace("Z", "+00:00")
-                exp_dt = datetime.fromisoformat(v)
-                if _now_utc() > exp_dt.astimezone(timezone.utc):
+                exp_dt = datetime.fromisoformat(v).astimezone(timezone.utc)
+                if _now_utc() > exp_dt:
+                    _dbg(f"[auth] token_expired: token_hash_prefix={th_prefix} exp={exp_dt.isoformat()}")
                     return jsonify({"ok": False, "error": "token_expired"}), 401
 
-            # Touch last_seen_at best-effort (won't break auth if column missing)
+            # touch last_seen_at best-effort (won't break auth if column missing)
             try:
                 _sb().table(WEB_TOKEN_TABLE).update(
                     {"last_seen_at": _now_utc().isoformat()}
-                ).eq("id", row.get("id")).execute()
-            except Exception:
-                pass
+                ).eq("token_hash", th).execute()
+            except Exception as e:
+                _dbg(f"[auth] last_seen_at update skipped: {type(e).__name__}: {str(e)[:140]}")
 
             g.account_id = row.get("account_id")
             g.web_token_hash = th
-            g.web_token_id = row.get("id")
 
+            _dbg(f"[auth] ok account_id={g.account_id} token_hash_prefix={th_prefix}")
             return fn(*args, **kwargs)
 
         except Exception as e:
-            # Keep 500 so you can see real server errors during debugging
-            print("[require_auth_plus] error:", str(e))
-            return jsonify({"ok": False, "error": "auth_failed"}), 500
+            _dbg(f"[auth] auth_failed: {type(e).__name__}: {str(e)[:200]}")
+            _dbg("[auth] traceback:\n" + traceback.format_exc())
+            return jsonify({"ok": False, "error": "auth_failed"}), 401
 
     return wrapper
