@@ -53,10 +53,18 @@ ADMIN_API_KEY = env("ADMIN_API_KEY", "")
 # Web Auth / Web Sessions
 # -----------------------------
 WEB_AUTH_ENABLED = env_bool("WEB_AUTH_ENABLED", True)
+
+# Pepper used for hashing tokens/otp hashes (keep secret)
 WEB_TOKEN_PEPPER = env("WEB_TOKEN_PEPPER", "dev-pepper-change-me")
-WEB_TOKEN_TABLE = env("WEB_TOKEN_TABLE", "web_sessions")
-WEB_OTP_TABLE = env("WEB_OTP_TABLE", "account_otps")
-WEB_OTP_TTL_SECONDS = int(env("WEB_OTP_TTL_SECONDS", "300") or "300")
+
+# IMPORTANT: match your actual Supabase tables
+WEB_TOKEN_TABLE = env("WEB_TOKEN_TABLE", "web_tokens")
+WEB_OTP_TABLE = env("WEB_OTP_TABLE", "web_otps")
+
+# OTP TTL (keep both, because older code might use seconds)
+WEB_OTP_TTL_MINUTES = int(env("WEB_OTP_TTL_MINUTES", "10") or "10")
+WEB_OTP_TTL_SECONDS = int(env("WEB_OTP_TTL_SECONDS", str(WEB_OTP_TTL_MINUTES * 60)) or str(WEB_OTP_TTL_MINUTES * 60))
+
 WEB_OTP_MAX_ATTEMPTS = int(env("WEB_OTP_MAX_ATTEMPTS", "5") or "5")
 
 
