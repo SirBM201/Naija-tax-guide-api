@@ -11,7 +11,7 @@ from typing import Any, Dict, Optional
 from flask import Blueprint, jsonify, request, g
 
 from app.core.supabase_client import supabase
-from app.core.auth import require_auth_plus  # validates sessions in web_tokens
+from app.core.auth import require_auth_plus
 from app.core.config import (
     WEB_AUTH_ENABLED,
     WEB_TOKEN_TABLE,
@@ -47,11 +47,9 @@ WEB_OTP_PEPPER = _env("WEB_OTP_PEPPER", WEB_TOKEN_PEPPER)
 WEB_SESSION_TTL_DAYS = int(_env("WEB_SESSION_TTL_DAYS", "30") or "30")
 WEB_OTP_TTL_MINUTES = int(_env("WEB_OTP_TTL_MINUTES", "10") or "10")
 
-# Optional: whether to return OTP in response (dev/testing)
 WEB_DEV_RETURN_OTP = _truthy(_env("WEB_DEV_RETURN_OTP", "0")) or (ENV == "dev")
 
 # --- Column mapping (match your Supabase schema) ---
-# Your table shows: contact, purpose, code_hash, code_plain, phone_e164, otp_code, used, expires_at, created_at, used_at
 OTP_COL_CONTACT = _env("WEB_OTP_COL_CONTACT", "contact")
 OTP_COL_PURPOSE = _env("WEB_OTP_COL_PURPOSE", "purpose")
 OTP_COL_CODE_HASH = _env("WEB_OTP_COL_CODE_HASH", "code_hash")
@@ -68,12 +66,10 @@ def _sha256_hex(s: str) -> str:
 
 
 def _otp_hash(contact: str, purpose: str, otp: str) -> str:
-    # peppered hash; ties OTP to contact+purpose
     return _sha256_hex(f"{WEB_OTP_PEPPER}:{contact}:{purpose}:{otp}")
 
 
 def _token_hash(raw_token: str) -> str:
-    # MUST match app/core/auth.py
     return _sha256_hex(f"{WEB_TOKEN_PEPPER}:{raw_token}")
 
 
@@ -91,47 +87,40 @@ def _normalize_contact(v: str) -> str:
 
 
 def _extract_supabase_error(e: Exception) -> Dict[str, Any]:
-    """
-    Try to extract useful info from supabase-py / postgrest errors.
-    Error shapes can vary; keep robust.
-    """
     info: Dict[str, Any] = {
         "type": e.__class__.__name__,
         "message": str(e),
     }
-
     for k in ("code", "details", "hint", "status", "status_code"):
         if hasattr(e, k):
             try:
                 info[k] = getattr(e, k)
             except Exception:
                 pass
-
     try:
         if getattr(e, "args", None):
             info["args"] = [str(a) for a in e.args[:3]]
     except Exception:
         pass
-
     try:
         first = e.args[0] if getattr(e, "args", None) else None
         if isinstance(first, dict):
             info["payload"] = first
     except Exception:
         pass
-
     return info
 
 
-def _upsert_account_for_contact(contact: str) -> Optional[str]:
+def _upsert_account_for_contact(contact: str) -> tuple[Optional[str], Optional[Dict[str, Any]]]:
     """
-    Ensure an account exists for this contact and return account_id.
+    Returns (account_id, error_info_if_any)
 
-    IMPORTANT: accounts.account_id is very often UUID in Supabase.
-    So we generate a UUID (uuid4) by default to avoid insert failures.
+    This will:
+      1) select existing by (provider='web', provider_user_id=contact)
+      2) try insert WITHOUT account_id (best if DB has default uuid)
+      3) fallback: insert WITH uuid
     """
     try:
-        # 1) lookup existing
         res = (
             _sb()
             .table("accounts")
@@ -143,27 +132,62 @@ def _upsert_account_for_contact(contact: str) -> Optional[str]:
         )
         rows = (res.data or []) if hasattr(res, "data") else []
         if rows and rows[0].get("account_id"):
-            return rows[0].get("account_id")
+            return rows[0].get("account_id"), None
+    except Exception as e:
+        # even lookup failed -> return details in debug
+        err = _extract_supabase_error(e)
+        print(f"[web_auth] accounts lookup failed: {err}")
+        return None, err
 
-        # 2) create new
-        # Use UUID to match typical Supabase schema
-        account_id = str(uuid.uuid4())
-
+    # Try insert WITHOUT account_id (let DB default generate UUID)
+    try:
         payload = {
-            "account_id": account_id,
             "provider": "web",
             "provider_user_id": contact,
             "display_name": contact,
             "phone": contact,
         }
+        ins = _sb().table("accounts").insert(payload).execute()
+        data = (ins.data or []) if hasattr(ins, "data") else []
+        if data and isinstance(data, list) and data[0].get("account_id"):
+            return data[0].get("account_id"), None
 
-        _sb().table("accounts").insert(payload).execute()
-        return account_id
+        # if insert didn't return row, re-select
+        res2 = (
+            _sb()
+            .table("accounts")
+            .select("account_id")
+            .eq("provider", "web")
+            .eq("provider_user_id", contact)
+            .limit(1)
+            .execute()
+        )
+        rows2 = (res2.data or []) if hasattr(res2, "data") else []
+        if rows2 and rows2[0].get("account_id"):
+            return rows2[0].get("account_id"), None
 
     except Exception as e:
         err = _extract_supabase_error(e)
-        print(f"[web_auth] account upsert/insert failed: {err}")
-        return None
+        print(f"[web_auth] accounts insert (no account_id) failed: {err}")
+
+        # Fallback: try insert WITH uuid (some schemas require explicit account_id)
+        try:
+            account_id = str(uuid.uuid4())
+            payload2 = {
+                "account_id": account_id,
+                "provider": "web",
+                "provider_user_id": contact,
+                "display_name": contact,
+                "phone": contact,
+            }
+            _sb().table("accounts").insert(payload2).execute()
+            return account_id, None
+        except Exception as e2:
+            err2 = _extract_supabase_error(e2)
+            print(f"[web_auth] accounts insert (with uuid) failed: {err2}")
+            return None, err2
+
+    return None, {"type": "UnknownError", "message": "account_insert_failed_without_exception"}
 
 
 # -----------------------------
@@ -182,7 +206,6 @@ def request_otp():
     if not contact:
         return jsonify({"ok": False, "error": "missing_contact"}), 400
 
-    # Create OTP
     otp = "123456" if ENV == "dev" else f"{secrets.randbelow(1000000):06d}"
     expires_at = _now_utc() + timedelta(minutes=WEB_OTP_TTL_MINUTES)
     code_hash = _otp_hash(contact, purpose, otp)
@@ -232,7 +255,6 @@ def verify_otp():
 
     code_hash = _otp_hash(contact, purpose, otp)
 
-    # Validate OTP (latest, not used, not expired)
     try:
         q = (
             _sb()
@@ -273,7 +295,6 @@ def verify_otp():
             pass
         return jsonify({"ok": False, "error": "otp_expired"}), 401
 
-    # mark OTP as used
     try:
         _sb().table(WEB_OTP_TABLE).update(
             {OTP_COL_USED: True, OTP_COL_USED_AT: _now_utc().isoformat().replace("+00:00", "Z")}
@@ -281,21 +302,20 @@ def verify_otp():
     except Exception:
         pass
 
-    # Ensure account exists
-    account_id = _upsert_account_for_contact(contact)
+    # Ensure account exists (NOW returns error detail)
+    account_id, acct_err = _upsert_account_for_contact(contact)
     if not account_id:
-        # IMPORTANT: expose root cause in debug
         if ENV == "dev" or WEB_AUTH_DEBUG:
             return jsonify(
                 {
                     "ok": False,
                     "error": "account_create_failed",
-                    "hint": "Check server logs for [web_auth] account upsert/insert failed. Common cause: accounts.account_id expects UUID.",
+                    "supabase": acct_err,
+                    "hint": "Most common causes: (1) accounts table schema mismatch (missing provider/provider_user_id/account_id), (2) account_id is UUID but insert is failing due to constraints/defaults, (3) RLS/policies if not using service role.",
                 }
             ), 500
         return jsonify({"ok": False, "error": "account_create_failed"}), 500
 
-    # Create session token + store session row
     raw_token = secrets.token_hex(32)
     expires_at = _now_utc() + timedelta(days=WEB_SESSION_TTL_DAYS)
 
