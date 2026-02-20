@@ -45,15 +45,10 @@ def _parse_origins(origins_raw: str):
 
 
 def _safe_import_bp(dotted: str, attr: str = "bp"):
-    """
-    Import a blueprint safely.
-    If missing or import errors happen, return None so the server still boots.
-    """
     try:
         mod = __import__(dotted, fromlist=[attr])
         return getattr(mod, attr)
-    except Exception as e:
-        print(f"[create_app] optional blueprint import failed: {dotted}.{attr} -> {e}")
+    except Exception:
         return None
 
 
@@ -72,7 +67,7 @@ def create_app() -> Flask:
         max_age=86400,
     )
 
-    # Core always-on routes
+    # Always-on routes
     app.register_blueprint(health_bp, url_prefix=api_prefix)
     app.register_blueprint(accounts_bp, url_prefix=api_prefix)
     app.register_blueprint(subs_bp, url_prefix=api_prefix)
@@ -89,14 +84,23 @@ def create_app() -> Flask:
     app.register_blueprint(meta_bp, url_prefix=api_prefix)
     app.register_blueprint(email_link_bp, url_prefix=api_prefix)
 
-    # Cron (no /api prefix usually)
+    # Cron (no /api prefix)
     app.register_blueprint(cron_bp)
 
     # Paystack
     app.register_blueprint(paystack_bp, url_prefix=api_prefix)
     app.register_blueprint(paystack_webhook_bp, url_prefix=api_prefix)
 
-    # OPTIONAL routes (won't crash server if missing)
+    # OPTIONAL web auth/session (won't crash boot if broken)
+    web_auth_bp = _safe_import_bp("app.routes.web_auth")
+    if web_auth_bp:
+        app.register_blueprint(web_auth_bp, url_prefix=api_prefix)
+
+    web_session_bp = _safe_import_bp("app.routes.web_session")
+    if web_session_bp:
+        app.register_blueprint(web_session_bp, url_prefix=api_prefix)
+
+    # Other OPTIONAL routes
     telegram_bp = _safe_import_bp("app.routes.telegram")
     if telegram_bp:
         app.register_blueprint(telegram_bp, url_prefix=api_prefix)
@@ -112,14 +116,5 @@ def create_app() -> Flask:
     billing_bp = _safe_import_bp("app.routes.billing")
     if billing_bp:
         app.register_blueprint(billing_bp, url_prefix=api_prefix)
-
-    # Web auth/session (safe import so server boots even if something is wrong)
-    web_auth_bp = _safe_import_bp("app.routes.web_auth", "bp")
-    if web_auth_bp:
-        app.register_blueprint(web_auth_bp, url_prefix=api_prefix)
-
-    web_session_bp = _safe_import_bp("app.routes.web_session", "bp")
-    if web_session_bp:
-        app.register_blueprint(web_session_bp, url_prefix=api_prefix)
 
     return app
