@@ -89,7 +89,8 @@ def create_app() -> Flask:
     cron_bp = _safe_import_bp("app.routes.cron", "bp")
     if cron_bp:
         app.register_blueprint(cron_bp)
-
+        
+        app.register_blueprint(bp)
     # -----------------------------
     # OPTIONAL BLUEPRINTS
     # -----------------------------
