@@ -15,10 +15,12 @@ def _sb():
 
 
 def _get_account(account_id: str) -> Optional[Dict[str, Any]]:
-    # Support schemas where PK may be account_id or id
+    """
+    Support schemas where PK may be account_id or id.
+    We query '*' to avoid column mismatch issues.
+    """
     for pk in ("account_id", "id"):
         try:
-            # Only query columns that exist (best effort)
             res = (
                 _sb()
                 .table("accounts")
@@ -35,7 +37,6 @@ def _get_account(account_id: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-# Support BOTH endpoints (in case you registered blueprints differently)
 @bp.get("/me")
 @bp.get("/web/auth/me")
 @require_auth_plus
@@ -50,45 +51,38 @@ def me():
 
     phone = (acct.get("phone") or acct.get("provider_user_id") or "").strip()
 
-    # require_auth_plus (latest) sets:
-    # g.raw_token_source and g.web_token_hash
-    # Some earlier versions used different names, so we keep best-effort.
-    source = getattr(g, "raw_token_source", None) or getattr(g, "auth_source", None)
+    # New standard set by updated core/auth.py
+    source = getattr(g, "auth_source", None)
 
-    return (
-        jsonify(
-            {
-                "ok": True,
-                "account": {
-                    "account_id": acct.get("account_id") or acct.get("id"),
-                    "display_name": acct.get("display_name"),
-                    "phone_e164": phone,
-                    "provider": acct.get("provider"),
-                    "provider_user_id": acct.get("provider_user_id"),
-                    "created_at": acct.get("created_at"),
-                },
-                "auth": {
-                    "source": source,
-                },
-                # keep these keys stable even if not yet wired
-                "subscription": getattr(g, "subscription", {}) or {},
-                "credits": getattr(g, "credits", {}) or {},
-            }
-        ),
-        200,
-    )
+    return jsonify(
+        {
+            "ok": True,
+            "account": {
+                "account_id": acct.get("account_id") or acct.get("id"),
+                "display_name": acct.get("display_name"),
+                "phone_e164": phone,
+                "provider": acct.get("provider"),
+                "provider_user_id": acct.get("provider_user_id"),
+                "created_at": acct.get("created_at"),
+            },
+            "auth": {
+                "source": source,
+                "token_expires_at": (getattr(g, "token_row", {}) or {}).get("expires_at"),
+            },
+            # keep these keys stable even if not yet wired
+            "subscription": getattr(g, "subscription", {}) or {},
+            "credits": getattr(g, "credits", {}) or {},
+        }
+    ), 200
 
 
 @bp.get("/billing/me")
 @require_auth_plus
 def billing_me():
-    return (
-        jsonify(
-            {
-                "ok": True,
-                "subscription": getattr(g, "subscription", {}) or {},
-                "credits": getattr(g, "credits", {}) or {},
-            }
-        ),
-        200,
-    )
+    return jsonify(
+        {
+            "ok": True,
+            "subscription": getattr(g, "subscription", {}) or {},
+            "credits": getattr(g, "credits", {}) or {},
+        }
+    ), 200
