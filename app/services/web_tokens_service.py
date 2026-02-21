@@ -150,7 +150,6 @@ def validate_token(
     if not row:
         return False, {}, "invalid_token"
 
-    # revoked styles
     if row.get("revoked") is True or row.get("revoked_at"):
         return False, {}, "token_revoked"
 
