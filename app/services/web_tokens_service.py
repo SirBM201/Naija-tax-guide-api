@@ -8,11 +8,10 @@ from typing import Any, Dict, Optional, Tuple
 from flask import Request
 
 from app.core.supabase_client import supabase
-from app.core.config import WEB_TOKEN_PEPPER
-from app.core.token_utils import token_hash
+from app.core.auth import token_hash
+from app.core.config import WEB_TOKEN_TABLE
 
-
-DEFAULT_TABLE = "web_sessions"
+DEFAULT_TABLE = WEB_TOKEN_TABLE or "web_tokens"
 
 
 def _env(name: str, default: str = "") -> str:
@@ -58,9 +57,6 @@ def _has_column(table: str, col: str) -> bool:
         return False
 
 
-# -----------------------------
-# Token extraction
-# -----------------------------
 def extract_bearer_token(req: Request) -> Optional[str]:
     auth = (req.headers.get("Authorization") or "").strip()
     if auth.lower().startswith("bearer "):
@@ -81,9 +77,11 @@ def extract_cookie_token(req: Request, cookie_name: Optional[str] = None) -> Opt
 
 def extract_any_token(req: Request) -> Tuple[Optional[str], Optional[str]]:
     """
-    Returns (token, source):
-      - source: "cookie" | "bearer" | None
-    Cookie-first, Bearer fallback.
+    Returns (token, source) where source is:
+      - "cookie"
+      - "bearer"
+      - None
+    Cookie-first (matches require_auth_plus).
     """
     t = extract_cookie_token(req)
     if t:
@@ -94,15 +92,11 @@ def extract_any_token(req: Request) -> Tuple[Optional[str], Optional[str]]:
     return None, None
 
 
-# -----------------------------
-# DB access
-# -----------------------------
 def _get_session_row_by_token(table: str, raw_token: str) -> Optional[Dict[str, Any]]:
     raw_token = (raw_token or "").strip()
     if not raw_token:
         return None
-
-    th = token_hash(raw_token, fallback_pepper=WEB_TOKEN_PEPPER)
+    th = token_hash(raw_token)
     try:
         res = (
             _sb()
@@ -126,15 +120,12 @@ def touch_last_seen(raw_token: str, table: str = DEFAULT_TABLE) -> None:
     if not _has_column(table, "last_seen_at"):
         return
     try:
-        th = token_hash(raw_token, fallback_pepper=WEB_TOKEN_PEPPER)
+        th = token_hash(raw_token)
         _sb().table(table).update({"last_seen_at": _iso(_now_utc())}).eq("token_hash", th).execute()
     except Exception:
         return
 
 
-# -----------------------------
-# Public API
-# -----------------------------
 def validate_token(
     raw_token: str,
     table: str = DEFAULT_TABLE,
@@ -167,10 +158,7 @@ def validate_token(
     return True, {"account_id": account_id, "token_row": row}, None
 
 
-def revoke_token(
-    raw_token: str,
-    table: str = DEFAULT_TABLE,
-) -> Tuple[bool, Optional[str]]:
+def revoke_token(raw_token: str, table: str = DEFAULT_TABLE) -> Tuple[bool, Optional[str]]:
     raw_token = (raw_token or "").strip()
     table = _table_name(table)
 
@@ -181,8 +169,7 @@ def revoke_token(
     if not row:
         return True, None
 
-    th = token_hash(raw_token, fallback_pepper=WEB_TOKEN_PEPPER)
-
+    th = token_hash(raw_token)
     updates: Dict[str, Any] = {}
     if _has_column(table, "revoked"):
         updates["revoked"] = True
