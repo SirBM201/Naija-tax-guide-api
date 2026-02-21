@@ -15,10 +15,6 @@ def _sb():
 
 
 def _get_account(account_id: str) -> Optional[Dict[str, Any]]:
-    """
-    Support schemas where PK may be account_id or id.
-    We query '*' to avoid column mismatch issues.
-    """
     for pk in ("account_id", "id"):
         try:
             res = (
@@ -50,39 +46,42 @@ def me():
         return jsonify({"ok": False, "error": "Unauthorized"}), 401
 
     phone = (acct.get("phone") or acct.get("provider_user_id") or "").strip()
+    source = getattr(g, "raw_token_source", None) or getattr(g, "auth_source", None)
 
-    # New standard set by updated core/auth.py
-    source = getattr(g, "auth_source", None)
-
-    return jsonify(
-        {
-            "ok": True,
-            "account": {
-                "account_id": acct.get("account_id") or acct.get("id"),
-                "display_name": acct.get("display_name"),
-                "phone_e164": phone,
-                "provider": acct.get("provider"),
-                "provider_user_id": acct.get("provider_user_id"),
-                "created_at": acct.get("created_at"),
-            },
-            "auth": {
-                "source": source,
-                "token_expires_at": (getattr(g, "token_row", {}) or {}).get("expires_at"),
-            },
-            # keep these keys stable even if not yet wired
-            "subscription": getattr(g, "subscription", {}) or {},
-            "credits": getattr(g, "credits", {}) or {},
-        }
-    ), 200
+    return (
+        jsonify(
+            {
+                "ok": True,
+                "account": {
+                    "account_id": acct.get("account_id") or acct.get("id"),
+                    "display_name": acct.get("display_name"),
+                    "phone_e164": phone,
+                    "provider": acct.get("provider"),
+                    "provider_user_id": acct.get("provider_user_id"),
+                    "created_at": acct.get("created_at"),
+                },
+                "auth": {
+                    "source": source,
+                    "token_expires_at": (getattr(g, "token_row", {}) or {}).get("expires_at"),
+                },
+                "subscription": getattr(g, "subscription", {}) or {},
+                "credits": getattr(g, "credits", {}) or {},
+            }
+        ),
+        200,
+    )
 
 
 @bp.get("/billing/me")
 @require_auth_plus
 def billing_me():
-    return jsonify(
-        {
-            "ok": True,
-            "subscription": getattr(g, "subscription", {}) or {},
-            "credits": getattr(g, "credits", {}) or {},
-        }
-    ), 200
+    return (
+        jsonify(
+            {
+                "ok": True,
+                "subscription": getattr(g, "subscription", {}) or {},
+                "credits": getattr(g, "credits", {}) or {},
+            }
+        ),
+        200,
+    )
