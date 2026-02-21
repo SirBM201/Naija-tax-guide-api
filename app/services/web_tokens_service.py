@@ -1,6 +1,7 @@
 # app/services/web_tokens_service.py
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
@@ -10,9 +11,28 @@ from app.core.supabase_client import supabase
 from app.core.auth import token_hash  # single source of truth for hashing
 
 
-# Table name comes from env/config via core.auth (uses WEB_TOKEN_TABLE there),
-# but we keep a default here too:
+# -----------------------------
+# Defaults / env
+# -----------------------------
 DEFAULT_TABLE = "web_sessions"
+
+
+def _env(name: str, default: str = "") -> str:
+    return (os.getenv(name, default) or default).strip()
+
+
+def _table_name(default: str = DEFAULT_TABLE) -> str:
+    # Prefer explicit table name from env if present
+    return (_env("WEB_TOKEN_TABLE") or default).strip() or default
+
+
+def _cookie_name() -> str:
+    # Align with web_auth.py cookie config
+    return (
+        _env("WEB_AUTH_COOKIE_NAME")
+        or _env("WEB_COOKIE_NAME")
+        or "ntg_session"
+    ).strip()
 
 
 def _sb():
@@ -59,6 +79,33 @@ def extract_bearer_token(req: Request) -> Optional[str]:
     return t2 or None
 
 
+def extract_cookie_token(req: Request, cookie_name: Optional[str] = None) -> Optional[str]:
+    name = (cookie_name or _cookie_name()).strip() or _cookie_name()
+    try:
+        t = (req.cookies.get(name) or "").strip()
+        return t or None
+    except Exception:
+        return None
+
+
+def extract_any_token(req: Request) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Returns (token, source) where source is one of:
+      - "bearer"
+      - "cookie"
+      - None
+    """
+    t = extract_bearer_token(req)
+    if t:
+        return t, "bearer"
+
+    t = extract_cookie_token(req)
+    if t:
+        return t, "cookie"
+
+    return None, None
+
+
 # -----------------------------
 # DB access
 # -----------------------------
@@ -83,19 +130,47 @@ def _get_session_row_by_token(table: str, raw_token: str) -> Optional[Dict[str, 
         return None
 
 
+def touch_last_seen(raw_token: str, table: str = DEFAULT_TABLE) -> None:
+    """
+    Best-effort update last_seen_at so you can track activity.
+    Never raises.
+    """
+    raw_token = (raw_token or "").strip()
+    table = _table_name(table)
+
+    if not raw_token:
+        return
+
+    if not _has_column(table, "last_seen_at"):
+        return
+
+    try:
+        th = token_hash(raw_token)
+        _sb().table(table).update({"last_seen_at": _iso(_now_utc())}).eq("token_hash", th).execute()
+    except Exception:
+        return
+
+
 # -----------------------------
 # Public API
 # -----------------------------
 def validate_token(
     raw_token: str,
     table: str = DEFAULT_TABLE,
+    touch: bool = True,
 ) -> Tuple[bool, Dict[str, Any], Optional[str]]:
     """
     Returns:
       (ok, {"account_id": <uuid>, "token_row": <row>}, error)
+
+    Validates:
+      - token exists
+      - not revoked (revoked=true OR revoked_at set)
+      - not expired
+      - account_id present
     """
     raw_token = (raw_token or "").strip()
-    table = (table or DEFAULT_TABLE).strip() or DEFAULT_TABLE
+    table = _table_name(table)
 
     if not raw_token:
         return False, {}, "missing_token"
@@ -120,6 +195,9 @@ def validate_token(
     if not account_id:
         return False, {}, "invalid_token"
 
+    if touch:
+        touch_last_seen(raw_token, table=table)
+
     return True, {"account_id": account_id, "token_row": row}, None
 
 
@@ -132,14 +210,15 @@ def revoke_token(
     Supports:
       - revoked (bool)
       - revoked_at (timestamp)
+
+    If token doesn't exist -> treat as already logged out.
     """
     raw_token = (raw_token or "").strip()
-    table = (table or DEFAULT_TABLE).strip() or DEFAULT_TABLE
+    table = _table_name(table)
 
     if not raw_token:
         return False, "missing_token"
 
-    # If token doesn't exist -> treat as already logged out
     row = _get_session_row_by_token(table, raw_token)
     if not row:
         return True, None
@@ -152,7 +231,6 @@ def revoke_token(
     if _has_column(table, "revoked_at"):
         updates["revoked_at"] = _iso(_now_utc())
 
-    # If neither column exists, we can't revoke reliably
     if not updates:
         return False, "revoke_not_supported"
 
