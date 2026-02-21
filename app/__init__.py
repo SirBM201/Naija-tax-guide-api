@@ -1,107 +1,86 @@
 # app/__init__.py
 from __future__ import annotations
 
-from flask import Flask
+from flask import Flask, jsonify
 from flask_cors import CORS
 
-from app.core.config import API_PREFIX, CORS_ORIGINS
+from .core.config import API_PREFIX, CORS_ORIGINS
 
 
-def _normalize_api_prefix(v: str) -> str:
-    v = (v or "").strip()
-    if not v:
-        return "/api"
-    if not v.startswith("/"):
-        v = "/" + v
-    return v.rstrip("/")
+def _apply_cors(app: Flask) -> None:
+    origins = (CORS_ORIGINS or "*").strip()
+    if origins == "*":
+        CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
+        return
+
+    origin_list = [o.strip() for o in origins.split(",") if o.strip()]
+    CORS(app, resources={r"/*": {"origins": origin_list}}, supports_credentials=True)
 
 
-def _parse_origins(origins_raw: str):
-    raw = (origins_raw or "").strip()
-    if not raw:
-        return "*", False
-    if raw == "*":
-        return "*", False
-    origins = [o.strip() for o in raw.split(",") if o.strip()]
-    return origins, True
-
-
-def _safe_import_bp(dotted: str, attr: str = "bp"):
+def _register_blueprints_once(app: Flask, blueprints: list) -> None:
     """
-    Import a blueprint safely.
-    If missing or import fails, return None so the server still boots.
+    Registers each blueprint only once.
+    - guards against duplicates in your blueprints list
+    - guards against accidental double imports
     """
-    try:
-        mod = __import__(dotted, fromlist=[attr])
-        return getattr(mod, attr)
-    except Exception as e:
-        # Optional: print for easier debugging on Koyeb logs
-        print(f"[boot] optional import failed: {dotted}:{attr} -> {e}")
-        return None
+    seen = set()
+
+    for bp in blueprints:
+        if bp is None:
+            continue
+
+        key = (getattr(bp, "name", None), id(bp))
+        if key in seen:
+            # skip duplicates safely
+            continue
+        seen.add(key)
+
+        # Prefix support (your API_PREFIX system)
+        if API_PREFIX:
+            app.register_blueprint(bp, url_prefix=API_PREFIX)
+        else:
+            app.register_blueprint(bp)
 
 
 def create_app() -> Flask:
     app = Flask(__name__)
 
-    api_prefix = _normalize_api_prefix(API_PREFIX)
-    origins, supports_credentials = _parse_origins(CORS_ORIGINS)
-
-    CORS(
-        app,
-        resources={rf"{api_prefix}/*": {"origins": origins}},
-        supports_credentials=supports_credentials,
-        allow_headers=["Content-Type", "Authorization"],
-        methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        max_age=86400,
-    )
+    # -----------------------------
+    # Core config
+    # -----------------------------
+    app.config["JSON_SORT_KEYS"] = False
+    _apply_cors(app)
 
     # -----------------------------
-    # REQUIRED / CORE BLUEPRINTS
+    # Health
     # -----------------------------
-    for dotted in [
-        "app.routes.health",
-        "app.routes.accounts",
-        "app.routes.subscriptions",
-        "app.routes.ask",
-        "app.routes.webhooks",
-        "app.routes.plans",
-        "app.routes.link_tokens",
-        "app.routes.whatsapp",
-        "app.routes.admin_link_tokens",
-        "app.routes.debug_routes",
-        "app.routes.accounts_admin",
-        "app.routes.meta",
-        "app.routes.email_link",
-        "app.routes.web_auth",
-        "app.routes.web_session",
-        "app.routes.paystack_webhook",
-    ]:
-        bp = _safe_import_bp(dotted, "bp")
-        if bp:
-            app.register_blueprint(bp, url_prefix=api_prefix)
+    @app.get("/health")
+    def health():
+        return jsonify({"ok": True})
 
-    # paystack_bp is named differently in your project
-    paystack_bp = _safe_import_bp("app.routes.paystack", "paystack_bp")
-    if paystack_bp:
-        app.register_blueprint(paystack_bp, url_prefix=api_prefix)
+    # -----------------------------
+    # Import blueprints (EDIT THESE IMPORTS to match your repo)
+    # -----------------------------
+    # IMPORTANT: only import each blueprint ONCE here.
 
-    # Cron (no /api prefix usually)
-    cron_bp = _safe_import_bp("app.routes.cron", "bp")
-    if cron_bp:
-        app.register_blueprint(cron_bp)
-        
-        app.register_blueprint(bp)
-    # -----------------------------
-    # OPTIONAL BLUEPRINTS
-    # -----------------------------
-    for dotted in [
-        "app.routes.telegram",
-        "app.routes.web_ask",
-        "app.routes.web_chat",
-        "app.routes.billing",
-    ]:
-        bp = _safe_import_bp(dotted, "bp")
-        if bp:
-            app.register_blueprint(bp, url_prefix=api_prefix)
+    from .routes.paystack_webhook import bp as paystack_webhook_bp  # ✅ updated name
+    # from .routes.auth import bp as auth_bp
+    # from .routes.web_session import bp as web_session_bp
+    # from .routes.ask import bp as ask_bp
+    # from .routes.plans import bp as plans_bp
+    # from .routes.subscriptions import bp as subscriptions_bp
+    # ...add your others...
+
+    blueprints = [
+        paystack_webhook_bp,
+        # auth_bp,
+        # web_session_bp,
+        # ask_bp,
+        # plans_bp,
+        # subscriptions_bp,
+        # ...
+    ]
+
+    _register_blueprints_once(app, blueprints)
 
     return app
