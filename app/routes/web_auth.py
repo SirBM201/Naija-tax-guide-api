@@ -10,7 +10,8 @@ from typing import Any, Dict, Optional
 from flask import Blueprint, jsonify, request, make_response
 
 from app.core.supabase_client import supabase
-from app.core.auth import token_hash
+from app.core.config import WEB_TOKEN_TABLE, WEB_OTP_TABLE, WEB_OTP_TTL_MINUTES, WEB_SESSION_TTL_DAYS, WEB_OTP_PEPPER, WEB_TOKEN_PEPPER
+from app.core.token_utils import token_hash
 from app.services.web_tokens_service import revoke_token
 from app.services.email_service import send_email_otp, smtp_is_configured
 
@@ -37,27 +38,22 @@ def _truthy(v: str | None) -> bool:
 # Cookie config (Option A)
 # -------------------------
 def _cookie_name() -> str:
-    # Prefer the new name; fall back to old envs if present
     return (
         _env("WEB_AUTH_COOKIE_NAME")
         or _env("WEB_COOKIE_NAME")
-        or _env("WEB_COOKIE_NAME_LEGACY")
         or "ntg_session"
     ).strip()
 
 
 def _cookie_secure() -> bool:
-    # For SameSite=None you MUST be Secure (true) on HTTPS
     return _env("WEB_AUTH_COOKIE_SECURE", _env("COOKIE_SECURE", "1")) == "1"
 
 
 def _cookie_samesite() -> str:
-    # Cross-site (Vercel -> Koyeb) requires SameSite=None + Secure
     return (_env("WEB_AUTH_COOKIE_SAMESITE", _env("COOKIE_SAMESITE", "None")) or "None").strip()
 
 
 def _cookie_domain() -> Optional[str]:
-    # Usually leave empty for cross-site (Vercel <-> Koyeb), unless you know you need it.
     v = _env("WEB_AUTH_COOKIE_DOMAIN", _env("COOKIE_DOMAIN", "")).strip()
     return v or None
 
@@ -67,15 +63,16 @@ ENV = _env("ENV", "prod").lower()
 WEB_AUTH_ENABLED = (_env("WEB_AUTH_ENABLED", "1") == "1")
 WEB_AUTH_DEBUG = (_env("WEB_AUTH_DEBUG", "0") == "1")
 
-WEB_OTP_TABLE = _env("WEB_OTP_TABLE", "web_otps")
-WEB_TOKEN_TABLE = _env("WEB_TOKEN_TABLE", "web_sessions")
+# Use config defaults, allow env override
+OTP_TABLE = (_env("WEB_OTP_TABLE", WEB_OTP_TABLE) or WEB_OTP_TABLE).strip()
+TOKEN_TABLE = (_env("WEB_TOKEN_TABLE", WEB_TOKEN_TABLE) or WEB_TOKEN_TABLE).strip()
 
-WEB_OTP_TTL_MINUTES = int(_env("WEB_OTP_TTL_MINUTES", "10") or "10")
-WEB_SESSION_TTL_DAYS = int(_env("WEB_SESSION_TTL_DAYS", "30") or "30")
+OTP_TTL_MINUTES = int(_env("WEB_OTP_TTL_MINUTES", str(WEB_OTP_TTL_MINUTES)) or str(WEB_OTP_TTL_MINUTES))
+SESSION_TTL_DAYS = int(_env("WEB_SESSION_TTL_DAYS", str(WEB_SESSION_TTL_DAYS)) or str(WEB_SESSION_TTL_DAYS))
 
-WEB_OTP_PEPPER = _env("WEB_OTP_PEPPER", _env("WEB_TOKEN_PEPPER", ""))
+OTP_PEPPER = (_env("WEB_OTP_PEPPER", WEB_OTP_PEPPER) or WEB_OTP_PEPPER).strip()
+TOKEN_PEPPER = (_env("WEB_TOKEN_PEPPER", WEB_TOKEN_PEPPER) or WEB_TOKEN_PEPPER).strip()
 
-# Dev-only OTP return (keep your current behavior)
 WEB_DEV_RETURN_OTP = (_env("WEB_DEV_RETURN_OTP", "0") == "1") or (ENV == "dev")
 
 
@@ -84,7 +81,7 @@ def _sha256_hex(s: str) -> str:
 
 
 def _otp_hash(contact: str, purpose: str, otp: str) -> str:
-    return _sha256_hex(f"{WEB_OTP_PEPPER}:{contact}:{purpose}:{otp}")
+    return _sha256_hex(f"{OTP_PEPPER}:{contact}:{purpose}:{otp}")
 
 
 def _normalize_contact(v: str) -> str:
@@ -116,7 +113,7 @@ def _has_column(table: str, col: str) -> bool:
 def _safe_debug_info() -> Dict[str, Any]:
     return {
         "env": ENV,
-        "tables": {"otp_table": WEB_OTP_TABLE, "token_table": WEB_TOKEN_TABLE},
+        "tables": {"otp_table": OTP_TABLE, "token_table": TOKEN_TABLE},
         "cookie": {
             "name": _cookie_name(),
             "secure": _cookie_secure(),
@@ -138,28 +135,21 @@ def _account_pk_column() -> str:
 def _upsert_account_for_contact(contact: str) -> Optional[str]:
     pk = _account_pk_column()
 
-    # 1) exists?
-    try:
-        res = (
-            _sb()
-            .table("accounts")
-            .select(pk)
-            .eq("provider", "web")
-            .eq("provider_user_id", contact)
-            .limit(1)
-            .execute()
-        )
-        rows = (res.data or []) if hasattr(res, "data") else []
-        if rows and rows[0].get(pk):
-            return str(rows[0][pk])
-    except Exception:
-        pass
+    # exists?
+    res = (
+        _sb()
+        .table("accounts")
+        .select(pk)
+        .eq("provider", "web")
+        .eq("provider_user_id", contact)
+        .limit(1)
+        .execute()
+    )
+    rows = (res.data or []) if hasattr(res, "data") else []
+    if rows and rows[0].get(pk):
+        return str(rows[0][pk])
 
-    # 2) insert minimal safe fields
-    payload: Dict[str, Any] = {
-        "provider": "web",
-        "provider_user_id": contact,
-    }
+    payload: Dict[str, Any] = {"provider": "web", "provider_user_id": contact}
     if _has_column("accounts", "display_name"):
         payload["display_name"] = contact
     if _has_column("accounts", "phone"):
@@ -174,21 +164,18 @@ def _upsert_account_for_contact(contact: str) -> Optional[str]:
         pass
 
     # fallback re-query
-    try:
-        res2 = (
-            _sb()
-            .table("accounts")
-            .select(pk)
-            .eq("provider", "web")
-            .eq("provider_user_id", contact)
-            .limit(1)
-            .execute()
-        )
-        rows2 = (res2.data or []) if hasattr(res2, "data") else []
-        if rows2 and rows2[0].get(pk):
-            return str(rows2[0][pk])
-    except Exception:
-        pass
+    res2 = (
+        _sb()
+        .table("accounts")
+        .select(pk)
+        .eq("provider", "web")
+        .eq("provider_user_id", contact)
+        .limit(1)
+        .execute()
+    )
+    rows2 = (res2.data or []) if hasattr(res2, "data") else []
+    if rows2 and rows2[0].get(pk):
+        return str(rows2[0][pk])
 
     return None
 
@@ -211,10 +198,10 @@ def request_otp():
         return jsonify({"ok": False, "error": "missing_contact"}), 400
 
     otp = f"{secrets.randbelow(1000000):06d}"
-    expires_at = _now_utc() + timedelta(minutes=WEB_OTP_TTL_MINUTES)
+    expires_at = _now_utc() + timedelta(minutes=OTP_TTL_MINUTES)
 
     try:
-        _sb().table(WEB_OTP_TABLE).insert(
+        _sb().table(OTP_TABLE).insert(
             {
                 "contact": contact,
                 "purpose": purpose,
@@ -229,7 +216,6 @@ def request_otp():
             resp["debug"] = _safe_debug_info()
         return jsonify(resp), 500
 
-    # Determine email destination
     dest_email = ""
     if _is_email(contact):
         dest_email = contact
@@ -243,17 +229,16 @@ def request_otp():
             to_email=dest_email,
             otp=otp,
             purpose=purpose,
-            ttl_minutes=WEB_OTP_TTL_MINUTES,
+            ttl_minutes=OTP_TTL_MINUTES,
         )
         sent_email = (email_err is None)
 
     resp: Dict[str, Any] = {
         "ok": True,
-        "ttl_minutes": WEB_OTP_TTL_MINUTES,
+        "ttl_minutes": OTP_TTL_MINUTES,
         "email_sent": bool(sent_email),
         "email_to": dest_email or None,
     }
-
     if dest_email and email_err:
         resp["email_error"] = email_err
 
@@ -264,7 +249,7 @@ def request_otp():
     if WEB_AUTH_DEBUG:
         resp["debug"] = _safe_debug_info()
 
-    # IMPORTANT: request_otp does NOT set cookies.
+    # request_otp MUST NOT set cookies
     return jsonify(resp), 200
 
 
@@ -278,7 +263,6 @@ def verify_otp():
         return jsonify({"ok": False, "error": "web_auth_disabled"}), 403
 
     data: Dict[str, Any] = request.get_json(silent=True) or {}
-
     contact = _normalize_contact(str(data.get("contact") or ""))
     purpose = (str(data.get("purpose") or "web_login")).strip()
     otp = str(data.get("otp") or "").strip()
@@ -293,7 +277,7 @@ def verify_otp():
 
     q = (
         _sb()
-        .table(WEB_OTP_TABLE)
+        .table(OTP_TABLE)
         .select("*")
         .eq("contact", contact)
         .eq("purpose", purpose)
@@ -311,21 +295,17 @@ def verify_otp():
         return jsonify(resp), 401
 
     row = rows[0]
-
-    # expiry check
     try:
-        exp = datetime.fromisoformat(str(row.get("expires_at")).replace("Z", "+00:00"))
+        exp = datetime.fromisoformat(str(row.get("expires_at", "")).replace("Z", "+00:00"))
         if _now_utc() > exp.astimezone(timezone.utc):
             return jsonify({"ok": False, "error": "otp_expired"}), 401
     except Exception:
         return jsonify({"ok": False, "error": "otp_expired"}), 401
 
-    # mark used (best effort)
+    # mark used best-effort
     try:
         if "id" in row:
-            _sb().table(WEB_OTP_TABLE).update(
-                {"used": True, "used_at": _now_utc().isoformat()}
-            ).eq("id", row["id"]).execute()
+            _sb().table(OTP_TABLE).update({"used": True, "used_at": _now_utc().isoformat()}).eq("id", row["id"]).execute()
     except Exception:
         pass
 
@@ -336,29 +316,26 @@ def verify_otp():
             resp["debug"] = _safe_debug_info()
         return jsonify(resp), 500
 
-    # Create session token row
     raw_token = secrets.token_hex(32)
-    expires_at = _now_utc() + timedelta(days=WEB_SESSION_TTL_DAYS)
+    expires_at = _now_utc() + timedelta(days=SESSION_TTL_DAYS)
 
     insert_payload: Dict[str, Any] = {
-        "token_hash": token_hash(raw_token),
+        "token_hash": token_hash(raw_token, fallback_pepper=TOKEN_PEPPER),
         "account_id": account_id,
         "expires_at": expires_at.isoformat(),
     }
 
-    # Support both revoke schemas
-    if _has_column(WEB_TOKEN_TABLE, "revoked"):
+    if _has_column(TOKEN_TABLE, "revoked"):
         insert_payload["revoked"] = False
-    if _has_column(WEB_TOKEN_TABLE, "revoked_at"):
+    if _has_column(TOKEN_TABLE, "revoked_at"):
         insert_payload["revoked_at"] = None
-
-    if _has_column(WEB_TOKEN_TABLE, "created_at"):
+    if _has_column(TOKEN_TABLE, "created_at"):
         insert_payload["created_at"] = _now_utc().isoformat()
-    if _has_column(WEB_TOKEN_TABLE, "last_seen_at"):
+    if _has_column(TOKEN_TABLE, "last_seen_at"):
         insert_payload["last_seen_at"] = _now_utc().isoformat()
 
     try:
-        _sb().table(WEB_TOKEN_TABLE).insert(insert_payload).execute()
+        _sb().table(TOKEN_TABLE).insert(insert_payload).execute()
     except Exception:
         resp = {"ok": False, "error": "token_issue_failed"}
         if WEB_AUTH_DEBUG:
@@ -367,7 +344,7 @@ def verify_otp():
 
     out: Dict[str, Any] = {
         "ok": True,
-        "token": raw_token,  # keep returning so PowerShell scripts still work
+        "token": raw_token,
         "account_id": account_id,
         "expires_at": expires_at.isoformat(),
         "auth_mode": "cookie+bearer",
@@ -381,10 +358,10 @@ def verify_otp():
         raw_token,
         httponly=True,
         secure=_cookie_secure(),
-        samesite=_cookie_samesite(),  # "None" for Vercel cross-site
+        samesite=_cookie_samesite(),
         domain=_cookie_domain(),
         path="/",
-        max_age=WEB_SESSION_TTL_DAYS * 24 * 60 * 60,
+        max_age=SESSION_TTL_DAYS * 24 * 60 * 60,
     )
     return resp
 
@@ -395,10 +372,8 @@ def verify_otp():
 @bp.post("/logout")
 @bp.post("/web/auth/logout")
 def logout():
-    # cookie first
     raw = (request.cookies.get(_cookie_name()) or "").strip()
 
-    # bearer fallback
     if not raw:
         auth = (request.headers.get("Authorization") or "").strip()
         if auth.lower().startswith("bearer "):
@@ -406,7 +381,7 @@ def logout():
 
     if raw:
         try:
-            revoke_token(raw, table=WEB_TOKEN_TABLE)
+            revoke_token(raw, table=TOKEN_TABLE)
         except Exception:
             pass
 
