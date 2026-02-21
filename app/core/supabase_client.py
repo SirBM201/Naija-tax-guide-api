@@ -11,6 +11,7 @@ Rules:
 from __future__ import annotations
 
 from typing import Any, Optional
+
 from supabase import create_client
 
 from .config import SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
@@ -28,10 +29,13 @@ def supabase() -> Any:
     if _client is not None:
         return _client
 
-    if not SUPABASE_URL:
+    url = (SUPABASE_URL or "").strip()
+    key = (SUPABASE_SERVICE_ROLE_KEY or "").strip()
+
+    if not url:
         raise RuntimeError("SUPABASE_URL is not set")
-    if not SUPABASE_SERVICE_ROLE_KEY:
+    if not key:
         raise RuntimeError("SUPABASE_SERVICE_ROLE_KEY is not set")
 
-    _client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+    _client = create_client(url, key)
     return _client
