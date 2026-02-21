@@ -25,23 +25,27 @@ def _truthy(v: str | None) -> bool:
 
 def _cookie_mode_enabled() -> bool:
     """
-    Cookie auth should be explicitly enabled.
-    Otherwise you'll accidentally force credentialed CORS and break '*' origins.
+    Cookie auth MUST be explicitly enabled. Otherwise you'll accidentally force
+    credentialed CORS and break '*' origins.
+
+    Enable by setting:
+      COOKIE_AUTH_ENABLED=1
     """
-    if _truthy(os.getenv("COOKIE_AUTH_ENABLED", "")):
-        return True
-    return False
-    cookie_name = (os.getenv("WEB_COOKIE_NAME", "ntg_session") or "ntg_session").strip()
-    return bool(cookie_name)  # default enables cookie name, but cookie-mode still depends on frontend using cookies
+    return _truthy(os.getenv("COOKIE_AUTH_ENABLED", ""))
 
 
-def _parse_origins(origins_raw: str, *, cookie_mode: bool) -> Tuple[Union[str, List[str]], bool, Optional[str]]:
+def _parse_origins(
+    origins_raw: str,
+    *,
+    cookie_mode: bool
+) -> Tuple[Union[str, List[str]], bool, Optional[str]]:
     """
     Returns (origins, supports_credentials, error_message_if_any)
 
-    IMPORTANT:
-      - If cookie_mode=True, origins MUST be an explicit list, not '*'
-      - supports_credentials must be True for cookies
+    Rules:
+      - If cookie_mode=True, origins MUST be explicit list (NOT '*')
+      - supports_credentials must be True for cookie mode
+      - If cookie_mode=False, '*' is allowed and supports_credentials=False
     """
     raw = (origins_raw or "").strip()
 
@@ -62,11 +66,9 @@ def _parse_origins(origins_raw: str, *, cookie_mode: bool) -> Tuple[Union[str, L
             return [], True, "CORS_ORIGINS parsed empty but cookie auth requires explicit origins."
         return "*", False, None
 
-    # If cookie mode => credentials ON
     if cookie_mode:
         return origins, True, None
 
-    # Non-cookie mode: can be list, credentials OFF by default
     return origins, False, None
 
 
@@ -94,13 +96,12 @@ def create_app() -> Flask:
     if cors_err:
         raise RuntimeError(f"[CORS] {cors_err}")
 
-    # NOTE:
-    # - supports_credentials MUST be True for cookies
-    # - expose_headers includes Set-Cookie so browser can see it if needed (debug/tools)
-    # - allow_headers includes Authorization + X-Auth-Token for legacy header auth
+    # Use regex resource pattern so ALL api paths match reliably
+    api_resource_regex = rf"^{api_prefix}/.*"
+
     CORS(
         app,
-        resources={rf"{api_prefix}/*": {"origins": origins}},
+        resources={api_resource_regex: {"origins": origins}},
         supports_credentials=supports_credentials,
         allow_headers=[
             "Content-Type",
@@ -122,16 +123,21 @@ def create_app() -> Flask:
         "cors": {
             "origins": origins,
             "supports_credentials": supports_credentials,
+            "resource_regex": api_resource_regex,
         },
         "required": [],
         "optional": [],
         "errors": [],
     }
 
-    # Strict mode: default ON in production
     strict = (os.getenv("STRICT_BLUEPRINTS", "1").strip() != "0")
 
-    def _register_bp(dotted: str, attr: str = "bp", required: bool = True, url_prefix: Optional[str] = api_prefix):
+    def _register_bp(
+        dotted: str,
+        attr: str = "bp",
+        required: bool = True,
+        url_prefix: Optional[str] = api_prefix
+    ):
         obj, err = _import_attr(dotted, attr)
         entry = {"module": dotted, "attr": attr, "registered": False, "url_prefix": url_prefix, "error": err}
 
@@ -166,9 +172,6 @@ def create_app() -> Flask:
         entry["registered"] = True
         (boot["required"] if required else boot["optional"]).append(entry)
 
-    # ---------------------------------------
-    # REQUIRED / CORE BLUEPRINTS (must exist)
-    # ---------------------------------------
     required_modules = [
         "app.routes.health",
         "app.routes.accounts",
