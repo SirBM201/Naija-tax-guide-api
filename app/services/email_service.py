@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import smtplib
 from email.message import EmailMessage
-from typing import Optional
+from typing import Optional, Dict
 
 
 def _env_first(*names: str, default: str = "") -> str:
@@ -19,15 +19,30 @@ def _truthy(v: str | None) -> bool:
     return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _int_env(*names: str, default: int = 0) -> int:
+    raw = _env_first(*names, default=str(default))
+    try:
+        return int(str(raw).strip())
+    except Exception:
+        return default
+
+
+# -------------------------------------------------
+# Env (supports both MAIL_* and SMTP_* styles)
+# -------------------------------------------------
 MAIL_ENABLED = _truthy(_env_first("MAIL_ENABLED", "SMTP_ENABLED", default="0"))
-MAIL_HOST = _env_first("MAIL_HOST", "SMTP_HOST")
-MAIL_PORT = int((_env_first("MAIL_PORT", "SMTP_PORT", default="0") or "0").strip() or "0")
-MAIL_USER = _env_first("MAIL_USER", "SMTP_USER")
-MAIL_PASS = _env_first("MAIL_PASS", "SMTP_PASS")
-MAIL_FROM_EMAIL = _env_first("MAIL_FROM_EMAIL", default="no-reply@thecre8hub.com")
-MAIL_FROM_NAME = _env_first("MAIL_FROM_NAME", default="NaijaTax Guide")
-MAIL_USE_TLS = _truthy(_env_first("MAIL_USE_TLS", default="1"))
-MAIL_USE_SSL = _truthy(_env_first("MAIL_USE_SSL", default="0"))
+
+MAIL_HOST = _env_first("MAIL_HOST", "SMTP_HOST", default="")
+MAIL_PORT = _int_env("MAIL_PORT", "SMTP_PORT", default=0)
+
+MAIL_USER = _env_first("MAIL_USER", "SMTP_USER", default="")
+MAIL_PASS = _env_first("MAIL_PASS", "SMTP_PASS", default="")
+
+MAIL_FROM_EMAIL = _env_first("MAIL_FROM_EMAIL", "SMTP_FROM_EMAIL", default="no-reply@thecre8hub.com")
+MAIL_FROM_NAME = _env_first("MAIL_FROM_NAME", "SMTP_FROM_NAME", default="NaijaTax Guide")
+
+MAIL_USE_TLS = _truthy(_env_first("MAIL_USE_TLS", "SMTP_USE_TLS", default="1"))
+MAIL_USE_SSL = _truthy(_env_first("MAIL_USE_SSL", "SMTP_USE_SSL", default="0"))
 
 EMAIL_DEBUG = _truthy(os.getenv("EMAIL_DEBUG", "0"))
 
@@ -40,26 +55,37 @@ def smtp_is_configured() -> bool:
     return True
 
 
-def smtp_debug_snapshot() -> dict:
+def smtp_debug_snapshot() -> Dict[str, object]:
     """
-    SAFE snapshot (no secrets)
+    SAFE snapshot (no secrets).
     """
     return {
         "mail_enabled": bool(MAIL_ENABLED),
         "mail_host_set": bool(MAIL_HOST),
-        "mail_port": MAIL_PORT,
+        "mail_port": int(MAIL_PORT),
         "mail_user_set": bool(MAIL_USER),
         "mail_pass_set": bool(MAIL_PASS),
         "mail_use_tls": bool(MAIL_USE_TLS),
         "mail_use_ssl": bool(MAIL_USE_SSL),
+        "mail_from_email": bool(MAIL_FROM_EMAIL),
+        "mail_from_name": bool(MAIL_FROM_NAME),
         "smtp_configured": smtp_is_configured(),
     }
 
 
 def send_email_otp(to_email: str, otp: str, purpose: str, ttl_minutes: int) -> Optional[str]:
     """
-    Returns None if sent, else returns error string.
+    Returns:
+      - None if sent successfully
+      - error string if failed
     """
+    to_email = (to_email or "").strip().lower()
+    otp = (otp or "").strip()
+    purpose = (purpose or "web_login").strip()
+
+    if not to_email:
+        return "missing_to_email"
+
     if not smtp_is_configured():
         return "smtp_not_configured"
 
@@ -71,7 +97,7 @@ def send_email_otp(to_email: str, otp: str, purpose: str, ttl_minutes: int) -> O
     text = (
         f"Your NaijaTax Guide one-time login code is: {otp}\n\n"
         f"Purpose: {purpose}\n"
-        f"This code expires in {ttl_minutes} minutes.\n\n"
+        f"This code expires in {int(ttl_minutes)} minutes.\n\n"
         f"If you did not request this code, ignore this email."
     )
     msg.set_content(text)
@@ -79,12 +105,15 @@ def send_email_otp(to_email: str, otp: str, purpose: str, ttl_minutes: int) -> O
     try:
         if MAIL_USE_SSL:
             with smtplib.SMTP_SSL(MAIL_HOST, MAIL_PORT, timeout=20) as server:
+                server.ehlo()
                 server.login(MAIL_USER, MAIL_PASS)
                 server.send_message(msg)
         else:
             with smtplib.SMTP(MAIL_HOST, MAIL_PORT, timeout=20) as server:
+                server.ehlo()
                 if MAIL_USE_TLS:
                     server.starttls()
+                    server.ehlo()
                 server.login(MAIL_USER, MAIL_PASS)
                 server.send_message(msg)
 
@@ -92,5 +121,5 @@ def send_email_otp(to_email: str, otp: str, purpose: str, ttl_minutes: int) -> O
 
     except Exception as e:
         if EMAIL_DEBUG:
-            return f"smtp_send_failed:{type(e).__name__}:{str(e)[:120]}"
+            return f"smtp_send_failed:{type(e).__name__}:{str(e)[:160]}"
         return f"smtp_send_failed:{type(e).__name__}"
