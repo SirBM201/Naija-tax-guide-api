@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from flask import Blueprint, jsonify, request, g
 
@@ -17,6 +17,10 @@ bp = Blueprint("subscriptions", __name__)
 ADMIN_KEY = (os.getenv("ADMIN_KEY", "") or "").strip()
 
 
+def _admin_key_configured() -> bool:
+    return bool(ADMIN_KEY)
+
+
 def _is_admin(req) -> bool:
     if not ADMIN_KEY:
         return False
@@ -29,7 +33,7 @@ def _is_admin(req) -> bool:
 def subscription_status():
     """
     Returns subscription status for the currently authenticated user.
-    Works for cookie OR bearer (your require_auth_plus sets g.account_id).
+    Works for cookie OR bearer (require_auth_plus sets g.account_id).
     """
     account_id = getattr(g, "account_id", None)
     status = get_subscription_status(account_id)
@@ -40,6 +44,7 @@ def subscription_status():
 def subscription_activate():
     """
     ADMIN ONLY: create a subscription row for testing
+
     Header:
       X-Admin-Key: <ADMIN_KEY>
 
@@ -50,13 +55,26 @@ def subscription_activate():
         "expires_at": "2026-03-01T00:00:00Z" (optional)
       }
     """
+    if not _admin_key_configured():
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "admin_key_not_configured",
+                    "message": "ADMIN_KEY env var is not set on the server. Set it in Koyeb env vars, then retry.",
+                }
+            ),
+            500,
+        )
+
     if not _is_admin(request):
+        got = bool((request.headers.get("X-Admin-Key", "") or "").strip())
         return (
             jsonify(
                 {
                     "ok": False,
                     "error": "forbidden",
-                    "message": "Admin key required.",
+                    "message": "Admin key required." if not got else "Admin key invalid.",
                 }
             ),
             403,
