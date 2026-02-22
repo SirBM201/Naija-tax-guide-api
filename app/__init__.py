@@ -91,11 +91,20 @@ def create_app() -> Flask:
     if cors_err:
         raise RuntimeError(f"[CORS] {cors_err}")
 
+    # NOTE:
+    # - We explicitly allow X-Admin-Key for admin-only endpoints (e.g. /api/subscription/activate)
+    # - supports_credentials must be True when using cookies
     CORS(
         app,
         resources={rf"{api_prefix}/*": {"origins": origins}},
         supports_credentials=supports_credentials,
-        allow_headers=["Content-Type", "Authorization", "X-Auth-Token", "X-Requested-With"],
+        allow_headers=[
+            "Content-Type",
+            "Authorization",
+            "X-Auth-Token",
+            "X-Requested-With",
+            "X-Admin-Key",  # ✅ needed for admin activate endpoints
+        ],
         expose_headers=["Set-Cookie"],
         methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         max_age=86400,
@@ -112,7 +121,12 @@ def create_app() -> Flask:
 
     strict = (os.getenv("STRICT_BLUEPRINTS", "1").strip() != "0")
 
-    def _register_bp(dotted: str, attr: str = "bp", required: bool = True, url_prefix: Optional[str] = api_prefix):
+    def _register_bp(
+        dotted: str,
+        attr: str = "bp",
+        required: bool = True,
+        url_prefix: Optional[str] = api_prefix,
+    ):
         obj, err = _import_attr(dotted, attr)
         entry = {"module": dotted, "attr": attr, "registered": False, "url_prefix": url_prefix, "error": err}
 
@@ -124,6 +138,7 @@ def create_app() -> Flask:
                 raise RuntimeError(f"[boot] REQUIRED blueprint import failed: {err}")
             return
 
+        # Detect duplicate blueprint *names* (Flask uses bp.name)
         bp_name = getattr(obj, "name", None) or f"{dotted}:{attr}"
 
         if not hasattr(app, "_bp_names"):
@@ -139,6 +154,7 @@ def create_app() -> Flask:
 
         app._bp_names.add(bp_name)  # type: ignore[attr-defined]
 
+        # Register with or without prefix
         if url_prefix:
             app.register_blueprint(obj, url_prefix=url_prefix)
         else:
@@ -147,10 +163,11 @@ def create_app() -> Flask:
         entry["registered"] = True
         (boot["required"] if required else boot["optional"]).append(entry)
 
+    # REQUIRED: core API routes
     required_modules = [
         "app.routes.health",
         "app.routes.accounts",
-        "app.routes.subscriptions",
+        "app.routes.subscriptions",     # ✅ includes /subscription/status + /subscription/activate
         "app.routes.ask",
         "app.routes.webhooks",
         "app.routes.plans",
@@ -167,9 +184,11 @@ def create_app() -> Flask:
     for dotted in required_modules:
         _register_bp(dotted, "bp", required=True, url_prefix=api_prefix)
 
+    # OPTIONAL: paystack helpers and cron (cron typically has NO api prefix)
     _register_bp("app.routes.paystack", "paystack_bp", required=False, url_prefix=api_prefix)
     _register_bp("app.routes.cron", "bp", required=False, url_prefix=None)
 
+    # OPTIONAL: multi-channel + web UI helpers
     optional_modules = [
         "app.routes.whatsapp",
         "app.routes.telegram",
@@ -182,6 +201,7 @@ def create_app() -> Flask:
 
     @app.get(f"{api_prefix}/_boot")
     def boot_report():
+        # A safe boot report endpoint for production diagnostics
         return jsonify({"ok": True, "boot": boot, "strict": strict})
 
     return app
