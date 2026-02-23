@@ -26,12 +26,6 @@ def _iso_or_none(value: Optional[str]) -> Optional[str]:
     return value if value else None
 
 
-def _safe_err(e: Exception) -> str:
-    # Keep it safe (no secrets). PostgREST errors are usually safe in str(e).
-    s = str(e) or e.__class__.__name__
-    return s[:500]
-
-
 def _compute_state(
     *,
     now: datetime,
@@ -122,12 +116,13 @@ def _try_fetch_latest_row(
     account_id: str,
     table_name: str,
     id_col: str,
-) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """
-    Returns (row, error_string).
+    Returns (row, safe_error_obj).
+    safe_error_obj never includes secrets.
     """
     try:
-        db = supabase()  # supabase is a function in this project
+        db = supabase()
         res = (
             db.table(table_name)
             .select("*")
@@ -139,7 +134,8 @@ def _try_fetch_latest_row(
         rows = getattr(res, "data", None) or []
         return (rows[0] if rows else None), None
     except Exception as e:
-        return None, _safe_err(e)
+        # Safe: stringified exception only (no env or keys)
+        return None, {"message": str(e)[:300]}
 
 
 def get_subscription_status(account_id: str) -> Dict[str, Any]:
@@ -149,12 +145,11 @@ def get_subscription_status(account_id: str) -> Dict[str, Any]:
     Tries, in order:
       - SUBSCRIPTIONS_TABLE env var (if provided)
       - user_subscriptions
-      - subscriptions
+      - subscriptions   (legacy)
 
     And for each table, tries id columns:
       - account_id
       - user_id
-      - auth_user_id
 
     Returns a stable shape:
       {
@@ -185,18 +180,18 @@ def get_subscription_status(account_id: str) -> Dict[str, Any]:
 
     env_table = (os.getenv("SUBSCRIPTIONS_TABLE", "") or "").strip()
     tables: List[str] = [t for t in [env_table, "user_subscriptions", "subscriptions"] if t]
-    id_cols = ["account_id", "user_id", "auth_user_id"]
+    id_cols = ["account_id", "user_id"]
 
     latest_row: Optional[Dict[str, Any]] = None
     used_table: Optional[str] = None
     used_id_col: Optional[str] = None
-    last_error: Optional[str] = None
+    last_safe_error: Optional[Dict[str, Any]] = None
 
     for t in tables:
         for c in id_cols:
-            row, err = _try_fetch_latest_row(account_id=account_id, table_name=t, id_col=c)
-            if err:
-                last_error = err
+            row, safe_err = _try_fetch_latest_row(account_id=account_id, table_name=t, id_col=c)
+            if safe_err:
+                last_safe_error = {"table": t, "id_col": c, **safe_err}
                 continue
             if row:
                 latest_row = row
@@ -215,21 +210,13 @@ def get_subscription_status(account_id: str) -> Dict[str, Any]:
             "expires_at": None,
             "grace_until": None,
             "trial_until": None,
-            "reason": "no_subscription" if not last_error else "db_error",
-            "debug_source": {"table": None, "id_col": None, "error": last_error},
+            "reason": "db_error" if last_safe_error else "no_subscription",
+            "debug_source": last_safe_error or {"table": None, "id_col": None},
         }
 
     plan_code = latest_row.get("plan_code") or latest_row.get("plan") or None
     status = latest_row.get("status") or None
-
-    # common variants
-    expires_at = (
-        latest_row.get("expires_at")
-        or latest_row.get("expires")
-        or latest_row.get("end_at")
-        or latest_row.get("expiry")
-        or None
-    )
+    expires_at = latest_row.get("expires_at") or latest_row.get("expires") or None
     grace_until = latest_row.get("grace_until") or latest_row.get("grace") or None
     trial_until = latest_row.get("trial_until") or latest_row.get("trial") or None
 
