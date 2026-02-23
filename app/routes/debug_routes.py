@@ -39,10 +39,6 @@ def list_routes():
 
 @bp.get("/_debug/config")
 def debug_config():
-    """
-    Safe config inspector (NO secrets).
-    Admin only.
-    """
     if not _admin_key_configured():
         return jsonify({"ok": False, "error": "admin_key_not_configured"}), 500
 
@@ -82,10 +78,6 @@ def debug_config():
 
 @bp.get("/_debug/subscription")
 def debug_subscription():
-    """
-    Safe subscription inspector.
-    Admin only.
-    """
     if not _admin_key_configured():
         return jsonify({"ok": False, "error": "admin_key_not_configured"}), 500
 
@@ -106,6 +98,4 @@ def debug_subscription():
 
     account_id = (request.args.get("account_id", "") or "").strip()
     status = get_subscription_status(account_id)
-
-    # wrap to keep response stable for your tests
-    return jsonify({"ok": True, "account_id": account_id, "computed_status": status})s
+    return jsonify({"ok": True, "account_id": account_id, "computed_status": status})
