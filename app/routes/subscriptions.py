@@ -2,106 +2,157 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Dict
+import uuid
+from typing import Any, Dict, Optional
 
-from flask import Blueprint, jsonify, request, g
+from flask import Blueprint, jsonify, request
 
-from app.core.auth import require_auth_plus
-from app.services.subscription_status_service import get_subscription_status
-from app.services.subscriptions_service import activate_subscription_now
+from app.services.subscriptions_service import (
+    activate_subscription_now,
+    debug_read_subscription,
+)
 
 bp = Blueprint("subscriptions", __name__)
 
-ADMIN_KEY = (os.getenv("ADMIN_KEY", "") or "").strip()
 
-
-def _admin_key_configured() -> bool:
-    return bool(ADMIN_KEY)
+# -----------------------------------------------------------------------------
+# Admin guard
+# -----------------------------------------------------------------------------
+def _admin_key() -> str:
+    # You may already use a different env name. Add aliases if needed.
+    return (os.getenv("ADMIN_KEY") or os.getenv("X_ADMIN_KEY") or os.getenv("BMS_ADMIN_KEY") or "").strip()
 
 
 def _is_admin(req) -> bool:
-    if not ADMIN_KEY:
-        return False
-    key = (req.headers.get("X-Admin-Key", "") or "").strip()
-    return bool(key) and key == ADMIN_KEY
+    want = _admin_key()
+    got = (req.headers.get("X-Admin-Key") or "").strip()
+    return bool(want) and got == want
 
 
-@bp.get("/subscription/status")
-@require_auth_plus
-def subscription_status():
-    """
-    Returns subscription status for the currently authenticated user.
-    Works for cookie OR bearer (require_auth_plus sets g.account_id).
-    """
-    account_id = str(getattr(g, "account_id", "") or "").strip()
-    status = get_subscription_status(account_id)
-    return jsonify(status), 200
+def _rootcause(where: str, e: Exception, *, req_id: str, hint: Optional[str] = None, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "where": where,
+        "type": type(e).__name__,
+        "message": str(e),
+        "request_id": req_id,
+    }
+    if hint:
+        out["hint"] = hint
+    if extra:
+        out["extra"] = extra
+    return out
 
 
+def _fail(status_code: int, error: str, *, req_id: str, root_cause: Optional[Dict[str, Any]] = None, extra: Optional[Dict[str, Any]] = None):
+    payload: Dict[str, Any] = {"ok": False, "error": error, "request_id": req_id}
+    if root_cause:
+        payload["root_cause"] = root_cause
+    if extra:
+        payload["extra"] = extra
+    return jsonify(payload), status_code
+
+
+# -----------------------------------------------------------------------------
+# Routes
+# -----------------------------------------------------------------------------
 @bp.post("/subscription/activate")
 def subscription_activate():
     """
-    ADMIN ONLY: create/upsert a subscription row for testing
-
-    Header:
-      X-Admin-Key: <ADMIN_KEY>
-
-    Body:
-      {
-        "account_id": "<uuid>",
-        "plan_code": "monthly|quarterly|yearly|trial|manual",
-        "status": "active" (optional),
-        "expires_at": "2026-03-01T00:00:00Z" (optional),
-        "grace_until": "2026-03-05T00:00:00Z" (optional),
-        "trial_until": "2026-03-10T00:00:00Z" (optional)
-      }
+    Admin endpoint to activate a subscription immediately.
+    Body JSON:
+      { "account_id": "<uuid>", "plan_code": "monthly|quarterly|yearly", "days": optional_int }
     """
-    if not _admin_key_configured():
-        return (
-            jsonify(
-                {
-                    "ok": False,
-                    "error": "admin_key_not_configured",
-                    "message": "ADMIN_KEY env var is not set on the server. Set it in Koyeb env vars, then retry.",
-                }
-            ),
-            500,
-        )
+    req_id = str(uuid.uuid4())
 
     if not _is_admin(request):
-        got = bool((request.headers.get("X-Admin-Key", "") or "").strip())
-        return (
-            jsonify(
-                {
-                    "ok": False,
-                    "error": "forbidden",
-                    "message": "Admin key required." if not got else "Admin key invalid.",
-                }
+        return _fail(401, "unauthorized", req_id=req_id, root_cause={"where": "admin_guard", "message": "Missing/invalid X-Admin-Key", "request_id": req_id})
+
+    try:
+        body = request.get_json(silent=True) or {}
+        account_id = (body.get("account_id") or "").strip()
+        plan_code = (body.get("plan_code") or "monthly").strip()
+        days = body.get("days", None)
+
+        if not account_id:
+            return _fail(400, "missing_account_id", req_id=req_id)
+
+        if days is not None:
+            try:
+                days = int(days)
+            except Exception:
+                return _fail(400, "invalid_days", req_id=req_id, root_cause={"where": "input.days", "message": "days must be an integer", "request_id": req_id})
+
+        # Call service (service returns structured root_cause on DB failures)
+        result = activate_subscription_now(account_id=account_id, plan_code=plan_code, days=days)
+
+        # If service already gave a structured failure, return it as-is (still with req_id)
+        if not result.get("ok"):
+            # Normalize: attach request_id if missing
+            if "request_id" not in result:
+                result["request_id"] = req_id
+            if "root_cause" in result and isinstance(result["root_cause"], dict) and "request_id" not in result["root_cause"]:
+                result["root_cause"]["request_id"] = req_id
+
+            # Treat service-level failures as 400 if input-related, otherwise 500
+            err = (result.get("error") or "").lower()
+            status = 400 if err.startswith("missing_") or err.startswith("invalid_") else 500
+            return jsonify(result), status
+
+        # Success
+        result["request_id"] = req_id
+        return jsonify(result), 200
+
+    except Exception as e:
+        return _fail(
+            500,
+            "internal_error",
+            req_id=req_id,
+            root_cause=_rootcause(
+                "routes.subscriptions.subscription_activate",
+                e,
+                req_id=req_id,
+                hint="Unexpected exception in route handler. Check Koyeb logs by request_id.",
             ),
-            403,
         )
 
-    body: Dict[str, Any] = request.get_json(silent=True) or {}
-    account_id = (body.get("account_id") or body.get("user_id") or "").strip()
-    plan_code = (body.get("plan_code") or body.get("plan") or "manual").strip()
-    status = (body.get("status") or "active").strip()
 
-    expires_at = body.get("expires_at")
-    grace_until = body.get("grace_until")
-    trial_until = body.get("trial_until")
+@bp.get("/_debug/subscription")
+def debug_subscription():
+    """
+    Admin debug read.
+    Query: ?account_id=<uuid>
+    """
+    req_id = str(uuid.uuid4())
 
-    if not account_id:
-        return jsonify({"ok": False, "error": "missing_account_id"}), 400
+    if not _is_admin(request):
+        return _fail(401, "unauthorized", req_id=req_id, root_cause={"where": "admin_guard", "message": "Missing/invalid X-Admin-Key", "request_id": req_id})
 
-    # ✅ FIX: use account_id keyword (NOT user_id)
-    res = activate_subscription_now(
-        account_id=account_id,
-        plan_code=plan_code,
-        status=status,
-        expires_at_iso=expires_at,
-        grace_until_iso=grace_until,
-        trial_until_iso=trial_until,
-    )
+    try:
+        account_id = (request.args.get("account_id") or "").strip()
+        if not account_id:
+            return _fail(400, "missing_account_id", req_id=req_id)
 
-    code = 200 if res.get("ok") else 400
-    return jsonify(res), code
+        result = debug_read_subscription(account_id)
+
+        if not result.get("ok"):
+            if "request_id" not in result:
+                result["request_id"] = req_id
+            if "root_cause" in result and isinstance(result["root_cause"], dict) and "request_id" not in result["root_cause"]:
+                result["root_cause"]["request_id"] = req_id
+            return jsonify(result), 500
+
+        result["request_id"] = req_id
+        return jsonify(result), 200
+
+    except Exception as e:
+        return _fail(
+            500,
+            "internal_error",
+            req_id=req_id,
+            root_cause=_rootcause(
+                "routes.subscriptions.debug_subscription",
+                e,
+                req_id=req_id,
+                hint="Unexpected exception in debug handler. Check Koyeb logs by request_id.",
+            ),
+        )
