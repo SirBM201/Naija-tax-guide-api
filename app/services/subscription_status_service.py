@@ -26,16 +26,11 @@ def _iso_or_none(value: Optional[str]) -> Optional[str]:
     return value if value else None
 
 
-def _sanitize_err(e: Exception) -> str:
-    """
-    Safe error string:
-    - no stack trace
-    - short
-    - does not include env values
-    """
-    s = str(e) or e.__class__.__name__
-    s = s.replace("\n", " ").strip()
-    return s[:280]
+def _safe_err(e: Exception) -> str:
+    # safe, non-secret, short error string (good for debug endpoints)
+    name = e.__class__.__name__
+    msg = str(e)[:180]
+    return f"{name}: {msg}"
 
 
 def _compute_state(
@@ -47,12 +42,28 @@ def _compute_state(
     grace_until: Optional[str],
     trial_until: Optional[str],
 ) -> Dict[str, Any]:
+    """
+    Compute active/state from timestamps + status.
+    Priority:
+      1) trial_until (if present + in future)
+      2) expires_at (if present + in future)
+      3) grace_until (if present + in future)
+      4) else expired/none
+
+    If DB marks canceled/disabled/etc, we treat as inactive (even if timestamps exist).
+    """
     status_norm = (status or "").strip().lower()
     exp_dt = _parse_iso(expires_at)
     grace_dt = _parse_iso(grace_until)
     trial_dt = _parse_iso(trial_until)
 
-    explicitly_inactive = status_norm in {"canceled", "cancelled", "inactive", "disabled", "paused"}
+    explicitly_inactive = status_norm in {
+        "canceled",
+        "cancelled",
+        "inactive",
+        "disabled",
+        "paused",
+    }
 
     if trial_dt and trial_dt > now and not explicitly_inactive:
         return {
@@ -87,6 +98,7 @@ def _compute_state(
             "trial_until": _iso_or_none(trial_until),
         }
 
+    # If we had any timestamps but they are in the past -> expired
     if exp_dt or grace_dt or trial_dt:
         return {
             "active": False,
@@ -98,6 +110,7 @@ def _compute_state(
             "trial_until": _iso_or_none(trial_until),
         }
 
+    # Otherwise: none
     return {
         "active": False,
         "state": "none",
@@ -116,10 +129,10 @@ def _try_fetch_latest_row(
     id_col: str,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """
-    Returns (row, safe_error_string).
+    Returns (row, error_string).
     """
     try:
-        db = supabase()
+        db = supabase()  # ✅ supabase is a function in this project
         res = (
             db.table(table_name)
             .select("*")
@@ -131,23 +144,23 @@ def _try_fetch_latest_row(
         rows = getattr(res, "data", None) or []
         return (rows[0] if rows else None), None
     except Exception as e:
-        return None, _sanitize_err(e)
+        return None, _safe_err(e)
 
 
 def get_subscription_status(account_id: str) -> Dict[str, Any]:
     """
-    Compatibility reader across schemas.
+    Attempts to read subscription status from Supabase with compatibility across schemas.
 
-    Tries tables:
-      - SUBSCRIPTIONS_TABLE env var (if set)
+    Tries, in order:
+      - SUBSCRIPTIONS_TABLE env var (if provided)
       - user_subscriptions
       - subscriptions
 
-    Tries id columns:
+    And for each table, tries id columns:
       - account_id
       - user_id
 
-    Returns:
+    Returns a stable shape:
       {
         account_id: str,
         active: bool,
@@ -187,7 +200,7 @@ def get_subscription_status(account_id: str) -> Dict[str, Any]:
         for c in id_cols:
             row, err = _try_fetch_latest_row(account_id=account_id, table_name=t, id_col=c)
             if err:
-                last_error = err
+                last_error = f"{t}.{c} -> {err}"
                 continue
             if row:
                 latest_row = row
@@ -212,12 +225,15 @@ def get_subscription_status(account_id: str) -> Dict[str, Any]:
 
     plan_code = latest_row.get("plan_code") or latest_row.get("plan") or None
     status = latest_row.get("status") or None
+
+    # normalize common timestamp column variants
     expires_at = latest_row.get("expires_at") or latest_row.get("expires") or None
     grace_until = latest_row.get("grace_until") or latest_row.get("grace") or None
     trial_until = latest_row.get("trial_until") or latest_row.get("trial") or None
 
+    now = _now_utc()
     computed = _compute_state(
-        now=_now_utc(),
+        now=now,
         plan_code=plan_code,
         status=status,
         expires_at=expires_at,
