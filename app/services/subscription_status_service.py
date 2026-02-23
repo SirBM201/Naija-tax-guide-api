@@ -1,15 +1,12 @@
 # app/services/subscription_status_service.py
 from __future__ import annotations
 
-from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, Optional
+import os
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional, Tuple, List
 
 from ..core.supabase_client import supabase
 
-
-# -------------------------------------------------------------------
-# Time helpers
-# -------------------------------------------------------------------
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
@@ -20,197 +17,221 @@ def _parse_iso(value: Optional[str]) -> Optional[datetime]:
         return None
     try:
         v = str(value).replace("Z", "+00:00")
-        dt = datetime.fromisoformat(v)
-        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        return datetime.fromisoformat(v)
     except Exception:
         return None
 
 
-def _iso(dt: Optional[datetime]) -> Optional[str]:
-    if not dt:
-        return None
-    if not dt.tzinfo:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).isoformat()
+def _iso_or_none(value: Optional[str]) -> Optional[str]:
+    return value if value else None
 
 
-# -------------------------------------------------------------------
-# DB helper (supabase in this repo is a FACTORY FUNCTION)
-# -------------------------------------------------------------------
-
-def _db():
-    return supabase() if callable(supabase) else supabase
-
-
-# -------------------------------------------------------------------
-# Public API
-# -------------------------------------------------------------------
-
-def get_subscription_status(account_id: Optional[str]) -> Dict[str, Any]:
+def _compute_state(
+    *,
+    now: datetime,
+    plan_code: Optional[str],
+    status: Optional[str],
+    expires_at: Optional[str],
+    grace_until: Optional[str],
+    trial_until: Optional[str],
+) -> Dict[str, Any]:
     """
-    Source of truth: public.user_subscriptions (latest row by created_at)
-
-    Returns:
-      {
-        ok: bool,
-        account_id: str|null,
-        active: bool,
-        state: "none"|"trialing"|"active"|"grace"|"expired"|"canceled"|"error",
-        plan_code: str|null,
-        expires_at: str|null,
-        grace_until: str|null,
-        reason: str,
-        message: str|null
-      }
+    Compute active/state from timestamps + status.
+    Priority:
+      1) trial_until (if present + in future)
+      2) expires_at (if present + in future)
+      3) grace_until (if present + in future)
+      4) else expired/none
     """
-    account_id = (account_id or "").strip()
-    if not account_id:
+    status_norm = (status or "").strip().lower()
+    exp_dt = _parse_iso(expires_at)
+    grace_dt = _parse_iso(grace_until)
+    trial_dt = _parse_iso(trial_until)
+
+    # If DB explicitly marks inactive/canceled, respect it (unless trial is active)
+    explicitly_inactive = status_norm in {"canceled", "cancelled", "inactive", "disabled", "paused"}
+
+    if trial_dt and trial_dt > now and not explicitly_inactive:
         return {
-            "ok": True,
-            "account_id": None,
-            "active": False,
-            "state": "none",
-            "plan_code": None,
-            "expires_at": None,
-            "grace_until": None,
-            "reason": "no_account_id",
-            "message": None,
+            "active": True,
+            "state": "trial",
+            "reason": "within_trial",
+            "plan_code": plan_code,
+            "expires_at": _iso_or_none(expires_at),
+            "grace_until": _iso_or_none(grace_until),
+            "trial_until": _iso_or_none(trial_until),
         }
 
-    # Fetch latest subscription row
+    if exp_dt and exp_dt > now and not explicitly_inactive:
+        return {
+            "active": True,
+            "state": "active",
+            "reason": "within_expiry",
+            "plan_code": plan_code,
+            "expires_at": _iso_or_none(expires_at),
+            "grace_until": _iso_or_none(grace_until),
+            "trial_until": _iso_or_none(trial_until),
+        }
+
+    if grace_dt and grace_dt > now and not explicitly_inactive:
+        return {
+            "active": True,
+            "state": "grace",
+            "reason": "within_grace",
+            "plan_code": plan_code,
+            "expires_at": _iso_or_none(expires_at),
+            "grace_until": _iso_or_none(grace_until),
+            "trial_until": _iso_or_none(trial_until),
+        }
+
+    # If we had any timestamps but they are in the past -> expired
+    if exp_dt or grace_dt or trial_dt:
+        return {
+            "active": False,
+            "state": "expired",
+            "reason": "expired",
+            "plan_code": plan_code,
+            "expires_at": _iso_or_none(expires_at),
+            "grace_until": _iso_or_none(grace_until),
+            "trial_until": _iso_or_none(trial_until),
+        }
+
+    # Otherwise: none
+    return {
+        "active": False,
+        "state": "none",
+        "reason": "no_subscription",
+        "plan_code": None,
+        "expires_at": None,
+        "grace_until": None,
+        "trial_until": None,
+    }
+
+
+def _try_fetch_latest_row(
+    *,
+    account_id: str,
+    table_name: str,
+    id_col: str,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Returns (row, error_string).
+    """
     try:
+        db = supabase()  # IMPORTANT: supabase is a function in this project
         res = (
-            _db()
-            .table("user_subscriptions")
+            db.table(table_name)
             .select("*")
-            .eq("account_id", account_id)
+            .eq(id_col, account_id)
             .order("created_at", desc=True)
             .limit(1)
             .execute()
         )
         rows = getattr(res, "data", None) or []
-        row = rows[0] if rows else None
+        return (rows[0] if rows else None), None
     except Exception as e:
+        return None, repr(e)
+
+
+def get_subscription_status(account_id: str) -> Dict[str, Any]:
+    """
+    Attempts to read subscription status from Supabase with compatibility across schemas.
+
+    Tries, in order:
+      - SUBSCRIPTIONS_TABLE env var (if provided)
+      - user_subscriptions
+      - subscriptions
+
+    And for each table, tries id columns:
+      - account_id
+      - user_id
+
+    Returns a stable shape:
+      {
+        account_id: str,
+        active: bool,
+        state: "active"|"trial"|"grace"|"expired"|"none",
+        plan_code: str|null,
+        expires_at: str|null,
+        grace_until: str|null,
+        trial_until: str|null,
+        reason: str,
+        debug_source: { table, id_col }   # safe
+      }
+    """
+    account_id = (account_id or "").strip()
+    if not account_id:
         return {
-            "ok": False,
-            "account_id": account_id,
+            "account_id": "",
             "active": False,
-            "state": "error",
+            "state": "none",
             "plan_code": None,
             "expires_at": None,
             "grace_until": None,
-            "reason": "db_error",
-            "message": repr(e),
+            "trial_until": None,
+            "reason": "no_account_id",
+            "debug_source": {"table": None, "id_col": None},
         }
 
-    if not row:
+    # Candidate tables (allow env override)
+    env_table = (os.getenv("SUBSCRIPTIONS_TABLE", "") or "").strip()
+    tables: List[str] = [t for t in [env_table, "user_subscriptions", "subscriptions"] if t]
+
+    # Candidate id columns
+    id_cols = ["account_id", "user_id"]
+
+    latest_row: Optional[Dict[str, Any]] = None
+    used_table: Optional[str] = None
+    used_id_col: Optional[str] = None
+    last_error: Optional[str] = None
+
+    for t in tables:
+        for c in id_cols:
+            row, err = _try_fetch_latest_row(account_id=account_id, table_name=t, id_col=c)
+            if err:
+                last_error = err
+                continue
+            if row:
+                latest_row = row
+                used_table = t
+                used_id_col = c
+                break
+        if latest_row:
+            break
+
+    if not latest_row:
+        # If we failed because schema mismatched, still return "none" but include safe error hint
+        # (does not leak secrets)
         return {
-            "ok": True,
             "account_id": account_id,
             "active": False,
             "state": "none",
             "plan_code": None,
             "expires_at": None,
             "grace_until": None,
-            "reason": "no_subscription",
-            "message": None,
+            "trial_until": None,
+            "reason": "no_subscription" if not last_error else "db_error",
+            "debug_source": {"table": None, "id_col": None, "error": last_error},
         }
 
-    # Normalize
-    plan_code = (row.get("plan_code") or row.get("plan") or None)
-    status = str(row.get("status") or "").strip().lower()  # optional column
-    expires_at = row.get("expires_at")
-    grace_until = row.get("grace_until")
+    plan_code = latest_row.get("plan_code") or latest_row.get("plan") or None
+    status = latest_row.get("status") or None
+    expires_at = latest_row.get("expires_at") or latest_row.get("expires") or None
+    grace_until = latest_row.get("grace_until") or latest_row.get("grace") or None
+    trial_until = latest_row.get("trial_until") or latest_row.get("trial") or None
 
     now = _now_utc()
-    exp_dt = _parse_iso(expires_at)
-    grace_dt = _parse_iso(grace_until)
+    computed = _compute_state(
+        now=now,
+        plan_code=plan_code,
+        status=status,
+        expires_at=expires_at,
+        grace_until=grace_until,
+        trial_until=trial_until,
+    )
 
-    # If your table stores trials but doesn't store expires_at, compute from created_at (best-effort)
-    if (status in {"trial", "trialing"} or str(plan_code or "").lower() == "trial") and not exp_dt:
-        created_dt = _parse_iso(row.get("created_at"))
-        if created_dt:
-            exp_dt = created_dt + timedelta(days=7)  # default trial window; keep simple here
-            expires_at = _iso(exp_dt)
-
-    # Canceled (only if status column exists and is used)
-    if status in {"canceled", "cancelled"}:
-        return {
-            "ok": True,
-            "account_id": account_id,
-            "active": False,
-            "state": "canceled",
-            "plan_code": plan_code,
-            "expires_at": expires_at,
-            "grace_until": grace_until,
-            "reason": "canceled",
-            "message": None,
-        }
-
-    # Trial counts as active while within expiry window (global-standard)
-    if status in {"trial", "trialing"} or str(plan_code or "").lower() == "trial":
-        if exp_dt and exp_dt > now:
-            return {
-                "ok": True,
-                "account_id": account_id,
-                "active": True,
-                "state": "trialing",
-                "plan_code": plan_code,
-                "expires_at": expires_at,
-                "grace_until": grace_until,
-                "reason": "trial_active",
-                "message": None,
-            }
-        # trial ended
-        return {
-            "ok": True,
-            "account_id": account_id,
-            "active": False,
-            "state": "expired",
-            "plan_code": plan_code,
-            "expires_at": expires_at,
-            "grace_until": grace_until,
-            "reason": "trial_ended" if exp_dt else "trial_no_expiry",
-            "message": None,
-        }
-
-    # Active window
-    if exp_dt and exp_dt > now:
-        return {
-            "ok": True,
-            "account_id": account_id,
-            "active": True,
-            "state": "active",
-            "plan_code": plan_code,
-            "expires_at": expires_at,
-            "grace_until": grace_until,
-            "reason": "within_expiry",
-            "message": None,
-        }
-
-    # Grace window (optionally keep access)
-    if grace_dt and grace_dt > now:
-        return {
-            "ok": True,
-            "account_id": account_id,
-            "active": True,
-            "state": "grace",
-            "plan_code": plan_code,
-            "expires_at": expires_at,
-            "grace_until": grace_until,
-            "reason": "within_grace",
-            "message": None,
-        }
-
-    # Expired
     return {
-        "ok": True,
         "account_id": account_id,
-        "active": False,
-        "state": "expired",
-        "plan_code": plan_code,
-        "expires_at": expires_at,
-        "grace_until": grace_until,
-        "reason": "expired",
-        "message": None,
+        **computed,
+        "debug_source": {"table": used_table, "id_col": used_id_col},
     }
