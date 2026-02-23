@@ -99,3 +99,4 @@ def debug_subscription():
     account_id = (request.args.get("account_id", "") or "").strip()
     status = get_subscription_status(account_id)
     return jsonify({"ok": True, "account_id": account_id, "computed_status": status})
+    
