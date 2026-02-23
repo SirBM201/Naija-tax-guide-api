@@ -1,23 +1,12 @@
 from __future__ import annotations
-
-import os
-from flask import Blueprint, jsonify, current_app
+from flask import Blueprint, current_app, jsonify
 
 bp = Blueprint("debug_routes", __name__)
 
-@bp.get("/__routes")
-def list_routes():
-    # Protect it (set DEBUG_ROUTES_KEY in env)
-    key = os.getenv("DEBUG_ROUTES_KEY", "").strip()
-    if key:
-        # simple header guard
-        # curl: -H "x-debug-key: YOURKEY"
-        from flask import request
-        if request.headers.get("x-debug-key", "") != key:
-            return jsonify({"ok": False, "error": "forbidden"}), 403
-
+@bp.get("/debug/routes")
+def debug_routes():
     rules = []
-    for r in sorted(current_app.url_map.iter_rules(), key=lambda x: str(x)):
+    for r in current_app.url_map.iter_rules():
         if r.endpoint == "static":
             continue
         rules.append({
@@ -25,4 +14,5 @@ def list_routes():
             "methods": sorted([m for m in r.methods if m not in ("HEAD","OPTIONS")]),
             "endpoint": r.endpoint,
         })
+    rules = sorted(rules, key=lambda x: x["rule"])
     return jsonify({"ok": True, "count": len(rules), "routes": rules})
