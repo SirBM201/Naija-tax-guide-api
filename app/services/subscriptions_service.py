@@ -1,169 +1,152 @@
 # app/services/subscriptions_service.py
 from __future__ import annotations
 
-import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 from ..core.supabase_client import supabase
-from .subscription_status_service import get_subscription_status as _get_status
 
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _iso(dt: Optional[datetime]) -> Optional[str]:
+def _parse_iso(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        v = str(value).replace("Z", "+00:00")
+        return datetime.fromisoformat(v)
+    except Exception:
+        return None
+
+
+def _to_iso(dt: Optional[datetime]) -> Optional[str]:
     if not dt:
         return None
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _subscriptions_table() -> str:
-    return (os.getenv("SUBSCRIPTIONS_TABLE", "") or "").strip() or "user_subscriptions"
+def _default_expiry_for_plan(plan_code: str, *, now: datetime) -> Optional[datetime]:
+    p = (plan_code or "").strip().lower()
 
-
-def get_subscription_status(account_id: str) -> Dict[str, Any]:
-    # Single source of truth
-    return _get_status(account_id)
-
-
-def _default_expiry_for_plan(plan_code: str) -> Optional[datetime]:
-    plan = (plan_code or "").strip().lower()
-    now = _now_utc()
-
-    if plan in {"trial"}:
+    # Keep these simple and predictable for now
+    if p in {"trial"}:
         return now + timedelta(days=7)
-
-    if plan in {"monthly", "month"}:
+    if p in {"monthly", "month"}:
         return now + timedelta(days=30)
-
-    if plan in {"quarterly", "quarter"}:
+    if p in {"quarterly", "quarter"}:
         return now + timedelta(days=90)
-
-    if plan in {"yearly", "annual", "year"}:
+    if p in {"yearly", "annual", "year"}:
         return now + timedelta(days=365)
 
-    # manual: no expiry unless provided
+    # manual: require expires_at to be explicitly set (or leave null)
     return None
 
 
 def activate_subscription_now(
     *,
-    account_id: str,
+    user_id: str,
     plan_code: str = "manual",
-    status: str = "active",
     expires_at_iso: Optional[str] = None,
-    grace_until_iso: Optional[str] = None,
+    status: str = "active",
+    grace_days: int = 3,
     trial_until_iso: Optional[str] = None,
+    provider: Optional[str] = "admin",
+    provider_ref: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Admin/testing helper: upserts the canonical row in public.user_subscriptions.
+    Admin/testing helper:
+    Upserts a row into public.user_subscriptions using account_id.
 
-    Requires that public.user_subscriptions exists with:
-      account_id, plan_code, status, expires_at, grace_until, trial_until
+    Requires SQL schema:
+      user_subscriptions(account_id unique, plan_code, status, expires_at, grace_until, trial_until, ...)
     """
-    account_id = (account_id or "").strip()
+    account_id = (user_id or "").strip()
     if not account_id:
         return {"ok": False, "error": "missing_account_id"}
 
-    plan_code = (plan_code or "manual").strip()
-    status = (status or "active").strip()
+    now = _now_utc()
 
-    # compute expires_at if not provided (for common plans)
-    expires_dt = None
-    if expires_at_iso:
+    exp_dt = _parse_iso(expires_at_iso)
+    trial_dt = _parse_iso(trial_until_iso)
+
+    if not exp_dt and plan_code:
+        exp_dt = _default_expiry_for_plan(plan_code, now=now)
+
+    grace_dt = None
+    if exp_dt:
         try:
-            expires_dt = datetime.fromisoformat(str(expires_at_iso).replace("Z", "+00:00"))
+            grace_dt = exp_dt + timedelta(days=int(grace_days))
         except Exception:
-            return {"ok": False, "error": "invalid_expires_at", "message": "expires_at must be ISO8601"}
-    else:
-        expires_dt = _default_expiry_for_plan(plan_code)
+            grace_dt = exp_dt + timedelta(days=3)
 
-    # grace/trial parsing (optional)
-    def _parse_optional(v: Optional[str], field: str) -> Optional[datetime]:
-        if not v:
-            return None
-        try:
-            return datetime.fromisoformat(str(v).replace("Z", "+00:00"))
-        except Exception:
-            raise ValueError(field)
-
-    try:
-        grace_dt = _parse_optional(grace_until_iso, "grace_until")
-        trial_dt = _parse_optional(trial_until_iso, "trial_until")
-    except ValueError as ve:
-        return {"ok": False, "error": f"invalid_{str(ve)}", "message": f"{ve} must be ISO8601"}
-
-    payload = {
+    payload: Dict[str, Any] = {
         "account_id": account_id,
-        "plan_code": plan_code,
-        "status": status,
-        "expires_at": _iso(expires_dt),
-        "grace_until": _iso(grace_dt),
-        "trial_until": _iso(trial_dt),
-        "updated_at": _iso(_now_utc()),
+        "plan_code": (plan_code or "").strip() or None,
+        "status": (status or "").strip() or "active",
+        "expires_at": _to_iso(exp_dt),
+        "grace_until": _to_iso(grace_dt),
+        "trial_until": _to_iso(trial_dt),
+        "provider": provider,
+        "provider_ref": provider_ref,
+        "updated_at": _to_iso(now),
     }
 
-    table = _subscriptions_table()
+    # Remove keys with None to avoid overwriting with null unintentionally
+    payload = {k: v for k, v in payload.items() if v is not None}
+
     try:
         db = supabase()
-        # Upsert by unique(account_id)
-        res = db.table(table).upsert(payload, on_conflict="account_id").execute()
-        _ = getattr(res, "data", None)
-        return {"ok": True, "table": table, "account_id": account_id, "written": payload}
+        # Requires UNIQUE(account_id) so upsert works deterministically
+        res = (
+            db.table("user_subscriptions")
+            .upsert(payload, on_conflict="account_id")
+            .execute()
+        )
+        return {"ok": True, "account_id": account_id, "subscription": getattr(res, "data", None)}
     except Exception as e:
-        return {
-            "ok": False,
-            "error": "db_insert_failed",
-            "message": str(e),
-            "table": table,
-        }
+        return {"ok": False, "error": "db_upsert_failed", "message": repr(e)}
 
-
-# -------------------------------------------------------------------
-# Webhook handlers (MUST exist because app.routes.webhooks imports them)
-# -------------------------------------------------------------------
 
 def handle_payment_success(event: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Called by Paystack webhook route.
+    Webhook entrypoint (Paystack or other).
+    This exists primarily so imports don't crash the app,
+    and to apply a subscription update when metadata includes account_id.
 
-    Expected shapes vary; we keep this safe + defensive and only act if we can
-    resolve account_id + plan_code.
+    Expected places for IDs:
+      event["data"]["metadata"]["account_id"] OR ["user_id"]
+    Expected plan:
+      event["data"]["metadata"]["plan_code"] OR ["plan"]
+
+    If not found, we return ok=False but do not raise.
     """
     try:
         data = (event or {}).get("data") or {}
-        metadata = data.get("metadata") or {}
+        meta = data.get("metadata") or {}
 
-        # You can pass account_id via Paystack metadata when initializing payment
-        account_id = (metadata.get("account_id") or metadata.get("user_id") or "").strip()
-        plan_code = (metadata.get("plan_code") or metadata.get("plan") or "monthly").strip()
+        account_id = (meta.get("account_id") or meta.get("user_id") or "").strip()
+        plan_code = (meta.get("plan_code") or meta.get("plan") or "monthly").strip()
+
+        provider_ref = str(data.get("reference") or data.get("id") or "") or None
 
         if not account_id:
             return {"ok": False, "error": "missing_account_id_in_metadata"}
 
-        # Activate (or extend) subscription
-        return activate_subscription_now(account_id=account_id, plan_code=plan_code, status="active")
+        # For now: activate using default expiry for plan unless metadata includes expires_at
+        expires_at = meta.get("expires_at")
+        trial_until = meta.get("trial_until")
+
+        return activate_subscription_now(
+            user_id=account_id,
+            plan_code=plan_code,
+            expires_at_iso=expires_at,
+            trial_until_iso=trial_until,
+            status="active",
+            provider="webhook",
+            provider_ref=provider_ref,
+        )
     except Exception as e:
-        return {"ok": False, "error": "exception", "message": str(e)[:300]}
-
-
-def handle_subscription_created(event: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Optional: Paystack subscription.create event.
-    You can wire this later; for now we keep a safe no-op unless metadata provides account_id.
-    """
-    try:
-        data = (event or {}).get("data") or {}
-        metadata = data.get("metadata") or {}
-
-        account_id = (metadata.get("account_id") or metadata.get("user_id") or "").strip()
-        plan_code = (metadata.get("plan_code") or metadata.get("plan") or "monthly").strip()
-
-        if not account_id:
-            return {"ok": True, "noop": True, "reason": "no_account_id_in_metadata"}
-
-        return activate_subscription_now(account_id=account_id, plan_code=plan_code, status="active")
-    except Exception as e:
-        return {"ok": False, "error": "exception", "message": str(e)[:300]}
+        # Never crash webhook worker
+        return {"ok": False, "error": "handle_payment_success_failed", "message": repr(e)}
