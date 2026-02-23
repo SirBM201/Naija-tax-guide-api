@@ -4,12 +4,11 @@ from __future__ import annotations
 import os
 from typing import Any, Dict, Optional
 
-from flask import Blueprint, jsonify, request, g
+from flask import Blueprint, jsonify, request
 
-from app.core.auth import require_auth_plus
-from app.services.subscriptions_service import get_subscription_status
+from app.services.subscription_status_service import get_subscription_status
 
-bp = Blueprint("debug_routes", __name__)
+bp = Blueprint("debug", __name__)
 
 ADMIN_KEY = (os.getenv("ADMIN_KEY", "") or "").strip()
 
@@ -22,35 +21,29 @@ def _is_admin(req) -> bool:
 
 
 def _safe_env() -> Dict[str, Any]:
-    """
-    SAFE debug info only: never return secrets.
-    """
-    api_prefix = (os.getenv("API_PREFIX", "") or "").strip() or "/api"
-    cors_origins = (os.getenv("CORS_ORIGINS", "") or "").strip()
+    # Never return secrets/values, only booleans / safe strings
+    api_prefix = (os.getenv("API_PREFIX", "") or "/api").strip() or "/api"
     return {
         "env": (os.getenv("ENV", "") or os.getenv("FLASK_ENV", "") or "prod").strip() or "prod",
         "api_prefix": api_prefix,
-        "cors_origins_set": bool(cors_origins),
-        "cookie_auth_enabled": (os.getenv("COOKIE_AUTH_ENABLED", "") or "").strip(),
-        "web_auth_enabled": (os.getenv("WEB_AUTH_ENABLED", "") or "").strip(),
         "admin_key_configured": bool(ADMIN_KEY),
+        "cookie_auth_enabled": (os.getenv("COOKIE_AUTH_ENABLED", "") or "").strip() or "0",
+        "web_auth_enabled": (os.getenv("WEB_AUTH_ENABLED", "") or "").strip() or "0",
+        "cors_origins_set": bool((os.getenv("CORS_ORIGINS", "") or "").strip()),
     }
 
 
 @bp.get("/_debug/config")
 def debug_config():
     if not _is_admin(request):
-        return jsonify({"ok": False, "error": "forbidden", "message": "Admin key required."}), 403
+        return jsonify({"ok": False, "error": "forbidden"}), 403
 
+    provided = bool((request.headers.get("X-Admin-Key", "") or "").strip())
     return jsonify(
         {
             "ok": True,
+            "admin_auth": {"configured": bool(ADMIN_KEY), "provided": provided, "valid": True},
             "safe_env": _safe_env(),
-            "admin_auth": {
-                "configured": bool(ADMIN_KEY),
-                "provided": bool((request.headers.get("X-Admin-Key", "") or "").strip()),
-                "valid": _is_admin(request),
-            },
         }
     ), 200
 
@@ -58,30 +51,19 @@ def debug_config():
 @bp.get("/_debug/subscription")
 def debug_subscription():
     if not _is_admin(request):
-        return jsonify({"ok": False, "error": "forbidden", "message": "Admin key required."}), 403
+        return jsonify({"ok": False, "error": "forbidden"}), 403
 
-    account_id = (request.args.get("account_id") or "").strip()
+    account_id = (request.args.get("account_id") or request.args.get("user_id") or "").strip()
     if not account_id:
         return jsonify({"ok": False, "error": "missing_account_id"}), 400
 
-    status = get_subscription_status(account_id)
+    computed = get_subscription_status(account_id)
+
     return jsonify(
         {
             "ok": True,
             "account_id": account_id,
-            "computed_status": status,
+            "computed_status": computed,
             "safe_env": _safe_env(),
-        }
-    ), 200
-
-
-@bp.get("/_debug/whoami")
-@require_auth_plus
-def debug_whoami():
-    return jsonify(
-        {
-            "ok": True,
-            "account_id": getattr(g, "account_id", None),
-            "auth_mode": getattr(g, "auth_mode", None),
         }
     ), 200
