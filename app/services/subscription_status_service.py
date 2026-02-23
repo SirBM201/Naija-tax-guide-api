@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-from ..core.supabase_client import supabase
+from app.core.supabase_client import supabase  # IMPORTANT: this is a CLIENT, not a function
 
 
 def _now_utc() -> datetime:
@@ -24,7 +24,6 @@ def _parse_iso(value: Optional[str]) -> Optional[datetime]:
 def _as_iso_or_none(value: Any) -> Optional[str]:
     if value is None:
         return None
-    # Supabase sometimes returns datetime-like, sometimes string; normalize to string
     return str(value)
 
 
@@ -42,15 +41,8 @@ def _compute_state(
     grace_dt = _parse_iso(grace_until)
     trial_dt = _parse_iso(trial_until)
 
-    explicitly_inactive = status_norm in {
-        "canceled",
-        "cancelled",
-        "inactive",
-        "disabled",
-        "paused",
-    }
+    explicitly_inactive = status_norm in {"canceled", "cancelled", "inactive", "disabled", "paused"}
 
-    # Trial has priority if present and still valid and not explicitly inactive
     if trial_dt and trial_dt > now and not explicitly_inactive:
         return {
             "active": True,
@@ -62,7 +54,6 @@ def _compute_state(
             "trial_until": _as_iso_or_none(trial_until),
         }
 
-    # Active subscription
     if exp_dt and exp_dt > now and not explicitly_inactive:
         return {
             "active": True,
@@ -74,7 +65,6 @@ def _compute_state(
             "trial_until": _as_iso_or_none(trial_until),
         }
 
-    # Grace window
     if grace_dt and grace_dt > now and not explicitly_inactive:
         return {
             "active": True,
@@ -86,7 +76,6 @@ def _compute_state(
             "trial_until": _as_iso_or_none(trial_until),
         }
 
-    # If any timestamps exist but are past => expired
     if exp_dt or grace_dt or trial_dt:
         return {
             "active": False,
@@ -98,7 +87,6 @@ def _compute_state(
             "trial_until": _as_iso_or_none(trial_until),
         }
 
-    # Otherwise no sub row meaningfully set
     return {
         "active": False,
         "state": "none",
@@ -112,20 +100,7 @@ def _compute_state(
 
 def get_subscription_status(account_id: str) -> Dict[str, Any]:
     """
-    Source of truth: public.user_subscriptions (canonical schema)
-
-    Returns:
-      {
-        account_id: str,
-        active: bool,
-        state: "active"|"trial"|"grace"|"expired"|"none",
-        plan_code: str|null,
-        expires_at: str|null,
-        grace_until: str|null,
-        trial_until: str|null,
-        reason: str,
-        debug_source: { table: "user_subscriptions" }
-      }
+    Source of truth: public.user_subscriptions
     """
     account_id = (account_id or "").strip()
     if not account_id:
@@ -142,9 +117,8 @@ def get_subscription_status(account_id: str) -> Dict[str, Any]:
         }
 
     try:
-        db = supabase()  # IMPORTANT: supabase is a function in this project
         res = (
-            db.table("user_subscriptions")
+            supabase.table("user_subscriptions")
             .select("account_id, plan_code, status, expires_at, grace_until, trial_until, created_at, updated_at")
             .eq("account_id", account_id)
             .limit(1)
@@ -178,23 +152,13 @@ def get_subscription_status(account_id: str) -> Dict[str, Any]:
             "debug_source": {"table": "user_subscriptions"},
         }
 
-    plan_code = row.get("plan_code")
-    status = row.get("status")
-    expires_at = _as_iso_or_none(row.get("expires_at"))
-    grace_until = _as_iso_or_none(row.get("grace_until"))
-    trial_until = _as_iso_or_none(row.get("trial_until"))
-
     computed = _compute_state(
         now=_now_utc(),
-        plan_code=plan_code,
-        status=status,
-        expires_at=expires_at,
-        grace_until=grace_until,
-        trial_until=trial_until,
+        plan_code=row.get("plan_code"),
+        status=row.get("status"),
+        expires_at=_as_iso_or_none(row.get("expires_at")),
+        grace_until=_as_iso_or_none(row.get("grace_until")),
+        trial_until=_as_iso_or_none(row.get("trial_until")),
     )
 
-    return {
-        "account_id": account_id,
-        **computed,
-        "debug_source": {"table": "user_subscriptions"},
-    }
+    return {"account_id": account_id, **computed, "debug_source": {"table": "user_subscriptions"}}
