@@ -11,6 +11,12 @@ from app.services.subscriptions_service import activate_subscription_now
 
 bp = Blueprint("paystack", __name__)
 
+# IMPORTANT:
+# Your accounts table UI shows a column named "account_id" (uuid).
+# Your earlier FK dump mentioned accounts.id — that mismatch must be resolved.
+# For now we default to "account_id" as the lookup column.
+ACCOUNTS_LOOKUP_COL = "account_id"
+
 
 def _sb():
     return supabase() if callable(supabase) else supabase
@@ -28,71 +34,59 @@ def _err(
     if extra:
         payload["extra"] = extra
     if root_cause:
-        payload["root_cause"] = {
-            "type": root_cause.__class__.__name__,
-            "message": str(root_cause),
-        }
+        payload["root_cause"] = {"type": root_cause.__class__.__name__, "message": str(root_cause)}
     return jsonify(payload), http_status
 
 
 def _extract_account_and_plan(body: Dict[str, Any]) -> tuple[str, str]:
-    """
-    Supports BOTH request shapes you used:
-
-    A) flat:
-      { account_id, plan_code, email }
-
-    B) metadata-based:
-      { email, metadata: { account_id, plan_code, ... } }
-    """
     account_id = (body.get("account_id") or "").strip()
     plan_code = (body.get("plan_code") or "").strip().lower()
 
     md = body.get("metadata") or {}
-    if not account_id:
-        account_id = (md.get("account_id") or "").strip()
-    if not plan_code:
-        plan_code = (md.get("plan_code") or "").strip().lower()
+    if isinstance(md, dict):
+        if not account_id:
+            account_id = (md.get("account_id") or "").strip()
+        if not plan_code:
+            plan_code = (md.get("plan_code") or "").strip().lower()
 
     return account_id, plan_code
 
 
-def _ensure_account_row(account_id: str, email: str):
+def _require_account_exists(account_id: str) -> Optional[Dict[str, Any]]:
     """
-    Fixes your FK error:
-      user_subscriptions.account_id -> accounts.account_id
-
-    If account row is missing, create it best-effort.
+    Strict FK safety:
+      - Do NOT auto-create accounts here.
+      - Account must exist already (created by OTP/login flow).
+    Returns None if OK, else an error dict.
     """
+    account_id = (account_id or "").strip()
     if not account_id:
-        return
+        return {"error": "account_id_required", "message": "account_id is required"}
 
     try:
-        # If it already exists, do nothing
-        existing = (
+        res = (
             _sb()
             .table("accounts")
-            .select("account_id")
-            .eq("account_id", account_id)
+            .select(ACCOUNTS_LOOKUP_COL)
+            .eq(ACCOUNTS_LOOKUP_COL, account_id)
             .limit(1)
             .execute()
         )
-        rows = (existing.data or []) if hasattr(existing, "data") else []
+        rows = (res.data or []) if hasattr(res, "data") else []
         if rows:
-            return
-
-        # Insert minimal row (avoid columns that might not exist)
-        _sb().table("accounts").insert(
-            {
-                "account_id": account_id,
-                "provider": "web",
-                "provider_user_id": (email or account_id),
-                "display_name": (email or "Web User"),
-            }
-        ).execute()
-    except Exception:
-        # best-effort only; activation will still fail if FK requires strict fields
-        return
+            return None
+        return {
+            "error": "account_not_found",
+            "message": "Account does not exist. Please login/create account first (OTP flow) before paying.",
+            "extra": {"account_id": account_id, "lookup_col": ACCOUNTS_LOOKUP_COL},
+        }
+    except Exception as e:
+        return {
+            "error": "accounts_lookup_failed",
+            "message": "Could not validate account existence.",
+            "root_cause": {"type": e.__class__.__name__, "message": str(e)},
+            "extra": {"account_id": account_id, "lookup_col": ACCOUNTS_LOOKUP_COL},
+        }
 
 
 @bp.get("/paystack/health")
@@ -112,25 +106,21 @@ def paystack_health():
 
 @bp.post("/paystack/init")
 def paystack_init():
-    """
-    Start a Paystack payment.
-
-    Supports:
-    - { account_id, plan_code, email }
-    - { email, metadata: { account_id, plan_code, ... }, amount_kobo?, currency? }
-    """
     body: Dict[str, Any] = request.get_json(silent=True) or {}
     email = (body.get("email") or "").strip()
     account_id, plan_code = _extract_account_and_plan(body)
 
     if not email:
         return _err(400, "email_required", "email is required")
-
     if not account_id:
         return _err(400, "account_id_required", "account_id is required (direct or in metadata)")
-
     if not plan_code:
         return _err(400, "plan_code_required", "plan_code is required (direct or in metadata)")
+
+    # STRICT: account must exist already
+    acc_err = _require_account_exists(account_id)
+    if acc_err:
+        return _err(400, acc_err["error"], acc_err["message"], extra=acc_err.get("extra"), root_cause=None)
 
     plan = get_plan(plan_code)
     if not plan or not plan.get("active", True):
@@ -142,11 +132,9 @@ def paystack_init():
 
     amount_kobo = amount_naira * 100
     currency = (body.get("currency") or "NGN").strip() or "NGN"
-
     reference = create_reference("NTG")
 
-    # keep whatever metadata user sent, but enforce needed keys
-    metadata = dict((body.get("metadata") or {}) if isinstance(body.get("metadata"), dict) else {})
+    metadata = dict(body.get("metadata") or {}) if isinstance(body.get("metadata"), dict) else {}
     metadata.update(
         {
             "account_id": account_id,
@@ -167,20 +155,20 @@ def paystack_init():
         )
         d = init_data.get("data") or {}
 
-        # Store initiated tx best-effort
+        # Best-effort: record initiation (your table has columns: reference,status,amount,currency,paid_at,account_id,plan_code,raw)
         try:
-            _sb().table("paystack_transactions").insert(
+            _sb().table("paystack_transactions").upsert(
                 {
                     "reference": reference,
-                    "account_id": account_id,
-                    "plan_code": plan_code,
+                    "status": "initiated",
                     "amount": amount_naira,
                     "currency": d.get("currency") or currency,
-                    "status": "initiated",
-                    "authorization_url": d.get("authorization_url"),
-                    "access_code": d.get("access_code"),
+                    "paid_at": None,
+                    "account_id": account_id,
+                    "plan_code": plan_code,
                     "raw": init_data,
-                }
+                },
+                on_conflict="reference",
             ).execute()
         except Exception:
             pass
@@ -202,9 +190,6 @@ def paystack_init():
 
 @bp.get("/paystack/verify/<reference>")
 def paystack_verify(reference: str):
-    """
-    Verify a transaction and (if successful) activate the subscription.
-    """
     reference = (reference or "").strip()
     if not reference:
         return _err(400, "missing_reference", "reference is required")
@@ -218,34 +203,36 @@ def paystack_verify(reference: str):
         account_id = (metadata.get("account_id") or "").strip()
         plan_code = (metadata.get("plan_code") or "").strip().lower()
 
-        # Update tx row best-effort
+        # Best-effort update
         try:
-            _sb().table("paystack_transactions").update(
+            _sb().table("paystack_transactions").upsert(
                 {
-                    "paystack_status": status,
-                    "transaction_id": str(tx.get("id") or ""),
-                    "paid_at": tx.get("paid_at"),
-                    "raw": data,
+                    "reference": reference,
                     "status": "success" if status == "success" else "failed",
-                }
-            ).eq("reference", reference).execute()
+                    "paid_at": tx.get("paid_at"),
+                    "amount": (tx.get("amount") or 0) // 100 if isinstance(tx.get("amount"), int) else None,
+                    "currency": tx.get("currency"),
+                    "account_id": account_id or None,
+                    "plan_code": plan_code or None,
+                    "raw": data,
+                },
+                on_conflict="reference",
+            ).execute()
         except Exception:
             pass
 
         if status != "success":
-            return _err(
-                400,
-                "payment_not_successful",
-                "payment not successful",
-                extra={"paystack_status": status, "reference": reference},
-            )
+            return _err(400, "payment_not_successful", "payment not successful", extra={"paystack_status": status, "reference": reference})
 
         if not account_id or not plan_code:
             return _err(400, "missing_metadata", "missing account_id/plan_code in metadata", extra={"metadata": metadata})
 
-        # ✅ Fix FK issue: ensure accounts row exists before subscription upsert
-        _ensure_account_row(account_id, email=(tx.get("customer") or {}).get("email") or "")
+        # STRICT: account must exist already
+        acc_err = _require_account_exists(account_id)
+        if acc_err:
+            return _err(400, acc_err["error"], acc_err["message"], extra=acc_err.get("extra"))
 
+        # Activate (store provider/provider_ref inside subscriptions_service if you update it)
         sub = activate_subscription_now(account_id=account_id, plan_code=plan_code, status="active")
 
         return jsonify({"ok": True, "reference": reference, "subscription": sub}), 200
