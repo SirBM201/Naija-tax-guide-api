@@ -27,10 +27,9 @@ def _iso_or_none(value: Optional[str]) -> Optional[str]:
 
 
 def _safe_err(e: Exception) -> str:
-    # safe, non-secret, short error string (good for debug endpoints)
-    name = e.__class__.__name__
-    msg = str(e)[:180]
-    return f"{name}: {msg}"
+    # Keep it safe (no secrets). PostgREST errors are usually safe in str(e).
+    s = str(e) or e.__class__.__name__
+    return s[:500]
 
 
 def _compute_state(
@@ -49,8 +48,6 @@ def _compute_state(
       2) expires_at (if present + in future)
       3) grace_until (if present + in future)
       4) else expired/none
-
-    If DB marks canceled/disabled/etc, we treat as inactive (even if timestamps exist).
     """
     status_norm = (status or "").strip().lower()
     exp_dt = _parse_iso(expires_at)
@@ -98,7 +95,6 @@ def _compute_state(
             "trial_until": _iso_or_none(trial_until),
         }
 
-    # If we had any timestamps but they are in the past -> expired
     if exp_dt or grace_dt or trial_dt:
         return {
             "active": False,
@@ -110,7 +106,6 @@ def _compute_state(
             "trial_until": _iso_or_none(trial_until),
         }
 
-    # Otherwise: none
     return {
         "active": False,
         "state": "none",
@@ -132,7 +127,7 @@ def _try_fetch_latest_row(
     Returns (row, error_string).
     """
     try:
-        db = supabase()  # ✅ supabase is a function in this project
+        db = supabase()  # supabase is a function in this project
         res = (
             db.table(table_name)
             .select("*")
@@ -159,6 +154,7 @@ def get_subscription_status(account_id: str) -> Dict[str, Any]:
     And for each table, tries id columns:
       - account_id
       - user_id
+      - auth_user_id
 
     Returns a stable shape:
       {
@@ -189,7 +185,7 @@ def get_subscription_status(account_id: str) -> Dict[str, Any]:
 
     env_table = (os.getenv("SUBSCRIPTIONS_TABLE", "") or "").strip()
     tables: List[str] = [t for t in [env_table, "user_subscriptions", "subscriptions"] if t]
-    id_cols = ["account_id", "user_id"]
+    id_cols = ["account_id", "user_id", "auth_user_id"]
 
     latest_row: Optional[Dict[str, Any]] = None
     used_table: Optional[str] = None
@@ -200,7 +196,7 @@ def get_subscription_status(account_id: str) -> Dict[str, Any]:
         for c in id_cols:
             row, err = _try_fetch_latest_row(account_id=account_id, table_name=t, id_col=c)
             if err:
-                last_error = f"{t}.{c} -> {err}"
+                last_error = err
                 continue
             if row:
                 latest_row = row
@@ -226,8 +222,14 @@ def get_subscription_status(account_id: str) -> Dict[str, Any]:
     plan_code = latest_row.get("plan_code") or latest_row.get("plan") or None
     status = latest_row.get("status") or None
 
-    # normalize common timestamp column variants
-    expires_at = latest_row.get("expires_at") or latest_row.get("expires") or None
+    # common variants
+    expires_at = (
+        latest_row.get("expires_at")
+        or latest_row.get("expires")
+        or latest_row.get("end_at")
+        or latest_row.get("expiry")
+        or None
+    )
     grace_until = latest_row.get("grace_until") or latest_row.get("grace") or None
     trial_until = latest_row.get("trial_until") or latest_row.get("trial") or None
 
