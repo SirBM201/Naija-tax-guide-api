@@ -1,9 +1,8 @@
 # app/services/subscription_status_service.py
 from __future__ import annotations
 
-import os
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Dict, Optional
 
 from ..core.supabase_client import supabase
 
@@ -22,8 +21,11 @@ def _parse_iso(value: Optional[str]) -> Optional[datetime]:
         return None
 
 
-def _iso_or_none(value: Optional[str]) -> Optional[str]:
-    return value if value else None
+def _as_iso_or_none(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    # Supabase sometimes returns datetime-like, sometimes string; normalize to string
+    return str(value)
 
 
 def _compute_state(
@@ -35,14 +37,6 @@ def _compute_state(
     grace_until: Optional[str],
     trial_until: Optional[str],
 ) -> Dict[str, Any]:
-    """
-    Compute active/state from timestamps + status.
-    Priority:
-      1) trial_until (if present + in future)
-      2) expires_at (if present + in future)
-      3) grace_until (if present + in future)
-      4) else expired/none
-    """
     status_norm = (status or "").strip().lower()
     exp_dt = _parse_iso(expires_at)
     grace_dt = _parse_iso(grace_until)
@@ -56,50 +50,55 @@ def _compute_state(
         "paused",
     }
 
+    # Trial has priority if present and still valid and not explicitly inactive
     if trial_dt and trial_dt > now and not explicitly_inactive:
         return {
             "active": True,
             "state": "trial",
             "reason": "within_trial",
             "plan_code": plan_code,
-            "expires_at": _iso_or_none(expires_at),
-            "grace_until": _iso_or_none(grace_until),
-            "trial_until": _iso_or_none(trial_until),
+            "expires_at": _as_iso_or_none(expires_at),
+            "grace_until": _as_iso_or_none(grace_until),
+            "trial_until": _as_iso_or_none(trial_until),
         }
 
+    # Active subscription
     if exp_dt and exp_dt > now and not explicitly_inactive:
         return {
             "active": True,
             "state": "active",
             "reason": "within_expiry",
             "plan_code": plan_code,
-            "expires_at": _iso_or_none(expires_at),
-            "grace_until": _iso_or_none(grace_until),
-            "trial_until": _iso_or_none(trial_until),
+            "expires_at": _as_iso_or_none(expires_at),
+            "grace_until": _as_iso_or_none(grace_until),
+            "trial_until": _as_iso_or_none(trial_until),
         }
 
+    # Grace window
     if grace_dt and grace_dt > now and not explicitly_inactive:
         return {
             "active": True,
             "state": "grace",
             "reason": "within_grace",
             "plan_code": plan_code,
-            "expires_at": _iso_or_none(expires_at),
-            "grace_until": _iso_or_none(grace_until),
-            "trial_until": _iso_or_none(trial_until),
+            "expires_at": _as_iso_or_none(expires_at),
+            "grace_until": _as_iso_or_none(grace_until),
+            "trial_until": _as_iso_or_none(trial_until),
         }
 
+    # If any timestamps exist but are past => expired
     if exp_dt or grace_dt or trial_dt:
         return {
             "active": False,
             "state": "expired",
             "reason": "expired",
             "plan_code": plan_code,
-            "expires_at": _iso_or_none(expires_at),
-            "grace_until": _iso_or_none(grace_until),
-            "trial_until": _iso_or_none(trial_until),
+            "expires_at": _as_iso_or_none(expires_at),
+            "grace_until": _as_iso_or_none(grace_until),
+            "trial_until": _as_iso_or_none(trial_until),
         }
 
+    # Otherwise no sub row meaningfully set
     return {
         "active": False,
         "state": "none",
@@ -111,47 +110,11 @@ def _compute_state(
     }
 
 
-def _try_fetch_latest_row(
-    *,
-    account_id: str,
-    table_name: str,
-    id_col: str,
-) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
-    """
-    Returns (row, safe_error_obj).
-    safe_error_obj never includes secrets.
-    """
-    try:
-        db = supabase()
-        res = (
-            db.table(table_name)
-            .select("*")
-            .eq(id_col, account_id)
-            .order("created_at", desc=True)
-            .limit(1)
-            .execute()
-        )
-        rows = getattr(res, "data", None) or []
-        return (rows[0] if rows else None), None
-    except Exception as e:
-        # Safe: stringified exception only (no env or keys)
-        return None, {"message": str(e)[:300]}
-
-
 def get_subscription_status(account_id: str) -> Dict[str, Any]:
     """
-    Attempts to read subscription status from Supabase with compatibility across schemas.
+    Source of truth: public.user_subscriptions (canonical schema)
 
-    Tries, in order:
-      - SUBSCRIPTIONS_TABLE env var (if provided)
-      - user_subscriptions
-      - subscriptions   (legacy)
-
-    And for each table, tries id columns:
-      - account_id
-      - user_id
-
-    Returns a stable shape:
+    Returns:
       {
         account_id: str,
         active: bool,
@@ -161,7 +124,7 @@ def get_subscription_status(account_id: str) -> Dict[str, Any]:
         grace_until: str|null,
         trial_until: str|null,
         reason: str,
-        debug_source: { table, id_col, error? }   # safe
+        debug_source: { table: "user_subscriptions" }
       }
     """
     account_id = (account_id or "").strip()
@@ -175,33 +138,21 @@ def get_subscription_status(account_id: str) -> Dict[str, Any]:
             "grace_until": None,
             "trial_until": None,
             "reason": "no_account_id",
-            "debug_source": {"table": None, "id_col": None},
+            "debug_source": {"table": "user_subscriptions"},
         }
 
-    env_table = (os.getenv("SUBSCRIPTIONS_TABLE", "") or "").strip()
-    tables: List[str] = [t for t in [env_table, "user_subscriptions", "subscriptions"] if t]
-    id_cols = ["account_id", "user_id"]
-
-    latest_row: Optional[Dict[str, Any]] = None
-    used_table: Optional[str] = None
-    used_id_col: Optional[str] = None
-    last_safe_error: Optional[Dict[str, Any]] = None
-
-    for t in tables:
-        for c in id_cols:
-            row, safe_err = _try_fetch_latest_row(account_id=account_id, table_name=t, id_col=c)
-            if safe_err:
-                last_safe_error = {"table": t, "id_col": c, **safe_err}
-                continue
-            if row:
-                latest_row = row
-                used_table = t
-                used_id_col = c
-                break
-        if latest_row:
-            break
-
-    if not latest_row:
+    try:
+        db = supabase()  # IMPORTANT: supabase is a function in this project
+        res = (
+            db.table("user_subscriptions")
+            .select("account_id, plan_code, status, expires_at, grace_until, trial_until, created_at, updated_at")
+            .eq("account_id", account_id)
+            .limit(1)
+            .execute()
+        )
+        rows = getattr(res, "data", None) or []
+        row = rows[0] if rows else None
+    except Exception as e:
         return {
             "account_id": account_id,
             "active": False,
@@ -210,19 +161,31 @@ def get_subscription_status(account_id: str) -> Dict[str, Any]:
             "expires_at": None,
             "grace_until": None,
             "trial_until": None,
-            "reason": "db_error" if last_safe_error else "no_subscription",
-            "debug_source": last_safe_error or {"table": None, "id_col": None},
+            "reason": "db_error",
+            "debug_source": {"table": "user_subscriptions", "error": repr(e)},
         }
 
-    plan_code = latest_row.get("plan_code") or latest_row.get("plan") or None
-    status = latest_row.get("status") or None
-    expires_at = latest_row.get("expires_at") or latest_row.get("expires") or None
-    grace_until = latest_row.get("grace_until") or latest_row.get("grace") or None
-    trial_until = latest_row.get("trial_until") or latest_row.get("trial") or None
+    if not row:
+        return {
+            "account_id": account_id,
+            "active": False,
+            "state": "none",
+            "plan_code": None,
+            "expires_at": None,
+            "grace_until": None,
+            "trial_until": None,
+            "reason": "no_subscription",
+            "debug_source": {"table": "user_subscriptions"},
+        }
 
-    now = _now_utc()
+    plan_code = row.get("plan_code")
+    status = row.get("status")
+    expires_at = _as_iso_or_none(row.get("expires_at"))
+    grace_until = _as_iso_or_none(row.get("grace_until"))
+    trial_until = _as_iso_or_none(row.get("trial_until"))
+
     computed = _compute_state(
-        now=now,
+        now=_now_utc(),
         plan_code=plan_code,
         status=status,
         expires_at=expires_at,
@@ -233,5 +196,5 @@ def get_subscription_status(account_id: str) -> Dict[str, Any]:
     return {
         "account_id": account_id,
         **computed,
-        "debug_source": {"table": used_table, "id_col": used_id_col},
+        "debug_source": {"table": "user_subscriptions"},
     }
