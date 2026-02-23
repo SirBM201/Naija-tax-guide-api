@@ -1,25 +1,40 @@
 # app/services/paystack_service.py
 from __future__ import annotations
 
-import hmac
 import hashlib
+import hmac
 from typing import Any, Dict, Optional
 from uuid import uuid4
 
 import requests
 
-from app.core.config import PAYSTACK_SECRET_KEY, PAYSTACK_CURRENCY, PAYSTACK_CALLBACK_URL
+from app.core.config import (
+    PAYSTACK_SECRET_KEY,
+    PAYSTACK_CURRENCY,
+    PAYSTACK_CALLBACK_URL,
+)
 
 PAYSTACK_BASE = "https://api.paystack.co"
 
 
+class PaystackError(RuntimeError):
+    pass
+
+
+def _require_secret() -> str:
+    key = (PAYSTACK_SECRET_KEY or "").strip()
+    if not key:
+        raise PaystackError("PAYSTACK_SECRET_KEY not configured")
+    return key
+
+
 def _headers() -> Dict[str, str]:
-    if not PAYSTACK_SECRET_KEY:
-        raise RuntimeError("PAYSTACK_SECRET_KEY not configured")
+    key = _require_secret()
     return {
-        "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",
+        "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
         "Accept": "application/json",
+        "User-Agent": "naijatax-guide/1.0",
     }
 
 
@@ -31,65 +46,49 @@ def initialize_transaction(
     *,
     email: str,
     amount_kobo: int,
-    reference: Optional[str] = None,
-    currency: Optional[str] = None,
+    reference: str,
     metadata: Optional[Dict[str, Any]] = None,
+    currency: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Initializes a Paystack transaction.
-
-    IMPORTANT:
-    - Paystack expects amount in KOBO (NGN), so caller must pass kobo.
-    - reference is optional; if missing, we'll generate one.
+    Calls Paystack transaction/initialize.
+    Paystack expects `amount` in KOBO.
     """
     email = (email or "").strip()
     if not email:
         raise ValueError("missing_email")
 
-    try:
-        amount_kobo_int = int(amount_kobo)
-    except Exception:
+    if amount_kobo is None or int(amount_kobo) <= 0:
         raise ValueError("invalid_amount_kobo")
-
-    if amount_kobo_int <= 0:
-        raise ValueError("invalid_amount_kobo")
-
-    ref = (reference or "").strip() or create_reference("NTG")
-    cur = (currency or PAYSTACK_CURRENCY or "NGN").strip() or "NGN"
 
     payload: Dict[str, Any] = {
         "email": email,
-        "amount": amount_kobo_int,  # KOBO
-        "currency": cur,
-        "reference": ref,
+        "amount": int(amount_kobo),
+        "currency": (currency or PAYSTACK_CURRENCY or "NGN"),
+        "reference": reference,
         "metadata": metadata or {},
     }
 
-    if PAYSTACK_CALLBACK_URL:
-        payload["callback_url"] = PAYSTACK_CALLBACK_URL
+    cb = (PAYSTACK_CALLBACK_URL or "").strip()
+    if cb:
+        payload["callback_url"] = cb
 
-    r = requests.post(
-        f"{PAYSTACK_BASE}/transaction/initialize",
-        headers=_headers(),
-        json=payload,
-        timeout=25,
-    )
-
-    # Paystack almost always returns JSON; still guard safely.
-    data: Dict[str, Any] = {}
     try:
-        data = r.json() if r.content else {}
-    except Exception:
-        data = {}
+        r = requests.post(
+            f"{PAYSTACK_BASE}/transaction/initialize",
+            headers=_headers(),
+            json=payload,
+            timeout=25,
+        )
+    except requests.RequestException as e:
+        raise PaystackError(f"paystack_network_error: {e}")
 
-    # Paystack success shape: { "status": true, "message": "...", "data": {...} }
-    if (not r.ok) or (not data.get("status")):
+    data = r.json() if r.content else {}
+
+    # Paystack returns {status: bool, message: str, data: {...}}
+    if not r.ok or not data.get("status"):
         msg = data.get("message") or f"paystack_init_failed_http_{r.status_code}"
-        raise RuntimeError(msg)
-
-    # Ensure our reference is returned even if Paystack doesn't echo (it should)
-    if isinstance(data.get("data"), dict) and not data["data"].get("reference"):
-        data["data"]["reference"] = ref
+        raise PaystackError(msg)
 
     return data
 
@@ -99,41 +98,30 @@ def verify_transaction(reference: str) -> Dict[str, Any]:
     if not reference:
         raise ValueError("missing_reference")
 
-    r = requests.get(
-        f"{PAYSTACK_BASE}/transaction/verify/{reference}",
-        headers=_headers(),
-        timeout=25,
-    )
-
-    data: Dict[str, Any] = {}
     try:
-        data = r.json() if r.content else {}
-    except Exception:
-        data = {}
+        r = requests.get(
+            f"{PAYSTACK_BASE}/transaction/verify/{reference}",
+            headers=_headers(),
+            timeout=25,
+        )
+    except requests.RequestException as e:
+        raise PaystackError(f"paystack_network_error: {e}")
 
-    if (not r.ok) or (not data.get("status")):
+    data = r.json() if r.content else {}
+    if not r.ok or not data.get("status"):
         msg = data.get("message") or f"paystack_verify_failed_http_{r.status_code}"
-        raise RuntimeError(msg)
-
+        raise PaystackError(msg)
     return data
 
 
 def verify_webhook_signature(raw_body: bytes, signature_header: str) -> bool:
     """
-    Paystack webhook signature uses HMAC SHA512(secret_key, raw_body)
-    Header: x-paystack-signature: <hex digest>
+    Paystack uses HMAC-SHA512 of raw request body with your secret key.
+    Header: x-paystack-signature
     """
-    if not PAYSTACK_SECRET_KEY:
-        return False
-
+    key = (PAYSTACK_SECRET_KEY or "").strip()
     sig = (signature_header or "").strip()
-    if not sig:
+    if not key or not sig or not raw_body:
         return False
-
-    mac = hmac.new(
-        PAYSTACK_SECRET_KEY.encode("utf-8"),
-        msg=raw_body,
-        digestmod=hashlib.sha512,
-    ).hexdigest()
-
+    mac = hmac.new(key.encode("utf-8"), msg=raw_body, digestmod=hashlib.sha512).hexdigest()
     return hmac.compare_digest(mac, sig)
