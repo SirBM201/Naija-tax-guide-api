@@ -1,7 +1,8 @@
+# app/__init__.py
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, Optional, Tuple, List, Union, Set
+from typing import Any, Dict, Optional, Tuple, List, Union
 
 from flask import Flask, jsonify
 from flask_cors import CORS
@@ -24,15 +25,14 @@ def _truthy(v: str | None) -> bool:
 
 def _cookie_mode_enabled() -> bool:
     """
-    Cookie auth should be explicitly enabled.
+    Cookie auth must be explicitly enabled.
     Otherwise you'll accidentally force credentialed CORS and break '*' origins.
     """
-    # Preferred explicit flag
     if _truthy(os.getenv("COOKIE_AUTH_ENABLED", "")):
         return True
 
-    # Backwards compat: enable via WEB_AUTH_ENABLED + explicit cookie samesite/secure config
-    if _truthy(os.getenv("WEB_AUTH_ENABLED", "")) and os.getenv("WEB_AUTH_COOKIE_SAMESITE"):
+    # Backwards compat: allow enabling via WEB_AUTH_ENABLED + explicit samesite/secure config
+    if _truthy(os.getenv("WEB_AUTH_ENABLED", "")) and (os.getenv("WEB_AUTH_COOKIE_SAMESITE") or os.getenv("COOKIE_SAMESITE")):
         return True
 
     return False
@@ -42,8 +42,8 @@ def _parse_origins(origins_raw: str, *, cookie_mode: bool) -> Tuple[Union[str, L
     """
     Returns (origins, supports_credentials, error_message_if_any)
 
-    IMPORTANT:
-      - If cookie_mode=True, origins MUST be an explicit list, not '*'
+    Rules:
+      - If cookie_mode=True, origins MUST be explicit list (NOT '*')
       - supports_credentials must be True for cookies
     """
     raw = (origins_raw or "").strip()
@@ -67,6 +67,7 @@ def _parse_origins(origins_raw: str, *, cookie_mode: bool) -> Tuple[Union[str, L
     if cookie_mode:
         return origins, True, None
 
+    # Non-cookie mode: credentials off by default (safer + works with broader origins)
     return origins, False, None
 
 
@@ -77,16 +78,6 @@ def _import_attr(dotted: str, attr: str) -> Tuple[Optional[Any], Optional[str]]:
         return obj, None
     except Exception as e:
         return None, f"{dotted}:{attr} -> {repr(e)}"
-
-
-def _snapshot_routes(app: Flask) -> Set[Tuple[str, str]]:
-    out: Set[Tuple[str, str]] = set()
-    for r in app.url_map.iter_rules():
-        for m in (r.methods or set()):
-            if m in {"HEAD", "OPTIONS"}:
-                continue
-            out.add((str(r.rule), m))
-    return out
 
 
 def create_app() -> Flask:
@@ -100,6 +91,7 @@ def create_app() -> Flask:
     if cors_err:
         raise RuntimeError(f"[CORS] {cors_err}")
 
+    # CORS
     CORS(
         app,
         resources={rf"{api_prefix}/*": {"origins": origins}},
@@ -109,32 +101,48 @@ def create_app() -> Flask:
             "Authorization",
             "X-Auth-Token",
             "X-Requested-With",
-            "X-Admin-Key",
+            "X-Admin-Key",  # needed for admin-only endpoints
         ],
         expose_headers=["Set-Cookie"],
         methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         max_age=86400,
     )
 
+    strict = (os.getenv("STRICT_BLUEPRINTS", "1").strip() != "0")
+
     boot: Dict[str, Any] = {
         "api_prefix": api_prefix,
         "cookie_mode": cookie_mode,
         "cors": {"origins": origins, "supports_credentials": supports_credentials},
+        "strict": strict,
         "required": [],
         "optional": [],
         "errors": [],
-        "route_collisions": [],
+        "registered_blueprints": [],
     }
 
-    strict = (os.getenv("STRICT_BLUEPRINTS", "1").strip() != "0")
+    # Track duplicates (module + bp.name)
+    app._bp_names = set()  # type: ignore[attr-defined]
+    app._bp_modules = set()  # type: ignore[attr-defined]
 
     def _register_bp(
         dotted: str,
         attr: str = "bp",
         required: bool = True,
         url_prefix: Optional[str] = api_prefix,
-    ):
-        before = _snapshot_routes(app)
+    ) -> None:
+        # Prevent accidental double-register by module path
+        if dotted in app._bp_modules:  # type: ignore[attr-defined]
+            entry = {
+                "module": dotted,
+                "attr": attr,
+                "registered": False,
+                "url_prefix": url_prefix,
+                "error": f"[boot] skipped duplicate module registration: {dotted}",
+            }
+            (boot["required"] if required else boot["optional"]).append(entry)
+            boot["errors"].append(entry)
+            return
 
         obj, err = _import_attr(dotted, attr)
         entry = {"module": dotted, "attr": attr, "registered": False, "url_prefix": url_prefix, "error": err}
@@ -147,22 +155,21 @@ def create_app() -> Flask:
                 raise RuntimeError(f"[boot] REQUIRED blueprint import failed: {err}")
             return
 
-        # Detect duplicate blueprint names (Flask uses bp.name)
         bp_name = getattr(obj, "name", None) or f"{dotted}:{attr}"
-        if not hasattr(app, "_bp_names"):
-            app._bp_names = set()  # type: ignore[attr-defined]
-
         if bp_name in app._bp_names:  # type: ignore[attr-defined]
             msg = f"[boot] Duplicate blueprint name detected: {bp_name} from {dotted}:{attr}"
             entry["error"] = msg
             boot["errors"].append(entry)
+            (boot["required"] if required else boot["optional"]).append(entry)
             if required and strict:
                 raise RuntimeError(msg)
             return
 
+        # Mark as registered
         app._bp_names.add(bp_name)  # type: ignore[attr-defined]
+        app._bp_modules.add(dotted)  # type: ignore[attr-defined]
 
-        # Register with or without prefix
+        # Register
         if url_prefix:
             app.register_blueprint(obj, url_prefix=url_prefix)
         else:
@@ -170,21 +177,11 @@ def create_app() -> Flask:
 
         entry["registered"] = True
         (boot["required"] if required else boot["optional"]).append(entry)
+        boot["registered_blueprints"].append({"bp_name": bp_name, "module": dotted, "url_prefix": url_prefix})
 
-        # Route-collision detection (best-effort)
-        after = _snapshot_routes(app)
-        new_routes = after - before
-        collided = [list(x) for x in (new_routes & before)]
-        if collided:
-            boot["route_collisions"].append(
-                {"module": dotted, "attr": attr, "url_prefix": url_prefix, "collisions": collided[:50]}
-            )
-            if required and strict:
-                raise RuntimeError(
-                    f"[boot] Route collision detected after registering {dotted}:{attr}: {collided[:5]}"
-                )
-
-    # REQUIRED: core API routes
+    # ------------------------------------------------------------
+    # REQUIRED blueprints (ONE TIME EACH)
+    # ------------------------------------------------------------
     required_modules = [
         "app.routes.health",
         "app.routes.accounts",
@@ -192,26 +189,29 @@ def create_app() -> Flask:
         "app.routes.ask",
         "app.routes.webhooks",
         "app.routes.plans",
-        "app.routes.link_tokens",
+
         "app.routes.admin_link_tokens",
         "app.routes.accounts_admin",
         "app.routes.meta",
+
         "app.routes.email_link",
         "app.routes.web_auth",
         "app.routes.web_session",
+
         "app.routes.paystack_webhook",
-        "app.routes.debug_routes",   # /api/_routes, /api/_debug/config, etc (if you have it)
-        "app.routes.debug_mail",     # /api/debug/mail
-        "app.routes._debug",         # /api/_debug/otp/latest (fixed)
+
+        # debug (pick ONE debug module family to avoid duplication)
+        "app.routes._debug",
     ]
     for dotted in required_modules:
         _register_bp(dotted, "bp", required=True, url_prefix=api_prefix)
 
-    # OPTIONAL: paystack helpers and cron (cron typically has NO api prefix)
+    # ------------------------------------------------------------
+    # OPTIONAL (safe to be missing)
+    # ------------------------------------------------------------
     _register_bp("app.routes.paystack", "paystack_bp", required=False, url_prefix=api_prefix)
     _register_bp("app.routes.cron", "bp", required=False, url_prefix=None)
 
-    # OPTIONAL: multi-channel + web UI helpers
     optional_modules = [
         "app.routes.whatsapp",
         "app.routes.telegram",
@@ -222,8 +222,12 @@ def create_app() -> Flask:
     for dotted in optional_modules:
         _register_bp(dotted, "bp", required=False, url_prefix=api_prefix)
 
+    # ------------------------------------------------------------
+    # Root-cause exposer (SAFE)
+    # ------------------------------------------------------------
     @app.get(f"{api_prefix}/_boot")
     def boot_report():
-        return jsonify({"ok": True, "boot": boot, "strict": strict})
+        # This is safe: it does not include secrets, only boot status + config shape.
+        return jsonify({"ok": True, "boot": boot}), 200
 
     return app
