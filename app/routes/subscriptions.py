@@ -31,10 +31,6 @@ def _is_admin(req) -> bool:
 @bp.get("/subscription/status")
 @require_auth_plus
 def subscription_status():
-    """
-    Returns subscription status for the currently authenticated user.
-    Works for cookie OR bearer (require_auth_plus sets g.account_id).
-    """
     account_id = getattr(g, "account_id", None)
     status = get_subscription_status(account_id)
     return jsonify(status), 200
@@ -42,19 +38,6 @@ def subscription_status():
 
 @bp.post("/subscription/activate")
 def subscription_activate():
-    """
-    ADMIN ONLY: create a subscription row for testing
-
-    Header:
-      X-Admin-Key: <ADMIN_KEY>
-
-    Body:
-      {
-        "account_id": "<uuid>",
-        "plan_code": "monthly|quarterly|yearly|trial|manual",
-        "expires_at": "2026-03-01T00:00:00Z" (optional)
-      }
-    """
     if not _admin_key_configured():
         return (
             jsonify(
@@ -85,6 +68,8 @@ def subscription_activate():
     plan_code = (body.get("plan_code") or body.get("plan") or "manual").strip()
     expires_at = body.get("expires_at")
     status = (body.get("status") or "active").strip()
+    grace_until = body.get("grace_until")
+    trial_until = body.get("trial_until")
 
     if not account_id:
         return jsonify({"ok": False, "error": "missing_account_id"}), 400
@@ -94,6 +79,8 @@ def subscription_activate():
         plan_code=plan_code,
         expires_at_iso=expires_at,
         status=status,
+        grace_until_iso=grace_until,
+        trial_until_iso=trial_until,
     )
     code = 200 if res.get("ok") else 400
     return jsonify(res), code
