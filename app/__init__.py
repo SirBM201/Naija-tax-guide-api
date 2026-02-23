@@ -1,4 +1,3 @@
-# app/__init__.py
 from __future__ import annotations
 
 import os
@@ -39,7 +38,9 @@ def _cookie_mode_enabled() -> bool:
     return False
 
 
-def _parse_origins(origins_raw: str, *, cookie_mode: bool) -> Tuple[Union[str, List[str]], bool, Optional[str]]:
+def _parse_origins(
+    origins_raw: str, *, cookie_mode: bool
+) -> Tuple[Union[str, List[str]], bool, Optional[str]]:
     """
     Returns (origins, supports_credentials, error_message_if_any)
 
@@ -92,7 +93,7 @@ def create_app() -> Flask:
         raise RuntimeError(f"[CORS] {cors_err}")
 
     # NOTE:
-    # - We explicitly allow X-Admin-Key for admin-only endpoints (e.g. /api/subscription/activate)
+    # - We explicitly allow X-Admin-Key for admin-only endpoints
     # - supports_credentials must be True when using cookies
     CORS(
         app,
@@ -103,7 +104,7 @@ def create_app() -> Flask:
             "Authorization",
             "X-Auth-Token",
             "X-Requested-With",
-            "X-Admin-Key",  # ✅ needed for admin activate endpoints
+            "X-Admin-Key",  # ✅ needed for admin endpoints
         ],
         expose_headers=["Set-Cookie"],
         methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
@@ -163,11 +164,13 @@ def create_app() -> Flask:
         entry["registered"] = True
         (boot["required"] if required else boot["optional"]).append(entry)
 
-    # REQUIRED: core API routes
+    # ============================================================
+    # REQUIRED: core API routes (keep stable)
+    # ============================================================
     required_modules = [
         "app.routes.health",
         "app.routes.accounts",
-        "app.routes.subscriptions",     # ✅ includes /subscription/status + /subscription/activate
+        "app.routes.subscriptions",
         "app.routes.ask",
         "app.routes.webhooks",
         "app.routes.plans",
@@ -185,11 +188,23 @@ def create_app() -> Flask:
     for dotted in required_modules:
         _register_bp(dotted, "bp", required=True, url_prefix=api_prefix)
 
-    # OPTIONAL: paystack helpers and cron (cron typically has NO api prefix)
+    # ============================================================
+    # OPTIONAL: debug helpers (registered when present)
+    # - debug_mail gives /api/debug/mail
+    # - debug_otp gives /api/_debug/otp/latest (once you add the file)
+    # ============================================================
+    _register_bp("app.routes.debug_mail", "bp", required=False, url_prefix=api_prefix)
+    _register_bp("app.routes.debug_otp", "bp", required=False, url_prefix=api_prefix)
+
+    # ============================================================
+    # OPTIONAL: paystack helpers and cron (cron has NO api prefix)
+    # ============================================================
     _register_bp("app.routes.paystack", "paystack_bp", required=False, url_prefix=api_prefix)
     _register_bp("app.routes.cron", "bp", required=False, url_prefix=None)
 
+    # ============================================================
     # OPTIONAL: multi-channel + web UI helpers
+    # ============================================================
     optional_modules = [
         "app.routes.whatsapp",
         "app.routes.telegram",
