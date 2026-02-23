@@ -9,9 +9,9 @@ bp = Blueprint("debug_mail", __name__)
 def debug_mail():
     # DO NOT expose secrets. Only show whether set.
     keys = [
-        "MAIL_ENABLED","MAIL_HOST","MAIL_PORT","MAIL_USER","MAIL_PASS",
-        "MAIL_FROM_EMAIL","MAIL_FROM_NAME","MAIL_USE_TLS",
-        "SMTP_ENABLED","SMTP_HOST","SMTP_PORT","SMTP_USER","SMTP_PASS",
+        "MAIL_ENABLED", "MAIL_HOST", "MAIL_PORT", "MAIL_USER", "MAIL_PASS",
+        "MAIL_FROM_EMAIL", "MAIL_FROM_NAME", "MAIL_USE_TLS",
+        "SMTP_ENABLED", "SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASS",
     ]
     out = {}
     for k in keys:
