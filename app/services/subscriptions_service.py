@@ -18,7 +18,7 @@ _PLAN_DAYS: Dict[str, int] = {
 
 
 # -----------------------------------------------------------------------------
-# Small utilities
+# Utilities
 # -----------------------------------------------------------------------------
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
@@ -37,12 +37,6 @@ def _duration_days(plan_code: str) -> int:
 
 
 def _rootcause(where: str, e: Exception, *, hint: Optional[str] = None, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """
-    Root-cause exposer (safe):
-    - No stack traces
-    - No env var dumping
-    - Just enough to diagnose quickly
-    """
     out: Dict[str, Any] = {
         "where": where,
         "type": type(e).__name__,
@@ -60,7 +54,7 @@ def _ok(data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _fail(error: str, *, where: str, e: Optional[Exception] = None, hint: Optional[str] = None, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    payload: Dict[str, Any] = {"ok": False, "error": error}
+    payload: Dict[str, Any] = {"ok": False, "error": error, "where": where}
     if e is not None:
         payload["root_cause"] = _rootcause(where, e, hint=hint, extra=extra)
     else:
@@ -70,39 +64,46 @@ def _fail(error: str, *, where: str, e: Optional[Exception] = None, hint: Option
     return payload
 
 
-# -----------------------------------------------------------------------------
-# DB helpers (Supabase in this project is a FACTORY function)
-# -----------------------------------------------------------------------------
 def _db():
-    # IMPORTANT: in your codebase, supabase is a function.
+    # IMPORTANT: in your codebase, supabase is a function (factory)
     return supabase()
 
 
+# -----------------------------------------------------------------------------
+# DB helpers (compatible with supabase/postgrest versions that DO NOT support
+# chaining .select() after .upsert())
+# -----------------------------------------------------------------------------
 def _upsert_user_subscription(payload: Dict[str, Any]) -> Tuple[bool, Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """
     Upsert into user_subscriptions using UNIQUE(account_id).
+    Compatible with older/newer postgrest builders by NOT chaining .select().
+
     Returns: (ok, row, error_info)
     """
     try:
         db = _db()
-        res = (
-            db.table("user_subscriptions")
-            .upsert(payload, on_conflict="account_id")
-            .select("account_id, plan_code, status, expires_at, grace_until, trial_until, created_at, updated_at")
-            .execute()
-        )
-        rows = getattr(res, "data", None) or []
-        row = rows[0] if rows else None
+
+        # Many postgrest/supabase-py versions return a builder without `.select`
+        # after `.upsert()`. So: execute upsert, then read back the row.
+        db.table("user_subscriptions").upsert(payload, on_conflict="account_id").execute()
+
+        # Read back
+        ok, row, err = _get_user_subscription(payload.get("account_id") or "")
+        if not ok:
+            return False, None, err
         return True, row, None
+
     except Exception as e:
         return False, None, _rootcause(
             "user_subscriptions.upsert",
             e,
-            hint="Verify table exists, RLS policy allows service role, and Supabase credentials are correct.",
+            hint="Upsert failed. Verify table exists, Supabase URL/KEY are set, and RLS allows the service role.",
+            extra={"on_conflict": "account_id", "payload_keys": sorted(list(payload.keys()))},
         )
 
 
 def _get_user_subscription(account_id: str) -> Tuple[bool, Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    account_id = (account_id or "").strip()
     try:
         db = _db()
         res = (
@@ -119,7 +120,8 @@ def _get_user_subscription(account_id: str) -> Tuple[bool, Optional[Dict[str, An
         return False, None, _rootcause(
             "user_subscriptions.select",
             e,
-            hint="If this fails, check Supabase URL/KEY env vars and RLS policies for user_subscriptions.",
+            hint="Read failed. Check Supabase credentials and RLS policies for user_subscriptions.",
+            extra={"account_id": account_id},
         )
 
 
@@ -133,10 +135,6 @@ def activate_subscription_now(
     days: Optional[int] = None,
     status: str = "active",
 ) -> Dict[str, Any]:
-    """
-    Admin/manual activation (or internal activation after payment).
-    Writes to: user_subscriptions (unique on account_id)
-    """
     where = "activate_subscription_now"
 
     account_id = (account_id or "").strip()
@@ -166,8 +164,8 @@ def activate_subscription_now(
         return {
             "ok": False,
             "error": "db_upsert_failed",
-            "root_cause": err,
             "where": where,
+            "root_cause": err,
             "table": "user_subscriptions",
             "attempted_payload_keys": sorted(list(payload.keys())),
         }
@@ -180,9 +178,6 @@ def cancel_subscription(
     account_id: str,
     status: str = "canceled",
 ) -> Dict[str, Any]:
-    """
-    Cancel but keep row for audit.
-    """
     where = "cancel_subscription"
     account_id = (account_id or "").strip()
     if not account_id:
@@ -197,7 +192,7 @@ def cancel_subscription(
 
     ok, row, err = _upsert_user_subscription(payload)
     if not ok:
-        return {"ok": False, "error": "db_upsert_failed", "root_cause": err, "where": where}
+        return {"ok": False, "error": "db_upsert_failed", "where": where, "root_cause": err}
 
     return _ok({"account_id": account_id, "subscription": row})
 
@@ -226,15 +221,12 @@ def set_trial(
 
     ok, row, err = _upsert_user_subscription(payload)
     if not ok:
-        return {"ok": False, "error": "db_upsert_failed", "root_cause": err, "where": where}
+        return {"ok": False, "error": "db_upsert_failed", "where": where, "root_cause": err}
 
     return _ok({"account_id": account_id, "subscription": row})
 
 
 def debug_read_subscription(account_id: str) -> Dict[str, Any]:
-    """
-    Helper used by debug routes.
-    """
     where = "debug_read_subscription"
     account_id = (account_id or "").strip()
     if not account_id:
@@ -242,56 +234,44 @@ def debug_read_subscription(account_id: str) -> Dict[str, Any]:
 
     ok, row, err = _get_user_subscription(account_id)
     if not ok:
-        return {"ok": False, "error": "db_read_failed", "root_cause": err, "where": where}
+        return {"ok": False, "error": "db_read_failed", "where": where, "root_cause": err}
 
     return _ok({"account_id": account_id, "subscription": row, "table": "user_subscriptions"})
 
 
 # -----------------------------------------------------------------------------
-# COMPATIBILITY SHIMS (prevent REQUIRED blueprint boot crashes)
+# Compatibility shims (prevent REQUIRED blueprint boot crashes)
 # -----------------------------------------------------------------------------
 def get_subscription_status(account_id: str) -> Dict[str, Any]:
     """
     app.routes.ask imports get_subscription_status from this module.
-    If the 'real' implementation lives elsewhere, delegate safely.
-    NEVER crash boot.
+    Delegate to subscription_status_service if present; fallback to DB.
+    Never crash boot.
     """
     where = "get_subscription_status(shim)"
     account_id = (account_id or "").strip()
     if not account_id:
         return _fail("missing_account_id", where=where, hint="account_id is required")
 
-    # Preferred: new service
     try:
         from .subscription_status_service import get_subscription_status as _gss  # type: ignore
         return _gss(account_id)
     except Exception:
-        # Fallback: compute minimal status from user_subscriptions
         ok, row, err = _get_user_subscription(account_id)
         if not ok:
-            return {"ok": False, "error": "db_read_failed", "root_cause": err, "where": where}
+            return {"ok": False, "error": "db_read_failed", "where": where, "root_cause": err}
 
         if not row:
-            return _ok(
-                {
-                    "account_id": account_id,
-                    "status": "free",
-                    "plan_code": None,
-                    "active": False,
-                    "source": "fallback:user_subscriptions(empty)",
-                }
-            )
+            return _ok({"account_id": account_id, "status": "free", "plan_code": None, "active": False, "source": "fallback:user_subscriptions(empty)"})
 
         status = (row.get("status") or "").strip().lower() or "unknown"
-        expires_at = row.get("expires_at")
-        active = status == "active"
         return _ok(
             {
                 "account_id": account_id,
                 "status": status,
                 "plan_code": row.get("plan_code"),
-                "expires_at": expires_at,
-                "active": active,
+                "expires_at": row.get("expires_at"),
+                "active": status == "active",
                 "source": "fallback:user_subscriptions",
             }
         )
@@ -307,8 +287,6 @@ def handle_payment_success(
     """
     app.routes.webhooks imports handle_payment_success from this module.
     Safe default behavior: activate subscription now.
-
-    Later, if you implement a dedicated payments pipeline, delegate here.
     """
     where = "handle_payment_success(shim)"
     account_id = (account_id or "").strip()
@@ -316,10 +294,6 @@ def handle_payment_success(
         return _fail("missing_account_id", where=where, hint="account_id is required")
 
     try:
-        # If you later create a dedicated handler:
-        # from .payments_service import handle_payment_success as _h
-        # return _h(account_id=account_id, plan_code=plan_code, days=days, meta=meta)
-
         return activate_subscription_now(
             account_id=account_id,
             plan_code=(plan_code or "monthly"),
@@ -331,7 +305,7 @@ def handle_payment_success(
             "handle_payment_success_failed",
             where=where,
             e=e,
-            hint="Activation failed inside webhook success handler. Check DB/RLS and payload values.",
+            hint="Activation failed inside webhook success handler.",
             extra={"plan_code": plan_code, "days": days, "meta_keys": sorted(list((meta or {}).keys()))},
         )
 
@@ -342,9 +316,6 @@ def handle_payment_failed(
     reason: Optional[str] = None,
     meta: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """
-    Optional shim in case webhooks route calls it.
-    """
     where = "handle_payment_failed(shim)"
     account_id = (account_id or "").strip()
     if not account_id:
@@ -357,6 +328,6 @@ def handle_payment_failed(
             "handle_payment_failed_failed",
             where=where,
             e=e,
-            hint="Cancel failed inside webhook failure handler. Check DB/RLS and account_id.",
+            hint="Cancel failed inside webhook failure handler.",
             extra={"reason": reason, "meta_keys": sorted(list((meta or {}).keys()))},
         )
