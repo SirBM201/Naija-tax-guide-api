@@ -7,7 +7,6 @@ from typing import Any, Dict, Optional, Tuple
 from ..core.supabase_client import supabase
 
 # Keep plan durations centralized.
-# If you later change billing logic, update here.
 _PLAN_DAYS: Dict[str, int] = {
     "monthly": 30,
     "quarterly": 90,
@@ -31,26 +30,70 @@ def _duration_days(plan_code: str) -> int:
     return _PLAN_DAYS.get(plan_code, 30)
 
 
-def _safe_err(e: Exception) -> Dict[str, Any]:
-    return {"type": type(e).__name__, "message": str(e), "repr": repr(e)}
+def _safe_err(e: Exception, where: str) -> Dict[str, Any]:
+    return {
+        "where": where,
+        "type": type(e).__name__,
+        "message": str(e),
+    }
 
 
 # -----------------------------------------------------------------------------
 # Compatibility shim (IMPORTANT)
 # -----------------------------------------------------------------------------
 # Your routes import get_subscription_status from this module.
-# But you implemented it in subscription_status_service.py.
-# So we re-export it here to prevent boot crashes.
+# If the real implementation lives elsewhere, re-export it safely.
 def get_subscription_status(account_id: str) -> Dict[str, Any]:
-    from .subscription_status_service import get_subscription_status as _gss
+    """
+    Compatibility shim:
+    - Primary: delegate to app.services.subscription_status_service.get_subscription_status
+    - Fallback: compute from user_subscriptions row (never crash boot)
+    """
+    account_id = (account_id or "").strip()
+    if not account_id:
+        return {"ok": False, "error": "missing_account_id"}
 
-    return _gss(account_id)
+    # Try the newer module first (no boot crash if missing).
+    try:
+        from .subscription_status_service import get_subscription_status as _gss  # type: ignore
+        return _gss(account_id)
+    except Exception:
+        # Fallback: conservative status based on DB row
+        ok, row, err = _get_user_subscription(account_id)
+        if not ok:
+            return {"ok": False, "error": "db_read_failed", "root_cause": err}
+
+        if not row:
+            return {
+                "ok": True,
+                "account_id": account_id,
+                "status": "free",
+                "plan_code": None,
+                "active": False,
+                "source": "fallback:user_subscriptions(empty)",
+            }
+
+        # Minimal interpretation
+        status = (row.get("status") or "").strip().lower()
+        expires_at = row.get("expires_at")
+        active = status == "active"
+        return {
+            "ok": True,
+            "account_id": account_id,
+            "status": status or "unknown",
+            "plan_code": row.get("plan_code"),
+            "expires_at": expires_at,
+            "active": active,
+            "source": "fallback:user_subscriptions",
+        }
 
 
 # -----------------------------------------------------------------------------
 # Core DB helpers
 # -----------------------------------------------------------------------------
-def _upsert_user_subscription(payload: Dict[str, Any]) -> Tuple[bool, Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+def _upsert_user_subscription(
+    payload: Dict[str, Any],
+) -> Tuple[bool, Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """
     Upsert into user_subscriptions using UNIQUE(account_id).
     Returns: (ok, row, error_info)
@@ -67,10 +110,12 @@ def _upsert_user_subscription(payload: Dict[str, Any]) -> Tuple[bool, Optional[D
         row = rows[0] if rows else None
         return True, row, None
     except Exception as e:
-        return False, None, _safe_err(e)
+        return False, None, _safe_err(e, where="user_subscriptions.upsert")
 
 
-def _get_user_subscription(account_id: str) -> Tuple[bool, Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+def _get_user_subscription(
+    account_id: str,
+) -> Tuple[bool, Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     try:
         db = supabase()
         res = (
@@ -84,7 +129,7 @@ def _get_user_subscription(account_id: str) -> Tuple[bool, Optional[Dict[str, An
         row = rows[0] if rows else None
         return True, row, None
     except Exception as e:
-        return False, None, _safe_err(e)
+        return False, None, _safe_err(e, where="user_subscriptions.select")
 
 
 # -----------------------------------------------------------------------------
@@ -107,9 +152,9 @@ def activate_subscription_now(
     plan_code = _norm_plan(plan_code)
 
     if not account_id:
-        return {"ok": False, "error": "missing_account_id", "root_cause": "account_id is required"}
+        return {"ok": False, "error": "missing_account_id", "root_cause": {"message": "account_id is required"}}
     if not plan_code:
-        return {"ok": False, "error": "missing_plan_code", "root_cause": "plan_code is required"}
+        return {"ok": False, "error": "missing_plan_code", "root_cause": {"message": "plan_code is required"}}
 
     now = _now_utc()
     dur = int(days) if days is not None else _duration_days(plan_code)
@@ -131,7 +176,7 @@ def activate_subscription_now(
             "ok": False,
             "error": "db_upsert_failed",
             "root_cause": err,
-            "payload": payload,
+            "where": "activate_subscription_now",
             "table": "user_subscriptions",
         }
 
@@ -144,7 +189,7 @@ def cancel_subscription(
     status: str = "canceled",
 ) -> Dict[str, Any]:
     """
-    Cancel but keep row for audit. Marks status and clears grace/trial optionally.
+    Cancel but keep row for audit.
     """
     account_id = (account_id or "").strip()
     if not account_id:
@@ -159,7 +204,7 @@ def cancel_subscription(
 
     ok, row, err = _upsert_user_subscription(payload)
     if not ok:
-        return {"ok": False, "error": "db_upsert_failed", "root_cause": err, "payload": payload}
+        return {"ok": False, "error": "db_upsert_failed", "root_cause": err, "where": "cancel_subscription"}
 
     return {"ok": True, "account_id": account_id, "subscription": row}
 
@@ -187,7 +232,7 @@ def set_trial(
 
     ok, row, err = _upsert_user_subscription(payload)
     if not ok:
-        return {"ok": False, "error": "db_upsert_failed", "root_cause": err, "payload": payload}
+        return {"ok": False, "error": "db_upsert_failed", "root_cause": err, "where": "set_trial"}
 
     return {"ok": True, "account_id": account_id, "subscription": row}
 
@@ -202,6 +247,6 @@ def debug_read_subscription(account_id: str) -> Dict[str, Any]:
 
     ok, row, err = _get_user_subscription(account_id)
     if not ok:
-        return {"ok": False, "error": "db_read_failed", "root_cause": err}
+        return {"ok": False, "error": "db_read_failed", "root_cause": err, "where": "debug_read_subscription"}
 
     return {"ok": True, "account_id": account_id, "subscription": row, "table": "user_subscriptions"}
