@@ -1,308 +1,83 @@
 # app/services/subscriptions_service.py
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional, Tuple
+import os
+import uuid
+from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, Optional
 
-from app.core.supabase_client import supabase
-from app.services.plans_service import get_plan
+from app.core.supabase_client import supabase  # <-- keep/adjust if your project path differs
 
 
-# -----------------------------
+# -----------------------------------------------------------------------------
 # Helpers
-# -----------------------------
-def _sb():
-    return supabase() if callable(supabase) else supabase
+# -----------------------------------------------------------------------------
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+def _request_id() -> str:
+    return str(uuid.uuid4())
 
 
-def _err(code: str, message: str, *, root_cause: Optional[Exception] = None, extra: Optional[Dict[str, Any]] = None):
-    out: Dict[str, Any] = {"ok": False, "error": code, "message": message}
+def _truthy(v: str | None) -> bool:
+    return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _debug_enabled() -> bool:
+    # Optional: enable extra info in responses without leaking secrets
+    return _truthy(os.getenv("DEBUG_SUBSCRIPTIONS"))
+
+
+def _root_cause(where: str, e: Exception, *, req_id: str, hint: Optional[str] = None, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "where": where,
+        "type": type(e).__name__,
+        "message": str(e),
+        "request_id": req_id,
+    }
+    if hint:
+        out["hint"] = hint
     if extra:
         out["extra"] = extra
-    if root_cause:
-        out["root_cause"] = {"type": root_cause.__class__.__name__, "message": str(root_cause)}
     return out
 
 
-def _duration_days_for_plan(plan_code: str, plan: Optional[Dict[str, Any]] = None) -> int:
-    """
-    We don’t know your exact plans schema, so we support common shapes:
-    - plan["duration_days"]
-    - plan["interval"] in {"monthly","quarterly","yearly"}
-    - fallback mapping by plan_code
-    """
-    p = plan or get_plan(plan_code) or {}
-
-    dd = p.get("duration_days")
-    if isinstance(dd, int) and dd > 0:
-        return dd
-
-    interval = (p.get("interval") or "").strip().lower()
-    if interval == "monthly":
-        return 30
-    if interval == "quarterly":
-        return 90
-    if interval == "yearly":
-        return 365
-
-    code = (plan_code or "").strip().lower()
-    if code in {"monthly", "month"}:
-        return 30
-    if code in {"quarterly", "quarter"}:
-        return 90
-    if code in {"yearly", "annual", "year"}:
-        return 365
-
-    # safe default
-    return 30
+def _ok(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    out: Dict[str, Any] = {"ok": True}
+    if payload:
+        out.update(payload)
+    return out
 
 
-def _ensure_accounts_row_exists(account_id: str, *, provider: str = "web", provider_user_id: str = "", display_name: str = ""):
-    """
-    IMPORTANT:
-      Your FK is user_subscriptions.account_id -> accounts.id
-
-    So we must ensure accounts.id == account_id exists.
-    """
-    if not account_id:
-        return
-
-    try:
-        res = _sb().table("accounts").select("id").eq("id", account_id).limit(1).execute()
-        rows = (res.data or []) if hasattr(res, "data") else []
-        if rows:
-            return
-
-        payload = {
-            "id": account_id,  # ✅ THIS is what satisfies the FK
-            "provider": provider or "web",
-            "provider_user_id": provider_user_id or account_id,
-            "display_name": display_name or provider_user_id or "Web User",
-        }
-
-        _sb().table("accounts").insert(payload).execute()
-    except Exception:
-        # best-effort only
-        return
+def _err(error: str, message: str, *, root_cause: Optional[Dict[str, Any]] = None, req_id: Optional[str] = None, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    out: Dict[str, Any] = {"ok": False, "error": error, "message": message}
+    if req_id:
+        out["request_id"] = req_id
+    if root_cause:
+        out["root_cause"] = root_cause
+    if extra:
+        out["extra"] = extra
+    return out
 
 
-# -----------------------------
-# Public API (ROUTES IMPORT THESE)
-# -----------------------------
-def activate_subscription_now(
-    *,
-    account_id: str,
-    plan_code: str,
-    status: str = "active",
-    provider: Optional[str] = None,
-    provider_ref: Optional[str] = None,
-    started_at: Optional[datetime] = None,
-) -> Dict[str, Any]:
-    """
-    Creates/updates the single subscription row per account (unique account_id).
-    Sets is_active=true and expires_at based on plan duration.
-    """
-    account_id = (account_id or "").strip()
-    plan_code = (plan_code or "").strip().lower()
-    status = (status or "active").strip().lower()
-
-    if not account_id:
-        raise ValueError("missing_account_id")
-    if not plan_code:
-        raise ValueError("missing_plan_code")
-
-    plan = get_plan(plan_code)
-    if not plan:
-        raise ValueError(f"invalid_plan_code:{plan_code}")
-
-    # Ensure FK parent exists
-    _ensure_accounts_row_exists(account_id, provider=(provider or "web"))
-
-    now = _utcnow()
-    start = started_at or now
-    days = _duration_days_for_plan(plan_code, plan=plan)
-    expires_at = start + timedelta(days=days)
-
-    row = {
-        "account_id": account_id,
-        "plan_code": plan_code,
-        "status": status,
-        "is_active": True,
-        "started_at": start.isoformat(),
-        "expires_at": expires_at.isoformat(),
-        "updated_at": now.isoformat(),
-        "provider": provider,
-        "provider_ref": provider_ref,
-        # keep grace_until/trial_until as-is unless you explicitly set them elsewhere
-    }
-
-    # Upsert by unique key (account_id)
-    try:
-        res = _sb().table("user_subscriptions").upsert(row, on_conflict="account_id").select("*").execute()
-        rows = (res.data or []) if hasattr(res, "data") else []
-        return rows[0] if rows else row
-    except Exception as e:
-        # root-cause exposer
-        raise RuntimeError(f"activate_subscription_now_failed: {e}") from e
-
-
+# -----------------------------------------------------------------------------
+# Subscription logic (minimal but stable)
+# -----------------------------------------------------------------------------
 def get_subscription_status(account_id: str) -> Dict[str, Any]:
     """
-    Returns computed status information used by other services/routes.
+    Returns a normalized subscription status for an account_id.
+    Safe: NEVER raises (always returns ok True/False).
     """
+    req_id = _request_id()
     account_id = (account_id or "").strip()
     if not account_id:
-        return _err("missing_account_id", "account_id is required")
+        return _err("missing_account_id", "account_id is required", req_id=req_id)
 
     try:
         res = (
-            _sb()
-            .table("user_subscriptions")
-            .select("account_id, plan_code, status, is_active, started_at, expires_at, grace_until, trial_until, provider, provider_ref")
-            .eq("account_id", account_id)
-            .limit(1)
-            .execute()
-        )
-        rows = (res.data or []) if hasattr(res, "data") else []
-        sub = rows[0] if rows else None
-
-        now = _utcnow()
-
-        if not sub:
-            return {
-                "ok": True,
-                "account_id": account_id,
-                "exists": False,
-                "status": "none",
-                "is_active": False,
-                "now_utc": now.isoformat(),
-                "is_overdue": False,
-            }
-
-        expires_at = sub.get("expires_at")
-        grace_until = sub.get("grace_until")
-        trial_until = sub.get("trial_until")
-
-        # Parse timestamps safely (Supabase may return ISO strings)
-        def _parse_ts(v: Any) -> Optional[datetime]:
-            if not v:
-                return None
-            if isinstance(v, datetime):
-                return v.astimezone(timezone.utc)
-            s = str(v).replace("Z", "+00:00")
-            try:
-                return datetime.fromisoformat(s).astimezone(timezone.utc)
-            except Exception:
-                return None
-
-        exp = _parse_ts(expires_at)
-        grace = _parse_ts(grace_until)
-        trial = _parse_ts(trial_until)
-
-        is_active = bool(sub.get("is_active"))
-        overdue = False
-
-        # overdue if expired AND grace is either null or already passed
-        if is_active and exp and now > exp and (grace is None or now > grace):
-            overdue = True
-
-        return {
-            "ok": True,
-            "exists": True,
-            "account_id": account_id,
-            "plan_code": sub.get("plan_code"),
-            "status": sub.get("status"),
-            "is_active": is_active,
-            "started_at": sub.get("started_at"),
-            "expires_at": sub.get("expires_at"),
-            "grace_until": sub.get("grace_until"),
-            "trial_until": sub.get("trial_until"),
-            "provider": sub.get("provider"),
-            "provider_ref": sub.get("provider_ref"),
-            "now_utc": now.isoformat(),
-            "is_overdue": overdue,
-        }
-
-    except Exception as e:
-        return _err("subscription_status_failed", "could not read subscription", root_cause=e)
-
-
-def handle_payment_success(*, reference: str, event: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """
-    Called by webhook route on charge.success.
-    Activates subscription using metadata.account_id + metadata.plan_code.
-    """
-    reference = (reference or "").strip()
-    if not reference:
-        return _err("missing_reference", "reference is required")
-
-    try:
-        data = (event or {}).get("data") if isinstance(event, dict) else None
-        if not isinstance(data, dict):
-            data = {}
-
-        md = data.get("metadata") or {}
-        account_id = (md.get("account_id") or "").strip()
-        plan_code = (md.get("plan_code") or "").strip().lower()
-
-        if not account_id or not plan_code:
-            return _err("missing_metadata", "missing account_id/plan_code in metadata", extra={"reference": reference})
-
-        # best-effort: mark tx success if table exists
-        try:
-            _sb().table("paystack_transactions").update(
-                {"status": "success", "paystack_status": "success", "raw": event or {}}
-            ).eq("reference", reference).execute()
-        except Exception:
-            pass
-
-        sub = activate_subscription_now(account_id=account_id, plan_code=plan_code, status="active", provider="paystack", provider_ref=reference)
-        return {"ok": True, "reference": reference, "subscription": sub}
-
-    except Exception as e:
-        return _err("handle_payment_success_failed", "failed to process success event", root_cause=e, extra={"reference": reference})
-
-
-def handle_payment_failed(*, reference: str, event: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """
-    Called by webhook route on charge.failed / transfer.failed etc.
-    """
-    reference = (reference or "").strip()
-    if not reference:
-        return _err("missing_reference", "reference is required")
-
-    try:
-        try:
-            _sb().table("paystack_transactions").update(
-                {"status": "failed", "paystack_status": "failed", "raw": event or {}}
-            ).eq("reference", reference).execute()
-        except Exception:
-            pass
-
-        return {"ok": True, "reference": reference, "status": "failed"}
-
-    except Exception as e:
-        return _err("handle_payment_failed_failed", "failed to process failed event", root_cause=e, extra={"reference": reference})
-
-def debug_read_subscription(account_id: str) -> Dict[str, Any]:
-    """
-    Debug helper used by routes/subscriptions.py.
-    Returns the raw user_subscriptions row (if any) plus computed status.
-    Safe to keep in prod but you can protect the route with admin auth later.
-    """
-    account_id = (account_id or "").strip()
-    if not account_id:
-        return {"ok": False, "error": "missing_account_id", "message": "account_id is required"}
-
-    try:
-        res = (
-            _sb()
-            .table("user_subscriptions")
-            .select("*")
+            supabase.table("user_subscriptions")
+            .select("account_id, plan_code, status, starts_at, ends_at, updated_at, created_at")
             .eq("account_id", account_id)
             .limit(1)
             .execute()
@@ -310,18 +85,254 @@ def debug_read_subscription(account_id: str) -> Dict[str, Any]:
         rows = (res.data or []) if hasattr(res, "data") else []
         row = rows[0] if rows else None
 
+        if not row:
+            return _ok(
+                {
+                    "account_id": account_id,
+                    "subscribed": False,
+                    "plan_code": None,
+                    "status": "none",
+                    "starts_at": None,
+                    "ends_at": None,
+                }
+            )
+
+        # Determine active based on ends_at if present
+        ends_at = row.get("ends_at")
+        now = datetime.now(timezone.utc)
+
+        active = False
+        if ends_at:
+            try:
+                # Supabase often returns ISO string
+                end_dt = datetime.fromisoformat(str(ends_at).replace("Z", "+00:00"))
+                active = end_dt > now
+            except Exception:
+                # if ends_at unparsable, fall back to status field
+                active = str(row.get("status") or "").lower() in {"active", "paid"}
+
+        else:
+            active = str(row.get("status") or "").lower() in {"active", "paid"}
+
+        return _ok(
+            {
+                "account_id": account_id,
+                "subscribed": bool(active),
+                "plan_code": row.get("plan_code"),
+                "status": "active" if active else (row.get("status") or "inactive"),
+                "starts_at": row.get("starts_at"),
+                "ends_at": row.get("ends_at"),
+            }
+        )
+
+    except Exception as e:
+        return _err(
+            "get_subscription_status_failed",
+            "could not read subscription status",
+            req_id=req_id,
+            root_cause=_root_cause(
+                "subscriptions_service.get_subscription_status",
+                e,
+                req_id=req_id,
+                hint="DB read failed (user_subscriptions). Check Supabase permissions, table name, and service role key.",
+                extra={"account_id": account_id},
+            ),
+        )
+
+
+def activate_subscription_now(*, account_id: str, plan_code: str = "monthly", days: Optional[int] = None) -> Dict[str, Any]:
+    """
+    Admin activation: creates/updates user_subscriptions for account_id.
+    Safe: NEVER raises (always returns ok True/False).
+    """
+    req_id = _request_id()
+    account_id = (account_id or "").strip()
+    plan_code = (plan_code or "monthly").strip().lower()
+
+    if not account_id:
+        return _err("missing_account_id", "account_id is required", req_id=req_id)
+
+    if plan_code not in {"monthly", "quarterly", "yearly"}:
+        return _err("invalid_plan_code", "plan_code must be monthly|quarterly|yearly", req_id=req_id)
+
+    # default duration
+    if days is None:
+        days = {"monthly": 30, "quarterly": 90, "yearly": 365}[plan_code]
+    try:
+        days = int(days)
+        if days <= 0:
+            return _err("invalid_days", "days must be > 0", req_id=req_id)
+    except Exception:
+        return _err("invalid_days", "days must be an integer", req_id=req_id)
+
+    starts_at = datetime.now(timezone.utc)
+    ends_at = starts_at + timedelta(days=days)
+
+    try:
+        # UPSERT by account_id (assumes account_id is unique in user_subscriptions)
+        payload = {
+            "account_id": account_id,
+            "plan_code": plan_code,
+            "status": "active",
+            "starts_at": starts_at.isoformat(),
+            "ends_at": ends_at.isoformat(),
+            "updated_at": _now_iso(),
+        }
+
+        res = (
+            supabase.table("user_subscriptions")
+            .upsert(payload, on_conflict="account_id")
+            .execute()
+        )
+
+        return _ok(
+            {
+                "account_id": account_id,
+                "plan_code": plan_code,
+                "status": "active",
+                "starts_at": payload["starts_at"],
+                "ends_at": payload["ends_at"],
+                "request_id": req_id,
+                "db": {"rows": len(res.data or [])} if _debug_enabled() else None,
+            }
+        )
+
+    except Exception as e:
+        return _err(
+            "activate_subscription_failed",
+            "could not activate subscription",
+            req_id=req_id,
+            root_cause=_root_cause(
+                "subscriptions_service.activate_subscription_now",
+                e,
+                req_id=req_id,
+                hint="DB upsert failed (user_subscriptions). Ensure table exists, account_id column type matches, and service role key is used on backend.",
+                extra={"account_id": account_id, "plan_code": plan_code, "days": days},
+            ),
+        )
+
+
+def debug_read_subscription(account_id: str) -> Dict[str, Any]:
+    """
+    Admin debug: returns raw user_subscriptions row + computed status.
+    Safe: NEVER raises (always returns ok True/False).
+    """
+    req_id = _request_id()
+    account_id = (account_id or "").strip()
+    if not account_id:
+        return _err("missing_account_id", "account_id is required", req_id=req_id)
+
+    try:
+        res = (
+            supabase.table("user_subscriptions")
+            .select("*")
+            .eq("account_id", account_id)
+            .limit(1)
+            .execute()
+        )
+        rows = (res.data or []) if hasattr(res, "data") else []
+        row = rows[0] if rows else None
         status = get_subscription_status(account_id)
 
-        return {
-            "ok": True,
-            "account_id": account_id,
-            "subscription_row": row,
-            "computed_status": status,
-        }
+        return _ok(
+            {
+                "account_id": account_id,
+                "subscription_row": row,
+                "computed_status": status,
+                "request_id": req_id,
+            }
+        )
+
     except Exception as e:
         return _err(
             "debug_read_subscription_failed",
             "could not read subscription for debug",
-            root_cause=e,
-            extra={"account_id": account_id},
+            req_id=req_id,
+            root_cause=_root_cause(
+                "subscriptions_service.debug_read_subscription",
+                e,
+                req_id=req_id,
+                hint="DB read failed. Check Supabase permissions and that user_subscriptions exists.",
+                extra={"account_id": account_id},
+            ),
+        )
+
+
+# -----------------------------------------------------------------------------
+# Paystack webhook handler (kept here to avoid missing-import crashes)
+# -----------------------------------------------------------------------------
+def handle_payment_success(*, event_id: str, event_type: str, reference: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Called by app.routes.webhooks (or similar) on Paystack payment success.
+    Stores event in paystack_events table (idempotent) and activates subscription (basic version).
+
+    NOTE: Your paystack_events table has: id, event_id, event_type, reference, payload, created_at
+    There is NO received_at (your SQL error confirmed that). Use created_at for ordering.
+    """
+    req_id = _request_id()
+    event_id = (event_id or "").strip()
+    event_type = (event_type or "").strip()
+    reference = (reference or "").strip()
+
+    if not event_id:
+        return _err("missing_event_id", "event_id is required", req_id=req_id)
+    if not event_type:
+        return _err("missing_event_type", "event_type is required", req_id=req_id)
+    if not reference:
+        return _err("missing_reference", "reference is required", req_id=req_id)
+
+    try:
+        # 1) Insert Paystack event (idempotent if you add unique index on event_id)
+        insert_payload = {
+            "event_id": event_id,
+            "event_type": event_type,
+            "reference": reference,
+            "payload": payload or {},
+            "created_at": _now_iso(),
+        }
+
+        # If unique index on event_id exists, Supabase upsert prevents duplicates
+        _ = supabase.table("paystack_events").upsert(insert_payload, on_conflict="event_id").execute()
+
+        # 2) OPTIONAL: activate subscription based on payload metadata if present
+        # Typical Paystack location: payload["data"]["metadata"] contains your account_id/plan.
+        data = (payload or {}).get("data") or {}
+        meta = data.get("metadata") or {}
+
+        account_id = (meta.get("account_id") or "").strip()
+        plan_code = (meta.get("plan_code") or "monthly").strip().lower()
+
+        if account_id:
+            act = activate_subscription_now(account_id=account_id, plan_code=plan_code, days=None)
+            return _ok(
+                {
+                    "stored_event": True,
+                    "activated": act.get("ok", False),
+                    "activation_result": act,
+                    "request_id": req_id,
+                }
+            )
+
+        # If no account_id in metadata, we still succeed storing the event
+        return _ok(
+            {
+                "stored_event": True,
+                "activated": False,
+                "warning": "event stored but no account_id found in payload.data.metadata.account_id",
+                "request_id": req_id,
+            }
+        )
+
+    except Exception as e:
+        return _err(
+            "handle_payment_success_failed",
+            "failed processing paystack success event",
+            req_id=req_id,
+            root_cause=_root_cause(
+                "subscriptions_service.handle_payment_success",
+                e,
+                req_id=req_id,
+                hint="DB write failed (paystack_events) or activation failed. Confirm paystack_events table exists + service role key configured.",
+                extra={"event_id": event_id, "event_type": event_type, "reference": reference},
+            ),
         )
