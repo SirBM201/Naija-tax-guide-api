@@ -1,4 +1,6 @@
 # app/routes/webhooks.py
+from __future__ import annotations
+
 import os
 import json
 import hmac
@@ -7,14 +9,14 @@ from typing import Any, Dict
 
 from flask import Blueprint, request, jsonify
 
-from ..services.subscriptions_service import handle_payment_success
+from app.services.subscriptions_service import handle_payment_success
 
 bp = Blueprint("webhooks", __name__)
 
 # -----------------------------
 # Paystack
 # -----------------------------
-PAYSTACK_WEBHOOK_SECRET = os.getenv("PAYSTACK_WEBHOOK_SECRET", "").strip()
+PAYSTACK_WEBHOOK_SECRET = (os.getenv("PAYSTACK_WEBHOOK_SECRET", "") or "").strip()
 
 
 def _verify_paystack_signature(raw_body: bytes, signature: str) -> bool:
@@ -50,38 +52,33 @@ def _ensure_dict(v: Any) -> Dict[str, Any]:
 
 def _extract_account_and_plan(data: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Try multiple places Paystack might store metadata.
     We expect you set these during transaction initialization:
       metadata: { account_id, plan_code, upgrade_mode? }
+
+    Some people store values inside metadata.custom_fields list:
+      [{variable_name, value}, ...]
     """
     meta = _ensure_dict((data or {}).get("metadata"))
 
-    # Some people store values inside metadata.custom_fields
     custom_fields = meta.get("custom_fields")
     if isinstance(custom_fields, list):
-        # custom_fields: [{display_name, variable_name, value}, ...]
         for item in custom_fields:
             try:
                 k = (item.get("variable_name") or "").strip()
-                v = (item.get("value") or "").strip()
+                v = item.get("value")
                 if k and k not in meta:
                     meta[k] = v
             except Exception:
                 pass
 
-    account_id = (meta.get("account_id") or "").strip()
-    plan_code = (meta.get("plan_code") or "").strip()
-    upgrade_mode = (meta.get("upgrade_mode") or "now").strip().lower()
+    account_id = str(meta.get("account_id") or "").strip()
+    plan_code = str(meta.get("plan_code") or "").strip()
+    upgrade_mode = str(meta.get("upgrade_mode") or "now").strip().lower()
 
     if upgrade_mode not in ("now", "at_expiry"):
         upgrade_mode = "now"
 
-    return {
-        "account_id": account_id,
-        "plan_code": plan_code,
-        "upgrade_mode": upgrade_mode,
-        "metadata": meta,
-    }
+    return {"account_id": account_id, "plan_code": plan_code, "upgrade_mode": upgrade_mode, "metadata": meta}
 
 
 @bp.post("/webhooks/paystack")
@@ -108,7 +105,6 @@ def paystack_webhook():
     upgrade_mode = extracted["upgrade_mode"]
 
     if not account_id or not plan_code:
-        # Don't crash the app; return clear error so you can see misconfigured metadata
         return jsonify(
             {
                 "ok": False,
@@ -124,17 +120,25 @@ def paystack_webhook():
     amount_kobo = data.get("amount")
     currency = data.get("currency", "NGN")
 
+    # ✅ Correct call: keyword arguments (stable signature)
     out = handle_payment_success(
+        account_id=account_id,
+        plan_code=plan_code,
+        paid_days=None,  # optional (service maps from plan_code)
+        provider="paystack",
+        provider_ref=reference,
+        upgrade_mode=upgrade_mode,
+    )
+
+    # Attach useful webhook context (kept shallow)
+    out.setdefault("webhook", {})
+    out["webhook"].update(
         {
             "event_id": event_id,
-            "provider": "paystack",
+            "event": event_type,
             "reference": reference,
-            "account_id": account_id,
-            "plan_code": plan_code,
             "amount_kobo": amount_kobo,
             "currency": currency,
-            "upgrade_mode": upgrade_mode,  # ✅ now supported
-            "raw": event,
         }
     )
 
@@ -144,18 +148,11 @@ def paystack_webhook():
 # -----------------------------
 # Meta (WhatsApp / Messenger / Instagram)
 # -----------------------------
-META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "").strip()
+META_VERIFY_TOKEN = (os.getenv("META_VERIFY_TOKEN", "") or "").strip()
 
 
 @bp.get("/webhooks/meta")
 def meta_verify():
-    """
-    Meta webhook verification endpoint.
-    Configure this URL in:
-    - WhatsApp Cloud API webhooks
-    - Facebook Messenger webhooks
-    - Instagram webhooks
-    """
     mode = request.args.get("hub.mode", "")
     token = request.args.get("hub.verify_token", "")
     challenge = request.args.get("hub.challenge", "")
@@ -167,15 +164,6 @@ def meta_verify():
 
 @bp.post("/webhooks/meta")
 def meta_events():
-    """
-    Receives Meta webhook events.
-    For now: just acknowledge. Later we will route to:
-    - WA inbound handler
-    - Messenger inbound handler
-    - Instagram DM inbound handler
-    """
-    payload = request.get_json(silent=True) or {}
-
-    # TODO next: route by payload structure.
-    # We'll implement in the inbound routes step.
+    # For now: acknowledge. Later route by payload shape.
+    _ = request.get_json(silent=True) or {}
     return jsonify({"ok": True}), 200
