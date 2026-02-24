@@ -2,9 +2,8 @@
 from __future__ import annotations
 
 import os
-import traceback
 import uuid
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, List, Union
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -26,13 +25,9 @@ def _truthy(v: str | None) -> bool:
 
 
 def _cookie_mode_enabled() -> bool:
-    """
-    Cookie auth should be explicitly enabled; otherwise you can accidentally
-    require credentialed CORS and break public API usage.
-    """
+    # Cookie auth mode requires explicit origins + credentials
     if _truthy(os.getenv("COOKIE_AUTH_ENABLED", "")):
         return True
-    # common pattern: WEB_AUTH_ENABLED + explicit SAMESITE implies cookie auth
     if _truthy(os.getenv("WEB_AUTH_ENABLED", "")) and os.getenv("WEB_AUTH_COOKIE_SAMESITE"):
         return True
     return False
@@ -41,18 +36,13 @@ def _cookie_mode_enabled() -> bool:
 def _parse_origins(
     origins_raw: str, *, cookie_mode: bool
 ) -> Tuple[Union[str, List[str]], bool, Optional[str]]:
-    """
-    Returns: (origins, supports_credentials, error_message)
-    """
     raw = (origins_raw or "").strip()
 
-    # no origins specified
     if not raw:
         if cookie_mode:
             return [], True, "CORS_ORIGINS is empty but cookie auth requires explicit origins."
         return "*", False, None
 
-    # wildcard origins
     if raw == "*":
         if cookie_mode:
             return [], True, "CORS_ORIGINS='*' is not allowed with cookie auth. Use explicit comma-separated origins."
@@ -67,7 +57,6 @@ def _parse_origins(
     if cookie_mode:
         return origins, True, None
 
-    # non-cookie mode (bearer tokens) can be non-credentialed
     return origins, False, None
 
 
@@ -82,11 +71,9 @@ def _import_attr(dotted: str, attr: str):
 def create_app() -> Flask:
     app = Flask(__name__)
 
-    # ------------------------------------------------------------
-    # API prefix + CORS
-    # ------------------------------------------------------------
     api_prefix = _normalize_api_prefix(API_PREFIX)
 
+    # ---------- CORS ----------
     cookie_mode = _cookie_mode_enabled()
     origins, supports_credentials, cors_err = _parse_origins(CORS_ORIGINS, cookie_mode=cookie_mode)
     if cors_err:
@@ -103,15 +90,28 @@ def create_app() -> Flask:
             "X-Requested-With",
             "X-Admin-Key",
             "X-Debug",
+            "X-Request-Id",
         ],
-        expose_headers=["Set-Cookie"],
+        expose_headers=["Set-Cookie", "X-Request-Id"],
         methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         max_age=86400,
     )
 
-    # ------------------------------------------------------------
-    # Boot report tracking
-    # ------------------------------------------------------------
+    # ---------- Request id ----------
+    @app.before_request
+    def _assign_request_id():
+        rid = (request.headers.get("X-Request-Id") or "").strip()
+        if not rid:
+            rid = str(uuid.uuid4())
+        request.environ["REQUEST_ID"] = rid
+
+    def _rid() -> str:
+        return str(request.environ.get("REQUEST_ID") or "")
+
+    def _debug_enabled() -> bool:
+        return (request.headers.get("X-Debug") or "").strip() == "1"
+
+    # ---------- Boot report ----------
     boot: Dict[str, Any] = {
         "api_prefix": api_prefix,
         "cookie_mode": cookie_mode,
@@ -121,7 +121,8 @@ def create_app() -> Flask:
         "registered": [],
         "failed": [],
     }
-    strict = bool(boot["strict"])
+
+    strict = boot["strict"]
 
     def _register_bp(
         dotted: str,
@@ -130,12 +131,7 @@ def create_app() -> Flask:
         url_prefix: Optional[str] = api_prefix,
     ):
         obj, err = _import_attr(dotted, attr)
-        entry = {
-            "module": dotted,
-            "attr": attr,
-            "required": required,
-            "url_prefix": url_prefix,
-        }
+        entry = {"module": dotted, "attr": attr, "url_prefix": url_prefix, "required": required}
 
         if obj is None:
             entry["error"] = err
@@ -146,9 +142,9 @@ def create_app() -> Flask:
 
         bp_name = getattr(obj, "name", None) or f"{dotted}:{attr}"
 
-        # ensure we don’t double-register same blueprint name
         if not hasattr(app, "_bp_names"):
             app._bp_names = set()  # type: ignore[attr-defined]
+
         if bp_name in app._bp_names:  # type: ignore[attr-defined]
             msg = f"[boot] Duplicate blueprint name detected: {bp_name} from {dotted}:{attr}"
             entry["error"] = msg
@@ -156,20 +152,18 @@ def create_app() -> Flask:
             if required and strict:
                 raise RuntimeError(msg)
             return
+
         app._bp_names.add(bp_name)  # type: ignore[attr-defined]
 
-        if url_prefix is None:
-            app.register_blueprint(obj)
-        else:
+        if url_prefix is not None:
             app.register_blueprint(obj, url_prefix=url_prefix)
+        else:
+            app.register_blueprint(obj)
 
         entry["bp_name"] = bp_name
         boot["registered"].append(entry)
 
-    # ------------------------------------------------------------
-    # Register routes
-    # ------------------------------------------------------------
-    # REQUIRED routes (app must fail if these don’t load)
+    # ---------- REQUIRED routes ----------
     required_modules = [
         "app.routes.health",
         "app.routes.accounts",
@@ -188,62 +182,48 @@ def create_app() -> Flask:
     for dotted in required_modules:
         _register_bp(dotted, "bp", required=True, url_prefix=api_prefix)
 
-    # OPTIONAL routes (do not fail boot if these aren’t present)
+    # ---------- OPTIONAL routes ----------
+    # Paystack modules may export different bp names depending on your file content.
     _register_bp("app.routes.paystack", "bp", required=False, url_prefix=api_prefix)
     _register_bp("app.routes.paystack", "paystack_bp", required=False, url_prefix=api_prefix)
     _register_bp("app.routes.paystack_webhook", "bp", required=False, url_prefix=api_prefix)
 
-    # Cron is usually mounted WITHOUT api_prefix inside that module (it should define /api/internal/... itself)
-    _register_bp("app.routes.cron", "bp", required=False, url_prefix=None)
+    # IMPORTANT: cron must be under /api so your PowerShell calls match:
+    #   $Base/api/internal/cron/expire-subscriptions
+    _register_bp("app.routes.cron", "bp", required=False, url_prefix=api_prefix)
 
-    # DEBUG routes (opt-in)
+    # ---------- DEBUG routes ----------
     if _truthy(os.getenv("ENABLE_DEBUG_ROUTES", "0")):
         _register_bp("app.routes._debug", "bp", required=False, url_prefix=api_prefix)
         _register_bp("app.routes.debug_routes", "bp", required=False, url_prefix=api_prefix)
 
-    # ------------------------------------------------------------
-    # Boot endpoint (always available)
-    # ------------------------------------------------------------
     @app.get(f"{api_prefix}/_boot")
     def boot_report():
-        request_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
-        admin_key_set = bool(os.getenv("ADMIN_KEY", "").strip())
-        return jsonify(
-            {
-                "ok": True,
-                "request_id": request_id,
-                "admin_key_set": admin_key_set,
-                "boot": boot,
-            }
-        ), 200
+        # Mark whether admin key exists in env (useful sanity check)
+        admin_key_set = bool((os.getenv("ADMIN_KEY") or "").strip())
+        return jsonify({"ok": True, "request_id": _rid(), "admin_key_set": admin_key_set, "boot": boot}), 200
 
-    # ------------------------------------------------------------
-    # Global error handler (short in prod, rich when X-Debug: 1)
-    # ------------------------------------------------------------
     @app.errorhandler(Exception)
     def _handle_any_error(e: Exception):
         status = getattr(e, "code", 500)
         msg = str(e) or type(e).__name__
-        request_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
-
-        debug_on = (request.headers.get("X-Debug") or "").strip() == "1"
 
         out: Dict[str, Any] = {
             "ok": False,
-            "request_id": request_id,
+            "request_id": _rid(),
             "error": type(e).__name__,
-            "message": msg[:400],
+            "message": msg[:800],
         }
 
-        if debug_on:
+        if _debug_enabled():
+            import traceback as _tb
+
             out["debug"] = {
                 "path": request.path,
                 "method": request.method,
-                "query": request.query_string.decode("utf-8", errors="ignore"),
-                "remote_addr": request.headers.get("X-Forwarded-For") or request.remote_addr,
-                # keep traceback limited but useful
-                "trace": traceback.format_exc(limit=12),
+                "content_type": request.content_type,
             }
+            out["traceback"] = _tb.format_exc(limit=50)
 
         return jsonify(out), status
 
