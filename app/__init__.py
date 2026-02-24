@@ -3,17 +3,18 @@ from __future__ import annotations
 
 import os
 import traceback
-from typing import Any, Dict, List, Optional, Tuple, Union
+import uuid
+from typing import Any, Dict, Optional, Tuple, List, Union
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, g
 from flask_cors import CORS
 
 from app.core.config import API_PREFIX, CORS_ORIGINS
 
 
-# ------------------------------------------------------------
+# ----------------------------
 # Helpers
-# ------------------------------------------------------------
+# ----------------------------
 def _normalize_api_prefix(v: str) -> str:
     v = (v or "").strip()
     if not v:
@@ -30,11 +31,10 @@ def _truthy(v: str | None) -> bool:
 def _cookie_mode_enabled() -> bool:
     """
     Cookie auth should be explicitly enabled.
-    Otherwise you can accidentally force credentialed CORS and break clients.
+    Otherwise you'll accidentally force credentialed CORS and break wildcard origins.
     """
     if _truthy(os.getenv("COOKIE_AUTH_ENABLED", "")):
         return True
-    # Back-compat: if web auth is enabled and cookie samesite is set, treat as cookie mode.
     if _truthy(os.getenv("WEB_AUTH_ENABLED", "")) and os.getenv("WEB_AUTH_COOKIE_SAMESITE"):
         return True
     return False
@@ -45,30 +45,30 @@ def _parse_origins(
 ) -> Tuple[Union[str, List[str]], bool, Optional[str]]:
     raw = (origins_raw or "").strip()
 
-    # No origins provided
+    # No origins configured
     if not raw:
         if cookie_mode:
             return [], True, "CORS_ORIGINS is empty but cookie auth requires explicit origins."
         return "*", False, None
 
-    # Wildcard origin
+    # Wildcard origins
     if raw == "*":
         if cookie_mode:
             return [], True, "CORS_ORIGINS='*' is not allowed with cookie auth. Use explicit comma-separated origins."
         return "*", False, None
 
-    # Comma-separated list
+    # Comma list
     origins = [o.strip() for o in raw.split(",") if o.strip()]
     if not origins:
         if cookie_mode:
             return [], True, "CORS_ORIGINS parsed empty but cookie auth requires explicit origins."
         return "*", False, None
 
-    # If cookie mode, we must allow credentials
+    # With cookie auth we MUST allow credentials
     if cookie_mode:
         return origins, True, None
 
-    # Non-cookie mode: explicit list is OK, but credentials can be off
+    # Token-only mode: no credentials required
     return origins, False, None
 
 
@@ -80,21 +80,40 @@ def _import_attr(dotted: str, attr: str):
         return None, f"{dotted}:{attr} -> {repr(e)}"
 
 
-# ------------------------------------------------------------
+def _get_admin_key() -> str:
+    return (os.getenv("ADMIN_KEY", "") or "").strip()
+
+
+def _is_admin_request() -> bool:
+    """
+    A request is considered admin ONLY if the header matches env ADMIN_KEY.
+    """
+    admin_key = _get_admin_key()
+    if not admin_key:
+        return False
+    hdr = (request.headers.get("X-Admin-Key") or "").strip()
+    return bool(hdr) and hdr == admin_key
+
+
+def _debug_enabled_by_headers() -> bool:
+    """
+    Only expose deep debug when:
+      - X-Debug: 1
+      - AND admin key matches
+    """
+    debug_on = (request.headers.get("X-Debug") or "").strip() == "1"
+    return debug_on and _is_admin_request()
+
+
+# ----------------------------
 # App factory
-# ------------------------------------------------------------
+# ----------------------------
 def create_app() -> Flask:
     app = Flask(__name__)
 
-    # IMPORTANT: admin key for internal routes (cron/debug)
-    # Set this in Koyeb env: ADMIN_KEY=...
-    app.config["ADMIN_KEY"] = (os.getenv("ADMIN_KEY", "") or "").strip()
-
     api_prefix = _normalize_api_prefix(API_PREFIX)
 
-    # -------------------------
-    # CORS
-    # -------------------------
+    # ---- CORS ----
     cookie_mode = _cookie_mode_enabled()
     origins, supports_credentials, cors_err = _parse_origins(CORS_ORIGINS, cookie_mode=cookie_mode)
     if cors_err:
@@ -117,21 +136,19 @@ def create_app() -> Flask:
         max_age=86400,
     )
 
-    # -------------------------
-    # Boot report (debug visibility)
-    # -------------------------
+    # ---- Boot report store ----
     boot: Dict[str, Any] = {
         "api_prefix": api_prefix,
         "cookie_mode": cookie_mode,
         "cors": {"origins": origins, "supports_credentials": supports_credentials},
         "strict": (os.getenv("STRICT_BLUEPRINTS", "1").strip() != "0"),
         "debug_routes_enabled": _truthy(os.getenv("ENABLE_DEBUG_ROUTES", "0")),
-        "admin_key_set": bool(app.config["ADMIN_KEY"]),
         "registered": [],
         "failed": [],
     }
-    strict = boot["strict"]
+    strict = bool(boot["strict"])
 
+    # ---- Blueprint registration with duplicate protection ----
     def _register_bp(
         dotted: str,
         attr: str = "bp",
@@ -139,7 +156,7 @@ def create_app() -> Flask:
         url_prefix: Optional[str] = api_prefix,
     ):
         obj, err = _import_attr(dotted, attr)
-        entry: Dict[str, Any] = {"module": dotted, "attr": attr, "url_prefix": url_prefix, "required": required}
+        entry = {"module": dotted, "attr": attr, "url_prefix": url_prefix, "required": required}
 
         if obj is None:
             entry["error"] = err
@@ -148,10 +165,8 @@ def create_app() -> Flask:
                 raise RuntimeError(f"[boot] REQUIRED blueprint import failed: {err}")
             return
 
-        # Prefer blueprint's actual .name, otherwise derive stable name
         bp_name = getattr(obj, "name", None) or f"{dotted}:{attr}"
 
-        # Track duplicates by blueprint NAME (Flask requires unique names)
         if not hasattr(app, "_bp_names"):
             app._bp_names = set()  # type: ignore[attr-defined]
 
@@ -165,7 +180,6 @@ def create_app() -> Flask:
 
         app._bp_names.add(bp_name)  # type: ignore[attr-defined]
 
-        # Register
         if url_prefix:
             app.register_blueprint(obj, url_prefix=url_prefix)
         else:
@@ -174,9 +188,7 @@ def create_app() -> Flask:
         entry["bp_name"] = bp_name
         boot["registered"].append(entry)
 
-    # ------------------------------------------------------------
-    # REQUIRED routes (must exist)
-    # ------------------------------------------------------------
+    # ---- REQUIRED routes ----
     required_modules = [
         "app.routes.health",
         "app.routes.accounts",
@@ -195,53 +207,56 @@ def create_app() -> Flask:
     for dotted in required_modules:
         _register_bp(dotted, "bp", required=True, url_prefix=api_prefix)
 
-    # ------------------------------------------------------------
-    # OPTIONAL routes (may or may not exist)
-    # IMPORTANT: Do NOT register the same module twice (this caused your paystack duplication)
-    # ------------------------------------------------------------
-    # Paystack (choose ONE bp only). Keep these commented unless your project actually has them.
+    # ---- OPTIONAL routes ----
     _register_bp("app.routes.paystack", "bp", required=False, url_prefix=api_prefix)
+    _register_bp("app.routes.paystack", "paystack_bp", required=False, url_prefix=api_prefix)
     _register_bp("app.routes.paystack_webhook", "bp", required=False, url_prefix=api_prefix)
+    _register_bp("app.routes.cron", "bp", required=False, url_prefix=None)
 
-    # Internal cron routes (RECOMMENDED)
-    _register_bp("app.routes.internal_cron", "bp", required=False, url_prefix=api_prefix)
-
-    # Debug routes (optional)
+    # ---- DEBUG routes (optional) ----
     if _truthy(os.getenv("ENABLE_DEBUG_ROUTES", "0")):
         _register_bp("app.routes._debug", "bp", required=False, url_prefix=api_prefix)
         _register_bp("app.routes.debug_routes", "bp", required=False, url_prefix=api_prefix)
 
-    # ------------------------------------------------------------
-    # Boot report endpoint
-    # ------------------------------------------------------------
+    # ---- Request id + debug flags ----
+    @app.before_request
+    def _attach_request_id():
+        g.request_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
+        g.debug_allowed = _debug_enabled_by_headers()
+
+    @app.after_request
+    def _attach_response_headers(resp):
+        # helpful for matching logs to client errors
+        resp.headers["X-Request-Id"] = getattr(g, "request_id", "")
+        return resp
+
+    # ---- Boot report endpoint ----
     @app.get(f"{api_prefix}/_boot")
     def boot_report():
-        return jsonify({"ok": True, "boot": boot}), 200
+        out = {"ok": True, "boot": boot, "request_id": getattr(g, "request_id", None)}
+        # Only reveal whether ADMIN_KEY is configured to admin requests
+        if _is_admin_request():
+            out["admin_key_set"] = bool(_get_admin_key())
+        return jsonify(out), 200
 
-    # ------------------------------------------------------------
-    # Global error handler (Debugger exposer)
-    # - Use header: X-Debug: 1 to see trace and extra context
-    # ------------------------------------------------------------
+    # ---- Error handler with SAFE debug exposer ----
     @app.errorhandler(Exception)
     def _handle_any_error(e: Exception):
-        status = getattr(e, "code", 500)  # HTTPException has .code
-        msg = str(e) or type(e).__name__
+        status = getattr(e, "code", 500)
 
-        debug_on = (request.headers.get("X-Debug") or "").strip() == "1"
+        msg = str(e) or type(e).__name__
         out: Dict[str, Any] = {
             "ok": False,
             "error": type(e).__name__,
             "message": msg[:500],
+            "request_id": getattr(g, "request_id", None),
+            "path": request.path,
+            "method": request.method,
         }
 
-        if debug_on:
-            out["debug"] = {
-                "path": request.path,
-                "method": request.method,
-                "query": request.query_string.decode("utf-8", errors="ignore"),
-                "remote_addr": request.remote_addr,
-            }
-            out["trace"] = traceback.format_exc()
+        # Only show stack trace when BOTH X-Debug=1 and correct X-Admin-Key
+        if getattr(g, "debug_allowed", False):
+            out["traceback"] = traceback.format_exc(limit=50)
 
         return jsonify(out), status
 
