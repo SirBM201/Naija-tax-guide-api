@@ -1,184 +1,172 @@
 # app/routes/paystack.py
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple
+import hmac
+import hashlib
+import os
+from typing import Any, Dict, Optional
+
 from flask import Blueprint, jsonify, request
 
-from app.core.supabase_client import supabase
-from app.services.plans_service import get_plan
-from app.services.paystack_service import create_reference, initialize_transaction, verify_transaction
 from app.services.subscriptions_service import activate_subscription_now
+from app.core.security import require_admin_key
 
-bp = Blueprint("paystack", __name__)
+# ---------------------------------------------------------
+# Blueprint
+# ---------------------------------------------------------
+# IMPORTANT:
+# Your boot log showed the loader expects: app.routes.paystack:paystack_bp
+# So we MUST export paystack_bp.
+paystack_bp = Blueprint("paystack", __name__)
 
-
-def _sb():
-    return supabase() if callable(supabase) else supabase
-
-
-def _err(http_status: int, code: str, message: str, *, root_cause: Optional[Exception] = None, extra: Optional[Dict[str, Any]] = None):
-    payload: Dict[str, Any] = {"ok": False, "error": code, "message": message}
-    if extra:
-        payload["extra"] = extra
-    if root_cause:
-        payload["root_cause"] = {"type": root_cause.__class__.__name__, "message": str(root_cause)}
-    return jsonify(payload), http_status
+# Also export bp as an alias in case some code expects bp
+bp = paystack_bp
 
 
-def _extract_account_and_plan(body: Dict[str, Any]) -> Tuple[str, str]:
-    account_id = (body.get("account_id") or "").strip()
-    plan_code = (body.get("plan_code") or "").strip().lower()
-
-    md = body.get("metadata") or {}
-    if not account_id:
-        account_id = (md.get("account_id") or "").strip()
-    if not plan_code:
-        plan_code = (md.get("plan_code") or "").strip().lower()
-
-    return account_id, plan_code
+# ---------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------
+def _get_secret() -> str:
+    # Use one env var name consistently (this is what you used in PS)
+    return (os.getenv("PAYSTACK_WEBHOOK_SECRET") or "").strip()
 
 
-@bp.get("/paystack/health")
-def paystack_health():
-    from app.core.config import PAYSTACK_SECRET_KEY, PAYSTACK_CURRENCY, PAYSTACK_CALLBACK_URL
+def _safe_json() -> Dict[str, Any]:
+    return request.get_json(silent=True) or {}
 
-    return jsonify(
-        {
+
+def _raw_body_bytes() -> bytes:
+    # Paystack signature must be computed over the raw request body
+    return request.get_data(cache=False, as_text=False) or b""
+
+
+def _compute_signature_hex(raw: bytes, secret: str) -> str:
+    return hmac.new(secret.encode("utf-8"), raw, hashlib.sha512).hexdigest()
+
+
+def _constant_time_equal(a: str, b: str) -> bool:
+    # Avoid timing attacks
+    try:
+        return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+    except Exception:
+        return False
+
+
+def _verify_paystack_signature() -> Optional[Dict[str, Any]]:
+    """
+    Returns an error dict if invalid; None if OK.
+    """
+    secret = _get_secret()
+    if not secret:
+        return {"ok": False, "error": "missing_webhook_secret"}
+
+    got = (request.headers.get("x-paystack-signature") or "").strip().lower()
+    if not got:
+        return {"ok": False, "error": "missing_signature_header"}
+
+    raw = _raw_body_bytes()
+    expected = _compute_signature_hex(raw, secret).lower()
+
+    if not _constant_time_equal(expected, got):
+        return {"ok": False, "error": "invalid_signature"}
+
+    return None
+
+
+# ---------------------------------------------------------
+# Routes
+# ---------------------------------------------------------
+@paystack_bp.post("/webhooks/paystack")
+def paystack_webhook():
+    """
+    Paystack Webhook endpoint.
+    Expected header: x-paystack-signature = HMAC-SHA512(raw_body, PAYSTACK_WEBHOOK_SECRET)
+    """
+    sig_err = _verify_paystack_signature()
+    if sig_err is not None:
+        return jsonify(sig_err), 401
+
+    payload = _safe_json()
+
+    event = (payload.get("event") or "").strip()
+    data = payload.get("data") or {}
+    if not isinstance(data, dict):
+        data = {}
+
+    reference = (data.get("reference") or "").strip()
+
+    metadata = data.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    account_id = (metadata.get("account_id") or "").strip()
+    plan_code = (metadata.get("plan_code") or "").strip() or "monthly"
+    upgrade_mode = (metadata.get("upgrade_mode") or "").strip() or "now"
+
+    # We only act on charge.success (typical for subscription activation)
+    if event != "charge.success":
+        return jsonify({
             "ok": True,
-            "secret_key_set": bool(PAYSTACK_SECRET_KEY),
-            "currency": PAYSTACK_CURRENCY,
-            "callback_url_set": bool((PAYSTACK_CALLBACK_URL or "").strip()),
-            "paystack_base": "https://api.paystack.co",
-        }
-    ), 200
+            "processed": False,
+            "event": event,
+            "reference": reference,
+            "reason": "ignored_event"
+        }), 200
 
-
-@bp.post("/paystack/init")
-def paystack_init():
-    body: Dict[str, Any] = request.get_json(silent=True) or {}
-    email = (body.get("email") or "").strip()
-    account_id, plan_code = _extract_account_and_plan(body)
-
-    if not email:
-        return _err(400, "email_required", "email is required")
     if not account_id:
-        return _err(400, "account_id_required", "account_id is required (direct or in metadata)")
-    if not plan_code:
-        return _err(400, "plan_code_required", "plan_code is required (direct or in metadata)")
+        return jsonify({
+            "ok": False,
+            "processed": False,
+            "event": event,
+            "reference": reference,
+            "error": "missing_account_id_in_metadata"
+        }), 400
 
-    plan = get_plan(plan_code)
-    if not plan or not plan.get("active", True):
-        return _err(400, "invalid_plan", "plan_code is invalid or inactive", extra={"plan_code": plan_code})
-
-    amount_naira = int(plan.get("price") or 0)
-    if amount_naira <= 0:
-        return _err(400, "invalid_plan_price", "plan price must be > 0", extra={"plan_code": plan_code})
-
-    amount_kobo = amount_naira * 100
-    currency = (body.get("currency") or "NGN").strip() or "NGN"
-    reference = create_reference("NTG")
-
-    # enforce required metadata keys
-    metadata = dict((body.get("metadata") or {}) if isinstance(body.get("metadata"), dict) else {})
-    metadata.update(
-        {
-            "account_id": account_id,        # may be accounts.id OR accounts.account_id; service will resolve later
-            "plan_code": plan_code,
-            "purpose": metadata.get("purpose") or "subscription",
-            "channel": metadata.get("channel") or "web",
-            "product": metadata.get("product") or "ntg_subscription",
-        }
+    # Activate subscription (your existing service)
+    out = activate_subscription_now(
+        account_id=account_id,
+        plan_code=plan_code,
+        # days is optional; for webhook mode you may map plan_code -> days in the service
+        days=None,
+        reference=reference,
+        upgrade_mode=upgrade_mode,
+        source="paystack_webhook",
     )
 
-    try:
-        init_data = initialize_transaction(
-            email=email,
-            amount_kobo=amount_kobo,
-            reference=reference,
-            metadata=metadata,
-            currency=currency,
-        )
-        d = init_data.get("data") or {}
-
-        # Store initiated tx best-effort (don’t assume extra columns exist)
-        try:
-            _sb().table("paystack_transactions").insert(
-                {
-                    "reference": reference,
-                    "account_id": account_id,
-                    "plan_code": plan_code,
-                    "amount": amount_naira,
-                    "currency": d.get("currency") or currency,
-                    "status": "initiated",
-                    "raw": init_data,
-                }
-            ).execute()
-        except Exception:
-            pass
-
-        return jsonify(
-            {
-                "ok": True,
-                "authorization_url": d.get("authorization_url"),
-                "access_code": d.get("access_code"),
-                "reference": reference,
-                "plan_code": plan_code,
-                "amount_kobo": amount_kobo,
-            }
-        ), 200
-
-    except Exception as e:
-        return _err(400, "paystack_init_failed", "could not initialize transaction", root_cause=e)
+    return jsonify({
+        "ok": bool(out.get("ok")),
+        "processed": bool(out.get("ok")),
+        "event": event,
+        "reference": reference,
+        "account_id": account_id,
+        "plan_code": plan_code,
+        "upgrade_mode": upgrade_mode,
+        "activation": out,
+    }), (200 if out.get("ok") else 400)
 
 
-@bp.get("/paystack/verify/<reference>")
-def paystack_verify(reference: str):
-    reference = (reference or "").strip()
-    if not reference:
-        return _err(400, "missing_reference", "reference is required")
+# Optional debug endpoint (admin protected)
+@paystack_bp.post("/_debug/paystack/signature_check")
+def debug_signature_check():
+    """
+    Admin-only endpoint to verify the server can compute signature for the received body.
+    This helps you debug signature mismatches quickly.
+    """
+    guard = require_admin_key()
+    if guard is not None:
+        return guard
 
-    try:
-        data = verify_transaction(reference)
-        tx = (data.get("data") or {})
-        status = (tx.get("status") or "").lower()
-        metadata = tx.get("metadata") or {}
+    secret = _get_secret()
+    raw = _raw_body_bytes()
+    got = (request.headers.get("x-paystack-signature") or "").strip().lower()
+    expected = _compute_signature_hex(raw, secret).lower() if secret else ""
 
-        account_id = (metadata.get("account_id") or "").strip()
-        plan_code = (metadata.get("plan_code") or "").strip().lower()
-
-        # Update tx best-effort (fallback if schema differs)
-        try:
-            _sb().table("paystack_transactions").update(
-                {
-                    "paystack_status": status,
-                    "paid_at": tx.get("paid_at"),
-                    "raw": data,
-                    "status": "success" if status == "success" else "failed",
-                }
-            ).eq("reference", reference).execute()
-        except Exception:
-            try:
-                _sb().table("paystack_transactions").update(
-                    {"raw": data, "status": "success" if status == "success" else "failed"}
-                ).eq("reference", reference).execute()
-            except Exception:
-                pass
-
-        if status != "success":
-            return _err(400, "payment_not_successful", "payment not successful", extra={"paystack_status": status, "reference": reference})
-
-        if not account_id or not plan_code:
-            return _err(400, "missing_metadata", "missing account_id/plan_code in metadata", extra={"metadata": metadata})
-
-        sub = activate_subscription_now(
-            account_id=account_id,
-            plan_code=plan_code,
-            status="active",
-            provider="paystack",
-            provider_ref=reference,
-        )
-
-        return jsonify({"ok": True, "reference": reference, "subscription": sub}), 200
-
-    except Exception as e:
-        return _err(400, "paystack_verify_failed", "could not verify/activate", root_cause=e)
+    return jsonify({
+        "ok": True,
+        "has_secret": bool(secret),
+        "raw_len": len(raw),
+        "got_present": bool(got),
+        "expected_prefix": expected[:16],
+        "got_prefix": got[:16],
+        "match": _constant_time_equal(expected, got) if secret and got else False,
+    }), 200
