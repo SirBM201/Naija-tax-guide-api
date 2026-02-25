@@ -20,22 +20,13 @@ from .response_refiner import refine_answer
 from .qa_usage_service import try_consume_cache_slot, get_cache_used_today
 
 
-# -----------------------------
-# Constants / knobs
-# -----------------------------
 MAX_QUESTION_CHARS = 2000
 
-# Daily cache question limits (answers served from cache/library-like sources)
 PAID_CACHE_DAILY_LIMIT = int((os.getenv("PAID_CACHE_DAILY_LIMIT", "1000") or "1000").strip())
 FREE_CACHE_DAILY_LIMIT = int((os.getenv("FREE_CACHE_DAILY_LIMIT", "20") or "20").strip())
-
-# Hard max across the entire system (optional guard)
 HARD_DAILY_MAX = int((os.getenv("HARD_DAILY_MAX", "1500") or "1500").strip())
 
 
-# -----------------------------
-# Debug
-# -----------------------------
 def _truthy(v: str | None) -> bool:
     return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
@@ -45,24 +36,9 @@ def _debug_enabled() -> bool:
 
 
 def _dbg_pack(**kv: Any) -> Dict[str, Any]:
-    # safe debug payload: NO tokens, NO secrets
     if not _debug_enabled():
         return {}
-    out: Dict[str, Any] = {}
-    for k, v in kv.items():
-        out[k] = v
-    return out
-
-
-# -----------------------------
-# Helpers
-# -----------------------------
-def _today_yyyy_mm_dd() -> str:
-    return date.today().isoformat()
-
-
-def _safe_str(v: Any) -> str:
-    return (v or "").strip()
+    return dict(kv)
 
 
 def _truncate(s: str, n: int) -> str:
@@ -70,8 +46,8 @@ def _truncate(s: str, n: int) -> str:
     return s if len(s) <= n else s[:n]
 
 
-def _now_epoch() -> int:
-    return int(time.time())
+def _safe_str(v: Any) -> str:
+    return (v or "").strip()
 
 
 def _sb():
@@ -79,11 +55,6 @@ def _sb():
 
 
 def _resolve_account_id(payload: Dict[str, Any]) -> Optional[str]:
-    """
-    Resolve account_id from payload:
-    - if account_id present, use it
-    - else if (provider, provider_user_id), lookup in accounts table
-    """
     account_id = _safe_str(payload.get("account_id"))
     if account_id:
         return account_id
@@ -111,14 +82,23 @@ def _resolve_account_id(payload: Dict[str, Any]) -> Optional[str]:
         return None
 
 
-# -----------------------------
-# Subscription status (best effort)
-# -----------------------------
+def _dev_bypass_subscription_enabled() -> bool:
+    # ✅ ONLY use in dev. Put this env var on Koyeb only when you want bypass.
+    return _truthy(os.getenv("DEV_BYPASS_SUBSCRIPTION", ""))
+
+
 def _get_subscription_status_best_effort(account_id: str, provider: str, provider_user_id: Optional[str]) -> Dict[str, Any]:
-    """
-    Wrapper around subscriptions_service.get_subscription_status.
-    If anything fails, return an expired-ish state to be safe.
-    """
+    # ✅ DEV BYPASS: treat as active if enabled
+    if _dev_bypass_subscription_enabled():
+        return {
+            "active": True,
+            "state": "dev_bypass",
+            "reason": "dev_bypass_subscription",
+            "plan_code": "DEV_BYPASS",
+            "expires_at": None,
+            "grace_until": None,
+        }
+
     try:
         return get_subscription_status(account_id, provider, provider_user_id)
     except Exception:
@@ -132,20 +112,17 @@ def _get_subscription_status_best_effort(account_id: str, provider: str, provide
         }
 
 
-# -----------------------------
-# Credits / Limits (RPC: consume_ai_credits)
-# -----------------------------
 def _consume_ai_credits(account_id: str, cost: int = 1) -> Tuple[bool, str, Dict[str, Any]]:
-    """
-    Deduct credits using an RPC if available.
-    Your DB should expose: consume_ai_credits(p_account_id uuid, p_cost int)
-    Returns: (ok, reason, debug_meta)
-    """
     cost = int(cost or 1)
     if cost < 1:
         cost = 1
 
     dbg: Dict[str, Any] = {"rpc": "consume_ai_credits", "cost": cost}
+
+    # ✅ DEV BYPASS: don’t consume credits during bypass
+    if _dev_bypass_subscription_enabled():
+        dbg.update({"rpc_ok": True, "rpc_reason": "dev_bypass_no_charge"})
+        return True, "ok", dbg
 
     try:
         res = _sb().rpc("consume_ai_credits", {"p_account_id": account_id, "p_cost": cost}).execute()
@@ -171,9 +148,6 @@ def _consume_ai_credits(account_id: str, cost: int = 1) -> Tuple[bool, str, Dict
         return False, "credits_rpc_failed", dbg
 
 
-# -----------------------------
-# AI call
-# -----------------------------
 def _call_ai_model(question: str, lang: str = "en") -> str:
     ans = ask_ai(question, lang=lang)
     if not ans:
@@ -181,11 +155,7 @@ def _call_ai_model(question: str, lang: str = "en") -> str:
     return ans
 
 
-# -----------------------------
-# Cache blocking message options (professional)
-# -----------------------------
 def _cache_limit_message(used: int, limit: int) -> str:
-    # concise + user-friendly
     return (
         f"You’ve reached today’s fast-answer limit ({used}/{limit}).\n\n"
         "To continue now:\n"
@@ -194,15 +164,7 @@ def _cache_limit_message(used: int, limit: int) -> str:
     )
 
 
-# -----------------------------
-# Public: unified ask (dict payload)
-# -----------------------------
 def ask_guarded(payload: Union[Dict[str, Any], str], *args, **kwargs) -> Dict[str, Any]:
-    """
-    ✅ NEW: supports dict payloads used by your routes.
-    ✅ Backwards compatible: if someone calls ask_guarded(question, account_id, ...), it still works.
-    """
-    # Back-compat path (old signature)
     if isinstance(payload, str):
         question = payload
         account_id = kwargs.get("account_id") or (args[0] if args else None)
@@ -239,14 +201,9 @@ def _ask_guarded_dict(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not account_id:
         return {"ok": False, "error": "account_required", "answer": ""}
 
-    debug: Dict[str, Any] = _dbg_pack(
-        stage="start",
-        provider=provider,
-        lang=lang,
-        channel=channel,
-    )
+    debug: Dict[str, Any] = _dbg_pack(stage="start", provider=provider, lang=lang, channel=channel)
 
-    # 1) Subscription check
+    # 1) Subscription check (with dev bypass option)
     sub = _get_subscription_status_best_effort(account_id, provider, provider_user_id)
     debug.update(_dbg_pack(stage="subscription_checked", subscription_state=sub.get("state"), sub_reason=sub.get("reason")))
 
@@ -255,20 +212,15 @@ def _ask_guarded_dict(payload: Dict[str, Any]) -> Dict[str, Any]:
             "ok": False,
             "error": "subscription_required",
             "answer": "Please activate a plan to use NaijaTax Guide.",
-            "meta": {
-                "channel": channel,
-                "subscription": sub,
-            },
+            "meta": {"channel": channel, "subscription": sub},
         }
         if _debug_enabled():
             out["meta"]["debug"] = debug
         return out
 
-    # Determine which daily cache limit applies
-    # (since subscription is active, treat as paid cache limit)
     cache_limit = PAID_CACHE_DAILY_LIMIT
 
-    # 2) Cache lookup (REAL schema)
+    # 2) Cache lookup
     normalized = basic_normalize(question)
     ck = canonical_key(question)
 
@@ -278,53 +230,37 @@ def _ask_guarded_dict(payload: Dict[str, Any]) -> Dict[str, Any]:
         canonical_key=ck,
     )
 
-    debug.update(_dbg_pack(stage="cache_checked", normalized_len=len(normalized), canonical_key=ck, cache_hit=bool(cache_row)))
+    debug.update(_dbg_pack(stage="cache_checked", canonical_key=ck, cache_hit=bool(cache_row)))
 
     if cache_row and cache_row.get("answer"):
-        # 2a) Enforce daily cache limit BEFORE serving cache
         used_before = get_cache_used_today(account_id)
         ok_slot, usage_dbg = try_consume_cache_slot(account_id, cache_limit)
 
         debug.update(_dbg_pack(stage="cache_limit_checked", cache_used_before=used_before, cache_limit=cache_limit, usage=usage_dbg))
 
         if not ok_slot:
-            used_now = used_before
             out = {
                 "ok": False,
                 "error": "cache_limit_reached",
-                "answer": _cache_limit_message(used_now, cache_limit),
-                "meta": {
-                    "channel": channel,
-                    "mode": "blocked_cache_limit",
-                    "cache_daily_limit": cache_limit,
-                    "cache_used_today": used_now,
-                },
+                "answer": _cache_limit_message(used_before, cache_limit),
+                "meta": {"channel": channel, "mode": "blocked_cache_limit", "cache_daily_limit": cache_limit, "cache_used_today": used_before},
             }
             if _debug_enabled():
                 out["meta"]["debug"] = debug
             return out
 
-        # touch cache best-effort
         cid = _safe_str(cache_row.get("id")) or ""
         if cid:
             touch_cache_best_effort(cid)
 
         refined = refine_answer(cache_row.get("answer"), lang=lang, source="cache", provider=provider) or cache_row.get("answer")
 
-        out = {
-            "ok": True,
-            "answer": refined,
-            "meta": {
-                "channel": channel,
-                "mode": "cache",
-                "canonical_key": ck,
-            },
-        }
+        out = {"ok": True, "answer": refined, "meta": {"channel": channel, "mode": "cache", "canonical_key": ck}}
         if _debug_enabled():
             out["meta"]["debug"] = debug
         return out
 
-    # 3) AI credits (only for AI generation)
+    # 3) AI credits (dev bypass does not charge)
     ok_credits, reason, credits_dbg = _consume_ai_credits(account_id=account_id, cost=1)
     debug.update(_dbg_pack(stage="credits_consumed", credits=credits_dbg))
 
@@ -349,17 +285,12 @@ def _ask_guarded_dict(payload: Dict[str, Any]) -> Dict[str, Any]:
         debug.update(_dbg_pack(stage="ai_ok", ai_len=len(answer)))
     except Exception as e:
         debug.update(_dbg_pack(stage="ai_failed", ai_error=str(e)[:200], last_ai_error=last_ai_error()[:200]))
-        out = {
-            "ok": False,
-            "error": str(e) or "ai_failed",
-            "answer": "Sorry — I couldn’t generate a response right now. Please try again.",
-            "meta": {"channel": channel, "mode": "ai_failed"},
-        }
+        out = {"ok": False, "error": str(e) or "ai_failed", "answer": "Sorry — I couldn’t generate a response right now. Please try again.", "meta": {"channel": channel, "mode": "ai_failed"}}
         if _debug_enabled():
-            out["meta"]["debug"] = debug
+          out["meta"]["debug"] = debug
         return out
 
-    # 5) Save AI answer to cache (REAL schema)
+    # 5) Save AI answer to cache
     upsert_ai_answer_to_cache_best_effort(
         normalized_question=normalized,
         answer=answer,
@@ -371,19 +302,12 @@ def _ask_guarded_dict(payload: Dict[str, Any]) -> Dict[str, Any]:
         priority=0,
     )
 
-    out = {
-        "ok": True,
-        "answer": answer,
-        "meta": {"channel": channel, "mode": "ai", "credits_deducted": 1, "canonical_key": ck},
-    }
+    out = {"ok": True, "answer": answer, "meta": {"channel": channel, "mode": "ai", "credits_deducted": 0 if _dev_bypass_subscription_enabled() else 1, "canonical_key": ck}}
     if _debug_enabled():
         out["meta"]["debug"] = debug
     return out
 
 
-# -----------------------------
-# Public: chat ask (sessions + history)
-# -----------------------------
 def ask_chat_guarded(
     *,
     messages: list[dict[str, str]],
@@ -391,24 +315,12 @@ def ask_chat_guarded(
     provider: str = "web",
     lang: str = "en",
 ) -> Dict[str, Any]:
-    """
-    Chat-style ask with credit/subscription enforcement.
-
-    - enforces subscription state
-    - deducts 1 AI credit per assistant response
-    - does NOT use QA cache (history makes caching unreliable)
-    """
     provider = (provider or "web").strip().lower()
-
     debug: Dict[str, Any] = _dbg_pack(stage="chat_start", provider=provider, lang=lang)
 
     sub = _get_subscription_status_best_effort(account_id, provider, None)
     if not (sub or {}).get("active"):
-        out = {
-            "ok": False,
-            "error": "subscription_required",
-            "answer": "Please activate a plan to use the Tax Assistant Chat.",
-        }
+        out = {"ok": False, "error": "subscription_required", "answer": "Please activate a plan to use the Tax Assistant Chat."}
         if _debug_enabled():
             out["meta"] = {"debug": debug, "subscription": sub}
         return out
@@ -416,28 +328,16 @@ def ask_chat_guarded(
     ok, reason, credits_dbg = _consume_ai_credits(account_id=account_id, cost=1)
     debug.update(_dbg_pack(stage="chat_credits", credits=credits_dbg))
     if not ok:
-        out = {
-            "ok": False,
-            "error": reason or "no_credits",
-            "answer": "You’ve reached your AI credit limit for now. Please top up or wait for your next reset.",
-        }
+        out = {"ok": False, "error": reason or "no_credits", "answer": "You’ve reached your AI credit limit for now. Please top up or wait for your next reset."}
         if _debug_enabled():
             out["meta"] = {"debug": debug}
         return out
 
     ans = ask_ai_chat(messages, lang=lang)
     if not ans:
-        out = {
-            "ok": False,
-            "error": last_ai_error() or "ai_failed",
-            "answer": "Sorry — I couldn’t generate a response right now. Please try again.",
-        }
+        out = {"ok": False, "error": last_ai_error() or "ai_failed", "answer": "Sorry — I couldn’t generate a response right now. Please try again."}
         if _debug_enabled():
             out["meta"] = {"debug": debug, "last_ai_error": last_ai_error()[:200]}
         return out
 
-    return {
-        "ok": True,
-        "answer": ans,
-        "meta": {"mode": "chat", "credits_deducted": 1},
-    }
+    return {"ok": True, "answer": ans, "meta": {"mode": "chat", "credits_deducted": 0 if _dev_bypass_subscription_enabled() else 1}}
