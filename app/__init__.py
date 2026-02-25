@@ -181,11 +181,13 @@ def create_app() -> Flask:
         boot["registered"].append(entry)
 
     # ---------- REQUIRED routes ----------
+    # ✅ IMPORTANT: add app.routes.web to support /api/web/ask (compat route)
     required_modules = [
         "app.routes.health",
         "app.routes.accounts",
         "app.routes.subscriptions",
         "app.routes.ask",
+        "app.routes.web",  # ✅ NEW (compat)
         "app.routes.webhooks",
         "app.routes.plans",
         "app.routes.link_tokens",
@@ -200,14 +202,8 @@ def create_app() -> Flask:
         _register_bp(dotted, "bp", required=True, url_prefix=api_prefix)
 
     # ---------- OPTIONAL routes ----------
-    # Paystack: your file exports paystack_bp (NOT bp) -> register that.
     _register_bp("app.routes.paystack", "paystack_bp", alias_name="paystack", required=False, url_prefix=api_prefix)
-
-    # If you have a separate file for paystack webhook later, keep it optional:
     _register_bp("app.routes.paystack_webhook", "bp", alias_name="paystack_webhook", required=False, url_prefix=api_prefix)
-
-    # Cron must be under /api so PowerShell calls match:
-    #   $Base/api/internal/cron/expire-subscriptions
     _register_bp("app.routes.cron", "bp", alias_name="cron", required=False, url_prefix=api_prefix)
 
     # ---------- DEBUG routes ----------
@@ -228,40 +224,33 @@ def create_app() -> Flask:
             }
         ), 200
 
-    # ---------- Runtime diagnostics ("simple debugger") ----------
+    # ---------- Runtime diagnostics ----------
     @app.get(f"{api_prefix}/_diag")
     def runtime_diag():
-        # Keep it simple and safe: no secrets, only boolean flags + hints.
         hints: List[str] = []
 
-        # Paystack blueprint hints
-        # If paystack.py exists but not exporting expected blueprint, it will show in boot.failed
         for f in boot.get("failed", []):
             mod = (f.get("module") or "")
             if mod == "app.routes.paystack":
                 hints.append(
                     "Paystack route failed to register. Ensure app/routes/paystack.py exports paystack_bp = Blueprint(...). "
-                    "app/__init__.py now imports paystack_bp."
+                    "app/__init__.py imports paystack_bp."
                 )
             if mod == "app.routes.paystack_webhooks":
                 hints.append("app.routes.paystack_webhooks does not exist. Remove its registration or create the module.")
 
-        # Cron hints
         cron_registered = any((r.get("alias_name") == "cron") for r in boot.get("registered", []))
         if not cron_registered:
             hints.append("Cron blueprint is NOT registered. Confirm app/routes/cron.py exists and exports bp = Blueprint(...).")
 
-        # Cookie/CORS hints
         if cookie_mode and origins == "*":
             hints.append("COOKIE_MODE is enabled but CORS origins are '*'. Use explicit origins when cookies are used.")
 
-        # Supabase env hints (common hidden cause of 500s)
         if not (os.getenv("SUPABASE_URL") or "").strip():
             hints.append("SUPABASE_URL is missing -> Supabase RPC/table calls will fail.")
         if not (os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY") or "").strip():
             hints.append("SUPABASE service key is missing -> RPC/table calls may fail.")
 
-        # Paystack env hints
         if not (os.getenv("PAYSTACK_WEBHOOK_SECRET") or "").strip() and not _safe_get_env_bool("PAYSTACK_WEBHOOK_BYPASS"):
             hints.append("PAYSTACK_WEBHOOK_SECRET is missing (and bypass not enabled). Paystack signature verification will fail.")
 
@@ -277,6 +266,12 @@ def create_app() -> Flask:
         }
 
         return jsonify({"ok": True, "request_id": _rid(), "env": env_view, "hints": hints}), 200
+
+    # ---------- Preflight safety net ----------
+    # ✅ If a client sends OPTIONS to a valid prefix route, ensure it never hard-fails.
+    @app.route(f"{api_prefix}/<path:_any>", methods=["OPTIONS"])
+    def _api_preflight(_any: str):
+        return ("", 204)
 
     # ---------- Global error handler (always JSON) ----------
     @app.errorhandler(Exception)
