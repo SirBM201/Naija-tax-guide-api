@@ -2,28 +2,66 @@
 from __future__ import annotations
 
 import os
-from supabase import create_client, Client
+from typing import Optional, Any
 
-_SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").strip()
-# IMPORTANT: backend MUST use SERVICE ROLE key for admin writes (never expose to frontend)
-_SUPABASE_SERVICE_ROLE_KEY = (os.getenv("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
-
-_supabase: Client | None = None
+from supabase import create_client
+from supabase.client import Client
 
 
-def get_supabase() -> Client:
-    global _supabase
-
-    if _supabase is not None:
-        return _supabase
-
-    if not _SUPABASE_URL or not _SUPABASE_SERVICE_ROLE_KEY:
-        raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
-
-    _supabase = create_client(_SUPABASE_URL, _SUPABASE_SERVICE_ROLE_KEY)
-    return _supabase
+def _env(name: str, default: str = "") -> str:
+    return str(os.getenv(name, default) or "").strip()
 
 
-# Backward compatible export for code that does: `from ... import supabase`
-# ✅ This is a CLIENT OBJECT (not a function)
-supabase: Client = get_supabase()
+def _require(name: str) -> str:
+    v = _env(name)
+    if not v:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return v
+
+
+class SupabaseProxy:
+    """
+    Backward compatible proxy.
+
+    Supports BOTH styles:
+      - supabase().rpc(...)
+      - supabase.rpc(...)
+
+    This prevents the exact error you hit:
+      TypeError: 'SyncClient' object is not callable
+    """
+
+    def __init__(self) -> None:
+        self._client: Optional[Client] = None
+
+    def _build_client(self) -> Client:
+        url = _require("SUPABASE_URL")
+
+        # Prefer service role on the backend
+        key = _env("SUPABASE_SERVICE_ROLE_KEY") or _env("SUPABASE_SERVICE_KEY") or _env("SUPABASE_ANON_KEY")
+        if not key:
+            raise RuntimeError(
+                "Missing Supabase key. Set one of: SUPABASE_SERVICE_ROLE_KEY, SUPABASE_SERVICE_KEY, SUPABASE_ANON_KEY"
+            )
+
+        return create_client(url, key)
+
+    def get(self) -> Client:
+        if self._client is None:
+            self._client = self._build_client()
+        return self._client
+
+    def reset(self) -> None:
+        self._client = None
+
+    def __call__(self) -> Client:
+        # Allows: supabase().rpc(...)
+        return self.get()
+
+    def __getattr__(self, name: str) -> Any:
+        # Allows: supabase.rpc(...)
+        return getattr(self.get(), name)
+
+
+# Exported symbol used across the app
+supabase = SupabaseProxy()
