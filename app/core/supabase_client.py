@@ -4,64 +4,78 @@ from __future__ import annotations
 import os
 from typing import Optional, Any
 
+# supabase-py
 from supabase import create_client
 from supabase.client import Client
 
 
+# Singleton client instances (lazy)
+_client_admin: Optional[Client] = None
+_client_anon: Optional[Client] = None
+
+
 def _env(name: str, default: str = "") -> str:
-    return str(os.getenv(name, default) or "").strip()
+    return (os.getenv(name) or default).strip()
 
 
-def _require(name: str) -> str:
-    v = _env(name)
-    if not v:
-        raise RuntimeError(f"Missing required environment variable: {name}")
-    return v
+def _get_supabase_url() -> str:
+    url = _env("SUPABASE_URL") or _env("NEXT_PUBLIC_SUPABASE_URL")
+    if not url:
+        raise RuntimeError("SUPABASE_URL is missing")
+    return url
 
 
-class SupabaseProxy:
+def _get_service_key() -> str:
+    # Prefer service role for backend writes
+    return (
+        _env("SUPABASE_SERVICE_ROLE_KEY")
+        or _env("SUPABASE_SERVICE_KEY")
+        or _env("SERVICE_ROLE_KEY")
+    )
+
+
+def _get_anon_key() -> str:
+    return _env("SUPABASE_ANON_KEY") or _env("NEXT_PUBLIC_SUPABASE_ANON_KEY")
+
+
+def get_supabase_client(admin: bool = True) -> Client:
     """
-    Backward compatible proxy.
+    Canonical getter used throughout the backend.
 
-    Supports BOTH styles:
-      - supabase().rpc(...)
-      - supabase.rpc(...)
-
-    This prevents the exact error you hit:
-      TypeError: 'SyncClient' object is not callable
+    - admin=True: uses SUPABASE_SERVICE_ROLE_KEY (recommended for backend)
+    - admin=False: uses SUPABASE_ANON_KEY (rarely needed in backend)
     """
+    global _client_admin, _client_anon
 
-    def __init__(self) -> None:
-        self._client: Optional[Client] = None
+    url = _get_supabase_url()
 
-    def _build_client(self) -> Client:
-        url = _require("SUPABASE_URL")
-
-        # Prefer service role on the backend
-        key = _env("SUPABASE_SERVICE_ROLE_KEY") or _env("SUPABASE_SERVICE_KEY") or _env("SUPABASE_ANON_KEY")
+    if admin:
+        if _client_admin is not None:
+            return _client_admin
+        key = _get_service_key() or _get_anon_key()
         if not key:
-            raise RuntimeError(
-                "Missing Supabase key. Set one of: SUPABASE_SERVICE_ROLE_KEY, SUPABASE_SERVICE_KEY, SUPABASE_ANON_KEY"
-            )
+            raise RuntimeError("SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_ANON_KEY fallback) is missing")
+        _client_admin = create_client(url, key)
+        return _client_admin
 
-        return create_client(url, key)
-
-    def get(self) -> Client:
-        if self._client is None:
-            self._client = self._build_client()
-        return self._client
-
-    def reset(self) -> None:
-        self._client = None
-
-    def __call__(self) -> Client:
-        # Allows: supabase().rpc(...)
-        return self.get()
-
-    def __getattr__(self, name: str) -> Any:
-        # Allows: supabase.rpc(...)
-        return getattr(self.get(), name)
+    # anon
+    if _client_anon is not None:
+        return _client_anon
+    anon = _get_anon_key()
+    if not anon:
+        raise RuntimeError("SUPABASE_ANON_KEY is missing")
+    _client_anon = create_client(url, anon)
+    return _client_anon
 
 
-# Exported symbol used across the app
-supabase = SupabaseProxy()
+# Backwards-compatible aliases (to prevent future boot crashes)
+def get_supabase() -> Client:
+    return get_supabase_client(admin=True)
+
+
+def supabase_admin() -> Client:
+    return get_supabase_client(admin=True)
+
+
+def supabase_anon() -> Client:
+    return get_supabase_client(admin=False)
