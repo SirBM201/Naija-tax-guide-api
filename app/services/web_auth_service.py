@@ -19,7 +19,6 @@ def _now_utc() -> datetime:
 
 
 def _iso(dt: datetime) -> str:
-    # Supabase likes ISO with timezone; your logs show +00:00 style, but both are ok.
     return dt.astimezone(timezone.utc).isoformat()
 
 
@@ -36,7 +35,7 @@ def _truthy(v: str | None) -> bool:
 
 WEB_AUTH_ENABLED = _truthy(_env("WEB_AUTH_ENABLED", "1"))
 
-# DEV OTP controls (you currently return dev_otp in responses)
+# DEV OTP controls
 WEB_AUTH_DEV_OTP_ENABLED = _truthy(_env("WEB_AUTH_DEV_OTP_ENABLED", "0"))
 WEB_AUTH_OTP_TTL_SECONDS = int(_env("WEB_AUTH_OTP_TTL_SECONDS", "600") or "600")
 WEB_AUTH_MASTER_OTP = _env("WEB_AUTH_MASTER_OTP", "")
@@ -50,10 +49,10 @@ WEB_AUTH_DEV_ALLOWED_CONTACTS_LIST = [
 # Token lifetime (web_tokens.expires_at)
 WEB_AUTH_TOKEN_TTL_DAYS = int(_env("WEB_AUTH_TOKEN_TTL_DAYS", "30") or "30")
 
-# Hash pepper (re-use ADMIN_API_KEY if you want stable hashing across env)
+# Hash pepper
 HASH_PEPPER = _env("OTP_HASH_PEPPER", _env("ADMIN_API_KEY", "dev-pepper"))
 
-# Cookie name used by routes when setting cookie after verify
+# Cookie name
 WEB_AUTH_COOKIE_NAME = _env("WEB_AUTH_COOKIE_NAME", _env("WEB_COOKIE_NAME", "ntg_session"))
 
 # Tables
@@ -75,12 +74,10 @@ def _hmac_sha256(value: str) -> str:
 
 
 def _hash_otp(contact: str, purpose: str, otp: str) -> str:
-    # stable + purpose-bound
     return _hmac_sha256(f"otp:{purpose}:{contact}:{otp}")
 
 
 def _hash_token(raw_token: str) -> str:
-    # store ONLY hash in DB; raw token never stored
     return _hmac_sha256(f"token:{raw_token}")
 
 
@@ -117,10 +114,9 @@ def _dev_guard(contact: str, shared_secret: Optional[str]) -> Optional[str]:
 
 
 # --------------------------------------------------
-# Account binding (accounts table uses provider=web, provider_user_id=contact)
+# Account binding (provider=web, provider_user_id=contact)
 # --------------------------------------------------
 def _get_or_create_web_account(contact: str) -> Tuple[bool, Optional[str], Optional[str]]:
-    # Your logs show accounts has: account_id, provider, provider_user_id, display_name, phone_e164
     q = (
         _sb()
         .table(ACCOUNTS_TABLE)
@@ -142,7 +138,7 @@ def _get_or_create_web_account(contact: str) -> Tuple[bool, Optional[str], Optio
                 "provider": "web",
                 "provider_user_id": contact,
                 "display_name": contact,
-                # keep compatibility with your current schema where phone_e164 is re-used for email too
+                # keep compatibility: some schemas reuse phone_e164 for email
                 "phone_e164": contact,
             }
         )
@@ -167,11 +163,6 @@ def request_web_otp(
     ip: Optional[str] = None,
     user_agent: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Creates an OTP row in web_otps.
-    Table expected fields (based on your logs): contact, purpose, code_hash, expires_at, used_at, revoked_at, created_at
-    Optional: device_id, ip, user_agent, attempts
-    """
     contact = (contact or "").strip()
     purpose = (purpose or "").strip() or "web_login"
 
@@ -180,15 +171,14 @@ def request_web_otp(
     if not WEB_AUTH_ENABLED:
         return {"ok": False, "error": "web_auth_disabled"}
 
-    # DEV mode (you currently expose dev_otp in response)
-    dev_err = None
     if WEB_AUTH_DEV_OTP_ENABLED:
-        dev_err = _dev_guard(contact, shared_secret)
-        if dev_err:
-            return {"ok": False, "error": dev_err}
+        err = _dev_guard(contact, shared_secret)
+        if err:
+            return {"ok": False, "error": err}
 
-    # Soft-revoke prior unused OTPs (revoked_at is the real column in your DB)
     now = _now_utc()
+
+    # revoke old unused OTPs
     _sb().table(WEB_OTPS_TABLE).update({"revoked_at": _iso(now)}).eq("contact", contact).eq(
         "purpose", purpose
     ).is_("used_at", "null").is_("revoked_at", "null").execute()
@@ -205,8 +195,6 @@ def request_web_otp(
         "used_at": None,
         "revoked_at": None,
     }
-
-    # Optional fields (only include if provided to reduce chance of “unknown column” errors)
     if device_id:
         payload["device_id"] = device_id
     if ip:
@@ -220,7 +208,6 @@ def request_web_otp(
         "ok": True,
         "ttl_minutes": int(int(WEB_AUTH_OTP_TTL_SECONDS) / 60),
     }
-
     if WEB_AUTH_DEV_OTP_ENABLED:
         out["dev_otp"] = otp
 
@@ -252,7 +239,14 @@ def verify_web_otp(
         ok, account_id, err = _get_or_create_web_account(contact)
         if not ok:
             return {"ok": False, "error": err}
-        return _create_web_token(account_id, ip=ip, user_agent=user_agent, device_id=device_id)
+        tok = _create_web_token(account_id, ip=ip, user_agent=user_agent, device_id=device_id)
+        return {
+            "ok": True,
+            "account_id": account_id,
+            "auth_mode": "cookie+bearer",
+            "token": tok["token"],
+            "expires_at": tok["expires_at"],
+        }
 
     code_hash = _hash_otp(contact, purpose, otp)
 
@@ -276,11 +270,9 @@ def verify_web_otp(
     row = q.data[0]
     exp = datetime.fromisoformat(str(row["expires_at"]).replace("Z", "+00:00"))
     if now > exp:
-        # mark revoked so it can’t be reused
         _sb().table(WEB_OTPS_TABLE).update({"revoked_at": _iso(now)}).eq("id", row["id"]).execute()
         return {"ok": False, "error": "otp_expired"}
 
-    # Mark used
     _sb().table(WEB_OTPS_TABLE).update({"used_at": _iso(now)}).eq("id", row["id"]).execute()
 
     ok, account_id, err = _get_or_create_web_account(contact)
@@ -289,8 +281,6 @@ def verify_web_otp(
 
     tok = _create_web_token(account_id, ip=ip, user_agent=user_agent, device_id=device_id)
 
-    # Mirror your current API response shape
-    # (your route can also set cookie using WEB_AUTH_COOKIE_NAME)
     return {
         "ok": True,
         "account_id": account_id,
@@ -301,7 +291,7 @@ def verify_web_otp(
 
 
 # --------------------------------------------------
-# TOKEN CREATE (web_tokens)
+# TOKEN CREATE (web_tokens)  -> revoked BOOLEAN
 # --------------------------------------------------
 def _create_web_token(
     account_id: str,
@@ -318,7 +308,7 @@ def _create_web_token(
         "account_id": account_id,
         "token_hash": token_hash,
         "expires_at": _iso(expires_at),
-        "revoked_at": None,
+        "revoked": False,          # ✅ boolean column
         "last_seen_at": _iso(now),
     }
     if ip:
@@ -334,13 +324,9 @@ def _create_web_token(
 
 
 # --------------------------------------------------
-# TOKEN VALIDATION (bearer token)
+# TOKEN VALIDATION (bearer token) -> revoked BOOLEAN
 # --------------------------------------------------
 def require_web_session(auth_header: str) -> Dict[str, Any]:
-    """
-    Keep name for backwards compatibility with your routes.
-    Validates against web_tokens (NOT web_sessions).
-    """
     token = _normalize_bearer(auth_header)
     if not token:
         return {"ok": False, "error": "missing_token"}
@@ -353,7 +339,7 @@ def require_web_session(auth_header: str) -> Dict[str, Any]:
         .table(WEB_TOKENS_TABLE)
         .select("*")
         .eq("token_hash", token_hash)
-        .is_("revoked_at", "null")
+        .eq("revoked", False)      # ✅ boolean filter
         .limit(1)
         .execute()
     )
@@ -365,7 +351,7 @@ def require_web_session(auth_header: str) -> Dict[str, Any]:
     exp = datetime.fromisoformat(str(row["expires_at"]).replace("Z", "+00:00"))
     if now > exp:
         # revoke on sight
-        _sb().table(WEB_TOKENS_TABLE).update({"revoked_at": _iso(now)}).eq("token_hash", token_hash).execute()
+        _sb().table(WEB_TOKENS_TABLE).update({"revoked": True}).eq("token_hash", token_hash).execute()
         return {"ok": False, "error": "session_expired"}
 
     # touch last_seen_at
@@ -378,10 +364,6 @@ def require_web_session(auth_header: str) -> Dict[str, Any]:
 # AUTH RESOLUTION (cookie OR bearer) — PREFER BEARER FIRST
 # --------------------------------------------------
 def get_account_id_from_request(flask_request) -> Tuple[Optional[str], str]:
-    """
-    Returns (account_id, source) where source is "bearer" | "cookie" | "none".
-    IMPORTANT: prefer Bearer over Cookie (fixes your “source=cookie even when token passed” issue).
-    """
     # 1) Bearer first
     auth = (flask_request.headers.get("Authorization") or "").strip()
     if auth:
@@ -400,7 +382,7 @@ def get_account_id_from_request(flask_request) -> Tuple[Optional[str], str]:
             .table(WEB_TOKENS_TABLE)
             .select("*")
             .eq("token_hash", token_hash)
-            .is_("revoked_at", "null")
+            .eq("revoked", False)   # ✅ boolean filter
             .limit(1)
             .execute()
         )
@@ -421,7 +403,7 @@ def get_account_id_from_request(flask_request) -> Tuple[Optional[str], str]:
 
 
 # --------------------------------------------------
-# LOGOUT
+# LOGOUT -> revoked BOOLEAN
 # --------------------------------------------------
 def logout_web_session(auth_header: str) -> Dict[str, Any]:
     token = _normalize_bearer(auth_header)
@@ -429,6 +411,5 @@ def logout_web_session(auth_header: str) -> Dict[str, Any]:
         return {"ok": False, "error": "missing_token"}
 
     token_hash = _hash_token(token)
-    now = _now_utc()
-    _sb().table(WEB_TOKENS_TABLE).update({"revoked_at": _iso(now)}).eq("token_hash", token_hash).execute()
+    _sb().table(WEB_TOKENS_TABLE).update({"revoked": True}).eq("token_hash", token_hash).execute()
     return {"ok": True}
