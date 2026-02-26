@@ -20,7 +20,7 @@ WEB_AUTH_OTP_TABLE = os.getenv("WEB_OTP_TABLE", "web_otps")
 WEB_AUTH_TOKEN_TABLE = os.getenv("WEB_TOKEN_TABLE", "web_tokens")
 WEB_AUTH_ACCOUNTS_TABLE = os.getenv("ACCOUNTS_TABLE", "accounts")
 
-# For internal use (keep names stable)
+# Internal aliases
 OTP_TABLE = WEB_AUTH_OTP_TABLE
 TOKEN_TABLE = WEB_AUTH_TOKEN_TABLE
 ACCOUNTS_TABLE = WEB_AUTH_ACCOUNTS_TABLE
@@ -32,6 +32,10 @@ MAX_ATTEMPTS = int(os.getenv("WEB_OTP_MAX_ATTEMPTS", "5"))
 
 SESSION_COOKIE_NAME = WEB_AUTH_COOKIE_NAME
 
+# Token settings
+TOKEN_TTL_SECONDS = int(os.getenv("WEB_TOKEN_TTL_SECONDS", "2592000"))  # 30 days
+TOKEN_LENGTH_BYTES = int(os.getenv("WEB_TOKEN_BYTES", "32"))
+
 # Dev bypass (optional)
 BYPASS_TOKEN = (os.getenv("BYPASS_TOKEN") or "").strip()
 
@@ -41,6 +45,10 @@ BYPASS_TOKEN = (os.getenv("BYPASS_TOKEN") or "").strip()
 # -----------------------------
 def _now_ts() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _ts_plus(seconds: int) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + seconds))
 
 
 def _sha256_hex(s: str) -> str:
@@ -82,8 +90,13 @@ def _extract_dev_bypass(req: Request) -> bool:
     return False
 
 
+def _random_token() -> str:
+    # URL-safe token, stable length
+    return secrets.token_urlsafe(TOKEN_LENGTH_BYTES)
+
+
 # -----------------------------
-# OTP API (matches your existing DB schema)
+# OTP API
 # -----------------------------
 def request_email_otp(email: str, purpose: str | None = None, request_ip: str | None = None) -> Dict[str, Any]:
     sb = get_supabase_client(admin=True)
@@ -96,14 +109,13 @@ def request_email_otp(email: str, purpose: str | None = None, request_ip: str | 
 
     otp_plain = _generate_numeric_code(OTP_LENGTH)
     code_hash = _sha256_hex(otp_plain)
-
-    expires_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + OTP_TTL_SECONDS))
+    expires_at = _ts_plus(OTP_TTL_SECONDS)
 
     row = {
         "contact": contact,
         "purpose": purpose,
         "code_hash": code_hash,
-        "code_plain": None,   # keep null in prod
+        "code_plain": None,  # keep null in prod
         "expires_at": expires_at,
         "used": False,
         "used_at": None,
@@ -115,32 +127,16 @@ def request_email_otp(email: str, purpose: str | None = None, request_ip: str | 
         "channel": "email",
         "email_sent": None,
         "email_error": None,
-        "otp_code": None,     # legacy (keep null)
+        "otp_code": None,  # legacy
         "phone_e164": None,
     }
 
     try:
         res = sb.table(OTP_TABLE).insert(row).execute()
         if getattr(res, "error", None):
-            return {
-                "ok": False,
-                "error": "otp_insert_failed",
-                "root_cause": str(res.error),
-                "debug": {
-                    "cookie": {"name": SESSION_COOKIE_NAME},
-                    "tables": {"otp_table": OTP_TABLE, "token_table": TOKEN_TABLE},
-                },
-            }
+            return {"ok": False, "error": "otp_insert_failed", "root_cause": str(res.error)}
     except Exception as e:
-        return {
-            "ok": False,
-            "error": "otp_insert_failed",
-            "root_cause": repr(e),
-            "debug": {
-                "cookie": {"name": SESSION_COOKIE_NAME},
-                "tables": {"otp_table": OTP_TABLE, "token_table": TOKEN_TABLE},
-            },
-        }
+        return {"ok": False, "error": "otp_insert_failed", "root_cause": repr(e)}
 
     dev_return_plain = _truthy(os.getenv("WEB_OTP_RETURN_PLAIN"))
 
@@ -201,13 +197,18 @@ def verify_email_otp(email: str, otp_code: str, purpose: str | None = None) -> D
     if not chosen:
         return {"ok": False, "error": "otp_not_found"}
 
+    # Expiry check (string timestamps are ISO; lexicographic works for Z format)
+    expires_at = (chosen.get("expires_at") or "").strip()
+    if expires_at and expires_at < _now_ts():
+        return {"ok": False, "error": "otp_expired"}
+
     if (chosen.get("code_hash") or "") != otp_hash:
         attempts = int(chosen.get("attempts") or 0) + 1
         updates: Dict[str, Any] = {"attempts": attempts, "last_attempt_at": _now_ts()}
 
         if attempts >= MAX_ATTEMPTS:
             lock_seconds = int(os.getenv("WEB_OTP_LOCK_SECONDS", "600"))
-            updates["locked_until"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + lock_seconds))
+            updates["locked_until"] = _ts_plus(lock_seconds)
 
         try:
             sb.table(OTP_TABLE).update(updates).eq("id", chosen["id"]).execute()
@@ -225,20 +226,140 @@ def verify_email_otp(email: str, otp_code: str, purpose: str | None = None) -> D
 
 
 # -----------------------------
-# Backwards-compatible exports expected by app.routes.web_auth
+# Account + token issuance
+# -----------------------------
+def _ensure_web_account(contact_email: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Ensures an accounts row exists for this web user.
+    Returns (account_id, error).
+    Assumes accounts table has at least: id, provider, provider_user_id, display_name, email/phone optional.
+    """
+    sb = get_supabase_client(admin=True)
+
+    provider = "web"
+    provider_user_id = contact_email  # stable mapping
+
+    try:
+        # try fetch
+        res = (
+            sb.table(ACCOUNTS_TABLE)
+            .select("id")
+            .eq("provider", provider)
+            .eq("provider_user_id", provider_user_id)
+            .limit(1)
+            .execute()
+        )
+        if getattr(res, "error", None):
+            return None, str(res.error)
+
+        row = (res.data or [None])[0]
+        if row and row.get("id"):
+            return row["id"], None
+
+        # insert
+        ins = {
+            "provider": provider,
+            "provider_user_id": provider_user_id,
+            "display_name": None,
+            "phone": None,
+            "email": contact_email,
+            "created_at": _now_ts(),
+            "updated_at": _now_ts(),
+        }
+        res2 = sb.table(ACCOUNTS_TABLE).insert(ins).execute()
+        if getattr(res2, "error", None):
+            return None, str(res2.error)
+
+        # inserted row
+        row2 = (res2.data or [None])[0]
+        if row2 and row2.get("id"):
+            return row2["id"], None
+
+        # if supabase doesn't return row due to settings, refetch
+        res3 = (
+            sb.table(ACCOUNTS_TABLE)
+            .select("id")
+            .eq("provider", provider)
+            .eq("provider_user_id", provider_user_id)
+            .limit(1)
+            .execute()
+        )
+        if getattr(res3, "error", None):
+            return None, str(res3.error)
+        row3 = (res3.data or [None])[0]
+        if row3 and row3.get("id"):
+            return row3["id"], None
+
+        return None, "account_create_failed"
+    except Exception as e:
+        return None, repr(e)
+
+
+def _issue_web_token(account_id: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Inserts a token into web_tokens and returns (token, expires_at, error).
+    Assumes web_tokens has at least: token, account_id, created_at, expires_at, revoked_at
+    """
+    sb = get_supabase_client(admin=True)
+
+    token = _random_token()
+    expires_at = _ts_plus(TOKEN_TTL_SECONDS)
+
+    row = {
+        "token": token,
+        "account_id": account_id,
+        "created_at": _now_ts(),
+        "expires_at": expires_at,
+        "revoked_at": None,
+    }
+
+    try:
+        res = sb.table(TOKEN_TABLE).insert(row).execute()
+        if getattr(res, "error", None):
+            return None, None, str(res.error)
+        return token, expires_at, None
+    except Exception as e:
+        return None, None, repr(e)
+
+
+def verify_web_otp_and_issue_token(contact: str, otp: str, purpose: str | None = None) -> Dict[str, Any]:
+    """
+    REQUIRED by app.routes.web_auth.
+    Flow: verify OTP -> ensure web account -> issue token.
+    """
+    contact_email = (contact or "").strip().lower()
+    if not contact_email:
+        return {"ok": False, "error": "contact_required"}
+
+    v = verify_email_otp(contact_email, otp_code=otp, purpose=purpose)
+    if not v.get("ok"):
+        return v
+
+    account_id, err = _ensure_web_account(contact_email)
+    if err or not account_id:
+        return {"ok": False, "error": "account_error", "root_cause": err}
+
+    token, expires_at, err2 = _issue_web_token(account_id)
+    if err2 or not token:
+        return {"ok": False, "error": "token_issue_failed", "root_cause": err2}
+
+    return {
+        "ok": True,
+        "account_id": account_id,
+        "token": token,
+        "expires_at": expires_at,
+        "cookie_name": SESSION_COOKIE_NAME,
+    }
+
+
+# -----------------------------
+# Backwards-compatible exports expected by routes
 # -----------------------------
 def request_web_otp(contact: str, purpose: str | None = None, request_ip: str | None = None) -> Dict[str, Any]:
-    """
-    Alias required by app.routes.web_auth.
-    Your DB shows contact is email for web_login, so map to request_email_otp.
-    """
     return request_email_otp(contact, purpose=purpose, request_ip=request_ip)
 
 
 def verify_web_otp(contact: str, otp: str, purpose: str | None = None) -> Dict[str, Any]:
-    """
-    Alias required by app.routes.web_auth.
-    """
     return verify_email_otp(contact, otp_code=otp, purpose=purpose)
 
 
@@ -246,16 +367,6 @@ def verify_web_otp(contact: str, otp: str, purpose: str | None = None) -> Dict[s
 # Auth resolver used by /ask
 # -----------------------------
 def get_account_id_from_request(req: Request) -> Tuple[Optional[str], Dict[str, Any]]:
-    """
-    Returns: (account_id, debug)
-
-    Resolution order:
-      1) body.account_id (if present)
-      2) Dev bypass token -> returns (None, {"bypass": True})
-      3) Bearer token -> lookup in TOKEN_TABLE -> account_id
-      4) Session cookie -> lookup in TOKEN_TABLE -> account_id
-      5) X-Account-Id header (optional fallback)
-    """
     debug: Dict[str, Any] = {"cookie": {"name": SESSION_COOKIE_NAME}}
 
     # JSON body account_id
