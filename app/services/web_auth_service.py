@@ -60,6 +60,9 @@ WEB_OTPS_TABLE = _env("WEB_OTPS_TABLE", "web_otps")
 WEB_TOKENS_TABLE = _env("WEB_TOKENS_TABLE", "web_tokens")
 ACCOUNTS_TABLE = _env("ACCOUNTS_TABLE", "accounts")
 
+# Accounts PK field (IMPORTANT: your FK is web_tokens.account_id -> accounts.id)
+ACCOUNTS_PK_FIELD = _env("ACCOUNTS_PK_FIELD", "id")
+
 
 def _sb():
     return supabase() if callable(supabase) else supabase
@@ -115,12 +118,15 @@ def _dev_guard(contact: str, shared_secret: Optional[str]) -> Optional[str]:
 
 # --------------------------------------------------
 # Account binding (provider=web, provider_user_id=contact)
+# IMPORTANT: accounts PK is assumed to be ACCOUNTS_PK_FIELD (default: "id")
 # --------------------------------------------------
 def _get_or_create_web_account(contact: str) -> Tuple[bool, Optional[str], Optional[str]]:
+    pk = ACCOUNTS_PK_FIELD or "id"
+
     q = (
         _sb()
         .table(ACCOUNTS_TABLE)
-        .select("account_id")
+        .select(pk)
         .eq("provider", "web")
         .eq("provider_user_id", contact)
         .limit(1)
@@ -128,7 +134,7 @@ def _get_or_create_web_account(contact: str) -> Tuple[bool, Optional[str], Optio
     )
 
     if getattr(q, "data", None):
-        return True, str(q.data[0]["account_id"]), None
+        return True, str(q.data[0][pk]), None
 
     ins = (
         _sb()
@@ -142,14 +148,15 @@ def _get_or_create_web_account(contact: str) -> Tuple[bool, Optional[str], Optio
                 "phone_e164": contact,
             }
         )
-        .select("account_id")
+        .select(pk)
         .execute()
     )
 
     if not getattr(ins, "data", None):
-        return False, None, "Failed to create account"
+        err_msg = getattr(ins, "error", None) or "Failed to create account"
+        return False, None, str(err_msg)
 
-    return True, str(ins.data[0]["account_id"]), None
+    return True, str(ins.data[0][pk]), None
 
 
 # --------------------------------------------------
@@ -305,10 +312,10 @@ def _create_web_token(
     expires_at = now + timedelta(days=int(WEB_AUTH_TOKEN_TTL_DAYS))
 
     payload: Dict[str, Any] = {
-        "account_id": account_id,
+        "account_id": account_id,     # must exist in accounts.<ACCOUNTS_PK_FIELD>
         "token_hash": token_hash,
         "expires_at": _iso(expires_at),
-        "revoked": False,          # ✅ boolean column
+        "revoked": False,             # boolean column
         "last_seen_at": _iso(now),
     }
     if ip:
@@ -339,7 +346,7 @@ def require_web_session(auth_header: str) -> Dict[str, Any]:
         .table(WEB_TOKENS_TABLE)
         .select("*")
         .eq("token_hash", token_hash)
-        .eq("revoked", False)      # ✅ boolean filter
+        .eq("revoked", False)
         .limit(1)
         .execute()
     )
@@ -382,7 +389,7 @@ def get_account_id_from_request(flask_request) -> Tuple[Optional[str], str]:
             .table(WEB_TOKENS_TABLE)
             .select("*")
             .eq("token_hash", token_hash)
-            .eq("revoked", False)   # ✅ boolean filter
+            .eq("revoked", False)
             .limit(1)
             .execute()
         )
