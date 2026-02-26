@@ -1,3 +1,4 @@
+# app/services/web_auth_service.py
 from __future__ import annotations
 
 import hashlib
@@ -6,6 +7,8 @@ import os
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple
+
+from flask import Request
 
 from app.core.config import (
     WEB_AUTH_ENABLED,
@@ -47,6 +50,35 @@ def _normalize_bearer(auth_header: str) -> str:
     v = auth_header.strip()
     if v.lower().startswith("bearer "):
         return v[7:].strip()
+    return ""
+
+
+# --------------------------------------------------
+# Token extraction (NEW)
+# --------------------------------------------------
+def _extract_web_token_from_request(req: Request) -> str:
+    """
+    Web session token can come from:
+    - Authorization: Bearer <token>
+    - X-Auth-Token: <token>
+    - Cookie: WEB_AUTH_COOKIE_NAME (default: ntg_session)
+    """
+    # header bearer
+    bearer = _normalize_bearer(req.headers.get("Authorization") or "")
+    if bearer:
+        return bearer
+
+    # header x token
+    x_token = (req.headers.get("X-Auth-Token") or "").strip()
+    if x_token:
+        return x_token
+
+    # cookie token
+    cookie_name = (os.getenv("WEB_AUTH_COOKIE_NAME") or "ntg_session").strip() or "ntg_session"
+    c = (req.cookies.get(cookie_name) or "").strip()
+    if c:
+        return c
+
     return ""
 
 
@@ -213,7 +245,7 @@ def _create_session(account_id: str, phone_e164: str, device_id: Optional[str]):
 
 
 # --------------------------------------------------
-# SESSION VALIDATION
+# SESSION VALIDATION (existing)
 # --------------------------------------------------
 def require_web_session(auth_header: str):
 
@@ -244,6 +276,56 @@ def require_web_session(auth_header: str):
     return {
         "ok": True,
         "account_id": row["account_id"],
+    }
+
+
+# --------------------------------------------------
+# SESSION VALIDATION (NEW, request-based)
+# --------------------------------------------------
+def resolve_web_identity_from_request(req: Request) -> Dict[str, Any]:
+    """
+    ✅ New helper for endpoints like /api/ask that want server-trusted identity.
+    Reads token from bearer/X-Auth-Token/cookie and resolves web_sessions row.
+
+    Returns:
+      { ok: True, account_id: "...", provider_user_id: "<phone_e164>", source: "cookie|bearer" }
+      or { ok: False, error: "..." }
+    """
+    token = _extract_web_token_from_request(req)
+    if not token:
+        return {"ok": False, "error": "missing_token"}
+
+    token_hash = _hash(f"session:{token}")
+
+    q = (
+        supabase.table("web_sessions")
+        .select("*")
+        .eq("token_hash", token_hash)
+        .eq("revoked", False)
+        .limit(1)
+        .execute()
+    )
+
+    if not q.data:
+        return {"ok": False, "error": "invalid_token"}
+
+    row = q.data[0]
+
+    exp = datetime.fromisoformat(row["expires_at"].replace("Z", "+00:00"))
+    if _now_utc() > exp:
+        return {"ok": False, "error": "session_expired"}
+
+    # provider_user_id (web) = phone_e164 by your schema
+    phone = (row.get("phone_e164") or "").strip() or None
+
+    # best guess auth source
+    source = "cookie" if (req.cookies.get((os.getenv("WEB_AUTH_COOKIE_NAME") or "ntg_session").strip() or "ntg_session")) else "bearer"
+
+    return {
+        "ok": True,
+        "account_id": row["account_id"],
+        "provider_user_id": phone,
+        "source": source,
     }
 
 
