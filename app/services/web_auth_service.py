@@ -8,50 +8,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple
 
-from flask import Request
-
-# ✅ Do NOT hard-import missing symbols from app.core.config
-# We import the module, then use getattr(...) with fallbacks.
-try:
-    import app.core.config as _cfg  # type: ignore
-except Exception:  # pragma: no cover
-    _cfg = None  # type: ignore
-
 from app.core.supabase_client import supabase
-
-
-# -----------------------------
-# Safe config getters
-# -----------------------------
-def _cfg_get(name: str, default: Any = None) -> Any:
-    if _cfg is None:
-        return default
-    return getattr(_cfg, name, default)
-
-
-def _truthy(v: Any) -> bool:
-    return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-# ---- Config values (safe) ----
-WEB_AUTH_ENABLED = _truthy(_cfg_get("WEB_AUTH_ENABLED", os.getenv("WEB_AUTH_ENABLED", "0")))
-WEB_AUTH_DEV_OTP_ENABLED = _truthy(_cfg_get("WEB_AUTH_DEV_OTP_ENABLED", os.getenv("WEB_AUTH_DEV_OTP_ENABLED", "0")))
-
-WEB_AUTH_OTP_TTL_SECONDS = int(_cfg_get("WEB_AUTH_OTP_TTL_SECONDS", os.getenv("WEB_AUTH_OTP_TTL_SECONDS", "600")) or 600)
-
-WEB_AUTH_MASTER_OTP = str(_cfg_get("WEB_AUTH_MASTER_OTP", os.getenv("WEB_AUTH_MASTER_OTP", "")) or "").strip()
-
-WEB_AUTH_DEV_SHARED_SECRET = str(_cfg_get("WEB_AUTH_DEV_SHARED_SECRET", os.getenv("WEB_AUTH_DEV_SHARED_SECRET", "")) or "").strip()
-
-# allowed phones list: config may define list already; env may define comma list
-_allowed_list = _cfg_get("WEB_AUTH_DEV_ALLOWED_PHONES_LIST", None)
-if isinstance(_allowed_list, list):
-    WEB_AUTH_DEV_ALLOWED_PHONES_LIST = [str(x).strip() for x in _allowed_list if str(x).strip()]
-else:
-    _raw = str(os.getenv("WEB_AUTH_DEV_ALLOWED_PHONES_LIST", "") or "").strip()
-    WEB_AUTH_DEV_ALLOWED_PHONES_LIST = [x.strip() for x in _raw.split(",") if x.strip()]
-
-OTP_HASH_PEPPER = str(_cfg_get("OTP_HASH_PEPPER", os.getenv("OTP_HASH_PEPPER", "")) or "").strip()
 
 
 # --------------------------------------------------
@@ -66,10 +23,40 @@ def _iso(dt: datetime) -> str:
 
 
 # --------------------------------------------------
+# Env helpers (NO app.core.config imports, to prevent boot crashes)
+# --------------------------------------------------
+def _env(name: str, default: str = "") -> str:
+    return (os.getenv(name, default) or default).strip()
+
+
+def _truthy(v: str | None) -> bool:
+    return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+WEB_AUTH_ENABLED = _truthy(_env("WEB_AUTH_ENABLED", "1"))
+WEB_AUTH_DEV_OTP_ENABLED = _truthy(_env("WEB_AUTH_DEV_OTP_ENABLED", "0"))
+WEB_AUTH_OTP_TTL_SECONDS = int(_env("WEB_AUTH_OTP_TTL_SECONDS", "600") or "600")
+WEB_AUTH_MASTER_OTP = _env("WEB_AUTH_MASTER_OTP", "")
+WEB_AUTH_DEV_SHARED_SECRET = _env("WEB_AUTH_DEV_SHARED_SECRET", "")
+WEB_AUTH_DEV_ALLOWED_PHONES_LIST = [
+    x.strip() for x in (_env("WEB_AUTH_DEV_ALLOWED_PHONES_LIST", "")).split(",") if x.strip()
+]
+
+OTP_HASH_PEPPER = _env("OTP_HASH_PEPPER", _env("ADMIN_API_KEY", "dev-pepper"))
+
+WEB_AUTH_COOKIE_NAME = _env("WEB_AUTH_COOKIE_NAME", _env("WEB_COOKIE_NAME", "ntg_session"))
+WEB_SESSIONS_TABLE = _env("WEB_SESSIONS_TABLE", "web_sessions")
+
+
+def _sb():
+    return supabase() if callable(supabase) else supabase
+
+
+# --------------------------------------------------
 # Hashing
 # --------------------------------------------------
 def _hash(value: str) -> str:
-    pepper = (OTP_HASH_PEPPER or os.getenv("ADMIN_API_KEY") or "dev-pepper").encode()
+    pepper = (OTP_HASH_PEPPER or "dev-pepper").encode()
     return hmac.new(pepper, value.encode(), hashlib.sha256).hexdigest()
 
 
@@ -82,26 +69,6 @@ def _normalize_bearer(auth_header: str) -> str:
     v = auth_header.strip()
     if v.lower().startswith("bearer "):
         return v[7:].strip()
-    return ""
-
-
-# --------------------------------------------------
-# Token extraction (bearer / X-Auth-Token / cookie)
-# --------------------------------------------------
-def _extract_web_token_from_request(req: Request) -> str:
-    bearer = _normalize_bearer(req.headers.get("Authorization") or "")
-    if bearer:
-        return bearer
-
-    x_token = (req.headers.get("X-Auth-Token") or "").strip()
-    if x_token:
-        return x_token
-
-    cookie_name = (os.getenv("WEB_AUTH_COOKIE_NAME") or "ntg_session").strip() or "ntg_session"
-    c = (req.cookies.get(cookie_name) or "").strip()
-    if c:
-        return c
-
     return ""
 
 
@@ -130,23 +97,25 @@ def _dev_guard(phone_e164: str, shared_secret: Optional[str]) -> Optional[str]:
 # --------------------------------------------------
 def _get_or_create_account_by_phone(phone_e164: str) -> Tuple[bool, Optional[str], Optional[str]]:
     q = (
-        supabase.table("accounts")
+        _sb()
+        .table("accounts")
         .select("id")
         .eq("phone_e164", phone_e164)
         .limit(1)
         .execute()
     )
 
-    if q.data:
+    if getattr(q, "data", None):
         account_id = q.data[0]["id"]
     else:
         ins = (
-            supabase.table("accounts")
+            _sb()
+            .table("accounts")
             .insert({"phone_e164": phone_e164})
             .select("id")
             .execute()
         )
-        if not ins.data:
+        if not getattr(ins, "data", None):
             return False, None, "Failed to create account"
         account_id = ins.data[0]["id"]
 
@@ -161,15 +130,15 @@ def request_web_otp(phone_e164: str, device_id: Optional[str], shared_secret: Op
     if err:
         return {"ok": False, "error": err}
 
-    # soft revoke old OTPs
-    supabase.table("web_otps").update({"revoked": True}).eq("phone_e164", phone_e164).eq("revoked", False).execute()
+    # Soft revoke instead of reject
+    _sb().table("web_otps").update({"revoked": True}).eq("phone_e164", phone_e164).eq("revoked", False).execute()
 
     otp = f"{secrets.randbelow(1000000):06d}"
     expires_at = _now_utc() + timedelta(seconds=int(WEB_AUTH_OTP_TTL_SECONDS))
 
     otp_hash = _hash(f"{phone_e164}:{otp}")
 
-    supabase.table("web_otps").insert(
+    _sb().table("web_otps").insert(
         {
             "phone_e164": phone_e164,
             "device_id": device_id,
@@ -197,7 +166,8 @@ def verify_web_otp(phone_e164: str, otp: str, device_id: Optional[str]):
         return _create_session(account_id, phone_e164, device_id)
 
     q = (
-        supabase.table("web_otps")
+        _sb()
+        .table("web_otps")
         .select("*")
         .eq("phone_e164", phone_e164)
         .eq("revoked", False)
@@ -206,15 +176,16 @@ def verify_web_otp(phone_e164: str, otp: str, device_id: Optional[str]):
         .execute()
     )
 
-    if not q.data:
+    if not getattr(q, "data", None):
         return {"ok": False, "error": "OTP not found"}
 
     row = q.data[0]
+
     incoming_hash = _hash(f"{phone_e164}:{otp}")
-    if incoming_hash != row["otp_hash"]:
+    if incoming_hash != row.get("otp_hash"):
         return {"ok": False, "error": "Invalid OTP"}
 
-    supabase.table("web_otps").update({"revoked": True}).eq("id", row["id"]).execute()
+    _sb().table("web_otps").update({"revoked": True}).eq("id", row["id"]).execute()
 
     ok, account_id, error = _get_or_create_account_by_phone(phone_e164)
     if not ok:
@@ -232,7 +203,7 @@ def _create_session(account_id: str, phone_e164: str, device_id: Optional[str]):
 
     expires_at = _now_utc() + timedelta(days=30)
 
-    supabase.table("web_sessions").insert(
+    _sb().table(WEB_SESSIONS_TABLE).insert(
         {
             "account_id": account_id,
             "phone_e164": phone_e164,
@@ -247,7 +218,7 @@ def _create_session(account_id: str, phone_e164: str, device_id: Optional[str]):
 
 
 # --------------------------------------------------
-# SESSION VALIDATION (header-based, existing)
+# SESSION VALIDATION (bearer token)
 # --------------------------------------------------
 def require_web_session(auth_header: str):
     token = _normalize_bearer(auth_header)
@@ -256,12 +227,22 @@ def require_web_session(auth_header: str):
 
     token_hash = _hash(f"session:{token}")
 
-    q = supabase.table("web_sessions").select("*").eq("token_hash", token_hash).eq("revoked", False).limit(1).execute()
-    if not q.data:
+    q = (
+        _sb()
+        .table(WEB_SESSIONS_TABLE)
+        .select("*")
+        .eq("token_hash", token_hash)
+        .eq("revoked", False)
+        .limit(1)
+        .execute()
+    )
+
+    if not getattr(q, "data", None):
         return {"ok": False, "error": "invalid_token"}
 
     row = q.data[0]
-    exp = datetime.fromisoformat(row["expires_at"].replace("Z", "+00:00"))
+
+    exp = datetime.fromisoformat(str(row["expires_at"]).replace("Z", "+00:00"))
     if _now_utc() > exp:
         return {"ok": False, "error": "session_expired"}
 
@@ -269,29 +250,39 @@ def require_web_session(auth_header: str):
 
 
 # --------------------------------------------------
-# SESSION VALIDATION (request-based, NEW helper)
+# SESSION VALIDATION (cookie OR bearer)
 # --------------------------------------------------
-def resolve_web_identity_from_request(req: Request) -> Dict[str, Any]:
-    token = _extract_web_token_from_request(req)
-    if not token:
-        return {"ok": False, "error": "missing_token"}
+def get_account_id_from_request(flask_request) -> Tuple[Optional[str], str]:
+    """
+    Returns (account_id, source) where source is "cookie" | "bearer" | "none".
+    """
+    raw_cookie = (flask_request.cookies.get(WEB_AUTH_COOKIE_NAME) or "").strip()
+    if raw_cookie:
+        token_hash = _hash(f"session:{raw_cookie}")
+        q = (
+            _sb()
+            .table(WEB_SESSIONS_TABLE)
+            .select("*")
+            .eq("token_hash", token_hash)
+            .eq("revoked", False)
+            .limit(1)
+            .execute()
+        )
+        if getattr(q, "data", None):
+            row = q.data[0]
+            try:
+                exp = datetime.fromisoformat(str(row["expires_at"]).replace("Z", "+00:00"))
+                if _now_utc() <= exp:
+                    return str(row["account_id"]), "cookie"
+            except Exception:
+                pass
 
-    token_hash = _hash(f"session:{token}")
+    auth = (flask_request.headers.get("Authorization") or "").strip()
+    out = require_web_session(auth)
+    if out.get("ok"):
+        return str(out.get("account_id")), "bearer"
 
-    q = supabase.table("web_sessions").select("*").eq("token_hash", token_hash).eq("revoked", False).limit(1).execute()
-    if not q.data:
-        return {"ok": False, "error": "invalid_token"}
-
-    row = q.data[0]
-    exp = datetime.fromisoformat(row["expires_at"].replace("Z", "+00:00"))
-    if _now_utc() > exp:
-        return {"ok": False, "error": "session_expired"}
-
-    phone = (row.get("phone_e164") or "").strip() or None
-    cookie_name = (os.getenv("WEB_AUTH_COOKIE_NAME") or "ntg_session").strip() or "ntg_session"
-    source = "cookie" if (req.cookies.get(cookie_name) or "").strip() else "bearer"
-
-    return {"ok": True, "account_id": row["account_id"], "provider_user_id": phone, "source": source}
+    return None, "none"
 
 
 # --------------------------------------------------
@@ -303,5 +294,5 @@ def logout_web_session(auth_header: str):
         return {"ok": False, "error": "missing_token"}
 
     token_hash = _hash(f"session:{token}")
-    supabase.table("web_sessions").update({"revoked": True}).eq("token_hash", token_hash).execute()
+    _sb().table(WEB_SESSIONS_TABLE).update({"revoked": True}).eq("token_hash", token_hash).execute()
     return {"ok": True}
