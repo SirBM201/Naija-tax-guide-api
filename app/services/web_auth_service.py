@@ -116,6 +116,7 @@ def request_email_otp(email: str, purpose: str | None = None, request_ip: str | 
         "email_sent": None,
         "email_error": None,
         "otp_code": None,     # legacy (keep null)
+        "phone_e164": None,
     }
 
     try:
@@ -221,6 +222,24 @@ def verify_email_otp(email: str, otp_code: str, purpose: str | None = None) -> D
         return {"ok": False, "error": "otp_mark_used_failed", "root_cause": repr(e)}
 
     return {"ok": True, "contact": contact, "purpose": purpose}
+
+
+# -----------------------------
+# Backwards-compatible exports expected by app.routes.web_auth
+# -----------------------------
+def request_web_otp(contact: str, purpose: str | None = None, request_ip: str | None = None) -> Dict[str, Any]:
+    """
+    Alias required by app.routes.web_auth.
+    Your DB shows contact is email for web_login, so map to request_email_otp.
+    """
+    return request_email_otp(contact, purpose=purpose, request_ip=request_ip)
+
+
+def verify_web_otp(contact: str, otp: str, purpose: str | None = None) -> Dict[str, Any]:
+    """
+    Alias required by app.routes.web_auth.
+    """
+    return verify_email_otp(contact, otp_code=otp, purpose=purpose)
 
 
 # -----------------------------
