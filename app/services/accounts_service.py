@@ -47,6 +47,10 @@ def _is_uuid(value: str) -> bool:
         return False
 
 
+def _safe_str(v: Any) -> str:
+    return (v or "").strip()
+
+
 # ---------------------------------------------------------
 # Provider normalization (must match DB constraint list)
 # ---------------------------------------------------------
@@ -125,7 +129,7 @@ def upsert_account(
             returning="representation",
         ).execute()
     except Exception as e:
-        return {"ok": False, "error": f"DB error: {str(e)}"}
+        return {"ok": False, "error": "db_error", "message": str(e)[:220]}
 
     row = (res.data or [None])[0]
     return {"ok": True, "account": row}
@@ -147,14 +151,14 @@ def lookup_account(
         res = (
             supabase()
             .table("accounts")
-            .select("id,provider,provider_user_id,auth_user_id,display_name,phone,phone_e164,updated_at,created_at")
+            .select("id,account_id,provider,provider_user_id,auth_user_id,display_name,phone,phone_e164,updated_at,created_at")
             .eq("provider", provider)
             .eq("provider_user_id", provider_user_id)
             .limit(1)
             .execute()
         )
     except Exception as e:
-        return {"ok": False, "error": f"DB error: {str(e)}"}
+        return {"ok": False, "error": "db_error", "message": str(e)[:220]}
 
     row = (res.data or [None])[0]
     if not row:
@@ -196,8 +200,8 @@ def upsert_account_link(
         if old and old != auth_user_id:
             return {
                 "ok": False,
-                "error": "This channel is already linked to another account.",
-                "reason": "channel_already_linked",
+                "error": "channel_already_linked",
+                "message": "This channel is already linked to another account.",
             }
 
     payload = {
@@ -216,14 +220,14 @@ def upsert_account_link(
             returning="representation",
         ).execute()
     except Exception as e:
-        return {"ok": False, "error": f"DB error: {str(e)}"}
+        return {"ok": False, "error": "db_error", "message": str(e)[:220]}
 
     row = (res.data or [None])[0]
     return {"ok": True, "account": row}
 
 
 # ---------------------------------------------------------
-# REQUIRED BY web_auth.py (BACKWARD SAFE)
+# REQUIRED BY web_auth.py (GLOBAL ID SAFE)
 # ---------------------------------------------------------
 def ensure_account_id(
     *,
@@ -235,20 +239,21 @@ def ensure_account_id(
     contact: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Ensures an account exists and returns accounts.id as account_id.
+    Ensures an account exists and returns the GLOBAL account identifier:
 
-    Accepts multiple aliases to prevent future crashes:
-      - phone_e164 or phone or contact (any of them)
-    Stores phone into accounts.phone (and keeps provider_user_id as the channel ID).
+        ✅ accounts.account_id  (preferred canonical)
+        ↪ fallback to accounts.id if account_id is missing
+
+    Failure exposer:
+      - returns debug details if DB row missing critical fields.
     """
     provider = _norm_provider(provider)
     provider_user_id = (provider_user_id or "").strip()
 
     err = _validate_provider_and_id(provider, provider_user_id)
     if err:
-        return {"ok": False, "error": err}
+        return {"ok": False, "error": "bad_request", "message": err}
 
-    # prefer phone_e164, then phone, then contact
     phone_value = (phone_e164 or phone or contact or None)
 
     res = upsert_account(
@@ -261,11 +266,36 @@ def ensure_account_id(
         return res
 
     row = res.get("account") or {}
-    account_id = row.get("id")
-    if not account_id:
-        return {"ok": False, "error": "Account created but id missing (unexpected)."}
+    gid = _safe_str(row.get("account_id"))
+    pk = _safe_str(row.get("id"))
 
-    return {"ok": True, "account_id": account_id, "account": row}
+    # Repair: if account_id is blank but id exists, backfill account_id=id
+    if not gid and pk:
+        try:
+            supabase().table("accounts").update({"account_id": pk}).eq("id", pk).execute()
+            gid = pk
+        except Exception as e:
+            return {
+                "ok": False,
+                "error": "account_id_missing",
+                "message": "Account row exists but account_id is missing and repair failed.",
+                "debug": {
+                    "id": pk,
+                    "account_id": gid,
+                    "repair_error": f"{type(e).__name__}: {str(e)[:180]}",
+                    "fix_sql": 'update public.accounts set account_id = id where account_id is null;',
+                },
+            }
+
+    if not gid:
+        return {
+            "ok": False,
+            "error": "account_missing_ids",
+            "message": "Account created/updated but both id and account_id are missing (unexpected).",
+            "debug": {"row_keys": list(row.keys())[:30]},
+        }
+
+    return {"ok": True, "account_id": gid, "account": row}
 
 
 # ---------------------------------------------------------
