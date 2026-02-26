@@ -4,24 +4,16 @@ from __future__ import annotations
 """
 ASK SERVICE (CANONICAL)
 
-Goal:
-- Use ONLY canonical identity: accounts.account_id
-- Never silently treat accounts.id as the app identity
-- If older clients send accounts.id, we TRANSLATE it to accounts.account_id (and expose it)
-- Provide strong failure exposers: error + root_cause + fix (+ optional debug)
+- Uses ONLY canonical identity: accounts.account_id
+- If older clients send accounts.id, it translates to accounts.account_id and exposes it in debug
 
-This service is called by:
-- routes/ask.py (web + legacy channels)
-
-Key invariants:
-- Any downstream service that touches subscriptions/credits/tokens must receive canonical account_id.
-
+This service is called by routes/ask.py (web + legacy channels).
 """
 
 import os
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict
 
 from app.core.supabase_client import supabase
 from app.services.credits_service import check_credit_balance
@@ -29,16 +21,8 @@ from app.services.qa_cache_service import answer_from_cache, increment_cache_use
 from app.services.ai_service import call_ai
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
-
 def _sb():
     return supabase() if callable(supabase) else supabase
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 def _truthy(v: str | None) -> bool:
@@ -66,21 +50,7 @@ def _has_column(table: str, col: str) -> bool:
         return False
 
 
-# -----------------------------
-# Canonical account id resolution
-# -----------------------------
-
 def resolve_canonical_account_id(raw_account_id: str) -> Dict[str, Any]:
-    """Resolve incoming identifier to canonical accounts.account_id.
-
-    Accepts:
-      - canonical accounts.account_id
-      - legacy accounts.id (translated)
-
-    Returns:
-      { ok: True, account_id: <canonical>, translated_from_id?: <legacy-id> }
-      { ok: False, error, root_cause, fix }
-    """
     v = (raw_account_id or "").strip()
     if not v:
         return {
@@ -99,7 +69,6 @@ def resolve_canonical_account_id(raw_account_id: str) -> Dict[str, Any]:
             "details": {"account_id": v},
         }
 
-    # 1) Try canonical: accounts.account_id = v
     if _has_column("accounts", "account_id"):
         try:
             q = _sb().table("accounts").select("id,account_id").eq("account_id", v).limit(1).execute()
@@ -114,7 +83,6 @@ def resolve_canonical_account_id(raw_account_id: str) -> Dict[str, Any]:
                 "fix": "Check Supabase connectivity/RLS for accounts table.",
             }
 
-    # 2) Try legacy: accounts.id = v, translate to account_id
     try:
         q = _sb().table("accounts").select("id,account_id").eq("id", v).limit(1).execute()
         rows = getattr(q, "data", None) or []
@@ -131,7 +99,6 @@ def resolve_canonical_account_id(raw_account_id: str) -> Dict[str, Any]:
         canonical = str(row.get("account_id") or "").strip()
         row_id = str(row.get("id") or "").strip()
 
-        # auto-repair missing account_id
         if not canonical and row_id:
             try:
                 _sb().table("accounts").update({"account_id": row_id}).eq("id", row_id).execute()
@@ -165,23 +132,7 @@ def resolve_canonical_account_id(raw_account_id: str) -> Dict[str, Any]:
         }
 
 
-# -----------------------------
-# Main guarded ask
-# -----------------------------
-
 def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
-    """Guarded ask endpoint.
-
-    Expected inputs:
-      - question (required)
-      - account_id (preferred) OR web cookie/bearer sets body['account_id'] in route
-      - __bypass optional (dev)
-
-    Output:
-      { ok: True, answer, from_cache, ... }
-      { ok: False, error, root_cause, fix, ... }
-    """
-
     question = (body.get("question") or "").strip()
     if not question:
         return {
@@ -198,15 +149,13 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
 
     account_id = str(resolved["account_id"]).strip()
 
-    # Expose translation if legacy id was supplied
-    translation_debug = {}
+    translation_debug: Dict[str, Any] = {}
     if resolved.get("translated_from_id"):
         translation_debug = {
             "note": "legacy accounts.id was supplied; translated to canonical accounts.account_id",
             "translated_from_id": resolved.get("translated_from_id"),
         }
 
-    # DEV bypass: allows asking even without subscription/credits
     bypass = bool(body.get("__bypass"))
     if bypass and not _truthy(os.getenv("ALLOW_DEV_BYPASS", "1")):
         return {
@@ -216,22 +165,12 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
             "fix": "Remove bypass headers or set ALLOW_DEV_BYPASS=1 in backend env.",
         }
 
-    # 1) Try cache
-    try:
-        cached = answer_from_cache(question)
-    except Exception as e:
-        cached = None
-        cache_err = {
-            "cache_error": f"{type(e).__name__}: {_clip(str(e))}",
-            "fix": "Check qa_cache table/RPC and indexes.",
-        }
-
+    cached = answer_from_cache(question, lang=(body.get("lang") or "en"))
     if cached:
         try:
             increment_cache_use(cached.get("id"))
         except Exception:
             pass
-
         return {
             "ok": True,
             "answer": cached.get("answer"),
@@ -240,31 +179,29 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
             "debug": {**translation_debug},
         }
 
-    # 2) Credits check (unless bypass)
     if not bypass:
         bal = check_credit_balance(account_id)
         if not bal.get("ok"):
-            # make sure credit service errors are visible
             return {
                 "ok": False,
                 "error": "credit_check_failed",
                 "root_cause": bal.get("root_cause") or bal.get("error"),
-                "fix": bal.get("fix") or "Fix credits table/RPC or RLS.",
+                "fix": bal.get("fix") or "Fix credits table/RLS.",
                 "details": bal.get("details") or {"account_id": account_id},
                 "debug": {**translation_debug},
             }
 
-        if bal.get("credits", 0) <= 0:
+        balance_val = int(bal.get("balance") or 0)
+        if balance_val <= 0:
             return {
                 "ok": False,
                 "error": "insufficient_credits",
                 "root_cause": "ai_credits_balance_zero",
                 "fix": "Top up credits or subscribe to a plan that includes AI credits.",
-                "details": {"account_id": account_id, "credits": bal.get("credits")},
+                "details": {"account_id": account_id, "balance": balance_val},
                 "debug": {**translation_debug},
             }
 
-    # 3) Call AI
     try:
         ai = call_ai(question=question, lang=(body.get("lang") or "en"), channel=(body.get("channel") or "web"))
     except Exception as e:
