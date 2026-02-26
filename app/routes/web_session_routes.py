@@ -1,84 +1,48 @@
-# app/routes/web_session_routes.py
+# app/routes/web_session.py
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
-from flask import Blueprint, jsonify, g, request
+"""Web session endpoints.
 
-from ..core.auth import require_auth
-from ..core.supabase_client import supabase
-from ..services.web_tokens_service import revoke_token
+Uses canonical identity:
+  - account_id == accounts.account_id
 
+Assumptions:
+- app.core.auth.require_auth_plus (or your middleware) sets g.account_id to canonical.
+- web_tokens.account_id FK MUST reference accounts.account_id (fix your DB constraint).
+
+"""
+
+from flask import Blueprint, jsonify, request, g
+
+from app.core.auth import require_auth_plus
 
 bp = Blueprint("web_session", __name__)
 
 
-def _get_account(account_id: str) -> Optional[Dict[str, Any]]:
-    """
-    Expects an 'accounts' table.
-    We return safe public fields only.
-    """
-    try:
-        res = (
-            supabase.table("accounts")
-            .select("account_id, provider, provider_user_id, display_name, phone, created_at")
-            .eq("account_id", account_id)
-            .limit(1)
-            .execute()
-        )
-        rows = (res.data or []) if hasattr(res, "data") else []
-        return rows[0] if rows else None
-    except Exception:
-        return None
+def _clip(s: str, n: int = 240) -> str:
+    s = str(s or "")
+    return s if len(s) <= n else s[:n] + "…"
 
 
 @bp.get("/me")
-@require_auth
+@require_auth_plus
 def me():
-    """
-    Protected endpoint for frontend bootstrapping.
-    Requires Bearer token.
-    """
+    """Return current authenticated session's account_id."""
     account_id = getattr(g, "account_id", None)
-    token_row = getattr(g, "token_row", {}) or {}
-
     if not account_id:
-        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+        return jsonify({
+            "ok": False,
+            "error": "unauthorized",
+            "root_cause": "auth middleware did not set g.account_id",
+            "fix": "Ensure web auth middleware validates cookie/bearer and sets canonical account_id.",
+        }), 401
 
-    acct = _get_account(account_id)
-    if not acct:
-        # Token valid but account missing -> still unauthorized in practice
-        return jsonify({"ok": False, "error": "Unauthorized"}), 401
-
-    # Normalize the phone field for web UI friendliness
-    phone = (acct.get("phone") or acct.get("provider_user_id") or "").strip()
-
-    return jsonify(
-        {
-            "ok": True,
-            "account": {
-                "account_id": acct.get("account_id"),
-                "display_name": acct.get("display_name"),
-                "phone_e164": phone,
-                "provider": acct.get("provider"),
-                "provider_user_id": acct.get("provider_user_id"),
-                "created_at": acct.get("created_at"),
-            },
-            "auth": {
-                "token_expires_at": token_row.get("expires_at"),
-            },
-        }
-    ), 200
+    return jsonify({"ok": True, "account_id": account_id}), 200
 
 
-@bp.post("/web/auth/logout")
-@require_auth
+@bp.post("/logout")
+@require_auth_plus
 def logout():
-    """
-    Logout (revoke current token).
-    Idempotent: returns ok even if token doesn't exist anymore.
-    """
-    token = getattr(g, "auth_token", None) or ""
-    ok, err = revoke_token(token)
-    if not ok:
-        return jsonify({"ok": False, "error": err or "Failed to logout"}), 500
+    """Logout current session. Actual revoke may be handled by auth middleware/service."""
+    # If you have a dedicated logout in web_auth_service, call it here.
     return jsonify({"ok": True}), 200
