@@ -6,6 +6,7 @@ import os
 from flask import Blueprint, jsonify, request
 
 from ..services.ask_service import ask_guarded
+from ..services.web_auth_service import resolve_web_identity_from_request  # ✅ NEW (added function, same file)
 
 bp = Blueprint("ask", __name__)
 
@@ -43,12 +44,15 @@ def ask():
 
     Body:
     {
-      "account_id": "<uuid>"  OR
+      "account_id": "<uuid>"  OR (web session derived)
       "provider": "wa|tg|web",
       "provider_user_id": "<id>",
       "question": "<text>",
-      "lang": "en|pcm|yo|ig|ha" (optional)
+      "lang": "en|pcm|yo|ig|ha" (optional),
+      "channel": "<string>" (optional)
     }
+
+    ✅ Upgrade: If account_id is missing, we derive it from web session (cookie/bearer).
     """
     body = request.get_json(silent=True) or {}
 
@@ -57,9 +61,25 @@ def ask():
         return jsonify({"ok": False, "error": "question_required"}), 400
 
     # ✅ Dev bypass support:
-    # If correct bypass token is provided, mark payload for ask_service to skip subscription/credits.
     if _is_dev_bypass_request():
         body["__bypass"] = True
+
+    # ✅ Session-derived identity (web)
+    # If frontend does not send account_id, we try to derive it.
+    account_id = (body.get("account_id") or "").strip()
+    provider = (body.get("provider") or "web").strip().lower()
+    provider_user_id = (body.get("provider_user_id") or "").strip()
+
+    if not account_id and provider in {"web", ""}:
+        ident = resolve_web_identity_from_request(request)
+        if ident.get("ok"):
+            body["account_id"] = ident.get("account_id") or ""
+            body["provider"] = "web"
+            # if you want a stable provider_user_id, we attach phone/email if available
+            if not provider_user_id:
+                puid = (ident.get("provider_user_id") or "").strip()
+                if puid:
+                    body["provider_user_id"] = puid
 
     try:
         resp = ask_guarded(body)
