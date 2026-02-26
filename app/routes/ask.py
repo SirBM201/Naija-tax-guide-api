@@ -2,11 +2,10 @@
 from __future__ import annotations
 
 import os
-
 from flask import Blueprint, jsonify, request
 
 from ..services.ask_service import ask_guarded
-from ..services.web_auth_service import resolve_web_identity_from_request  # ✅ NEW (added function, same file)
+from ..services.web_auth_service import get_account_id_from_request
 
 bp = Blueprint("ask", __name__)
 
@@ -42,17 +41,22 @@ def ask():
     """
     Unified guarded AI endpoint.
 
-    Body:
+    Preferred (web cookie auth):
     {
-      "account_id": "<uuid>"  OR (web session derived)
+      "question": "<text>",
+      "lang": "en|pcm|yo|ig|ha" (optional),
+      "channel": "<optional>"
+    }
+
+    Backwards compatible:
+    {
+      "account_id": "<uuid>" OR
       "provider": "wa|tg|web",
       "provider_user_id": "<id>",
       "question": "<text>",
-      "lang": "en|pcm|yo|ig|ha" (optional),
-      "channel": "<string>" (optional)
+      "lang": "...",
+      "channel": "..."
     }
-
-    ✅ Upgrade: If account_id is missing, we derive it from web session (cookie/bearer).
     """
     body = request.get_json(silent=True) or {}
 
@@ -60,31 +64,22 @@ def ask():
     if not question:
         return jsonify({"ok": False, "error": "question_required"}), 400
 
-    # ✅ Dev bypass support:
+    # ✅ Dev bypass support
     if _is_dev_bypass_request():
         body["__bypass"] = True
 
-    # ✅ Session-derived identity (web)
-    # If frontend does not send account_id, we try to derive it.
-    account_id = (body.get("account_id") or "").strip()
-    provider = (body.get("provider") or "web").strip().lower()
-    provider_user_id = (body.get("provider_user_id") or "").strip()
-
-    if not account_id and provider in {"web", ""}:
-        ident = resolve_web_identity_from_request(request)
-        if ident.get("ok"):
-            body["account_id"] = ident.get("account_id") or ""
-            body["provider"] = "web"
-            # if you want a stable provider_user_id, we attach phone/email if available
-            if not provider_user_id:
-                puid = (ident.get("provider_user_id") or "").strip()
-                if puid:
-                    body["provider_user_id"] = puid
+    # ✅ NEW: If account_id not provided, derive from cookie/bearer session automatically
+    if not (body.get("account_id") or "").strip():
+        account_id, source = get_account_id_from_request(request)
+        if account_id:
+            body["account_id"] = account_id
+            body.setdefault("provider", "web")
+            # provider_user_id is optional; not required for guarded ask
+            body.setdefault("__auth_source", source)
 
     try:
         resp = ask_guarded(body)
 
-        # Business-rule failures still return 200 (frontend-friendly), except malformed input
         status = 200
         if not resp.get("ok") and resp.get("error") in {
             "invalid_request",
