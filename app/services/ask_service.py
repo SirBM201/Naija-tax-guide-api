@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 import os
-import time
-from datetime import date
 from typing import Any, Dict, Optional, Tuple, Union
 
 from ..core.supabase_client import supabase
@@ -74,6 +72,8 @@ def _resolve_account_id(payload: Dict[str, Any]) -> Optional[str]:
     Resolve account_id from payload:
     - if account_id present, use it
     - else if (provider, provider_user_id), lookup in accounts table
+
+    ✅ Updated to support either accounts.account_id OR accounts.id.
     """
     account_id = _safe_str(payload.get("account_id"))
     if account_id:
@@ -88,7 +88,7 @@ def _resolve_account_id(payload: Dict[str, Any]) -> Optional[str]:
         res = (
             _sb()
             .table("accounts")
-            .select("account_id")
+            .select("id,account_id")
             .eq("provider", provider)
             .eq("provider_user_id", provider_user_id)
             .limit(1)
@@ -97,7 +97,10 @@ def _resolve_account_id(payload: Dict[str, Any]) -> Optional[str]:
         rows = getattr(res, "data", None) or []
         if not rows:
             return None
-        return _safe_str(rows[0].get("account_id")) or None
+
+        row = rows[0] or {}
+        # Prefer explicit account_id, else fallback to id
+        return _safe_str(row.get("account_id")) or _safe_str(row.get("id")) or None
     except Exception:
         return None
 
@@ -242,10 +245,8 @@ def _ask_guarded_dict(payload: Dict[str, Any]) -> Dict[str, Any]:
                 out["meta"]["debug"] = debug
             return out
     else:
-        # Dev bypass pretends active
         sub = {"active": True, "state": "dev_bypass", "plan_code": "DEV", "reason": "dev_bypass"}
 
-    # Determine cache limit (paid if active)
     cache_limit = PAID_CACHE_DAILY_LIMIT if sub.get("active") else FREE_CACHE_DAILY_LIMIT
 
     # 2) Cache lookup
@@ -261,7 +262,6 @@ def _ask_guarded_dict(payload: Dict[str, Any]) -> Dict[str, Any]:
     debug.update(_dbg_pack(stage="cache_checked", canonical_key=ck, cache_hit=bool(cache_row)))
 
     if cache_row and cache_row.get("answer"):
-        # Enforce daily cache limit (SKIP when dev bypass)
         if not bypass:
             used_before = get_cache_used_today(account_id)
             ok_slot, usage_dbg = try_consume_cache_slot(account_id, cache_limit)
@@ -365,9 +365,6 @@ def ask_chat_guarded(
     provider: str = "web",
     lang: str = "en",
 ) -> Dict[str, Any]:
-    """
-    Chat-style ask with credit/subscription enforcement.
-    """
     provider = (provider or "web").strip().lower()
 
     sub = _get_subscription_status_best_effort(account_id, provider, None)
