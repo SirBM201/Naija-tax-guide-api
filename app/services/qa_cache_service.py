@@ -1,14 +1,36 @@
 # app/services/qa_cache_service.py
 from __future__ import annotations
 
+"""
+QA CACHE SERVICE (BOOT-SAFE + BACKWARD COMPAT)
+
+This module must export:
+  - find_cached_answer(...)
+  - touch_cache_best_effort(...)
+  - upsert_ai_answer_to_cache_best_effort(...)
+  - answer_from_cache(...)       (alias/wrapper)
+  - increment_cache_use(...)     (alias/wrapper)
+"""
+
 from typing import Optional, Dict, Any
 from datetime import datetime, timezone
+import re
 
-from ..core.supabase_client import supabase
+from app.core.supabase_client import supabase
+
+
+def _sb():
+    return supabase() if callable(supabase) else supabase
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _normalize_question(q: str) -> str:
+    q = (q or "").strip().lower()
+    q = re.sub(r"\s+", " ", q)
+    return q
 
 
 def find_cached_answer(
@@ -25,7 +47,7 @@ def find_cached_answer(
         if canonical_key and canonical_key.strip():
             ck = canonical_key.strip()
             res = (
-                supabase().table("qa_cache")
+                _sb().table("qa_cache")
                 .select("*")
                 .eq("enabled", True)
                 .eq("canonical_key", ck)
@@ -38,7 +60,7 @@ def find_cached_answer(
                 return res.data[0]
 
         res = (
-            supabase().table("qa_cache")
+            _sb().table("qa_cache")
             .select("*")
             .eq("enabled", True)
             .eq("normalized_question", nq)
@@ -59,12 +81,12 @@ def touch_cache_best_effort(cache_id: str) -> None:
     if not cid:
         return
     try:
-        res = supabase().table("qa_cache").select("use_count").eq("id", cid).limit(1).execute()
+        res = _sb().table("qa_cache").select("use_count").eq("id", cid).limit(1).execute()
         current = 0
         if getattr(res, "data", None):
             current = int(res.data[0].get("use_count") or 0)
 
-        supabase().table("qa_cache").update(
+        _sb().table("qa_cache").update(
             {"use_count": current + 1, "last_used_at": _now_iso()}
         ).eq("id", cid).execute()
     except Exception:
@@ -101,10 +123,21 @@ def upsert_ai_answer_to_cache_best_effort(
         payload["canonical_key"] = canonical_key.strip()
 
     try:
-        # canonical_key+lang preferred when present; else normalized_question+lang
         if payload.get("canonical_key"):
-            supabase().table("qa_cache").upsert(payload, on_conflict="canonical_key,lang").execute()
+            _sb().table("qa_cache").upsert(payload, on_conflict="canonical_key,lang").execute()
         else:
-            supabase().table("qa_cache").upsert(payload, on_conflict="normalized_question,lang").execute()
+            _sb().table("qa_cache").upsert(payload, on_conflict="normalized_question,lang").execute()
     except Exception:
         return
+
+
+# Backward-compat exports
+def answer_from_cache(question: str, lang: str = "en", canonical_key: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    nq = _normalize_question(question)
+    return find_cached_answer(nq, lang=lang, canonical_key=canonical_key)
+
+
+def increment_cache_use(cache_id: Optional[str]) -> None:
+    if not cache_id:
+        return
+    touch_cache_best_effort(cache_id)
