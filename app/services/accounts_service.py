@@ -8,6 +8,22 @@ import uuid
 from app.core.supabase_client import supabase
 
 
+# =========================================================
+# ACCOUNTS IDENTITY MODEL (IMPORTANT)
+# =========================================================
+# - accounts.id         : physical row PK (supabase row id)
+# - accounts.account_id : CANONICAL "global account identifier" used everywhere
+#
+# Your system (web_tokens, web_sessions, user_subscriptions, etc.) should reference
+# accounts.account_id, NOT accounts.id.
+#
+# This service therefore:
+#  1) ALWAYS returns account_id = accounts.account_id
+#  2) Auto-repairs legacy rows where account_id is NULL by setting account_id = id
+#  3) Emits failure exposers (root cause + fix) on DB failures
+# =========================================================
+
+
 # ---------------------------------------------------------
 # Time helpers
 # ---------------------------------------------------------
@@ -47,8 +63,32 @@ def _is_uuid(value: str) -> bool:
         return False
 
 
-def _safe_str(v: Any) -> str:
-    return (v or "").strip()
+# ---------------------------------------------------------
+# Failure exposers
+# ---------------------------------------------------------
+def _expose_db_error(
+    *,
+    where: str,
+    exc: Exception,
+    fix: str,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Standardized DB failure exposer so you always see:
+      - root_cause (short)
+      - where it happened
+      - what to do next (fix)
+    """
+    payload: Dict[str, Any] = {
+        "ok": False,
+        "error": "db_error",
+        "where": where,
+        "root_cause": f"{type(exc).__name__}: {str(exc)[:260]}",
+        "fix": fix,
+    }
+    if extra:
+        payload["details"] = extra
+    return payload
 
 
 # ---------------------------------------------------------
@@ -91,14 +131,46 @@ def _validate_provider_and_id(provider: str, provider_user_id: str) -> Optional[
 
     if provider == "email":
         v = provider_user_id.strip().lower()
-        if "@" not in v or "." not in v:
-            return "provider_user_id must be a valid email address for provider=email"
+        if "@" not in v:
+            return "provider_user_id must be a valid email for provider=email"
 
     return None
 
 
 # ---------------------------------------------------------
-# Accounts: upsert / link / lookup
+# Identity helpers (canonical account_id)
+# ---------------------------------------------------------
+def _canonical_account_id_from_row(row: Dict[str, Any]) -> Optional[str]:
+    """
+    Canonical account key = accounts.account_id.
+    If missing, fall back to id (legacy) but DO NOT return it without repair.
+    """
+    if not row:
+        return None
+    return (row.get("account_id") or row.get("id") or None)
+
+
+def _repair_account_id_if_missing(row: Dict[str, Any]) -> None:
+    """
+    Best-effort repair for legacy rows:
+      if accounts.account_id is NULL, set account_id = id
+    This prevents FK failures across web_tokens/web_sessions/etc.
+    """
+    try:
+        if not row:
+            return
+        rid = row.get("id")
+        aid = row.get("account_id")
+        if rid and not aid:
+            supabase().table("accounts").update({"account_id": str(rid)}).eq("id", str(rid)).execute()
+            row["account_id"] = str(rid)
+    except Exception:
+        # Never crash callers during a repair attempt.
+        return
+
+
+# ---------------------------------------------------------
+# Account upsert / link / lookup
 # ---------------------------------------------------------
 def upsert_account(
     *,
@@ -107,6 +179,11 @@ def upsert_account(
     display_name: Optional[str] = None,
     phone: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """
+    Upsert a channel identity into accounts table.
+    NOTE: Returns the full account row; callers should use ensure_account_id()
+    if they need the canonical account_id.
+    """
     provider = _norm_provider(provider)
     provider_user_id = (provider_user_id or "").strip()
 
@@ -123,15 +200,32 @@ def upsert_account(
     }
 
     try:
-        res = supabase().table("accounts").upsert(
-            payload,
-            on_conflict="provider,provider_user_id",
-            returning="representation",
-        ).execute()
+        res = (
+            supabase()
+            .table("accounts")
+            .upsert(payload, on_conflict="provider,provider_user_id", returning="representation")
+            .execute()
+        )
     except Exception as e:
-        return {"ok": False, "error": "db_error", "message": str(e)[:220]}
+        return _expose_db_error(
+            where="accounts.upsert_account",
+            exc=e,
+            fix="Check accounts table constraints/RLS. Ensure provider+provider_user_id unique constraint matches upsert on_conflict.",
+            extra={"provider": provider, "provider_user_id": provider_user_id},
+        )
 
-    row = (res.data or [None])[0]
+    row = (getattr(res, "data", None) or [None])[0]
+    if not row:
+        return {
+            "ok": False,
+            "error": "account_upsert_failed",
+            "root_cause": "upsert returned no row",
+            "fix": "Ensure Supabase is returning representation and RLS allows select on accounts.",
+            "details": {"provider": provider, "provider_user_id": provider_user_id},
+        }
+
+    # Repair legacy missing account_id (best-effort)
+    _repair_account_id_if_missing(row)
     return {"ok": True, "account": row}
 
 
@@ -158,19 +252,25 @@ def lookup_account(
             .execute()
         )
     except Exception as e:
-        return {"ok": False, "error": "db_error", "message": str(e)[:220]}
+        return _expose_db_error(
+            where="accounts.lookup_account",
+            exc=e,
+            fix="Check accounts table schema and RLS permissions. Ensure select is allowed.",
+            extra={"provider": provider, "provider_user_id": provider_user_id},
+        )
 
-    row = (res.data or [None])[0]
+    row = (getattr(res, "data", None) or [None])[0]
     if not row:
-        return {"ok": True, "found": False, "linked": False, "auth_user_id": None, "account": None}
+        return {"ok": True, "found": False}
 
-    auth_user_id = row.get("auth_user_id")
+    _repair_account_id_if_missing(row)
     return {
         "ok": True,
         "found": True,
-        "linked": bool(auth_user_id),
-        "auth_user_id": auth_user_id,
         "account": row,
+        "auth_user_id": row.get("auth_user_id"),
+        "account_id": row.get("account_id"),
+        "id": row.get("id"),
     }
 
 
@@ -182,6 +282,11 @@ def upsert_account_link(
     display_name: Optional[str] = None,
     phone: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """
+    Link a channel identity to an existing auth_user_id.
+
+    NOTE: This function does not decide identity model; it simply links auth_user_id.
+    """
     provider = _norm_provider(provider)
     provider_user_id = (provider_user_id or "").strip()
     auth_user_id = (auth_user_id or "").strip()
@@ -200,8 +305,8 @@ def upsert_account_link(
         if old and old != auth_user_id:
             return {
                 "ok": False,
-                "error": "channel_already_linked",
-                "message": "This channel is already linked to another account.",
+                "error": "This channel is already linked to another account.",
+                "reason": "channel_already_linked",
             }
 
     payload = {
@@ -214,20 +319,35 @@ def upsert_account_link(
     }
 
     try:
-        res = supabase().table("accounts").upsert(
-            payload,
-            on_conflict="provider,provider_user_id",
-            returning="representation",
-        ).execute()
+        res = (
+            supabase()
+            .table("accounts")
+            .upsert(payload, on_conflict="provider,provider_user_id", returning="representation")
+            .execute()
+        )
     except Exception as e:
-        return {"ok": False, "error": "db_error", "message": str(e)[:220]}
+        return _expose_db_error(
+            where="accounts.upsert_account_link",
+            exc=e,
+            fix="Check accounts table constraints/RLS. Ensure provider+provider_user_id unique constraint matches upsert on_conflict.",
+            extra={"provider": provider, "provider_user_id": provider_user_id, "auth_user_id": auth_user_id},
+        )
 
-    row = (res.data or [None])[0]
+    row = (getattr(res, "data", None) or [None])[0]
+    if not row:
+        return {
+            "ok": False,
+            "error": "account_link_failed",
+            "root_cause": "upsert returned no row",
+            "fix": "Ensure Supabase is returning representation and RLS allows select on accounts.",
+        }
+
+    _repair_account_id_if_missing(row)
     return {"ok": True, "account": row}
 
 
 # ---------------------------------------------------------
-# REQUIRED BY web_auth.py (GLOBAL ID SAFE)
+# MAIN ENTRYPOINT USED BY ROUTES/SERVICES
 # ---------------------------------------------------------
 def ensure_account_id(
     *,
@@ -239,20 +359,21 @@ def ensure_account_id(
     contact: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Ensures an account exists and returns the GLOBAL account identifier:
+    Ensures an account exists and returns CANONICAL accounts.account_id as account_id.
 
-        ✅ accounts.account_id  (preferred canonical)
-        ↪ fallback to accounts.id if account_id is missing
+    Accepts multiple aliases to prevent future crashes:
+      - phone_e164 or phone or contact (any of them)
 
-    Failure exposer:
-      - returns debug details if DB row missing critical fields.
+    IMPORTANT:
+      - This function DOES NOT return accounts.id anymore (legacy behavior removed).
+      - If a legacy row has account_id=NULL, it repairs it (account_id=id) to keep FK-safe.
     """
     provider = _norm_provider(provider)
     provider_user_id = (provider_user_id or "").strip()
 
     err = _validate_provider_and_id(provider, provider_user_id)
     if err:
-        return {"ok": False, "error": "bad_request", "message": err}
+        return {"ok": False, "error": err}
 
     phone_value = (phone_e164 or phone or contact or None)
 
@@ -263,155 +384,107 @@ def ensure_account_id(
         phone=phone_value,
     )
     if not res.get("ok"):
+        # bubble up full exposer
         return res
 
     row = res.get("account") or {}
-    gid = _safe_str(row.get("account_id"))
-    pk = _safe_str(row.get("id"))
+    _repair_account_id_if_missing(row)
 
-    # Repair: if account_id is blank but id exists, backfill account_id=id
-    if not gid and pk:
-        try:
-            supabase().table("accounts").update({"account_id": pk}).eq("id", pk).execute()
-            gid = pk
-        except Exception as e:
-            return {
-                "ok": False,
-                "error": "account_id_missing",
-                "message": "Account row exists but account_id is missing and repair failed.",
-                "debug": {
-                    "id": pk,
-                    "account_id": gid,
-                    "repair_error": f"{type(e).__name__}: {str(e)[:180]}",
-                    "fix_sql": 'update public.accounts set account_id = id where account_id is null;',
-                },
-            }
-
-    if not gid:
+    account_id = _canonical_account_id_from_row(row)
+    if not account_id:
         return {
             "ok": False,
-            "error": "account_missing_ids",
-            "message": "Account created/updated but both id and account_id are missing (unexpected).",
-            "debug": {"row_keys": list(row.keys())[:30]},
+            "error": "account_id_missing",
+            "root_cause": "accounts row has neither account_id nor id",
+            "fix": "Verify accounts table has columns id (uuid) and account_id (uuid).",
+            "details": {"row": row},
         }
 
-    return {"ok": True, "account_id": gid, "account": row}
+    # Enforce that returned account_id equals accounts.account_id post-repair
+    account_id = str(row.get("account_id") or account_id)
+
+    return {"ok": True, "account_id": account_id, "account": row}
 
 
 # ---------------------------------------------------------
-# Plan status (kept as-is)
+# Plan status (kept as-is, but uses auth_user_id)
 # ---------------------------------------------------------
 def _plan_from_subscriptions_table(auth_user_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     try:
         res = (
             supabase()
             .table("subscriptions")
-            .select("user_id,plan,status,start_at,end_at,updated_at,id")
-            .eq("user_id", auth_user_id)
-            .order("updated_at", desc=True)
+            .select("status,plan_code,expires_at,started_at,created_at,updated_at")
+            .eq("auth_user_id", auth_user_id)
+            .order("created_at", desc=True)
             .limit(1)
             .execute()
         )
     except Exception as e:
-        return None, str(e)
+        return None, f"subscriptions table error: {str(e)}"
 
-    row = (res.data or [None])[0]
+    row = (getattr(res, "data", None) or [None])[0]
     if not row:
         return None, None
 
-    end_dt = _parse_dt(row.get("end_at"))
-    status = (row.get("status") or "").strip().lower() or None
-
-    active = False
-    if end_dt and end_dt > _now_utc():
-        active = True
-    elif status in ("active", "paid", "success"):
-        active = True
+    exp = _parse_dt(row.get("expires_at"))
+    is_active = _is_active_from_expiry(exp)
 
     return (
         {
             "known": True,
-            "source": "subscriptions",
-            "plan": row.get("plan"),
+            "is_active": is_active,
+            "plan": row.get("plan_code"),
             "status": row.get("status"),
-            "plan_expiry": end_dt.isoformat() if end_dt else None,
-            "is_active": bool(active),
+            "plan_expiry": exp.isoformat() if exp else None,
+            "notes": "From subscriptions table",
         },
         None,
     )
 
 
-def _try_fetch_plan_from_table_guess(table_name: str, auth_user_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    auth_err = None
-    user_err = None
-
+def _try_fetch_plan_from_table_guess(table: str, auth_user_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     try:
         res = (
             supabase()
-            .table(table_name)
+            .table(table)
             .select("*")
             .eq("auth_user_id", auth_user_id)
             .order("created_at", desc=True)
             .limit(1)
             .execute()
         )
-        row = (res.data or [None])[0]
-        if row:
-            expiry_dt = _parse_dt(
-                row.get("end_at")
-                or row.get("plan_expiry")
-                or row.get("expires_at")
-                or row.get("current_period_end")
-            )
-            active = bool(row.get("is_active")) if isinstance(row.get("is_active"), bool) else _is_active_from_expiry(expiry_dt)
-            return (
-                {
-                    "known": True,
-                    "source": table_name,
-                    "plan": row.get("plan") or row.get("tier") or row.get("plan_code"),
-                    "status": row.get("status"),
-                    "plan_expiry": expiry_dt.isoformat() if expiry_dt else None,
-                    "is_active": bool(active),
-                },
-                None,
-            )
     except Exception as e:
-        auth_err = str(e)
+        return None, str(e)
 
-    try:
-        res2 = (
-            supabase()
-            .table(table_name)
-            .select("*")
-            .eq("user_id", auth_user_id)
-            .order("updated_at", desc=True)
-            .limit(1)
-            .execute()
-        )
-        row2 = (res2.data or [None])[0]
-        if row2:
-            expiry_dt = _parse_dt(row2.get("end_at") or row2.get("expires_at") or row2.get("plan_expiry"))
-            active = _is_active_from_expiry(expiry_dt)
-            return (
-                {
-                    "known": True,
-                    "source": table_name,
-                    "plan": row2.get("plan") or row2.get("tier") or row2.get("plan_code"),
-                    "status": row2.get("status"),
-                    "plan_expiry": expiry_dt.isoformat() if expiry_dt else None,
-                    "is_active": bool(active),
-                },
-                None,
-            )
-    except Exception as e:
-        user_err = str(e)
+    row = (getattr(res, "data", None) or [None])[0]
+    if not row:
+        return None, None
 
-    return None, (auth_err or user_err)
+    # best-effort extraction
+    status = row.get("status") or row.get("state")
+    plan = row.get("plan_code") or row.get("plan") or row.get("tier")
+    exp = _parse_dt(row.get("expires_at") or row.get("expiry") or row.get("plan_expiry"))
+    is_active = _is_active_from_expiry(exp)
+
+    return (
+        {
+            "known": True,
+            "is_active": is_active,
+            "plan": plan,
+            "status": status,
+            "plan_expiry": exp.isoformat() if exp else None,
+            "notes": f"From {table} (guessed columns)",
+        },
+        None,
+    )
 
 
-def get_plan_status(auth_user_id: Optional[str]) -> Dict[str, Any]:
+def get_plan_status_for_auth_user(auth_user_id: str) -> Dict[str, Any]:
     auth_user_id = (auth_user_id or "").strip()
     if not auth_user_id:
+        return {"ok": True, "known": False, "is_active": False, "plan": None, "status": None, "plan_expiry": None}
+    if not _is_uuid(auth_user_id):
         return {"ok": True, "known": False, "is_active": False, "plan": None, "status": None, "plan_expiry": None}
 
     plan_obj, err = _plan_from_subscriptions_table(auth_user_id)
