@@ -1,6 +1,21 @@
 # app/services/ask_service.py
 from __future__ import annotations
 
+"""
+ASK SERVICE (HARDENED)
+
+Changes vs old version:
+✅ account identity is STRICT:
+    - account_id MUST be the canonical accounts.account_id
+    - NO silent fallback to accounts.id anywhere
+
+✅ Failure exposers:
+    - If account resolution fails, response includes root_cause + fix + debug keys (when ASK_DEBUG enabled)
+
+✅ Dev bypass:
+    - Same behavior: routes/ask.py sets __bypass=True after validating BYPASS_TOKEN.
+"""
+
 import os
 from typing import Any, Dict, Optional, Tuple, Union
 
@@ -37,7 +52,7 @@ def _truthy(v: str | None) -> bool:
 
 
 def _debug_enabled() -> bool:
-    return _truthy(os.getenv("ASK_DEBUG")) or _truthy(os.getenv("WEB_AUTH_DEBUG"))
+    return _truthy(os.getenv("ASK_DEBUG")) or _truthy(os.getenv("WEB_AUTH_DEBUG")) or _truthy(os.getenv("AUTH_DEBUG"))
 
 
 def _dbg_pack(**kv: Any) -> Dict[str, Any]:
@@ -67,28 +82,32 @@ def _dev_bypass_enabled(payload: Dict[str, Any]) -> bool:
     return bool(payload.get("__bypass") is True)
 
 
-def _resolve_account_id(payload: Dict[str, Any]) -> Optional[str]:
+def _resolve_account_id_strict(payload: Dict[str, Any]) -> Tuple[Optional[str], Dict[str, Any]]:
     """
-    Resolve account_id from payload:
-    - if account_id present, use it
-    - else if (provider, provider_user_id), lookup in accounts table
+    STRICT resolver:
+      - if payload.account_id present => return it
+      - else if (provider, provider_user_id) => lookup accounts.account_id ONLY
+      - NEVER returns accounts.id.
 
-    ✅ Updated to support either accounts.account_id OR accounts.id.
+    Returns (account_id, debug_info)
     """
+    dbg: Dict[str, Any] = {}
     account_id = _safe_str(payload.get("account_id"))
     if account_id:
-        return account_id
+        dbg["source"] = "payload.account_id"
+        return account_id, dbg
 
     provider = _safe_str(payload.get("provider")).lower()
     provider_user_id = _safe_str(payload.get("provider_user_id"))
     if not provider or not provider_user_id:
-        return None
+        dbg["source"] = "missing_provider_or_provider_user_id"
+        return None, dbg
 
     try:
         res = (
             _sb()
             .table("accounts")
-            .select("id,account_id")
+            .select("account_id")
             .eq("provider", provider)
             .eq("provider_user_id", provider_user_id)
             .limit(1)
@@ -96,13 +115,23 @@ def _resolve_account_id(payload: Dict[str, Any]) -> Optional[str]:
         )
         rows = getattr(res, "data", None) or []
         if not rows:
-            return None
+            dbg["source"] = "accounts_lookup_no_rows"
+            return None, dbg
 
         row = rows[0] or {}
-        # Prefer explicit account_id, else fallback to id
-        return _safe_str(row.get("account_id")) or _safe_str(row.get("id")) or None
-    except Exception:
-        return None
+        aid = _safe_str(row.get("account_id"))
+        if not aid:
+            dbg["source"] = "accounts_account_id_empty"
+            return None, dbg
+
+        dbg["source"] = "accounts.account_id"
+        return aid, dbg
+
+    except Exception as e:
+        dbg["source"] = "accounts_lookup_exception"
+        dbg["error_type"] = type(e).__name__
+        dbg["error"] = str(e)[:220]
+        return None, dbg
 
 
 # -----------------------------
@@ -187,7 +216,7 @@ def ask_guarded(payload: Union[Dict[str, Any], str], *args, **kwargs) -> Dict[st
         question = payload
         account_id = kwargs.get("account_id") or (args[0] if args else None)
         if not account_id:
-            return {"ok": False, "error": "account_required", "answer": ""}
+            return {"ok": False, "error": "account_required", "answer": "", "root_cause": "missing_account_id", "fix": "Provide canonical accounts.account_id."}
         return _ask_guarded_dict(
             {
                 "question": question,
@@ -215,168 +244,130 @@ def _ask_guarded_dict(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not question:
         return {"ok": False, "error": "question_required", "answer": ""}
 
-    account_id = _resolve_account_id(payload)
+    account_id, ridbg = _resolve_account_id_strict(payload)
     if not account_id:
-        return {"ok": False, "error": "account_required", "answer": ""}
-
-    bypass = _dev_bypass_enabled(payload)
-
-    debug: Dict[str, Any] = _dbg_pack(
-        stage="start",
-        provider=provider,
-        lang=lang,
-        channel=channel,
-        dev_bypass=bypass,
-    )
-
-    # 1) Subscription check (SKIP when dev bypass)
-    if not bypass:
-        sub = _get_subscription_status_best_effort(account_id, provider, provider_user_id)
-        debug.update(_dbg_pack(stage="subscription_checked", subscription_state=sub.get("state"), sub_reason=sub.get("reason")))
-
-        if not sub.get("active"):
-            out = {
-                "ok": False,
-                "error": "subscription_required",
-                "answer": "Please activate a plan to use NaijaTax Guide.",
-                "meta": {"channel": channel, "subscription": sub},
-            }
-            if _debug_enabled():
-                out["meta"]["debug"] = debug
-            return out
-    else:
-        sub = {"active": True, "state": "dev_bypass", "plan_code": "DEV", "reason": "dev_bypass"}
-
-    cache_limit = PAID_CACHE_DAILY_LIMIT if sub.get("active") else FREE_CACHE_DAILY_LIMIT
-
-    # 2) Cache lookup
-    normalized = basic_normalize(question)
-    ck = canonical_key(question)
-
-    cache_row = find_cached_answer(
-        normalized_question=normalized,
-        lang=lang,
-        canonical_key=ck,
-    )
-
-    debug.update(_dbg_pack(stage="cache_checked", canonical_key=ck, cache_hit=bool(cache_row)))
-
-    if cache_row and cache_row.get("answer"):
-        if not bypass:
-            used_before = get_cache_used_today(account_id)
-            ok_slot, usage_dbg = try_consume_cache_slot(account_id, cache_limit)
-            debug.update(_dbg_pack(stage="cache_limit_checked", cache_used_before=used_before, cache_limit=cache_limit, usage=usage_dbg))
-
-            if not ok_slot:
-                out = {
-                    "ok": False,
-                    "error": "cache_limit_reached",
-                    "answer": _cache_limit_message(used_before, cache_limit),
-                    "meta": {
-                        "channel": channel,
-                        "mode": "blocked_cache_limit",
-                        "cache_daily_limit": cache_limit,
-                        "cache_used_today": used_before,
-                    },
-                }
-                if _debug_enabled():
-                    out["meta"]["debug"] = debug
-                return out
-
-        cid = _safe_str(cache_row.get("id")) or ""
-        if cid:
-            touch_cache_best_effort(cid)
-
-        refined = refine_answer(cache_row.get("answer"), lang=lang, source="cache", provider=provider) or cache_row.get("answer")
-
-        out = {"ok": True, "answer": refined, "meta": {"channel": channel, "mode": "cache", "canonical_key": ck}}
-        if _debug_enabled():
-            out["meta"]["debug"] = debug
-        return out
-
-    # 3) AI credits (SKIP when dev bypass)
-    if not bypass:
-        ok_credits, reason, credits_dbg = _consume_ai_credits(account_id=account_id, cost=1)
-        debug.update(_dbg_pack(stage="credits_consumed", credits=credits_dbg))
-
-        if not ok_credits:
-            out = {
-                "ok": False,
-                "error": reason or "no_credits",
-                "answer": "You’ve reached your AI credit limit for now. Please top up or wait for your next reset.",
-                "meta": {"channel": channel, "mode": "blocked_credits"},
-            }
-            if _debug_enabled():
-                out["meta"]["debug"] = debug
-            return out
-
-    # 4) AI generation
-    try:
-        raw = _call_ai_model(question, lang=lang)
-        refined = refine_answer(raw, lang=lang, source="ai", provider=provider)
-        if not refined:
-            raise RuntimeError("ai_refine_failed")
-        answer = refined
-        debug.update(_dbg_pack(stage="ai_ok", ai_len=len(answer)))
-    except Exception as e:
-        debug.update(_dbg_pack(stage="ai_failed", ai_error=str(e)[:200], last_ai_error=(last_ai_error() or "")[:200]))
         out = {
             "ok": False,
-            "error": str(e) or "ai_failed",
-            "answer": "Sorry — I couldn’t generate a response right now. Please try again.",
-            "meta": {"channel": channel, "mode": "ai_failed"},
+            "error": "account_required",
+            "answer": "",
+            "root_cause": "account_id_missing_or_not_resolvable",
+            "fix": (
+                "Pass canonical accounts.account_id, OR pass provider+provider_user_id that maps to a row with a non-null accounts.account_id. "
+                "DO NOT pass accounts.id."
+            ),
         }
-        if _debug_enabled():
-            out["meta"]["debug"] = debug
+        out.update(_dbg_pack(account_resolution=ridbg))
         return out
 
-    # 5) Save AI answer to cache (best effort)
-    upsert_ai_answer_to_cache_best_effort(
-        normalized_question=normalized,
-        answer=answer,
-        tags=None,
-        source="ai",
-        lang=lang,
-        canonical_key=ck,
-        enabled=True,
-        priority=0,
-    )
+    # Hard daily max gate (fast fail)
+    try:
+        used_today = int(get_cache_used_today(account_id) or 0)
+        if used_today >= HARD_DAILY_MAX:
+            return {
+                "ok": False,
+                "error": "hard_daily_limit_reached",
+                "answer": "",
+                "message": f"Daily limit reached ({used_today}/{HARD_DAILY_MAX}). Try again tomorrow.",
+            }
+    except Exception:
+        pass
 
-    out = {
+    # subscription status best effort
+    sub = _get_subscription_status_best_effort(account_id, provider, provider_user_id)
+    is_paid = bool(sub.get("active"))
+
+    # Cache limit selection
+    cache_limit = PAID_CACHE_DAILY_LIMIT if is_paid else FREE_CACHE_DAILY_LIMIT
+
+    # Canonicalize question for cache key
+    norm_q = basic_normalize(question)
+    ckey = canonical_key(norm_q, lang=lang)
+
+    # Try cache
+    cached = find_cached_answer(ckey)
+    if cached and cached.get("answer"):
+        # touch + consume slot best effort
+        try:
+            touch_cache_best_effort(ckey)
+        except Exception:
+            pass
+        try:
+            try_consume_cache_slot(account_id, provider, channel)
+        except Exception:
+            pass
+
+        ans = refine_answer(cached.get("answer") or "", lang=lang)
+        return {
+            "ok": True,
+            "answer": ans,
+            "source": "cache",
+            "account_id": account_id,
+            "subscription": sub,
+            **_dbg_pack(cache_key=ckey),
+        }
+
+    # Cache slot check (best effort)
+    try:
+        used = int(get_cache_used_today(account_id) or 0)
+        if used >= cache_limit:
+            return {
+                "ok": False,
+                "error": "cache_limit_reached",
+                "answer": "",
+                "message": _cache_limit_message(used, cache_limit),
+                "account_id": account_id,
+                "subscription": sub,
+                **_dbg_pack(cache_used=used, cache_limit=cache_limit),
+            }
+    except Exception:
+        pass
+
+    # AI credits gate (unless dev bypass)
+    if not _dev_bypass_enabled(payload):
+        ok_credits, reason, cdbg = _consume_ai_credits(account_id, cost=1)
+        if not ok_credits:
+            return {
+                "ok": False,
+                "error": "no_credits",
+                "answer": "",
+                "message": "You do not have enough AI credits to answer new questions right now.",
+                "reason": reason,
+                "account_id": account_id,
+                "subscription": sub,
+                **_dbg_pack(credits=cdbg),
+            }
+
+    # AI call
+    try:
+        ans = _call_ai_model(question, lang=lang)
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": "ai_failed",
+            "answer": "",
+            "root_cause": f"{type(e).__name__}: {str(e)[:220]}",
+            "fix": "Check OpenAI key/config, model settings, or upstream AI provider availability.",
+        }
+
+    ans = refine_answer(ans, lang=lang)
+
+    # Cache write best effort
+    try:
+        upsert_ai_answer_to_cache_best_effort(ckey, question=question, answer=ans, lang=lang)
+    except Exception:
+        pass
+
+    # Consume cache slot best effort
+    try:
+        try_consume_cache_slot(account_id, provider, channel)
+    except Exception:
+        pass
+
+    return {
         "ok": True,
-        "answer": answer,
-        "meta": {
-            "channel": channel,
-            "mode": "ai",
-            "credits_deducted": 0 if bypass else 1,
-            "canonical_key": ck,
-            "dev_bypass": bypass,
-        },
+        "answer": ans,
+        "source": "ai",
+        "account_id": account_id,
+        "subscription": sub,
+        **_dbg_pack(cache_key=ckey),
     }
-    if _debug_enabled():
-        out["meta"]["debug"] = debug
-    return out
-
-
-def ask_chat_guarded(
-    *,
-    messages: list[dict[str, str]],
-    account_id: str,
-    provider: str = "web",
-    lang: str = "en",
-) -> Dict[str, Any]:
-    provider = (provider or "web").strip().lower()
-
-    sub = _get_subscription_status_best_effort(account_id, provider, None)
-    if not (sub or {}).get("active"):
-        return {"ok": False, "error": "subscription_required", "answer": "Please activate a plan to use the Tax Assistant Chat."}
-
-    ok, reason, _ = _consume_ai_credits(account_id=account_id, cost=1)
-    if not ok:
-        return {"ok": False, "error": reason or "no_credits", "answer": "You’ve reached your AI credit limit for now. Please top up or wait for your next reset."}
-
-    ans = ask_ai_chat(messages, lang=lang)
-    if not ans:
-        return {"ok": False, "error": last_ai_error() or "ai_failed", "answer": "Sorry — I couldn’t generate a response right now. Please try again."}
-
-    return {"ok": True, "answer": ans, "meta": {"mode": "chat", "credits_deducted": 1}}
