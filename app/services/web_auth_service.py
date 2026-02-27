@@ -86,26 +86,73 @@ def _random_token() -> str:
     return secrets.token_urlsafe(TOKEN_LENGTH_BYTES)
 
 
-def _revoke_token(sb, token: str) -> Tuple[bool, Optional[str]]:
-    if not token:
-        return False, "token_required"
-    try:
-        res = sb.table(TOKEN_TABLE).update({"revoked_at": _now_ts()}).eq("token", token).execute()
-        if getattr(res, "error", None):
-            return False, str(res.error)
-        return True, None
-    except Exception as e:
-        return False, repr(e)
+def _sb_error_blob(res: Any, op: str, table: str, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Root-cause exposer for Supabase/PostgREST failures.
+
+    We try to safely include whatever the supabase client exposes (error, status_code, data),
+    without leaking secrets. This makes debugging "schema cache" / missing columns obvious.
+    """
+    blob: Dict[str, Any] = {
+        "op": op,
+        "table": table,
+    }
+
+    if extra:
+        blob["extra"] = extra
+
+    err = getattr(res, "error", None)
+    if err is not None:
+        blob["error"] = str(err)
+
+    # Best-effort extra details (varies by client version)
+    sc = getattr(res, "status_code", None)
+    if sc is not None:
+        blob["status_code"] = sc
+
+    data = getattr(res, "data", None)
+    if data is not None:
+        # data can be huge; keep it small and safe
+        try:
+            if isinstance(data, list) and len(data) > 3:
+                blob["data_preview"] = data[:3]
+                blob["data_count"] = len(data)
+            else:
+                blob["data_preview"] = data
+        except Exception:
+            pass
+
+    return blob
 
 
-def _safe_insert_otp_row(sb, row: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+def _safe_insert(sb: Any, table: str, row: Dict[str, Any], op: str) -> Tuple[bool, Optional[Dict[str, Any]]]:
     try:
-        res = sb.table(OTP_TABLE).insert(row).execute()
+        res = sb.table(table).insert(row).execute()
         if getattr(res, "error", None):
-            return False, str(res.error)
+            return False, _sb_error_blob(res, op=op, table=table, extra={"row_keys": sorted(list(row.keys()))})
         return True, None
     except Exception as e:
-        return False, repr(e)
+        return False, {"op": op, "table": table, "error": repr(e), "extra": {"row_keys": sorted(list(row.keys()))}}
+
+
+def _safe_update(sb: Any, table: str, updates: Dict[str, Any], where_col: str, where_val: Any, op: str) -> Tuple[bool, Optional[Dict[str, Any]]]:
+    try:
+        res = sb.table(table).update(updates).eq(where_col, where_val).execute()
+        if getattr(res, "error", None):
+            return False, _sb_error_blob(
+                res,
+                op=op,
+                table=table,
+                extra={"updates_keys": sorted(list(updates.keys())), "where": {where_col: str(where_val)}},
+            )
+        return True, None
+    except Exception as e:
+        return False, {
+            "op": op,
+            "table": table,
+            "error": repr(e),
+            "extra": {"updates_keys": sorted(list(updates.keys())), "where": {where_col: str(where_val)}},
+        }
 
 
 # -----------------------------
@@ -120,7 +167,6 @@ def request_email_otp(
 ) -> Dict[str, Any]:
     """
     Generates OTP, stores hash in DB, returns a server-only _otp_plain so the route can email it.
-    The route decides whether to expose OTP in response (dev only).
     """
     sb = get_supabase_client(admin=True)
 
@@ -146,18 +192,20 @@ def request_email_otp(
         "locked_until": None,
         "request_ip": request_ip,
         "channel": "email",
+        # Note: device_id + user_agent are not stored unless your table has those columns.
+        # We still capture them in debug for troubleshooting.
     }
 
-    ok, err = _safe_insert_otp_row(sb, row)
+    ok, root = _safe_insert(sb, OTP_TABLE, row, op="insert_otp")
     if not ok:
-        return {"ok": False, "error": "otp_insert_failed", "root_cause": err}
+        return {"ok": False, "error": "otp_insert_failed", "root_cause": root}
 
     return {
         "ok": True,
         "contact": contact,
         "purpose": purpose,
         "expires_at": expires_at,
-        "_otp_plain": otp_plain,  # SERVER-ONLY (route uses it to send email)
+        "_otp_plain": otp_plain,
         "debug": {
             "tables": {"otp_table": OTP_TABLE, "token_table": TOKEN_TABLE},
             "received": {
@@ -194,10 +242,10 @@ def verify_email_otp(email: str, otp_code: str, purpose: str | None = None) -> D
             .execute()
         )
         if getattr(res, "error", None):
-            return {"ok": False, "error": "otp_lookup_failed", "root_cause": str(res.error)}
+            return {"ok": False, "error": "otp_lookup_failed", "root_cause": _sb_error_blob(res, op="select_otp", table=OTP_TABLE)}
         rows = res.data or []
     except Exception as e:
-        return {"ok": False, "error": "otp_lookup_failed", "root_cause": repr(e)}
+        return {"ok": False, "error": "otp_lookup_failed", "root_cause": {"op": "select_otp", "table": OTP_TABLE, "error": repr(e)}}
 
     chosen = None
     for r in rows:
@@ -223,17 +271,12 @@ def verify_email_otp(email: str, otp_code: str, purpose: str | None = None) -> D
             lock_seconds = int(os.getenv("WEB_OTP_LOCK_SECONDS", "600"))
             updates["locked_until"] = _ts_plus(lock_seconds)
 
-        try:
-            sb.table(OTP_TABLE).update(updates).eq("id", chosen["id"]).execute()
-        except Exception:
-            pass
-
+        _safe_update(sb, OTP_TABLE, updates, where_col="id", where_val=chosen["id"], op="update_otp_attempts")
         return {"ok": False, "error": "otp_invalid"}
 
-    try:
-        sb.table(OTP_TABLE).update({"used": True, "used_at": _now_ts()}).eq("id", chosen["id"]).execute()
-    except Exception as e:
-        return {"ok": False, "error": "otp_mark_used_failed", "root_cause": repr(e)}
+    ok, root = _safe_update(sb, OTP_TABLE, {"used": True, "used_at": _now_ts()}, where_col="id", where_val=chosen["id"], op="mark_otp_used")
+    if not ok:
+        return {"ok": False, "error": "otp_mark_used_failed", "root_cause": root}
 
     return {"ok": True, "contact": contact, "purpose": purpose}
 
@@ -241,7 +284,7 @@ def verify_email_otp(email: str, otp_code: str, purpose: str | None = None) -> D
 # -----------------------------
 # Account + token issuance
 # -----------------------------
-def _ensure_web_account(contact_email: str) -> Tuple[Optional[str], Optional[str]]:
+def _ensure_web_account(contact_email: str) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
     sb = get_supabase_client(admin=True)
 
     provider = "web"
@@ -257,7 +300,7 @@ def _ensure_web_account(contact_email: str) -> Tuple[Optional[str], Optional[str
             .execute()
         )
         if getattr(res, "error", None):
-            return None, str(res.error)
+            return None, _sb_error_blob(res, op="select_account", table=ACCOUNTS_TABLE)
 
         row = (res.data or [None])[0]
         if row and row.get("id"):
@@ -269,20 +312,32 @@ def _ensure_web_account(contact_email: str) -> Tuple[Optional[str], Optional[str
             "created_at": _now_ts(),
             "updated_at": _now_ts(),
         }
-        res2 = sb.table(ACCOUNTS_TABLE).insert(ins).execute()
+        ok, root = _safe_insert(sb, ACCOUNTS_TABLE, ins, op="insert_account")
+        if not ok:
+            return None, root
+
+        # Re-select for id (more reliable across client versions)
+        res2 = (
+            sb.table(ACCOUNTS_TABLE)
+            .select("id")
+            .eq("provider", provider)
+            .eq("provider_user_id", provider_user_id)
+            .limit(1)
+            .execute()
+        )
         if getattr(res2, "error", None):
-            return None, str(res2.error)
+            return None, _sb_error_blob(res2, op="reselect_account", table=ACCOUNTS_TABLE)
 
         row2 = (res2.data or [None])[0]
         if row2 and row2.get("id"):
             return row2["id"], None
 
-        return None, "account_create_failed"
+        return None, {"op": "insert_account", "table": ACCOUNTS_TABLE, "error": "account_create_failed"}
     except Exception as e:
-        return None, repr(e)
+        return None, {"op": "ensure_account", "table": ACCOUNTS_TABLE, "error": repr(e)}
 
 
-def _issue_web_token(account_id: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+def _issue_web_token(account_id: str) -> Tuple[Optional[str], Optional[str], Optional[Dict[str, Any]]]:
     sb = get_supabase_client(admin=True)
 
     token = _random_token()
@@ -293,16 +348,15 @@ def _issue_web_token(account_id: str) -> Tuple[Optional[str], Optional[str], Opt
         "account_id": account_id,
         "created_at": _now_ts(),
         "expires_at": expires_at,
-        "revoked_at": None,
+        "revoked_at": None,  # IMPORTANT: must exist in DB OR PostgREST cache must be reloaded
     }
 
-    try:
-        res = sb.table(TOKEN_TABLE).insert(row).execute()
-        if getattr(res, "error", None):
-            return None, None, str(res.error)
-        return token, expires_at, None
-    except Exception as e:
-        return None, None, repr(e)
+    ok, root = _safe_insert(sb, TOKEN_TABLE, row, op="insert_token")
+    if not ok:
+        # Return a rich, explicit root cause to UI
+        return None, None, root
+
+    return token, expires_at, None
 
 
 def verify_web_otp_and_issue_token(contact: str, otp: str, purpose: str | None = None) -> Dict[str, Any]:
@@ -314,13 +368,13 @@ def verify_web_otp_and_issue_token(contact: str, otp: str, purpose: str | None =
     if not v.get("ok"):
         return v
 
-    account_id, err = _ensure_web_account(contact_email)
-    if err or not account_id:
-        return {"ok": False, "error": "account_error", "root_cause": err}
+    account_id, root = _ensure_web_account(contact_email)
+    if root or not account_id:
+        return {"ok": False, "error": "account_error", "root_cause": root}
 
-    token, expires_at, err2 = _issue_web_token(account_id)
-    if err2 or not token:
-        return {"ok": False, "error": "token_issue_failed", "root_cause": err2}
+    token, expires_at, root2 = _issue_web_token(account_id)
+    if root2 or not token:
+        return {"ok": False, "error": "token_issue_failed", "root_cause": root2}
 
     return {
         "ok": True,
@@ -336,16 +390,16 @@ def logout_web_session(req: Request) -> Dict[str, Any]:
 
     bearer = _extract_bearer(req)
     if bearer:
-        ok, err = _revoke_token(sb, bearer)
-        if not ok and err:
-            return {"ok": False, "error": "logout_failed", "root_cause": err}
+        ok, root = _safe_update(sb, TOKEN_TABLE, {"revoked_at": _now_ts()}, where_col="token", where_val=bearer, op="revoke_token_bearer")
+        if not ok:
+            return {"ok": False, "error": "logout_failed", "root_cause": root}
         return {"ok": True, "logged_out": True, "source": "bearer"}
 
     cookie_token = (req.cookies.get(SESSION_COOKIE_NAME) or "").strip()
     if cookie_token:
-        ok, err = _revoke_token(sb, cookie_token)
-        if not ok and err:
-            return {"ok": False, "error": "logout_failed", "root_cause": err}
+        ok, root = _safe_update(sb, TOKEN_TABLE, {"revoked_at": _now_ts()}, where_col="token", where_val=cookie_token, op="revoke_token_cookie")
+        if not ok:
+            return {"ok": False, "error": "logout_failed", "root_cause": root}
         return {"ok": True, "logged_out": True, "source": "cookie"}
 
     return {"ok": True, "logged_out": True, "source": "none"}
@@ -373,7 +427,10 @@ def verify_web_otp(
 
 
 def get_account_id_from_request(req: Request) -> Tuple[Optional[str], Dict[str, Any]]:
-    debug: Dict[str, Any] = {"cookie": {"name": SESSION_COOKIE_NAME}}
+    debug: Dict[str, Any] = {
+        "cookie": {"name": SESSION_COOKIE_NAME},
+        "tables": {"token_table": TOKEN_TABLE, "accounts_table": ACCOUNTS_TABLE},
+    }
 
     if _extract_dev_bypass(req):
         debug["source"] = "bypass"
@@ -393,9 +450,12 @@ def get_account_id_from_request(req: Request) -> Tuple[Optional[str], Dict[str, 
                 .limit(1)
                 .execute()
             )
-            row = (res.data or [None])[0]
-            if row and row.get("account_id"):
-                return row["account_id"], debug
+            if getattr(res, "error", None):
+                debug["token_lookup_error"] = _sb_error_blob(res, op="select_token_bearer", table=TOKEN_TABLE)
+            else:
+                row = (res.data or [None])[0]
+                if row and row.get("account_id") and not row.get("revoked_at"):
+                    return row["account_id"], debug
         except Exception as e:
             debug["token_error"] = repr(e)
 
@@ -410,9 +470,12 @@ def get_account_id_from_request(req: Request) -> Tuple[Optional[str], Dict[str, 
                 .limit(1)
                 .execute()
             )
-            row = (res.data or [None])[0]
-            if row and row.get("account_id"):
-                return row["account_id"], debug
+            if getattr(res, "error", None):
+                debug["cookie_lookup_error"] = _sb_error_blob(res, op="select_token_cookie", table=TOKEN_TABLE)
+            else:
+                row = (res.data or [None])[0]
+                if row and row.get("account_id") and not row.get("revoked_at"):
+                    return row["account_id"], debug
         except Exception as e:
             debug["cookie_error"] = repr(e)
 
