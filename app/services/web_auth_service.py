@@ -5,14 +5,17 @@ import hashlib
 import os
 import secrets
 import time
-from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
 import requests
 from flask import Request
 
 WEB_AUTH_COOKIE_NAME = os.getenv("WEB_AUTH_COOKIE_NAME", "ntg_web_token").strip() or "ntg_web_token"
+
+# How many times to retry token generation if we hit unique conflicts, etc.
+TOKEN_INSERT_MAX_RETRIES = int(os.getenv("WEB_TOKEN_INSERT_MAX_RETRIES", "5") or "5")
+TOKEN_INSERT_RETRY_SLEEP_MS = int(os.getenv("WEB_TOKEN_INSERT_RETRY_SLEEP_MS", "50") or "50")
 
 
 def _now_utc() -> datetime:
@@ -33,16 +36,15 @@ def _pepper() -> str:
 
 
 def _otp_ttl_minutes() -> int:
-    return int(os.getenv("WEB_OTP_TTL_MINUTES", "10"))
+    return int(os.getenv("WEB_OTP_TTL_MINUTES", "10") or "10")
 
 
 def _token_ttl_days() -> int:
-    return int(os.getenv("WEB_TOKEN_TTL_DAYS", "30"))
+    return int(os.getenv("WEB_TOKEN_TTL_DAYS", "30") or "30")
 
 
 def _supabase_url() -> str:
-    v = (os.getenv("SUPABASE_URL") or "").strip().rstrip("/")
-    return v
+    return (os.getenv("SUPABASE_URL") or "").strip().rstrip("/")
 
 
 def _supabase_key() -> str:
@@ -65,14 +67,20 @@ def _sb_headers() -> Dict[str, str]:
     }
 
 
-def _truncate(s: str, n: int = 1200) -> str:
+def _truncate(s: str, n: int = 1800) -> str:
     if s is None:
         return ""
     s = str(s)
     return s if len(s) <= n else (s[:n] + "...<truncated>")
 
 
-def _sb_request(method: str, path: str, *, params: Dict[str, Any] | None = None, json: Any = None) -> Tuple[bool, Any, Dict[str, Any]]:
+def _sb_request(
+    method: str,
+    path: str,
+    *,
+    params: Dict[str, Any] | None = None,
+    json: Any = None,
+) -> Tuple[bool, Any, Dict[str, Any]]:
     """
     Returns: (ok, data, debug)
     debug always includes status + response snippet on failure.
@@ -82,7 +90,8 @@ def _sb_request(method: str, path: str, *, params: Dict[str, Any] | None = None,
     try:
         res = requests.request(method, url, headers=_sb_headers(), params=params, json=json, timeout=25)
         dt = round((time.time() - t0) * 1000)
-        dbg = {
+
+        dbg: Dict[str, Any] = {
             "url": url,
             "method": method,
             "status": res.status_code,
@@ -114,6 +123,19 @@ def _hash_token(token: str) -> str:
     return _sha256_hex(f"tok:{token}:{_pepper()}")
 
 
+def _looks_like_fk_violation(payload: Any, dbg: Dict[str, Any]) -> bool:
+    body = (dbg.get("error_body") or "")
+    # PostgREST typically uses "23503" for FK violations (Postgres error code),
+    # and includes "violates foreign key constraint".
+    return ("23503" in body) or ("foreign key" in body.lower()) or ("violates foreign key" in body.lower())
+
+
+def _looks_like_unique_violation(payload: Any, dbg: Dict[str, Any]) -> bool:
+    body = (dbg.get("error_body") or "")
+    # Unique violations are usually 23505; PostgREST sometimes emits 409.
+    return ("23505" in body) or (dbg.get("status") == 409) or ("duplicate key" in body.lower()) or ("unique" in body.lower())
+
+
 def request_web_otp(
     *,
     contact: str,
@@ -130,7 +152,11 @@ def request_web_otp(
     purpose = (purpose or "web_login").strip().lower()
 
     if not _supabase_url() or not _supabase_key():
-        return {"ok": False, "error": "supabase_not_configured", "root_cause": "Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY"}
+        return {
+            "ok": False,
+            "error": "supabase_not_configured",
+            "root_cause": "Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY",
+        }
 
     otp_plain = f"{secrets.randbelow(1000000):06d}"
     expires_at = _now_utc() + timedelta(minutes=_otp_ttl_minutes())
@@ -151,7 +177,12 @@ def request_web_otp(
 
     ok, data, dbg = _sb_request("POST", "/web_otps", json=row)
     if not ok:
-        return {"ok": False, "error": "otp_insert_failed", "root_cause": dbg.get("error_body") or data, "debug": dbg}
+        return {
+            "ok": False,
+            "error": "otp_insert_failed",
+            "root_cause": dbg.get("error_body") or data,
+            "debug": dbg,
+        }
 
     created = data[0] if isinstance(data, list) and data else data
     return {
@@ -190,7 +221,11 @@ def _find_latest_otp(contact: str, purpose: str) -> Tuple[Optional[Dict[str, Any
 
 
 def _mark_otp_used(otp_id: str) -> Optional[Dict[str, Any]]:
-    ok, data, dbg = _sb_request("PATCH", f"/web_otps?id=eq.{otp_id}", json={"used": True, "used_at": _now_utc().isoformat()})
+    ok, data, dbg = _sb_request(
+        "PATCH",
+        f"/web_otps?id=eq.{otp_id}",
+        json={"used": True, "used_at": _now_utc().isoformat()},
+    )
     if ok:
         return {"ok": True}
     return {"ok": False, "root_cause": dbg.get("error_body") or data, "debug": dbg}
@@ -199,9 +234,8 @@ def _mark_otp_used(otp_id: str) -> Optional[Dict[str, Any]]:
 def _get_or_create_web_account(contact: str) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """
     Returns the account row from 'accounts' for provider='web'.
-    Your schema currently has BOTH 'id' and 'account_id'.
+    Your schema has BOTH 'id' and (often) 'account_id'.
     """
-    # Try fetch first
     params = {
         "select": "id,account_id,provider,provider_user_id",
         "provider": "eq.web",
@@ -216,11 +250,8 @@ def _get_or_create_web_account(contact: str) -> Tuple[Optional[Dict[str, Any]], 
     if rows:
         return rows[0], None
 
-    # Create row (minimal fields)
-    row = {
-        "provider": "web",
-        "provider_user_id": contact,
-    }
+    # Create row (minimal fields). If accounts.account_id has a DB default, it will populate.
+    row = {"provider": "web", "provider_user_id": contact}
     ok, data, dbg = _sb_request("POST", "/accounts", json=row)
     if not ok:
         return None, {"error": "account_create_failed", "root_cause": dbg.get("error_body") or data, "debug": dbg}
@@ -229,58 +260,95 @@ def _get_or_create_web_account(contact: str) -> Tuple[Optional[Dict[str, Any]], 
     return created, None
 
 
-def _insert_web_token_with_fallback(account_row: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+def _insert_web_token_defensive(account_row: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """
-    Defensive token insert:
-    - First tries accounts.id
-    - If FK complains, tries accounts.account_id
-    This protects you from schema drift (exactly what happened).
+    Defensive token insert to survive schema drift:
+    - Candidate #1: accounts.id
+    - Candidate #2: accounts.account_id
+    - Retries on UNIQUE conflicts (token_hash) by regenerating token/hash.
+
+    WHY:
+    - You already saw FK drift in the past (accounts(id) vs accounts(account_id)).
+    - You also saw HTTP/2 409 Conflict on /web_tokens inserts (likely unique token_hash).
     """
-    token_plain = secrets.token_urlsafe(48)
-    token_hash = _hash_token(token_plain)
     expires_at = (_now_utc() + timedelta(days=_token_ttl_days())).isoformat()
 
-    candidates = []
+    candidates: List[Tuple[str, str]] = []
     if account_row.get("id"):
-        candidates.append(("accounts.id", account_row["id"]))
+        candidates.append(("accounts.id", str(account_row["id"])))
     if account_row.get("account_id"):
-        candidates.append(("accounts.account_id", account_row["account_id"]))
+        candidates.append(("accounts.account_id", str(account_row["account_id"])))
 
-    last_err: Optional[Dict[str, Any]] = None
+    if not candidates:
+        return None, {"error": "web_token_insert_failed", "root_cause": "Account row has no id/account_id to reference", "account_row": account_row}
 
-    for label, acct_value in candidates:
-        payload = {
-            "token_hash": token_hash,
-            "account_id": acct_value,
-            "expires_at": expires_at,
-            "revoked": False,
-        }
+    attempts_debug: List[Dict[str, Any]] = []
 
-        ok, data, dbg = _sb_request("POST", "/web_tokens", json=payload)
-        if ok:
-            created = data[0] if isinstance(data, list) and data else data
-            return {
-                "ok": True,
-                "token": token_plain,
+    for candidate_label, acct_value in candidates:
+        # Try multiple times in case token_hash unique collides (rare, but you saw 409).
+        for n in range(1, TOKEN_INSERT_MAX_RETRIES + 1):
+            token_plain = secrets.token_urlsafe(48)
+            token_hash = _hash_token(token_plain)
+
+            payload = {
                 "token_hash": token_hash,
+                "account_id": acct_value,  # this must match whatever FK expects
                 "expires_at": expires_at,
-                "account_id": acct_value,
-                "account_id_source": label,
-                "token_row_id": (created or {}).get("id"),
-            }, None
+                "revoked": False,
+            }
 
-        # keep error for root cause exposure
-        last_err = {
-            "error": "web_token_insert_failed",
-            "attempt": label,
-            "root_cause": dbg.get("error_body") or data,
-            "debug": dbg,
-        }
+            ok, data, dbg = _sb_request("POST", "/web_tokens", json=payload)
+            if ok:
+                created = data[0] if isinstance(data, list) and data else data
+                return {
+                    "ok": True,
+                    "token": token_plain,
+                    "token_hash": token_hash,
+                    "expires_at": expires_at,
+                    "token_row_id": (created or {}).get("id"),
+                    "token_fk_value": acct_value,
+                    "token_fk_source": candidate_label,
+                }, None
 
-    return None, last_err or {"error": "web_token_insert_failed", "root_cause": "No account id candidates available"}
+            # Store failure details for root-cause exposure
+            attempts_debug.append(
+                {
+                    "candidate": candidate_label,
+                    "try": n,
+                    "status": dbg.get("status"),
+                    "root_cause": dbg.get("error_body") or data,
+                    "supabase": dbg,
+                }
+            )
+
+            # If it looks like FK mismatch, stop retrying this candidate and move to the next.
+            if _looks_like_fk_violation(data, dbg):
+                break
+
+            # If unique conflict, retry with a new token/hash.
+            if _looks_like_unique_violation(data, dbg):
+                if TOKEN_INSERT_RETRY_SLEEP_MS > 0:
+                    time.sleep(TOKEN_INSERT_RETRY_SLEEP_MS / 1000.0)
+                continue
+
+            # Other errors: don't spin forever; move to next candidate.
+            break
+
+    return None, {
+        "error": "web_token_insert_failed",
+        "root_cause": "All insert candidates failed",
+        "attempts": attempts_debug,
+        "account_row": {"id": account_row.get("id"), "account_id": account_row.get("account_id")},
+    }
 
 
 def verify_web_otp_and_issue_token(*, contact: str, otp: str, purpose: str) -> Dict[str, Any]:
+    """
+    Verifies OTP and issues a new web token row.
+
+    Root-cause exposure:
+    - Any Supabase failure returns (status + error_body + stage) inside debug/attempts.
+    """
     contact = (contact or "").strip().lower()
     purpose = (purpose or "web_login").strip().lower()
     otp = (otp or "").strip()
@@ -300,10 +368,10 @@ def verify_web_otp_and_issue_token(*, contact: str, otp: str, purpose: str) -> D
 
     # expiry check
     try:
-        exp = otp_row["expires_at"]
+        exp = str(otp_row["expires_at"])
         exp_dt = datetime.fromisoformat(exp.replace("Z", "+00:00"))
         if _now_utc() >= exp_dt:
-            return {"ok": False, "error": "otp_expired", "expires_at": exp}
+            return {"ok": False, "error": "otp_expired", "expires_at": exp, "otp_id": otp_row.get("id")}
     except Exception as e:
         return {"ok": False, "error": "otp_expiry_parse_failed", "root_cause": repr(e), "otp_row": otp_row}
 
@@ -312,7 +380,7 @@ def verify_web_otp_and_issue_token(*, contact: str, otp: str, purpose: str) -> D
         return {"ok": False, "error": "otp_invalid", "otp_id": otp_row.get("id")}
 
     # mark used
-    used_res = _mark_otp_used(otp_row["id"])
+    used_res = _mark_otp_used(str(otp_row["id"]))
     if used_res and not used_res.get("ok"):
         return {"ok": False, "error": "otp_mark_used_failed", "root_cause": used_res.get("root_cause"), "debug": used_res.get("debug")}
 
@@ -321,20 +389,30 @@ def verify_web_otp_and_issue_token(*, contact: str, otp: str, purpose: str) -> D
     if acct_err:
         return {"ok": False, **acct_err}
 
-    # insert token (with fallback between id vs account_id)
-    token_res, token_err = _insert_web_token_with_fallback(acct)
+    # issue token
+    token_res, token_err = _insert_web_token_defensive(acct)
     if token_err:
-        return {"ok": False, "error": "token_issue_failed", **token_err, "account_row": acct}
+        return {"ok": False, "error": "token_issue_failed", **token_err}
+
+    # IMPORTANT:
+    # Return a stable "account_id" for the app if your accounts table has account_id.
+    # Even if web_tokens.account_id currently references accounts.id, we still want
+    # to expose accounts.account_id outward where possible.
+    public_account_id = acct.get("account_id") or acct.get("id")
 
     return {
         "ok": True,
-        "account_id": token_res["account_id"],
-        "token": token_res["token"],
-        "expires_at": token_res["expires_at"],
+        "account_id": str(public_account_id),
+        "token": str(token_res["token"]),
+        "expires_at": str(token_res["expires_at"]),
         "debug": {
             "otp_id": otp_row.get("id"),
             "account_row": {"id": acct.get("id"), "account_id": acct.get("account_id")},
-            "insert_used_account_id_source": token_res.get("account_id_source"),
+            "token_insert": {
+                "token_row_id": token_res.get("token_row_id"),
+                "token_fk_source": token_res.get("token_fk_source"),
+                "token_fk_value": token_res.get("token_fk_value"),
+            },
         },
     }
 
@@ -356,52 +434,96 @@ def _extract_token_from_request(req: Request) -> Tuple[str, Dict[str, Any]]:
 
 
 def get_account_id_from_request(req: Request) -> Tuple[Optional[str], Dict[str, Any]]:
-    token, dbg = _extract_token_from_request(req)
+    """
+    Validates the token and returns the PUBLIC account_id if available.
+
+    This is resilient to both schemas:
+    - web_tokens.account_id -> accounts.id
+    - web_tokens.account_id -> accounts.account_id
+
+    We do this by selecting an embedded accounts(account_id) when PostgREST can.
+    """
+    token, src_dbg = _extract_token_from_request(req)
     if not token:
-        return None, {"ok": False, "error": "missing_token", **dbg}
+        return None, {"ok": False, "error": "missing_token", **src_dbg}
 
     token_hash = _hash_token(token)
 
+    # Ask PostgREST to embed the accounts row if FK exists.
+    # If embed isn't possible, it will just omit accounts field (still fine).
     params = {
-        "select": "id,account_id,expires_at,revoked",
+        "select": "id,account_id,expires_at,revoked,accounts(account_id,id)",
         "token_hash": f"eq.{token_hash}",
         "limit": "1",
     }
     ok, data, sb_dbg = _sb_request("GET", "/web_tokens", params=params)
     if not ok:
-        return None, {"ok": False, "error": "token_lookup_failed", "root_cause": sb_dbg.get("error_body") or data, "debug": sb_dbg, **dbg}
+        return None, {
+            "ok": False,
+            "error": "token_lookup_failed",
+            "root_cause": sb_dbg.get("error_body") or data,
+            "debug": sb_dbg,
+            **src_dbg,
+        }
 
     rows = data if isinstance(data, list) else []
     if not rows:
-        return None, {"ok": False, "error": "invalid_token", **dbg}
+        return None, {"ok": False, "error": "invalid_token", **src_dbg}
 
     row = rows[0]
     if row.get("revoked") is True:
-        return None, {"ok": False, "error": "token_revoked", **dbg}
+        return None, {"ok": False, "error": "token_revoked", **src_dbg}
 
     try:
         exp_dt = datetime.fromisoformat(str(row["expires_at"]).replace("Z", "+00:00"))
         if _now_utc() >= exp_dt:
-            return None, {"ok": False, "error": "token_expired", "expires_at": row.get("expires_at"), **dbg}
+            return None, {"ok": False, "error": "token_expired", "expires_at": row.get("expires_at"), **src_dbg}
     except Exception as e:
-        return None, {"ok": False, "error": "token_expiry_parse_failed", "root_cause": repr(e), "token_row": row, **dbg}
+        return None, {"ok": False, "error": "token_expiry_parse_failed", "root_cause": repr(e), "token_row": row, **src_dbg}
+
+    # Derive "public" account_id:
+    # - Prefer embedded accounts.account_id if present
+    # - Else if token row's account_id is already a public id, return it
+    # - Else fallback to embedded accounts.id
+    public_account_id: Optional[str] = None
+
+    embedded = row.get("accounts")
+    if isinstance(embedded, list) and embedded:
+        embedded = embedded[0]
+    if isinstance(embedded, dict):
+        if embedded.get("account_id"):
+            public_account_id = str(embedded.get("account_id"))
+        elif embedded.get("id"):
+            public_account_id = str(embedded.get("id"))
+
+    if not public_account_id and row.get("account_id"):
+        public_account_id = str(row.get("account_id"))
 
     # update last_seen_at (non-fatal)
     _sb_request("PATCH", f"/web_tokens?id=eq.{row.get('id')}", json={"last_seen_at": _now_utc().isoformat()})
 
-    return str(row.get("account_id")), {"ok": True, **dbg}
+    return public_account_id, {"ok": True, **src_dbg, "debug": {"supabase": sb_dbg, "resolved_from_embed": bool(public_account_id and isinstance(embedded, dict))}}
 
 
 def logout_web_session(req: Request) -> Dict[str, Any]:
-    token, dbg = _extract_token_from_request(req)
+    """
+    Revokes the current token row (best effort).
+    Root-cause is returned if revoke fails.
+    """
+    token, src_dbg = _extract_token_from_request(req)
     if not token:
-        return {"ok": True, "logged_out": False, "reason": "no_token", **dbg}
+        return {"ok": True, "logged_out": False, "reason": "no_token", **src_dbg}
 
     token_hash = _hash_token(token)
 
-    # revoke any matching token rows
     ok, data, sb_dbg = _sb_request("PATCH", f"/web_tokens?token_hash=eq.{token_hash}", json={"revoked": True})
     if not ok:
-        return {"ok": False, "error": "logout_failed", "root_cause": sb_dbg.get("error_body") or data, "debug": sb_dbg, **dbg}
+        return {
+            "ok": False,
+            "error": "logout_failed",
+            "root_cause": sb_dbg.get("error_body") or data,
+            "debug": sb_dbg,
+            **src_dbg,
+        }
 
-    return {"ok": True, "logged_out": True, **dbg}
+    return {"ok": True, "logged_out": True, **src_dbg}
