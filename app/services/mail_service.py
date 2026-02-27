@@ -3,65 +3,48 @@ from __future__ import annotations
 
 import os
 import smtplib
-from typing import Optional, Tuple, Dict
-from email.mime.multipart import MIMEMultipart
+import ssl
+from typing import Optional, Dict, Any
 from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 
-# ---------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------
 def _truthy(v: str | None) -> bool:
     return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-def _get_env(*names: str, default: str = "") -> str:
-    for n in names:
-        v = os.getenv(n)
-        if v is not None and str(v).strip() != "":
-            return str(v).strip()
-    return default
+# ---------------------------------------------------------
+# ENV CONFIG (MAIL_* primary; SMTP_* fallback)
+# ---------------------------------------------------------
+MAIL_ENABLED = _truthy(os.getenv("MAIL_ENABLED", "0"))
+
+MAIL_HOST = (os.getenv("MAIL_HOST") or os.getenv("SMTP_HOST") or "").strip()
+MAIL_PORT = int((os.getenv("MAIL_PORT") or os.getenv("SMTP_PORT") or "587").strip() or "587")
+
+MAIL_USER = (os.getenv("MAIL_USER") or os.getenv("SMTP_USER") or "").strip()
+MAIL_PASS = (os.getenv("MAIL_PASS") or os.getenv("SMTP_PASS") or "").strip()
+
+MAIL_FROM_NAME = (os.getenv("MAIL_FROM_NAME") or "NaijaTax Guide").strip()
+MAIL_FROM_EMAIL = (os.getenv("MAIL_FROM_EMAIL") or os.getenv("SMTP_FROM") or MAIL_USER or "").strip()
+
+MAIL_USE_SSL = _truthy(os.getenv("MAIL_USE_SSL", "0"))
+MAIL_USE_TLS = _truthy(os.getenv("MAIL_USE_TLS", "1"))
+
+DEFAULT_OTP_SUBJECT = (os.getenv("WEB_OTP_EMAIL_SUBJECT") or "Your NaijaTax Guide OTP").strip()
 
 
-def _get_int_env(*names: str, default: int) -> int:
-    raw = _get_env(*names, default=str(default))
-    try:
-        return int(raw)
-    except Exception:
-        return default
-
-
-def _mail_config() -> Tuple[bool, Dict[str, str], Dict[str, bool]]:
-    """
-    Supports BOTH MAIL_* and SMTP_* env naming.
-    """
-    enabled = _truthy(_get_env("MAIL_ENABLED", "SMTP_ENABLED", default="0"))
-
-    host = _get_env("MAIL_HOST", "SMTP_HOST", default="")
-    port = _get_int_env("MAIL_PORT", "SMTP_PORT", default=2525)
-
-    user = _get_env("MAIL_USER", "SMTP_USER", default="")
-    password = _get_env("MAIL_PASS", "SMTP_PASS", default="")
-
-    from_name = _get_env("MAIL_FROM_NAME", "SMTP_FROM_NAME", default="NaijaTax Guide")
-    from_email = _get_env("MAIL_FROM_EMAIL", "SMTP_FROM_EMAIL", default="no-reply@example.com")
-
-    # TLS/SSL toggles
-    use_tls = _truthy(_get_env("MAIL_USE_TLS", "SMTP_USE_TLS", default="1"))
-    use_ssl = _truthy(_get_env("MAIL_USE_SSL", "SMTP_USE_SSL", default="0"))
-
-    debug = _truthy(_get_env("MAIL_DEBUG", "SMTP_DEBUG", default="0"))
-
-    cfg = {
-        "host": host,
-        "port": str(port),
-        "user": user,
-        "pass": password,
-        "from_name": from_name,
-        "from_email": from_email,
+def _smtp_config_snapshot(to_email: str) -> Dict[str, Any]:
+    return {
+        "enabled": MAIL_ENABLED,
+        "host": MAIL_HOST,
+        "port": MAIL_PORT,
+        "use_ssl": MAIL_USE_SSL,
+        "use_tls": MAIL_USE_TLS,
+        "user_present": bool(MAIL_USER),
+        "pass_present": bool(MAIL_PASS),
+        "from": f"{MAIL_FROM_NAME} <{MAIL_FROM_EMAIL}>",
+        "to": to_email,
     }
-    flags = {"enabled": enabled, "use_tls": use_tls, "use_ssl": use_ssl, "debug": debug}
-    return enabled, cfg, flags
 
 
 # ---------------------------------------------------------
@@ -72,100 +55,70 @@ def send_email(
     subject: str,
     html_body: str,
     text_body: Optional[str] = None,
-) -> bool:
+) -> Dict[str, Any]:
+    """
+    Sends transactional email via SMTP.
+    Returns a structured result:
+      { ok: bool, error?: str, root_cause?: str, debug?: {...} }
+    """
     to_email = (to_email or "").strip()
-    subject = (subject or "").strip()
-
-    enabled, cfg, flags = _mail_config()
-
-    if not enabled:
-        print("[mail] disabled (MAIL_ENABLED/SMTP_ENABLED is falsey)")
-        return False
-
-    missing = []
-    if not cfg["host"]:
-        missing.append("MAIL_HOST/SMTP_HOST")
-    if not cfg["port"]:
-        missing.append("MAIL_PORT/SMTP_PORT")
-    if not cfg["user"]:
-        missing.append("MAIL_USER/SMTP_USER")
-    if not cfg["pass"]:
-        missing.append("MAIL_PASS/SMTP_PASS")
-    if not cfg["from_email"]:
-        missing.append("MAIL_FROM_EMAIL/SMTP_FROM_EMAIL")
-
     if not to_email:
-        missing.append("to_email")
+        return {"ok": False, "error": "to_email_required"}
 
-    if not subject:
-        missing.append("subject")
+    if not MAIL_ENABLED:
+        return {"ok": False, "error": "mail_disabled", "debug": _smtp_config_snapshot(to_email)}
 
-    if missing:
-        print(f"[mail] Missing config/fields: {', '.join(missing)}")
-        if flags["debug"]:
-            print("[mail] raw cfg:", {k: ("***" if k == "pass" else v) for k, v in cfg.items()})
-            print("[mail] flags:", flags)
-        return False
+    if not all([MAIL_HOST, MAIL_PORT, MAIL_USER, MAIL_PASS, MAIL_FROM_EMAIL]):
+        return {
+            "ok": False,
+            "error": "mail_not_configured",
+            "debug": _smtp_config_snapshot(to_email),
+        }
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
-    msg["From"] = f'{cfg["from_name"]} <{cfg["from_email"]}>'
+    msg["From"] = f"{MAIL_FROM_NAME} <{MAIL_FROM_EMAIL}>"
     msg["To"] = to_email
 
     if text_body:
         msg.attach(MIMEText(text_body, "plain", "utf-8"))
-    msg.attach(MIMEText(html_body or "", "html", "utf-8"))
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
 
     try:
-        if flags["debug"]:
-            print("[mail] sending with:", {
-                "host": cfg["host"],
-                "port": cfg["port"],
-                "use_tls": flags["use_tls"],
-                "use_ssl": flags["use_ssl"],
-                "from": cfg["from_email"],
-                "to": to_email,
-            })
-
-        if flags["use_ssl"]:
-            server: smtplib.SMTP = smtplib.SMTP_SSL(cfg["host"], int(cfg["port"]), timeout=20)
+        if MAIL_USE_SSL:
+            context = ssl.create_default_context()
+            with smtplib.SMTP_SSL(MAIL_HOST, MAIL_PORT, timeout=20, context=context) as server:
+                server.login(MAIL_USER, MAIL_PASS)
+                server.sendmail(MAIL_FROM_EMAIL, to_email, msg.as_string())
         else:
-            server = smtplib.SMTP(cfg["host"], int(cfg["port"]), timeout=20)
+            with smtplib.SMTP(MAIL_HOST, MAIL_PORT, timeout=20) as server:
+                if MAIL_USE_TLS:
+                    context = ssl.create_default_context()
+                    server.starttls(context=context)
+                server.login(MAIL_USER, MAIL_PASS)
+                server.sendmail(MAIL_FROM_EMAIL, to_email, msg.as_string())
 
-        with server as s:
-            s.ehlo()
-            if flags["use_tls"] and not flags["use_ssl"]:
-                s.starttls()
-                s.ehlo()
-
-            s.login(cfg["user"], cfg["pass"])
-            s.sendmail(cfg["from_email"], [to_email], msg.as_string())
-
-        print(f"[mail] Sent -> {to_email}")
-        return True
-
-    except smtplib.SMTPAuthenticationError as e:
-        print(f"[mail] AUTH ERROR -> {e}")
-        return False
-    except smtplib.SMTPException as e:
-        print(f"[mail] SMTP ERROR -> {e}")
-        return False
+        return {"ok": True, "debug": _smtp_config_snapshot(to_email)}
     except Exception as e:
-        print(f"[mail] ERROR -> {repr(e)}")
-        return False
+        return {
+            "ok": False,
+            "error": "mail_send_failed",
+            "root_cause": repr(e),
+            "debug": _smtp_config_snapshot(to_email),
+        }
 
 
 # ---------------------------------------------------------
 # OTP TEMPLATE
 # ---------------------------------------------------------
-def send_otp_email(to_email: str, otp_code: str) -> bool:
-    otp_code = (otp_code or "").strip()
-    subject = (os.getenv("WEB_OTP_EMAIL_SUBJECT") or "Your Login OTP Code").strip()
+def send_otp_email(to_email: str, otp_code: str) -> Dict[str, Any]:
+    subject = DEFAULT_OTP_SUBJECT
 
     html_body = f"""
     <div style="font-family:Arial,sans-serif;max-width:600px;margin:auto">
-        <h2 style="margin:0 0 12px 0;">NaijaTax Guide</h2>
-        <p style="margin:0 0 12px 0;">Your One-Time Password (OTP) is:</p>
+        <h2>NaijaTax Guide</h2>
+        <p>Your One-Time Password (OTP) is:</p>
+
         <div style="
             font-size:32px;
             font-weight:bold;
@@ -174,14 +127,16 @@ def send_otp_email(to_email: str, otp_code: str) -> bool:
             padding:15px;
             text-align:center;
             border-radius:8px;
-            margin:0 0 12px 0;
-        ">{otp_code}</div>
-        <p style="margin:0 0 12px 0;">This code expires in 10 minutes.</p>
-        <p style="margin:0 0 12px 0;">If you did not request this login, ignore this email.</p>
-        <hr style="border:none;border-top:1px solid #ddd;margin:16px 0;">
-        <small style="color:#666;">© NaijaTax Guide</small>
+        ">
+            {otp_code}
+        </div>
+
+        <p>This code expires in 10 minutes.</p>
+        <p>If you did not request this login, ignore this email.</p>
+        <hr>
+        <small>© NaijaTax Guide</small>
     </div>
-    """.strip()
+    """
 
     text_body = f"Your OTP code is: {otp_code}\nThis code expires in 10 minutes."
 
