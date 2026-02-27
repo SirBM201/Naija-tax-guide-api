@@ -13,7 +13,8 @@ from app.services.web_auth_service import (
     get_account_id_from_request,
     WEB_AUTH_COOKIE_NAME,
 )
-from app.services.mail_service import send_otp_email, smtp_status
+from app.services.mail_service import send_otp_email
+
 
 bp = Blueprint("web_auth", __name__)
 
@@ -50,18 +51,15 @@ def request_otp():
     delivery: Dict[str, Any] = {"mode": "email", "sent": False}
 
     if otp_plain:
-        email_res = send_otp_email(contact, otp_plain)
-        if email_res.get("ok"):
+        mail_res = send_otp_email(contact, otp_plain)
+        if mail_res.get("ok"):
             delivery["sent"] = True
             delivery["provider"] = "smtp"
         else:
             delivery["sent"] = False
-            delivery["error"] = email_res.get("error", "email_send_failed")
-            delivery["root_cause"] = email_res.get("root_cause")
-            delivery["smtp_status"] = email_res.get("debug") or smtp_status()
-    else:
-        delivery["sent"] = False
-        delivery["error"] = "otp_generation_failed"
+            delivery["error"] = mail_res.get("error") or "email_send_failed"
+            delivery["root_cause"] = mail_res.get("root_cause")
+            delivery["debug"] = mail_res.get("debug")
 
     out = {
         "ok": True,
@@ -72,9 +70,8 @@ def request_otp():
         "debug": r.get("debug", {}),
     }
 
-    # DEV ONLY: show otp
     if dev_return_plain and otp_plain:
-        out["otp"] = otp_plain
+        out["otp"] = otp_plain  # DEV ONLY
 
     return jsonify(out), 200
 
@@ -97,7 +94,6 @@ def verify_otp():
     token = r["token"]
     resp = make_response(jsonify(r), 200)
 
-    # cookie optional
     if _truthy(os.getenv("COOKIE_AUTH_ENABLED", "1")):
         secure = _truthy(os.getenv("COOKIE_SECURE", "1"))
         samesite = os.getenv("COOKIE_SAMESITE", "None")
