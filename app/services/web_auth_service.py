@@ -20,6 +20,11 @@ REVOKE_OLD_TOKENS_ON_LOGIN = str(os.getenv("WEB_REVOKE_OLD_TOKENS_ON_LOGIN", "1"
     "1", "true", "yes", "y", "on"
 }
 
+# If enabled, bearer failures will fall back to cookie (recommended ON for now)
+BEARER_FALLBACK_TO_COOKIE = str(os.getenv("WEB_BEARER_FALLBACK_TO_COOKIE", "1")).strip().lower() in {
+    "1", "true", "yes", "y", "on"
+}
+
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
@@ -30,10 +35,6 @@ def _sha256_hex(s: str) -> str:
 
 
 def _require_env(*names: str) -> str:
-    """
-    Return first non-empty env value from names.
-    Raise if none present.
-    """
     for n in names:
         v = (os.getenv(n) or "").strip()
         if v:
@@ -42,13 +43,10 @@ def _require_env(*names: str) -> str:
 
 
 def _otp_pepper() -> str:
-    # Prefer specific peppers you showed in screenshots
-    # (OTP_HASH_PEPPER is commonly used name; WEB_OTP_PEPPER is also ok)
     return _require_env("WEB_OTP_PEPPER", "OTP_HASH_PEPPER")
 
 
 def _token_pepper() -> str:
-    # Prefer specific token pepper you showed
     return _require_env("WEB_TOKEN_PEPPER")
 
 
@@ -127,12 +125,10 @@ def _sb_request(
 
 
 def _hash_otp(otp: str) -> str:
-    # IMPORTANT: uses OTP pepper
     return _sha256_hex(f"otp:{otp}:{_otp_pepper()}")
 
 
 def _hash_token(token: str) -> str:
-    # IMPORTANT: uses TOKEN pepper
     return _sha256_hex(f"tok:{token}:{_token_pepper()}")
 
 
@@ -250,11 +246,6 @@ def _revoke_all_tokens_for_account(accounts_id: str) -> None:
 
 
 def _insert_web_token(account_row: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
-    """
-    DB constraint:
-      web_tokens.account_id REFERENCES accounts(id)
-    So ALWAYS insert accounts.id into web_tokens.account_id.
-    """
     accounts_id = str(account_row["id"])
     expires_at = (_now_utc() + timedelta(days=_token_ttl_days())).isoformat()
 
@@ -357,28 +348,30 @@ def verify_web_otp_and_issue_token(*, contact: str, otp: str, purpose: str) -> D
     }
 
 
-def _extract_token_from_request(req: Request) -> Tuple[str, Dict[str, Any]]:
-    debug: Dict[str, Any] = {"token_source": None}
+def _extract_token_candidates(req: Request) -> Tuple[str, str, Dict[str, Any]]:
+    """
+    Return (bearer_token, cookie_token, debug)
+    """
+    debug: Dict[str, Any] = {"token_source": None, "has_bearer": False, "has_cookie": False}
 
     h = (req.headers.get("Authorization") or "").strip()
+    bearer = ""
     if h.lower().startswith("bearer "):
-        debug["token_source"] = "bearer"
-        return h[7:].strip(), debug
+        bearer = h[7:].strip()
+        debug["has_bearer"] = bool(bearer)
 
-    c = (req.cookies.get(WEB_AUTH_COOKIE_NAME) or "").strip()
-    if c:
-        debug["token_source"] = "cookie"
-        return c, debug
+    cookie = (req.cookies.get(WEB_AUTH_COOKIE_NAME) or "").strip()
+    debug["has_cookie"] = bool(cookie)
 
-    return "", debug
+    return bearer, cookie, debug
 
 
-def get_account_id_from_request(req: Request) -> Tuple[Optional[str], Dict[str, Any]]:
-    token, src_dbg = _extract_token_from_request(req)
-    if not token:
-        return None, {"ok": False, "error": "missing_token", **src_dbg}
-
-    token_hash = _hash_token(token)
+def _lookup_token_plain(token_plain: str) -> Tuple[Optional[str], Dict[str, Any]]:
+    """
+    Lookup token_plain in web_tokens by hashing it and selecting row.
+    Returns (public_account_id, debug)
+    """
+    token_hash = _hash_token(token_plain)
 
     params = {
         "select": "id,account_id,expires_at,revoked,last_seen_at,accounts(id,account_id)",
@@ -387,22 +380,22 @@ def get_account_id_from_request(req: Request) -> Tuple[Optional[str], Dict[str, 
     }
     ok, data, sb_dbg = _sb_request("GET", "/web_tokens", params=params)
     if not ok:
-        return None, {"ok": False, "error": "token_lookup_failed", "root_cause": sb_dbg.get("error_body") or data, "debug": sb_dbg, **src_dbg}
+        return None, {"ok": False, "error": "token_lookup_failed", "root_cause": sb_dbg.get("error_body") or data, "debug": sb_dbg}
 
     rows = data if isinstance(data, list) else []
     if not rows:
-        return None, {"ok": False, "error": "invalid_token", **src_dbg}
+        return None, {"ok": False, "error": "invalid_token", "debug": {"supabase": sb_dbg}}
 
     row = rows[0]
     if row.get("revoked") is True:
-        return None, {"ok": False, "error": "token_revoked", **src_dbg}
+        return None, {"ok": False, "error": "token_revoked", "debug": {"supabase": sb_dbg}}
 
     try:
         exp_dt = datetime.fromisoformat(str(row["expires_at"]).replace("Z", "+00:00"))
         if _now_utc() >= exp_dt:
-            return None, {"ok": False, "error": "token_expired", "expires_at": row.get("expires_at"), **src_dbg}
+            return None, {"ok": False, "error": "token_expired", "expires_at": row.get("expires_at"), "debug": {"supabase": sb_dbg}}
     except Exception as e:
-        return None, {"ok": False, "error": "token_expiry_parse_failed", "root_cause": repr(e), "token_row": row, **src_dbg}
+        return None, {"ok": False, "error": "token_expiry_parse_failed", "root_cause": repr(e), "token_row": row, "debug": {"supabase": sb_dbg}}
 
     public_account_id: Optional[str] = None
     embedded = row.get("accounts")
@@ -423,11 +416,40 @@ def get_account_id_from_request(req: Request) -> Tuple[Optional[str], Dict[str, 
     except Exception:
         pass
 
-    return public_account_id, {"ok": True, **src_dbg, "debug": {"supabase": sb_dbg}}
+    return public_account_id, {"ok": True, "debug": {"supabase": sb_dbg}}
+
+
+def get_account_id_from_request(req: Request) -> Tuple[Optional[str], Dict[str, Any]]:
+    bearer, cookie, src_dbg = _extract_token_candidates(req)
+
+    if not bearer and not cookie:
+        return None, {"ok": False, "error": "missing_token", **src_dbg}
+
+    # 1) Prefer bearer if present
+    if bearer:
+        acc, dbg = _lookup_token_plain(bearer)
+        if acc:
+            return acc, {"ok": True, "token_source": "bearer", **src_dbg, "debug": dbg.get("debug")}
+
+        # 2) Fallback to cookie if enabled and cookie exists
+        if BEARER_FALLBACK_TO_COOKIE and cookie:
+            acc2, dbg2 = _lookup_token_plain(cookie)
+            if acc2:
+                return acc2, {"ok": True, "token_source": "cookie_fallback", **src_dbg, "debug": dbg2.get("debug")}
+
+        return None, {"ok": False, "error": "invalid_token", "token_source": "bearer", **src_dbg}
+
+    # cookie only
+    acc3, dbg3 = _lookup_token_plain(cookie)
+    if acc3:
+        return acc3, {"ok": True, "token_source": "cookie", **src_dbg, "debug": dbg3.get("debug")}
+
+    return None, {"ok": False, "error": "invalid_token", "token_source": "cookie", **src_dbg}
 
 
 def logout_web_session(req: Request) -> Dict[str, Any]:
-    token, src_dbg = _extract_token_from_request(req)
+    bearer, cookie, src_dbg = _extract_token_candidates(req)
+    token = bearer or cookie
     if not token:
         return {"ok": True, "logged_out": False, "reason": "no_token", **src_dbg}
 
