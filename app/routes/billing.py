@@ -1,9 +1,8 @@
 # app/routes/billing.py
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 from flask import Blueprint, jsonify, request
 
@@ -24,23 +23,35 @@ def _sb():
     return supabase() if callable(supabase) else supabase
 
 
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return _now().isoformat()
 
 
 def _safe_json() -> Dict[str, Any]:
     return request.get_json(silent=True) or {}
 
 
-def _store_paystack_event(*, event_id: Optional[str], event_type: str, reference: Optional[str], payload: Dict[str, Any]) -> None:
+def _store_paystack_event(
+    *,
+    event_id: Optional[str],
+    event_type: str,
+    reference: Optional[str],
+    payload: Dict[str, Any],
+) -> None:
     """
-    paystack_events schema:
-      id bigint pk
-      event_id text unique nullable
-      event_type text not null
-      reference text nullable
-      payload jsonb not null
-      created_at timestamptz not null
+    Table expected (recommended):
+      paystack_events:
+        id bigint pk
+        event_id text unique nullable
+        event_type text not null
+        reference text nullable
+        payload jsonb not null
+        created_at timestamptz not null
+    This is best-effort. If table doesn't exist, it won't break payments.
     """
     row = {
         "event_id": event_id,
@@ -52,36 +63,30 @@ def _store_paystack_event(*, event_id: Optional[str], event_type: str, reference
     try:
         _sb().table("paystack_events").insert(row).execute()
     except Exception:
-        # idempotency: event_id is UNIQUE; duplicates should not break webhook
+        # idempotency: event_id may be unique; duplicates shouldn't break
         pass
 
 
-def _upsert_user_subscription(*, account_id: str, plan_code: str, duration_days: int, provider: str, provider_ref: str) -> Dict[str, Any]:
+def _upsert_user_subscription(
+    *,
+    account_id: str,
+    plan_code: str,
+    duration_days: int,
+    provider: str,
+    provider_ref: str,
+) -> Dict[str, Any]:
     """
-    user_subscriptions has UNIQUE(account_id). We upsert by:
-      - fetch existing by account_id
-      - update if exists
-      - else insert new
-    Columns exist:
-      id uuid pk
-      account_id uuid not null
-      plan_code text not null
-      status text not null
-      started_at timestamptz not null
-      expires_at timestamptz nullable
-      is_active boolean not null
-      pending_* nullable
-      grace_until, trial_until nullable
-      provider/provider_ref nullable
-      current_period_end nullable
+    user_subscriptions unique by account_id (one current subscription per account).
+    This function will:
+      - update existing row if found
+      - else insert a new row
     """
-    now = datetime.now(timezone.utc)
+    now = _now()
     expires = now + timedelta(days=int(duration_days))
-
     now_iso = now.isoformat()
     exp_iso = expires.isoformat()
 
-    # try find existing
+    # Find existing
     existing = (
         _sb()
         .table("user_subscriptions")
@@ -101,7 +106,6 @@ def _upsert_user_subscription(*, account_id: str, plan_code: str, duration_days:
         "current_period_end": exp_iso,
         "provider": provider,
         "provider_ref": provider_ref,
-        # clear pending fields
         "pending_plan_code": None,
         "pending_starts_at": None,
         "updated_at": now_iso,
@@ -131,6 +135,8 @@ def _upsert_user_subscription(*, account_id: str, plan_code: str, duration_days:
     return out[0] if out else ins
 
 
+# -------------------- ROUTES --------------------
+
 @bp.get("/billing/plans")
 def billing_plans():
     active_only = (request.args.get("active_only") or "1").strip() != "0"
@@ -152,7 +158,6 @@ def billing_me():
     if not account_id:
         return jsonify({"ok": False, "error": "unauthorized", "debug": debug}), 401
 
-    # return current subscription snapshot (best effort)
     sub = None
     err = None
     try:
@@ -169,13 +174,15 @@ def billing_me():
     except Exception as e:
         err = repr(e)
 
-    return jsonify({"ok": True, "account_id": account_id, "subscription": sub, "db_warning": err, "debug": debug}), 200
+    return jsonify(
+        {"ok": True, "account_id": account_id, "subscription": sub, "db_warning": err, "debug": debug}
+    ), 200
 
 
 @bp.post("/billing/checkout")
 def billing_checkout():
     """
-    Start Paystack transaction (requires auth identity because we must bind to account_id).
+    Start Paystack transaction (requires auth identity to bind to account_id).
     Body: { "plan_code": "monthly|quarterly|yearly", "email": "payer@email.com" }
     """
     account_id, debug = get_account_id_from_request(request)
@@ -193,7 +200,6 @@ def billing_checkout():
     if not plan or not plan.get("active", True):
         return jsonify({"ok": False, "error": "plan_not_found"}), 404
 
-    # amount is from DEFAULT_PLANS in code (DB plans has no price column)
     price_ngn = int(plan.get("price") or 0)
     if price_ngn <= 0:
         return jsonify({"ok": False, "error": "plan_price_missing"}), 400
@@ -202,7 +208,7 @@ def billing_checkout():
     metadata = {
         "product": "naija_tax_guide",
         "plan_code": plan_code,
-        "account_id": account_id,   # IMPORTANT: this is accounts.account_id
+        "account_id": account_id,  # IMPORTANT
         "email": email,
     }
 
@@ -252,7 +258,6 @@ def billing_verify():
     plan_code = (metadata.get("plan_code") or "").strip().lower()
     account_id = (metadata.get("account_id") or "").strip()
 
-    # store verify payload in paystack_events (best effort)
     _store_paystack_event(event_id=tx_id, event_type="verify", reference=reference, payload=ps)
 
     if status != "success":
