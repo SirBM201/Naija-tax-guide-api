@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import hashlib
-import os
 import secrets
 import time
 from datetime import datetime, timezone, timedelta
@@ -11,23 +10,27 @@ from typing import Any, Dict, Optional, Tuple, List
 import requests
 from flask import Request
 
-# -------------------- ENV / TABLE NAMES --------------------
+from app.core.config import (
+    SUPABASE_URL,
+    SUPABASE_SERVICE_ROLE_KEY,
+    WEB_AUTH_COOKIE_NAME,
+    WEB_TOKEN_PEPPER,
+    WEB_OTP_PEPPER,
+    WEB_OTP_TTL_MINUTES,
+    WEB_SESSION_TTL_DAYS,
+    WEB_OTP_TABLE,
+    WEB_TOKEN_TABLE,
+)
 
-WEB_AUTH_COOKIE_NAME = (os.getenv("WEB_AUTH_COOKIE_NAME", "ntg_web_token").strip() or "ntg_web_token")
+# Optional behavior toggles (env-driven, but safe defaults)
+TOKEN_INSERT_MAX_RETRIES = int((__import__("os").getenv("WEB_TOKEN_INSERT_MAX_RETRIES", "5") or "5"))
+TOKEN_INSERT_RETRY_SLEEP_MS = int((__import__("os").getenv("WEB_TOKEN_INSERT_RETRY_SLEEP_MS", "50") or "50"))
 
-# Table names (overrideable)
-ACCOUNTS_TABLE = (os.getenv("ACCOUNTS_TABLE", "accounts").strip() or "accounts")
-WEB_OTP_TABLE = (os.getenv("WEB_OTP_TABLE", "web_otps").strip() or "web_otps")
-WEB_TOKEN_TABLE = (os.getenv("WEB_TOKEN_TABLE", "web_tokens").strip() or "web_tokens")
-
-TOKEN_INSERT_MAX_RETRIES = int(os.getenv("WEB_TOKEN_INSERT_MAX_RETRIES", "5") or "5")
-TOKEN_INSERT_RETRY_SLEEP_MS = int(os.getenv("WEB_TOKEN_INSERT_RETRY_SLEEP_MS", "50") or "50")
-
-REVOKE_OLD_TOKENS_ON_LOGIN = str(os.getenv("WEB_REVOKE_OLD_TOKENS_ON_LOGIN", "1")).strip().lower() in {
+REVOKE_OLD_TOKENS_ON_LOGIN = str(__import__("os").getenv("WEB_REVOKE_OLD_TOKENS_ON_LOGIN", "1")).strip().lower() in {
     "1", "true", "yes", "y", "on"
 }
 
-BEARER_FALLBACK_TO_COOKIE = str(os.getenv("WEB_BEARER_FALLBACK_TO_COOKIE", "1")).strip().lower() in {
+BEARER_FALLBACK_TO_COOKIE = str(__import__("os").getenv("WEB_BEARER_FALLBACK_TO_COOKIE", "1")).strip().lower() in {
     "1", "true", "yes", "y", "on"
 }
 
@@ -42,59 +45,21 @@ def _sha256_hex(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
-def _require_env(*names: str) -> str:
-    for n in names:
-        v = (os.getenv(n) or "").strip()
-        if v:
-            return v
-    raise RuntimeError(f"Missing required env var. Provide one of: {', '.join(names)}")
-
-
 def _otp_pepper() -> str:
-    return _require_env("WEB_OTP_PEPPER", "OTP_HASH_PEPPER")
+    # WEB_OTP_PEPPER is already defaulted in config.py
+    return (WEB_OTP_PEPPER or "").strip()
 
 
 def _token_pepper() -> str:
-    return _require_env("WEB_TOKEN_PEPPER")
+    return (WEB_TOKEN_PEPPER or "").strip()
 
 
-def _otp_ttl_minutes() -> int:
-    return int(os.getenv("WEB_OTP_TTL_MINUTES", "10") or "10")
+def _hash_otp(otp: str) -> str:
+    return _sha256_hex(f"otp:{otp}:{_otp_pepper()}")
 
 
-def _token_ttl_days() -> int:
-    return int(os.getenv("WEB_TOKEN_TTL_DAYS", "30") or "30")
-
-
-# -------------------- supabase rest --------------------
-
-def _supabase_url() -> str:
-    url = (os.getenv("SUPABASE_URL") or "").strip().rstrip("/")
-    if not url:
-        raise RuntimeError("SUPABASE_URL is missing")
-    return url
-
-
-def _supabase_key() -> str:
-    key = (os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_SERVICE_KEY") or "").strip()
-    if not key:
-        raise RuntimeError("SUPABASE_SERVICE_ROLE_KEY is missing")
-    return key
-
-
-def _postgrest_base() -> str:
-    return f"{_supabase_url()}/rest/v1"
-
-
-def _sb_headers() -> Dict[str, str]:
-    key = _supabase_key()
-    return {
-        "apikey": key,
-        "Authorization": f"Bearer {key}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Prefer": "return=representation",
-    }
+def _hash_token(token: str) -> str:
+    return _sha256_hex(f"tok:{token}:{_token_pepper()}")
 
 
 def _truncate(s: Any, n: int = 1800) -> str:
@@ -102,6 +67,33 @@ def _truncate(s: Any, n: int = 1800) -> str:
         return ""
     s = str(s)
     return s if len(s) <= n else (s[:n] + "...<truncated>")
+
+
+# -------------------- supabase postgrest --------------------
+
+def _postgrest_base() -> str:
+    url = (SUPABASE_URL or "").strip().rstrip("/")
+    if not url:
+        raise RuntimeError("SUPABASE_URL is missing")
+    return f"{url}/rest/v1"
+
+
+def _service_key() -> str:
+    key = (SUPABASE_SERVICE_ROLE_KEY or "").strip()
+    if not key:
+        raise RuntimeError("SUPABASE_SERVICE_ROLE_KEY is missing")
+    return key
+
+
+def _sb_headers() -> Dict[str, str]:
+    key = _service_key()
+    return {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Prefer": "return=representation",
+    }
 
 
 def _sb_request(
@@ -134,7 +126,7 @@ def _sb_request(
         return False, None, {"url": url, "method": method, "status": 0, "exception": repr(e)}
 
 
-# -------------------- errors (failure exposure) --------------------
+# -------------------- error helper --------------------
 
 def _fail(*, stage: str, error: str, root_cause: Any = None, debug: Any = None, extra: Dict[str, Any] | None = None):
     out: Dict[str, Any] = {"ok": False, "error": error, "stage": stage}
@@ -147,29 +139,9 @@ def _fail(*, stage: str, error: str, root_cause: Any = None, debug: Any = None, 
     return out
 
 
-# -------------------- hashing helpers --------------------
-
-def _hash_otp(otp: str) -> str:
-    return _sha256_hex(f"otp:{otp}:{_otp_pepper()}")
-
-
-def _hash_token(token: str) -> str:
-    return _sha256_hex(f"tok:{token}:{_token_pepper()}")
-
-
-def _looks_like_fk_violation(dbg: Dict[str, Any]) -> bool:
-    body = (dbg.get("error_body") or "")
-    return ("23503" in body) or ("foreign key" in body.lower()) or ("violates foreign key" in body.lower())
-
-
 def _looks_like_unique_violation(dbg: Dict[str, Any]) -> bool:
     body = (dbg.get("error_body") or "")
     return ("23505" in body) or (dbg.get("status") == 409) or ("duplicate key" in body.lower()) or ("unique" in body.lower())
-
-
-def _looks_like_email(v: str) -> bool:
-    v = (v or "").strip().lower()
-    return ("@" in v) and ("." in v.split("@")[-1])
 
 
 # -------------------- OTP Request --------------------
@@ -189,7 +161,7 @@ def request_web_otp(
         return _fail(stage="validate_contact", error="invalid_contact_email", extra={"contact": contact})
 
     otp_plain = f"{secrets.randbelow(1000000):06d}"
-    expires_at = _now_utc() + timedelta(minutes=_otp_ttl_minutes())
+    expires_at = _now_utc() + timedelta(minutes=int(WEB_OTP_TTL_MINUTES or 10))
 
     row = {
         "contact": contact,
@@ -203,16 +175,13 @@ def request_web_otp(
         "request_ip": ip,
         "channel": "email",
         "sent_to": contact,
+        "user_agent": user_agent,
+        "device_id": device_id,
     }
 
     ok, data, dbg = _sb_request("POST", f"/{WEB_OTP_TABLE}", json=row)
     if not ok:
-        return _fail(
-            stage="otp_insert",
-            error="otp_insert_failed",
-            root_cause=dbg.get("error_body") or data,
-            debug=dbg,
-        )
+        return _fail(stage="otp_insert", error="otp_insert_failed", root_cause=dbg.get("error_body") or data, debug=dbg)
 
     created = data[0] if isinstance(data, list) and data else data
     return {
@@ -220,10 +189,9 @@ def request_web_otp(
         "contact": contact,
         "purpose": purpose,
         "expires_at": expires_at.isoformat(),
-        "_otp_plain": otp_plain,
+        "_otp_plain": otp_plain,  # server-only
         "debug": {
-            "received": {"device_id": device_id, "ip": ip, "user_agent_present": bool(user_agent)},
-            "tables": {"otp_table": WEB_OTP_TABLE, "token_table": WEB_TOKEN_TABLE, "accounts_table": ACCOUNTS_TABLE},
+            "tables": {"otp_table": WEB_OTP_TABLE, "token_table": WEB_TOKEN_TABLE, "accounts_table": "accounts"},
             "supabase": dbg,
             "otp_row_id": (created or {}).get("id"),
         },
@@ -257,138 +225,94 @@ def _mark_otp_used(otp_id: str) -> Dict[str, Any]:
     return _fail(stage="otp_mark_used", error="otp_mark_used_failed", root_cause=dbg.get("error_body") or data, debug=dbg)
 
 
-# -------------------- Accounts (email persistence + canonical account_id) --------------------
+# -------------------- Accounts (canonical account_id) --------------------
 
-def _ensure_account_email(accounts_id: str, contact_email: str) -> Tuple[bool, Dict[str, Any]]:
-    """
-    Ensures accounts.email is set.
-    If email already set, does nothing.
-    If missing/blank, patches it.
-
-    Returns (ok, debug/err dict)
-    """
-    params = {"select": "id,email,provider_user_id", "id": f"eq.{accounts_id}", "limit": "1"}
-    ok, data, dbg = _sb_request("GET", f"/{ACCOUNTS_TABLE}", params=params)
+def _patch_account(accounts_row_id: str, patch: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
+    ok, data, dbg = _sb_request("PATCH", f"/accounts?id=eq.{accounts_row_id}", json=patch)
     if not ok:
-        return False, _fail(stage="accounts_email_read", error="accounts_email_read_failed", root_cause=dbg.get("error_body") or data, debug=dbg)
-
-    rows = data if isinstance(data, list) else []
-    current = rows[0] if rows else {}
-    existing_email = (current.get("email") or "").strip().lower()
-
-    if existing_email:
-        return True, {"ok": True, "already_set": True, "email": existing_email}
-
-    patch = {"email": contact_email, "updated_at": _now_utc().isoformat()}
-    ok2, data2, dbg2 = _sb_request("PATCH", f"/{ACCOUNTS_TABLE}?id=eq.{accounts_id}", json=patch)
-    if not ok2:
-        return False, _fail(stage="accounts_email_patch", error="accounts_email_patch_failed", root_cause=dbg2.get("error_body") or data2, debug=dbg2)
-
-    return True, {"ok": True, "updated": True, "email": contact_email, "supabase": dbg2}
-
-
-def _ensure_account_account_id(accounts_id: str) -> Tuple[bool, Dict[str, Any]]:
-    """
-    Ensures accounts.account_id is populated (canonical identity).
-    If account_id is NULL/blank, set it to id.
-    """
-    params = {"select": "id,account_id", "id": f"eq.{accounts_id}", "limit": "1"}
-    ok, data, dbg = _sb_request("GET", f"/{ACCOUNTS_TABLE}", params=params)
-    if not ok:
-        return False, _fail(stage="accounts_account_id_read", error="accounts_account_id_read_failed", root_cause=dbg.get("error_body") or data, debug=dbg)
-
-    rows = data if isinstance(data, list) else []
-    row = rows[0] if rows else {}
-    current = (row.get("account_id") or "").strip()
-
-    if current:
-        return True, {"ok": True, "already_set": True, "account_id": current}
-
-    patch = {"account_id": accounts_id, "updated_at": _now_utc().isoformat()}
-    ok2, data2, dbg2 = _sb_request("PATCH", f"/{ACCOUNTS_TABLE}?id=eq.{accounts_id}", json=patch)
-    if not ok2:
-        return False, _fail(stage="accounts_account_id_patch", error="accounts_account_id_patch_failed", root_cause=dbg2.get("error_body") or data2, debug=dbg2)
-
-    return True, {"ok": True, "updated": True, "account_id": accounts_id, "supabase": dbg2}
+        return False, _fail(stage="account_patch", error="account_patch_failed", root_cause=dbg.get("error_body") or data, debug=dbg)
+    return True, {"ok": True, "supabase": dbg}
 
 
 def _get_or_create_web_account(contact: str) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """
-    Accounts table expected:
-      - provider = 'web'
-      - provider_user_id = contact (email)
-      - email column exists and will be stored/backfilled
-      - account_id column (canonical) is ensured to be populated (set to id if NULL)
+    Ensures:
+      - accounts row exists for provider='web' and provider_user_id=email
+      - accounts.email is set
+      - accounts.account_id is set (canonical UUID used everywhere else)
+    Strategy:
+      - If row exists and account_id is empty => set account_id = id
+      - If row doesn't exist => create with id (uuid) and account_id = same uuid
     """
+    contact = (contact or "").strip().lower()
+
     params = {
-        "select": "id,account_id,provider,provider_user_id,email,created_at,updated_at,display_name",
+        "select": "id,account_id,provider,provider_user_id,email,created_at,updated_at",
         "provider": "eq.web",
         "provider_user_id": f"eq.{contact}",
         "limit": "1",
     }
-    ok, data, dbg = _sb_request("GET", f"/{ACCOUNTS_TABLE}", params=params)
+    ok, data, dbg = _sb_request("GET", "/accounts", params=params)
     if not ok:
         return None, _fail(stage="account_lookup", error="account_lookup_failed", root_cause=dbg.get("error_body") or data, debug=dbg)
 
     rows = data if isinstance(data, list) else []
     if rows:
         acct = rows[0] or {}
-        accounts_id = str(acct.get("id") or "").strip()
+        row_id = str(acct.get("id") or "").strip()
+        acct_id = str(acct.get("account_id") or "").strip()
+        email = str(acct.get("email") or "").strip().lower()
 
-        warnings: Dict[str, Any] = {}
-        if accounts_id:
-            ok_e, info_e = _ensure_account_email(accounts_id, contact)
-            if not ok_e:
-                warnings["email"] = info_e
+        # backfill email if missing
+        patch: Dict[str, Any] = {}
+        if row_id and not email:
+            patch["email"] = contact
 
-            ok_a, info_a = _ensure_account_account_id(accounts_id)
-            if not ok_a:
-                warnings["account_id"] = info_a
+        # backfill canonical account_id if missing
+        if row_id and not acct_id:
+            patch["account_id"] = row_id
 
-        if warnings:
-            acct["_persist_warnings"] = warnings
+        if patch:
+            patch["updated_at"] = _now_utc().isoformat()
+            ok2, info = _patch_account(row_id, patch)
+            if not ok2:
+                # not fatal, but expose warning
+                acct["_repair_warning"] = info
+            else:
+                acct.update(patch)
 
         return acct, None
 
-    # Create new account row WITH email.
-    # account_id may be NULL depending on DB defaults, so we patch it after insert.
+    # Create new row (explicit id so account_id is guaranteed)
+    # If your accounts table already auto-generates id, this is still fine.
+    import uuid
+    new_id = str(uuid.uuid4())
     row = {
+        "id": new_id,
+        "account_id": new_id,          # canonical
         "provider": "web",
         "provider_user_id": contact,
         "email": contact,
-        "display_name": contact,
         "created_at": _now_utc().isoformat(),
         "updated_at": _now_utc().isoformat(),
     }
-    ok, data, dbg = _sb_request("POST", f"/{ACCOUNTS_TABLE}", json=row)
-    if not ok:
-        return None, _fail(stage="account_create", error="account_create_failed", root_cause=dbg.get("error_body") or data, debug=dbg)
+    ok3, data3, dbg3 = _sb_request("POST", "/accounts", json=row)
+    if not ok3:
+        return None, _fail(stage="account_create", error="account_create_failed", root_cause=dbg3.get("error_body") or data3, debug=dbg3)
 
-    created = data[0] if isinstance(data, list) and data else (data or {})
-    accounts_id = str((created or {}).get("id") or "").strip()
-
-    warnings: Dict[str, Any] = {}
-    if accounts_id:
-        ok_a, info_a = _ensure_account_account_id(accounts_id)
-        if not ok_a:
-            warnings["account_id"] = info_a
-
-    if warnings:
-        created["_persist_warnings"] = warnings
-
+    created = data3[0] if isinstance(data3, list) and data3 else data3
     return created, None
 
 
-# -------------------- Tokens --------------------
+# -------------------- Sessions (web_sessions / web_tokens) --------------------
 
-def _revoke_all_tokens_for_account(accounts_id: str) -> None:
-    # Best-effort
-    _sb_request("PATCH", f"/{WEB_TOKEN_TABLE}?account_id=eq.{accounts_id}", json={"revoked": True})
+def _revoke_all_sessions_for_account(account_id: str) -> None:
+    # revoke = true; if table has revoked_at, set it too (harmless if column missing in PostgREST? -> it will error)
+    _sb_request("PATCH", f"/{WEB_TOKEN_TABLE}?account_id=eq.{account_id}", json={"revoked": True, "revoked_at": _now_utc().isoformat()})
 
 
-def _insert_web_token(account_row: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
-    accounts_id = str(account_row["id"])
-    expires_at = (_now_utc() + timedelta(days=_token_ttl_days())).isoformat()
+def _insert_web_session(*, account_id: str, ip: Optional[str], user_agent: Optional[str]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    expires_at = (_now_utc() + timedelta(days=int(WEB_SESSION_TTL_DAYS or 30))).isoformat()
 
     attempts: List[Dict[str, Any]] = []
 
@@ -398,9 +322,11 @@ def _insert_web_token(account_row: Dict[str, Any]) -> Tuple[Optional[Dict[str, A
 
         payload = {
             "token_hash": token_hash,
-            "account_id": accounts_id,  # FK -> accounts.id
+            "account_id": account_id,  # canonical accounts.account_id
             "expires_at": expires_at,
             "revoked": False,
+            "ip": ip,
+            "user_agent": user_agent,
         }
 
         ok, data, dbg = _sb_request("POST", f"/{WEB_TOKEN_TABLE}", json=payload)
@@ -411,16 +337,11 @@ def _insert_web_token(account_row: Dict[str, Any]) -> Tuple[Optional[Dict[str, A
                 "token": token_plain,
                 "token_hash": token_hash,
                 "expires_at": expires_at,
-                "token_row_id": (created or {}).get("id"),
-                "accounts_id": accounts_id,
+                "session_row_id": (created or {}).get("id"),
+                "account_id": account_id,
             }, None
 
-        attempts.append(
-            {"try": n, "status": dbg.get("status"), "root_cause": dbg.get("error_body") or data, "supabase": dbg}
-        )
-
-        if _looks_like_fk_violation(dbg):
-            break
+        attempts.append({"try": n, "status": dbg.get("status"), "root_cause": dbg.get("error_body") or data, "supabase": dbg})
 
         if _looks_like_unique_violation(dbg):
             if TOKEN_INSERT_RETRY_SLEEP_MS > 0:
@@ -429,12 +350,10 @@ def _insert_web_token(account_row: Dict[str, Any]) -> Tuple[Optional[Dict[str, A
 
         break
 
-    return None, _fail(stage="token_insert", error="web_token_insert_failed", root_cause="insert_failed", extra={"attempts": attempts})
+    return None, _fail(stage="session_insert", error="web_session_insert_failed", root_cause="insert_failed", extra={"attempts": attempts})
 
 
-# -------------------- OTP Verify -> Token Issue --------------------
-
-def verify_web_otp_and_issue_token(*, contact: str, otp: str, purpose: str) -> Dict[str, Any]:
+def verify_web_otp_and_issue_token(*, contact: str, otp: str, purpose: str, ip: Optional[str] = None, user_agent: Optional[str] = None) -> Dict[str, Any]:
     contact = (contact or "").strip().lower()
     purpose = (purpose or "web_login").strip().lower()
     otp = (otp or "").strip()
@@ -471,42 +390,40 @@ def verify_web_otp_and_issue_token(*, contact: str, otp: str, purpose: str) -> D
     if acct_err:
         return {"ok": False, **acct_err}
 
+    canonical_account_id = str(acct.get("account_id") or acct.get("id") or "").strip()
+    if not canonical_account_id:
+        return _fail(stage="account_state", error="account_id_missing", extra={"account_row": acct})
+
     if REVOKE_OLD_TOKENS_ON_LOGIN:
         try:
-            _revoke_all_tokens_for_account(str(acct["id"]))
+            _revoke_all_sessions_for_account(canonical_account_id)
         except Exception:
             pass
 
-    token_res, token_err = _insert_web_token(acct)
-    if token_err:
-        return {"ok": False, **token_err}
-
-    warnings = acct.get("_persist_warnings") or {}
-
-    # IMPORTANT:
-    # - return account_id as CANONICAL accounts.account_id if present, else fallback to accounts.id
-    canonical_account_id = str((acct.get("account_id") or acct.get("id") or "")).strip()
+    sess_res, sess_err = _insert_web_session(account_id=canonical_account_id, ip=ip, user_agent=user_agent)
+    if sess_err:
+        return {"ok": False, **sess_err}
 
     return {
         "ok": True,
-        "account_id": canonical_account_id,
-        "token": str(token_res["token"]),
-        "expires_at": str(token_res["expires_at"]),
+        "account_id": canonical_account_id,     # ✅ canonical
+        "token": str(sess_res["token"]),
+        "expires_at": str(sess_res["expires_at"]),
         "debug": {
             "otp_id": otp_row.get("id"),
-            "tables": {"otp_table": WEB_OTP_TABLE, "token_table": WEB_TOKEN_TABLE, "accounts_table": ACCOUNTS_TABLE},
             "account_row": {
                 "id": acct.get("id"),
                 "account_id": acct.get("account_id"),
                 "provider": acct.get("provider"),
                 "provider_user_id": acct.get("provider_user_id"),
                 "email": acct.get("email") or contact,
+                "repair_warning": acct.get("_repair_warning"),
             },
-            "token_insert": {
-                "token_row_id": token_res.get("token_row_id"),
-                "accounts_id": token_res.get("accounts_id"),
+            "session_insert": {
+                "table": WEB_TOKEN_TABLE,
+                "session_row_id": sess_res.get("session_row_id"),
+                "account_id": sess_res.get("account_id"),
             },
-            "persist_warnings": warnings or {"ok": True},
         },
     }
 
@@ -537,10 +454,8 @@ def _extract_token_candidates(req: Request) -> Tuple[str, str, Dict[str, Any]]:
 def _lookup_token_plain(token_plain: str) -> Tuple[Optional[str], Dict[str, Any]]:
     token_hash = _hash_token(token_plain)
 
-    # Some projects have no foreign-table embed relationship configured.
-    # We still try embed, but we also work without it.
     params = {
-        "select": "id,account_id,expires_at,revoked,last_seen_at,accounts(id,account_id,email,provider,provider_user_id)",
+        "select": "id,account_id,expires_at,revoked,revoked_at,last_seen_at,created_at",
         "token_hash": f"eq.{token_hash}",
         "limit": "1",
     }
@@ -563,28 +478,17 @@ def _lookup_token_plain(token_plain: str) -> Tuple[Optional[str], Dict[str, Any]
     except Exception as e:
         return None, _fail(stage="token_expiry_parse", error="token_expiry_parse_failed", root_cause=repr(e), extra={"token_row": row}, debug={"supabase": sb_dbg})
 
-    # Canonical: accounts.account_id if present, else accounts.id, else token row account_id
-    canonical_account_id: Optional[str] = None
-    embedded = row.get("accounts")
-    if isinstance(embedded, list) and embedded:
-        embedded = embedded[0]
+    account_id = str(row.get("account_id") or "").strip() or None
+    if not account_id:
+        return None, _fail(stage="token_state", error="token_missing_account_id", extra={"token_row": row}, debug={"supabase": sb_dbg})
 
-    if isinstance(embedded, dict):
-        if embedded.get("account_id"):
-            canonical_account_id = str(embedded.get("account_id"))
-        elif embedded.get("id"):
-            canonical_account_id = str(embedded.get("id"))
-
-    if not canonical_account_id:
-        # token row account_id points to accounts.id, but we accept it as fallback
-        canonical_account_id = str(row.get("account_id")) if row.get("account_id") else None
-
+    # best-effort last_seen
     try:
         _sb_request("PATCH", f"/{WEB_TOKEN_TABLE}?id=eq.{row.get('id')}", json={"last_seen_at": _now_utc().isoformat()})
     except Exception:
         pass
 
-    return canonical_account_id, {"ok": True, "debug": {"supabase": sb_dbg}}
+    return account_id, {"ok": True, "debug": {"supabase": sb_dbg}}
 
 
 def get_account_id_from_request(req: Request) -> Tuple[Optional[str], Dict[str, Any]]:
@@ -620,7 +524,7 @@ def logout_web_session(req: Request) -> Dict[str, Any]:
 
     token_hash = _hash_token(token)
 
-    ok, data, sb_dbg = _sb_request("PATCH", f"/{WEB_TOKEN_TABLE}?token_hash=eq.{token_hash}", json={"revoked": True})
+    ok, data, sb_dbg = _sb_request("PATCH", f"/{WEB_TOKEN_TABLE}?token_hash=eq.{token_hash}", json={"revoked": True, "revoked_at": _now_utc().isoformat()})
     if not ok:
         return _fail(stage="logout", error="logout_failed", root_cause=sb_dbg.get("error_body") or data, debug=sb_dbg, extra=src_dbg)
 
