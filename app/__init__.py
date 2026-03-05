@@ -26,9 +26,9 @@ def _truthy(v: str | None) -> bool:
 
 def _cookie_mode_enabled() -> bool:
     # Cookie auth mode requires explicit origins + credentials
-    if _truthy(os.getenv("COOKIE_AUTH_ENABLED", "")):
+    if _truthy(os.getenv("COOKIE_AUTH_ENABLED", "1")):
         return True
-    if _truthy(os.getenv("WEB_AUTH_ENABLED", "")) and os.getenv("WEB_AUTH_COOKIE_SAMESITE"):
+    if _truthy(os.getenv("WEB_AUTH_ENABLED", "")) and (os.getenv("COOKIE_SAMESITE") or "").strip():
         return True
     return False
 
@@ -83,6 +83,9 @@ def create_app() -> Flask:
     if cors_err:
         raise RuntimeError(f"[CORS] {cors_err}")
 
+    # When cookie_mode=True:
+    # - supports_credentials must be True
+    # - origins must be explicit list (not '*')
     CORS(
         app,
         resources={rf"{api_prefix}/*": {"origins": origins}},
@@ -99,6 +102,7 @@ def create_app() -> Flask:
         expose_headers=["Set-Cookie", "X-Request-Id"],
         methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         max_age=86400,
+        vary_header=True,  # IMPORTANT: Vary: Origin for credentialed requests
     )
 
     # ---------- Request id ----------
@@ -114,6 +118,11 @@ def create_app() -> Flask:
         rid = str(request.environ.get("REQUEST_ID") or "")
         if rid:
             resp.headers["X-Request-Id"] = rid
+
+        # extra safety: avoid caching auth responses
+        if request.path.startswith(f"{api_prefix}/web/auth/"):
+            resp.headers["Cache-Control"] = "no-store"
+
         return resp
 
     def _rid() -> str:
@@ -160,7 +169,6 @@ def create_app() -> Flask:
 
         bp_name = getattr(obj, "name", None) or f"{dotted}:{attr}"
 
-        # prevent duplicate blueprint names
         if not hasattr(app, "_bp_names"):
             app._bp_names = set()  # type: ignore[attr-defined]
         if bp_name in app._bp_names:  # type: ignore[attr-defined]
@@ -186,10 +194,10 @@ def create_app() -> Flask:
         "app.routes.accounts",
         "app.routes.subscriptions",
         "app.routes.ask",
-        "app.routes.web",          # compat: /api/web/ask etc.
+        "app.routes.web",
         "app.routes.webhooks",
         "app.routes.plans",
-        "app.routes.billing",      # ✅ REQUIRED (your Paystack flow lives here)
+        "app.routes.billing",
         "app.routes.link_tokens",
         "app.routes.admin_link_tokens",
         "app.routes.accounts_admin",
@@ -202,10 +210,6 @@ def create_app() -> Flask:
         _register_bp(dotted, "bp", required=True, url_prefix=api_prefix)
 
     # ---------- OPTIONAL routes ----------
-    # ✅ Paystack module file was deleted, so DO NOT register it here.
-    # _register_bp("app.routes.paystack", "paystack_bp", alias_name="paystack", required=False, url_prefix=api_prefix)
-    # _register_bp("app.routes.paystack_webhook", "bp", alias_name="paystack_webhook", required=False, url_prefix=api_prefix)
-
     _register_bp("app.routes.cron", "bp", alias_name="cron", required=False, url_prefix=api_prefix)
 
     # ---------- DEBUG routes ----------
@@ -238,10 +242,13 @@ def create_app() -> Flask:
         if cookie_mode and origins == "*":
             hints.append("COOKIE_MODE is enabled but CORS origins are '*'. Use explicit origins when cookies are used.")
 
+        if cookie_mode and (isinstance(origins, list) and not origins):
+            hints.append("COOKIE_MODE is enabled but parsed origins list is empty. Set CORS_ORIGINS to your frontend URL(s).")
+
         if not (os.getenv("SUPABASE_URL") or "").strip():
             hints.append("SUPABASE_URL is missing -> Supabase RPC/table calls will fail.")
         if not (os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY") or "").strip():
-            hints.append("SUPABASE service key is missing -> RPC/table calls may fail.")
+            hints.append("Supabase service key is missing -> RPC/table calls may fail.")
 
         if not (os.getenv("PAYSTACK_WEBHOOK_SECRET") or "").strip():
             hints.append("PAYSTACK_WEBHOOK_SECRET is missing. Paystack signature verification will fail for /api/billing/webhook.")
