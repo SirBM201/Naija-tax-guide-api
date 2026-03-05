@@ -13,11 +13,21 @@ def env_bool(name: str, default: bool = False) -> bool:
     return v in ("1", "true", "yes", "y", "on")
 
 
+def env_int(name: str, default: int) -> int:
+    v = env(name, str(default))
+    try:
+        return int(v)
+    except Exception:
+        return int(default)
+
+
 # -----------------------------
-# Core
+# Core / Runtime
 # -----------------------------
-ENV = env("ENV", "prod")
-PORT = int(env("PORT", "8000") or "8000")
+ENV = env("ENV", "prod").lower()
+DEBUG = env_bool("DEBUG", False) or (ENV == "dev")
+
+PORT = env_int("PORT", 8000)
 
 # Routing
 API_PREFIX = env("API_PREFIX", "")  # "" or "/api"
@@ -26,14 +36,15 @@ if API_PREFIX and not API_PREFIX.startswith("/"):
 API_PREFIX = API_PREFIX.rstrip("/")
 
 # CORS
-CORS_ORIGINS = env("CORS_ORIGINS", "*")  # comma-separated or "*"
+# Comma-separated or "*" (if you use cookies cross-site, you must NOT use "*")
+CORS_ORIGINS = env("CORS_ORIGINS", "*")
 
 
 # -----------------------------
 # Supabase
 # -----------------------------
 SUPABASE_URL = env("SUPABASE_URL")
-SUPABASE_SERVICE_ROLE_KEY = env("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_SERVICE_ROLE_KEY = env("SUPABASE_SERVICE_ROLE_KEY") or env("SUPABASE_SERVICE_KEY")
 
 
 # -----------------------------
@@ -50,39 +61,37 @@ ADMIN_API_KEY = env("ADMIN_API_KEY", "")
 
 
 # -----------------------------
-# Web Auth / Web Sessions
+# Web Auth / Web Sessions (matches your current web_auth_service.py)
 # -----------------------------
 WEB_AUTH_ENABLED = env_bool("WEB_AUTH_ENABLED", True)
 
-# Session token hashing pepper
+# Hashing peppers
 WEB_TOKEN_PEPPER = env("WEB_TOKEN_PEPPER", "dev-pepper-change-me")
-
-# OTP hashing pepper (can be same as token pepper, but can be separate)
 WEB_OTP_PEPPER = env("WEB_OTP_PEPPER", WEB_TOKEN_PEPPER)
 
-# IMPORTANT: match your actual Supabase tables
-# Your updated routes/services assume "web_sessions" (not "web_tokens").
-WEB_TOKEN_TABLE = env("WEB_TOKEN_TABLE", "web_sessions")
+# IMPORTANT: your current service uses these actual tables
+WEB_TOKEN_TABLE = env("WEB_TOKEN_TABLE", "web_tokens")
 WEB_OTP_TABLE = env("WEB_OTP_TABLE", "web_otps")
 
 # OTP lifetime
-# Keep both seconds + minutes for compatibility with older code paths.
-WEB_OTP_TTL_SECONDS = int(env("WEB_OTP_TTL_SECONDS", "600") or "600")  # 10 mins
-WEB_OTP_TTL_MINUTES = int(env("WEB_OTP_TTL_MINUTES", str(max(1, WEB_OTP_TTL_SECONDS // 60))) or "10")
-WEB_OTP_MAX_ATTEMPTS = int(env("WEB_OTP_MAX_ATTEMPTS", "5") or "5")
+WEB_OTP_TTL_MINUTES = env_int("WEB_OTP_TTL_MINUTES", 10)
+WEB_OTP_TTL_SECONDS = env_int("WEB_OTP_TTL_SECONDS", WEB_OTP_TTL_MINUTES * 60)
+WEB_OTP_MAX_ATTEMPTS = env_int("WEB_OTP_MAX_ATTEMPTS", 5)
 
-# Session lifetime
-WEB_SESSION_TTL_DAYS = int(env("WEB_SESSION_TTL_DAYS", "30") or "30")
+# Token/session lifetime
+WEB_TOKEN_TTL_DAYS = env_int("WEB_TOKEN_TTL_DAYS", 30)
 
-# Cookie settings (used by web_auth.py; defined here so env naming stays consistent)
-WEB_AUTH_COOKIE_NAME = env("WEB_AUTH_COOKIE_NAME", "ntg_session")
+# Cookie settings (used by routes/web_auth.py)
+WEB_AUTH_COOKIE_NAME = env("WEB_AUTH_COOKIE_NAME", "ntg_web_token")
 WEB_AUTH_COOKIE_SECURE = env_bool("WEB_AUTH_COOKIE_SECURE", True)
-WEB_AUTH_COOKIE_SAMESITE = env("WEB_AUTH_COOKIE_SAMESITE", "None")  # "None" for cross-site (Vercel -> Koyeb)
-WEB_AUTH_COOKIE_DOMAIN = env("WEB_AUTH_COOKIE_DOMAIN", "")  # usually blank/None unless you know you need it
+WEB_AUTH_COOKIE_SAMESITE = env("WEB_AUTH_COOKIE_SAMESITE", "None")  # None for cross-site cookie
+WEB_AUTH_COOKIE_DOMAIN = env("WEB_AUTH_COOKIE_DOMAIN", "")  # keep blank normally
+WEB_AUTH_COOKIE_MAX_AGE = env_int("WEB_AUTH_COOKIE_MAX_AGE", 2592000)  # 30 days
 
-# Debug
-WEB_AUTH_DEBUG = env_bool("WEB_AUTH_DEBUG", False)
-WEB_DEV_RETURN_OTP = env_bool("WEB_DEV_RETURN_OTP", False) or (ENV.lower() == "dev")
+# Route behavior toggles
+COOKIE_AUTH_ENABLED = env_bool("COOKIE_AUTH_ENABLED", True)  # legacy supported by your routes
+WEB_AUTH_RETURN_BEARER = env_bool("WEB_AUTH_RETURN_BEARER", False)
+WEB_OTP_RETURN_PLAIN = env_bool("WEB_OTP_RETURN_PLAIN", False)  # DEV ONLY
 
 
 # -----------------------------
@@ -92,4 +101,21 @@ PAYSTACK_SECRET_KEY = env("PAYSTACK_SECRET_KEY", "")
 PAYSTACK_PUBLIC_KEY = env("PAYSTACK_PUBLIC_KEY", "")
 PAYSTACK_CURRENCY = env("PAYSTACK_CURRENCY", "NGN") or "NGN"
 PAYSTACK_CALLBACK_URL = env("PAYSTACK_CALLBACK_URL", "")
-PAYSTACK_WEBHOOK_TOLERANCE_SECONDS = int(env("PAYSTACK_WEBHOOK_TOLERANCE_SECONDS", "300") or "300")
+PAYSTACK_WEBHOOK_TOLERANCE_SECONDS = env_int("PAYSTACK_WEBHOOK_TOLERANCE_SECONDS", 300)
+
+
+# -----------------------------
+# Dev bypass flags (support BOTH naming styles you currently have)
+# -----------------------------
+# UI env you showed:
+BYPASS_AUTH = env_bool("BYPASS_AUTH", False)  # you set DISABLED -> effectively False
+DEV_BYPASS_SUBSCRIPTION = env_bool("DEV_BYPASS_SUBSCRIPTION", False)
+
+# Code env used in ask.py right now:
+BYPASS_TOKEN = env("BYPASS_TOKEN", "")
+DEV_BYPASS_TOKEN = env("DEV_BYPASS_TOKEN", "")
+
+# Unified meaning for "subscription bypass is allowed"
+# If you want bypass OFF completely, set:
+#   DEV_BYPASS_SUBSCRIPTION=0 and remove BYPASS_TOKEN/DEV_BYPASS_TOKEN
+ALLOW_SUBSCRIPTION_BYPASS = DEV_BYPASS_SUBSCRIPTION or bool(BYPASS_TOKEN or DEV_BYPASS_TOKEN)
