@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from flask import Blueprint, jsonify, request, make_response
 
@@ -20,6 +20,39 @@ bp = Blueprint("web_auth", __name__)
 
 def _truthy(v: str | None) -> bool:
     return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _cookie_mode_enabled() -> bool:
+    return _truthy(os.getenv("COOKIE_AUTH_ENABLED", "1"))
+
+
+def _cookie_secure() -> bool:
+    # For cross-site cookies (localhost -> koyeb.app), Secure must be True.
+    # In pure localhost backend dev (http://localhost:5000), Secure must be False.
+    return _truthy(os.getenv("COOKIE_SECURE", "1"))
+
+
+def _cookie_samesite() -> str:
+    # Cross-site requires "None"
+    # For same-site, "Lax" is OK.
+    return (os.getenv("COOKIE_SAMESITE", "None") or "None").strip()
+
+
+def _cookie_domain() -> Optional[str]:
+    # Usually DO NOT set domain on Koyeb; let it be host-only.
+    # Set only if you truly understand the implications.
+    d = (os.getenv("COOKIE_DOMAIN") or "").strip()
+    return d or None
+
+
+def _cookie_max_age() -> int:
+    return int(os.getenv("COOKIE_MAX_AGE", "2592000") or "2592000")  # 30 days
+
+
+def _return_bearer_in_json() -> bool:
+    # Recommended: cookie-only for web.
+    # If you still want token returned, set WEB_AUTH_RETURN_BEARER=1
+    return _truthy(os.getenv("WEB_AUTH_RETURN_BEARER", "0"))
 
 
 @bp.post("/web/auth/request-otp")
@@ -73,7 +106,9 @@ def request_otp():
     if dev_return_plain and otp_plain:
         out["otp"] = otp_plain
 
-    return jsonify(out), 200
+    resp = make_response(jsonify(out), 200)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @bp.post("/web/auth/verify-otp")
@@ -91,13 +126,34 @@ def verify_otp():
     if not r.get("ok"):
         return jsonify(r), 400
 
-    token = r["token"]
-    resp = make_response(jsonify(r), 200)
+    token = r.get("token") or ""
 
-    if _truthy(os.getenv("COOKIE_AUTH_ENABLED", "1")):
-        secure = _truthy(os.getenv("COOKIE_SECURE", "1"))
-        samesite = (os.getenv("COOKIE_SAMESITE", "None") or "None").strip()
-        max_age = int(os.getenv("COOKIE_MAX_AGE", "2592000") or "2592000")
+    # If you want cookie-only mode, remove token from JSON response
+    if _cookie_mode_enabled() and not _return_bearer_in_json():
+        r = {**r}
+        r.pop("token", None)
+
+    resp = make_response(jsonify(r), 200)
+    resp.headers["Cache-Control"] = "no-store"
+
+    if _cookie_mode_enabled():
+        secure = _cookie_secure()
+        samesite = _cookie_samesite()
+
+        # Browser rule: SameSite=None MUST have Secure=True, or cookie is dropped.
+        if samesite.lower() == "none" and not secure:
+            # Force safety: if someone misconfigured env, do not set a broken cookie.
+            return jsonify(
+                {
+                    "ok": False,
+                    "error": "cookie_config_invalid",
+                    "message": "COOKIE_SAMESITE=None requires COOKIE_SECURE=1 (Secure cookies).",
+                    "debug": {"COOKIE_SAMESITE": samesite, "COOKIE_SECURE": secure},
+                }
+            ), 500
+
+        max_age = _cookie_max_age()
+        domain = _cookie_domain()
 
         resp.set_cookie(
             WEB_AUTH_COOKIE_NAME,
@@ -107,6 +163,7 @@ def verify_otp():
             secure=secure,
             samesite=samesite,
             path="/",
+            domain=domain,
         )
 
     return resp
@@ -116,13 +173,22 @@ def verify_otp():
 def me():
     account_id, debug = get_account_id_from_request(request)
     if not account_id:
-        return jsonify({"ok": False, "error": "unauthorized", "debug": debug}), 401
-    return jsonify({"ok": True, "account_id": account_id, "debug": debug}), 200
+        resp = make_response(jsonify({"ok": False, "error": "unauthorized", "debug": debug}), 401)
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+    resp = make_response(jsonify({"ok": True, "account_id": account_id, "debug": debug}), 200)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @bp.post("/web/auth/logout")
 def logout():
     r = logout_web_session(request)
+
     resp = make_response(jsonify(r), 200)
-    resp.delete_cookie(WEB_AUTH_COOKIE_NAME, path="/")
+    resp.headers["Cache-Control"] = "no-store"
+
+    domain = _cookie_domain()
+    resp.delete_cookie(WEB_AUTH_COOKIE_NAME, path="/", domain=domain)
+
     return resp
