@@ -22,34 +22,29 @@ def _debug_enabled() -> bool:
     return _truthy(_env("ASK_DEBUG", "0")) or _truthy(_env("DEBUG", "0"))
 
 
-def _get_bearer_token() -> str:
-    h = (request.headers.get("Authorization") or "").strip()
-    if h.lower().startswith("bearer "):
-        return h[7:].strip()
-    return ""
+def _safe_json():
+    return request.get_json(silent=True) or {}
 
 
-def _is_dev_bypass_request() -> bool:
-    """
-    Allow dev bypass ONLY when the request includes the correct token.
-    This lets your frontend bypass mode work even when there is no subscription yet.
-    """
-    expected = (_env("BYPASS_TOKEN") or _env("DEV_BYPASS_TOKEN") or "").strip()
-    if not expected:
-        return False
-
-    bearer = _get_bearer_token()
-    x_token = (request.headers.get("X-Auth-Token") or "").strip()
-
-    return bearer == expected or x_token == expected
+def _fail(status: int, *, error: str, stage: str, hint: str = "", root_cause: str = "", debug=None, extra=None):
+    payload = {"ok": False, "error": error, "stage": stage}
+    if hint:
+        payload["hint"] = hint
+    if root_cause:
+        payload["root_cause"] = root_cause
+    if debug is not None:
+        payload["debug"] = debug
+    if extra:
+        payload.update(extra)
+    return jsonify(payload), status
 
 
 @bp.post("/ask")
 def ask():
     """
-    Unified guarded AI endpoint.
+    Unified guarded AI endpoint (AUTH REQUIRED).
 
-    Preferred (web cookie/bearer auth):
+    Expected body:
     {
       "question": "<text>",
       "lang": "en|pcm|yo|ig|ha" (optional),
@@ -66,23 +61,36 @@ def ask():
       "channel": "..."
     }
     """
-    body = request.get_json(silent=True) or {}
+    body = _safe_json()
 
     question = (body.get("question") or "").strip()
     if not question:
-        return jsonify({"ok": False, "error": "question_required"}), 400
-
-    # Dev bypass support (token-protected)
-    if _is_dev_bypass_request():
-        body["__bypass"] = True
+        return _fail(
+            400,
+            error="question_required",
+            stage="validate_input",
+            hint="Send JSON: {\"question\":\"...\"}",
+        )
 
     # If account_id not provided, derive from cookie/bearer session automatically
     if not (body.get("account_id") or "").strip():
-        account_id, source = get_account_id_from_request(request)
-        if account_id:
-            body["account_id"] = account_id
-            body.setdefault("provider", "web")
-            body.setdefault("__auth_source", source)
+        account_id, auth_debug = get_account_id_from_request(request)
+        if not account_id:
+            # This is now strict: no bypass allowed
+            return _fail(
+                401,
+                error="unauthorized",
+                stage="auth",
+                hint="Login via OTP first, then call /ask with Authorization: Bearer <token> (or cookie).",
+                debug=auth_debug,
+            )
+
+        body["account_id"] = account_id
+        body.setdefault("provider", "web")
+        body.setdefault("__auth_source", auth_debug)
+
+    # Hard safety: explicitly ensure bypass cannot be injected from client
+    body.pop("__bypass", None)
 
     try:
         resp = ask_guarded(body)
@@ -96,20 +104,37 @@ def ask():
                 status = 401
             elif resp.get("error") in {"insufficient_credits"}:
                 status = 402
+            elif resp.get("error") in {"subscription_inactive", "payment_required"}:
+                # if you later gate by subscription, use 402 or 403 depending on your policy
+                status = 402
             else:
                 status = 500
+
+        # Add extra failure exposure in debug mode
+        if _debug_enabled() and status >= 400:
+            resp = {
+                **resp,
+                "_debug": {
+                    "stage": "ask_guarded",
+                    "has_account_id": bool(body.get("account_id")),
+                    "provider": body.get("provider"),
+                    "headers_present": {
+                        "authorization": bool((request.headers.get("Authorization") or "").strip()),
+                        "cookie": bool(request.cookies),
+                    },
+                },
+            }
 
         return jsonify(resp), status
 
     except Exception as e:
         if _debug_enabled():
-            return jsonify(
-                {
-                    "ok": False,
-                    "error": "ask_failed",
-                    "root_cause": f"{type(e).__name__}: {str(e)}",
-                    "fix": "Check server logs for the traceback and confirm ask_service + dependencies exports exist.",
-                }
-            ), 500
+            return _fail(
+                500,
+                error="ask_failed",
+                stage="exception",
+                root_cause=f"{type(e).__name__}: {str(e)}",
+                hint="Check server logs for traceback. Confirm ask_service + dependencies are deployed.",
+            )
 
         return jsonify({"ok": False, "error": "ask_failed"}), 500
