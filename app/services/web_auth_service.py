@@ -256,7 +256,7 @@ def _insert_web_token(account_row: Dict[str, Any]) -> Tuple[Optional[Dict[str, A
 
         payload = {
             "token_hash": token_hash,
-            "account_id": accounts_id,   # IMPORTANT: this is accounts.id
+            "account_id": accounts_id,  # accounts.id
             "expires_at": expires_at,
             "revoked": False,
         }
@@ -273,7 +273,9 @@ def _insert_web_token(account_row: Dict[str, Any]) -> Tuple[Optional[Dict[str, A
                 "accounts_id": accounts_id,
             }, None
 
-        attempts.append({"try": n, "status": dbg.get("status"), "root_cause": dbg.get("error_body") or data, "supabase": dbg})
+        attempts.append(
+            {"try": n, "status": dbg.get("status"), "root_cause": dbg.get("error_body") or data, "supabase": dbg}
+        )
 
         if _looks_like_fk_violation(dbg):
             break
@@ -316,7 +318,12 @@ def verify_web_otp_and_issue_token(*, contact: str, otp: str, purpose: str) -> D
 
     used_res = _mark_otp_used(str(otp_row["id"]))
     if used_res and not used_res.get("ok"):
-        return {"ok": False, "error": "otp_mark_used_failed", "root_cause": used_res.get("root_cause"), "debug": used_res.get("debug")}
+        return {
+            "ok": False,
+            "error": "otp_mark_used_failed",
+            "root_cause": used_res.get("root_cause"),
+            "debug": used_res.get("debug"),
+        }
 
     acct, acct_err = _get_or_create_web_account(contact)
     if acct_err:
@@ -332,10 +339,9 @@ def verify_web_otp_and_issue_token(*, contact: str, otp: str, purpose: str) -> D
     if token_err:
         return {"ok": False, "error": "token_issue_failed", **token_err}
 
-    # IMPORTANT: return accounts.id as account_id (canonical join key)
     return {
         "ok": True,
-        "account_id": str(acct.get("id")),
+        "account_id": str(acct.get("id")),  # canonical accounts.id
         "token": str(token_res["token"]),
         "expires_at": str(token_res["expires_at"]),
         "debug": {
@@ -347,7 +353,13 @@ def verify_web_otp_and_issue_token(*, contact: str, otp: str, purpose: str) -> D
 
 
 def _extract_token_candidates(req: Request) -> Tuple[str, str, Dict[str, Any]]:
-    debug: Dict[str, Any] = {"token_source": None, "has_bearer": False, "has_cookie": False}
+    debug: Dict[str, Any] = {
+        "token_source": None,
+        "has_bearer": False,
+        "has_cookie": False,
+        "origin": (req.headers.get("Origin") or "").strip() or None,
+        "host": (req.headers.get("Host") or "").strip() or None,
+    }
 
     h = (req.headers.get("Authorization") or "").strip()
     bearer = ""
@@ -362,10 +374,6 @@ def _extract_token_candidates(req: Request) -> Tuple[str, str, Dict[str, Any]]:
 
 
 def _lookup_token_plain(token_plain: str) -> Tuple[Optional[str], Dict[str, Any]]:
-    """
-    Lookup token_plain in web_tokens by hashing it and selecting row.
-    Returns (accounts.id, debug)  <-- canonical
-    """
     token_hash = _hash_token(token_plain)
 
     params = {
@@ -375,7 +383,12 @@ def _lookup_token_plain(token_plain: str) -> Tuple[Optional[str], Dict[str, Any]
     }
     ok, data, sb_dbg = _sb_request("GET", "/web_tokens", params=params)
     if not ok:
-        return None, {"ok": False, "error": "token_lookup_failed", "root_cause": sb_dbg.get("error_body") or data, "debug": sb_dbg}
+        return None, {
+            "ok": False,
+            "error": "token_lookup_failed",
+            "root_cause": sb_dbg.get("error_body") or data,
+            "debug": sb_dbg,
+        }
 
     rows = data if isinstance(data, list) else []
     if not rows:
@@ -388,11 +401,21 @@ def _lookup_token_plain(token_plain: str) -> Tuple[Optional[str], Dict[str, Any]
     try:
         exp_dt = datetime.fromisoformat(str(row["expires_at"]).replace("Z", "+00:00"))
         if _now_utc() >= exp_dt:
-            return None, {"ok": False, "error": "token_expired", "expires_at": row.get("expires_at"), "debug": {"supabase": sb_dbg}}
+            return None, {
+                "ok": False,
+                "error": "token_expired",
+                "expires_at": row.get("expires_at"),
+                "debug": {"supabase": sb_dbg},
+            }
     except Exception as e:
-        return None, {"ok": False, "error": "token_expiry_parse_failed", "root_cause": repr(e), "token_row": row, "debug": {"supabase": sb_dbg}}
+        return None, {
+            "ok": False,
+            "error": "token_expiry_parse_failed",
+            "root_cause": repr(e),
+            "token_row": row,
+            "debug": {"supabase": sb_dbg},
+        }
 
-    # IMPORTANT: prefer accounts.id (internal canonical id)
     canonical_account_id: Optional[str] = None
     embedded = row.get("accounts")
     if isinstance(embedded, list) and embedded:
@@ -450,6 +473,12 @@ def logout_web_session(req: Request) -> Dict[str, Any]:
 
     ok, data, sb_dbg = _sb_request("PATCH", f"/web_tokens?token_hash=eq.{token_hash}", json={"revoked": True})
     if not ok:
-        return {"ok": False, "error": "logout_failed", "root_cause": sb_dbg.get("error_body") or data, "debug": sb_dbg, **src_dbg}
+        return {
+            "ok": False,
+            "error": "logout_failed",
+            "root_cause": sb_dbg.get("error_body") or data,
+            "debug": sb_dbg,
+            **src_dbg,
+        }
 
     return {"ok": True, "logged_out": True, **src_dbg}
