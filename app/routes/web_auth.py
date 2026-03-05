@@ -22,37 +22,60 @@ def _truthy(v: str | None) -> bool:
     return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _env(name: str, default: str = "") -> str:
+    return (os.getenv(name, default) or default).strip()
+
+
 def _cookie_mode_enabled() -> bool:
-    return _truthy(os.getenv("COOKIE_AUTH_ENABLED", "1"))
+    # New standard env var name (preferred)
+    v = _env("COOKIE_AUTH_ENABLED", "")
+    if v:
+        return _truthy(v)
+    # Fallback: allow disabling cookie mode via WEB_AUTH_RETURN_BEARER=1
+    # If bearer return is forced, cookie mode can still be on, but most setups want cookie.
+    return True
 
 
 def _cookie_secure() -> bool:
-    # For cross-site cookies (localhost -> koyeb.app), Secure must be True.
-    # In pure localhost backend dev (http://localhost:5000), Secure must be False.
-    return _truthy(os.getenv("COOKIE_SECURE", "1"))
+    # Preferred (matches config.py naming)
+    v = _env("WEB_AUTH_COOKIE_SECURE", "")
+    if v:
+        return _truthy(v)
+    # Backwards compatibility
+    return _truthy(_env("COOKIE_SECURE", "1"))
 
 
 def _cookie_samesite() -> str:
-    # Cross-site requires "None"
-    # For same-site, "Lax" is OK.
-    return (os.getenv("COOKIE_SAMESITE", "None") or "None").strip()
+    v = _env("WEB_AUTH_COOKIE_SAMESITE", "")
+    if v:
+        return v
+    return _env("COOKIE_SAMESITE", "None")
 
 
 def _cookie_domain() -> Optional[str]:
-    # Usually DO NOT set domain on Koyeb; let it be host-only.
-    # Set only if you truly understand the implications.
-    d = (os.getenv("COOKIE_DOMAIN") or "").strip()
+    v = _env("WEB_AUTH_COOKIE_DOMAIN", "")
+    if v:
+        return v or None
+    d = _env("COOKIE_DOMAIN", "")
     return d or None
 
 
 def _cookie_max_age() -> int:
-    return int(os.getenv("COOKIE_MAX_AGE", "2592000") or "2592000")  # 30 days
+    # Preferred (matches config naming idea)
+    v = _env("WEB_AUTH_COOKIE_MAX_AGE", "")
+    if v:
+        return int(v or "2592000")
+    return int(_env("COOKIE_MAX_AGE", "2592000") or "2592000")  # 30 days
 
 
 def _return_bearer_in_json() -> bool:
-    # Recommended: cookie-only for web.
     # If you still want token returned, set WEB_AUTH_RETURN_BEARER=1
-    return _truthy(os.getenv("WEB_AUTH_RETURN_BEARER", "0"))
+    return _truthy(_env("WEB_AUTH_RETURN_BEARER", "0"))
+
+
+def _dev_return_plain_otp() -> bool:
+    # DEV ONLY (never enable in prod)
+    return _truthy(_env("WEB_OTP_RETURN_PLAIN", "0"))
 
 
 @bp.post("/web/auth/request-otp")
@@ -78,8 +101,6 @@ def request_otp():
         return jsonify(r), 400
 
     otp_plain = r.get("_otp_plain")  # server-only
-    dev_return_plain = _truthy(os.getenv("WEB_OTP_RETURN_PLAIN", "0"))
-
     delivery: Dict[str, Any] = {"mode": "email", "sent": False}
 
     if otp_plain:
@@ -102,8 +123,7 @@ def request_otp():
         "debug": r.get("debug", {}),
     }
 
-    # DEV ONLY (never enable in prod)
-    if dev_return_plain and otp_plain:
+    if _dev_return_plain_otp() and otp_plain:
         out["otp"] = otp_plain
 
     resp = make_response(jsonify(out), 200)
@@ -126,9 +146,9 @@ def verify_otp():
     if not r.get("ok"):
         return jsonify(r), 400
 
-    token = r.get("token") or ""
+    token = (r.get("token") or "").strip()
 
-    # If you want cookie-only mode, remove token from JSON response
+    # cookie-only mode: remove token from JSON response unless explicitly requested
     if _cookie_mode_enabled() and not _return_bearer_in_json():
         r = {**r}
         r.pop("token", None)
@@ -140,15 +160,13 @@ def verify_otp():
         secure = _cookie_secure()
         samesite = _cookie_samesite()
 
-        # Browser rule: SameSite=None MUST have Secure=True, or cookie is dropped.
         if samesite.lower() == "none" and not secure:
-            # Force safety: if someone misconfigured env, do not set a broken cookie.
             return jsonify(
                 {
                     "ok": False,
                     "error": "cookie_config_invalid",
-                    "message": "COOKIE_SAMESITE=None requires COOKIE_SECURE=1 (Secure cookies).",
-                    "debug": {"COOKIE_SAMESITE": samesite, "COOKIE_SECURE": secure},
+                    "message": "SameSite=None requires Secure cookies (WEB_AUTH_COOKIE_SECURE=1).",
+                    "debug": {"WEB_AUTH_COOKIE_SAMESITE": samesite, "WEB_AUTH_COOKIE_SECURE": secure},
                 }
             ), 500
 
@@ -176,6 +194,7 @@ def me():
         resp = make_response(jsonify({"ok": False, "error": "unauthorized", "debug": debug}), 401)
         resp.headers["Cache-Control"] = "no-store"
         return resp
+
     resp = make_response(jsonify({"ok": True, "account_id": account_id, "debug": debug}), 200)
     resp.headers["Cache-Control"] = "no-store"
     return resp
