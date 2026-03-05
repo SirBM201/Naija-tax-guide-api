@@ -17,7 +17,7 @@ def env_int(name: str, default: int) -> int:
     try:
         return int(env(name, str(default)) or str(default))
     except Exception:
-        return int(default)
+        return default
 
 
 # -----------------------------
@@ -57,56 +57,58 @@ ADMIN_API_KEY = env("ADMIN_API_KEY", "")
 
 
 # -----------------------------
-# Ask / Debug / Bypass
-# -----------------------------
-ASK_DEBUG = env_bool("ASK_DEBUG", False) or env_bool("DEBUG", False)
-
-# Dev bypass controls used across ask/web auth
-ALLOW_DEV_BYPASS = env_bool("ALLOW_DEV_BYPASS", True)
-BYPASS_TOKEN = env("BYPASS_TOKEN", "") or env("DEV_BYPASS_TOKEN", "")
-DEV_BYPASS_SUBSCRIPTION = env_bool("DEV_BYPASS_SUBSCRIPTION", False)  # you showed this exists in env
-BYPASS_AUTH = env_bool("BYPASS_AUTH", False)  # optional legacy flag
-
-
-# -----------------------------
 # Web Auth / Web Sessions
 # -----------------------------
 WEB_AUTH_ENABLED = env_bool("WEB_AUTH_ENABLED", True)
 
-# Peppers
+# Hashing peppers (MUST be set in prod)
 WEB_TOKEN_PEPPER = env("WEB_TOKEN_PEPPER", "dev-pepper-change-me")
 WEB_OTP_PEPPER = env("WEB_OTP_PEPPER", WEB_TOKEN_PEPPER)
 
-# Table names (IMPORTANT: export compat aliases so old imports never crash)
-# You can set WEB_TOKEN_TABLE in env to either "web_tokens" or "web_sessions" depending on your schema.
-WEB_TOKEN_TABLE = env("WEB_TOKEN_TABLE", "web_tokens")  # <--- default to web_tokens (your current web_auth_service uses web_tokens)
-WEB_SESSIONS_TABLE = env("WEB_SESSIONS_TABLE", WEB_TOKEN_TABLE)  # compat alias
-WEB_TOKENS_TABLE = env("WEB_TOKENS_TABLE", WEB_TOKEN_TABLE)  # compat alias
+# ✅ IMPORTANT exports (your boot error was missing WEB_TOKEN_TABLE)
+# default to the newer table names you are using now
+WEB_TOKEN_TABLE = env("WEB_TOKEN_TABLE", "web_sessions")  # "web_sessions" preferred
+WEB_OTP_TABLE = env("WEB_OTP_TABLE", "web_otps")          # "web_otps"
 
-WEB_OTP_TABLE = env("WEB_OTP_TABLE", "web_otps")
-
-# OTP lifetime (seconds + minutes for compatibility)
+# OTP lifetime
 WEB_OTP_TTL_SECONDS = env_int("WEB_OTP_TTL_SECONDS", 600)  # 10 mins
 WEB_OTP_TTL_MINUTES = env_int("WEB_OTP_TTL_MINUTES", max(1, WEB_OTP_TTL_SECONDS // 60))
 WEB_OTP_MAX_ATTEMPTS = env_int("WEB_OTP_MAX_ATTEMPTS", 5)
 
 # Session lifetime
 WEB_SESSION_TTL_DAYS = env_int("WEB_SESSION_TTL_DAYS", 30)
-WEB_TOKEN_TTL_DAYS = env_int("WEB_TOKEN_TTL_DAYS", WEB_SESSION_TTL_DAYS)  # legacy alias some code uses
 
-# Cookie settings
+# Cookie (canonical names)
 WEB_AUTH_COOKIE_NAME = env("WEB_AUTH_COOKIE_NAME", "ntg_session")
 WEB_AUTH_COOKIE_SECURE = env_bool("WEB_AUTH_COOKIE_SECURE", True)
-WEB_AUTH_COOKIE_SAMESITE = env("WEB_AUTH_COOKIE_SAMESITE", "None")  # cross-site (Vercel -> Koyeb)
-WEB_AUTH_COOKIE_DOMAIN = env("WEB_AUTH_COOKIE_DOMAIN", "")  # usually blank
+WEB_AUTH_COOKIE_SAMESITE = env("WEB_AUTH_COOKIE_SAMESITE", "None")  # cross-site needs None
+WEB_AUTH_COOKIE_DOMAIN = env("WEB_AUTH_COOKIE_DOMAIN", "")          # usually blank
+WEB_AUTH_COOKIE_MAX_AGE = env_int("WEB_AUTH_COOKIE_MAX_AGE", 2592000)  # 30 days
 
-# Debug flags
+# Debug
 WEB_AUTH_DEBUG = env_bool("WEB_AUTH_DEBUG", False)
 WEB_DEV_RETURN_OTP = env_bool("WEB_DEV_RETURN_OTP", False) or (ENV.lower() == "dev")
 
-# Token insertion retry (used by some implementations)
-WEB_TOKEN_INSERT_MAX_RETRIES = env_int("WEB_TOKEN_INSERT_MAX_RETRIES", 5)
-WEB_TOKEN_INSERT_RETRY_SLEEP_MS = env_int("WEB_TOKEN_INSERT_RETRY_SLEEP_MS", 50)
+# ---------------------------------------------------------
+# Backwards-compatible ENV aliases (so older code won’t break)
+# ---------------------------------------------------------
+# Your web_auth.py route currently reads COOKIE_* env vars directly.
+# We keep these aliases so you can set either style in Koyeb.
+COOKIE_AUTH_ENABLED = env_bool("COOKIE_AUTH_ENABLED", True)
+COOKIE_SECURE = env_bool("COOKIE_SECURE", WEB_AUTH_COOKIE_SECURE)
+COOKIE_SAMESITE = env("COOKIE_SAMESITE", WEB_AUTH_COOKIE_SAMESITE)
+COOKIE_DOMAIN = env("COOKIE_DOMAIN", WEB_AUTH_COOKIE_DOMAIN)
+COOKIE_MAX_AGE = env_int("COOKIE_MAX_AGE", WEB_AUTH_COOKIE_MAX_AGE)
+
+WEB_AUTH_RETURN_BEARER = env_bool("WEB_AUTH_RETURN_BEARER", False)
+WEB_OTP_RETURN_PLAIN = env_bool("WEB_OTP_RETURN_PLAIN", False)
+
+
+# -----------------------------
+# Dev bypass controls (auth + subscription)
+# -----------------------------
+ALLOW_DEV_BYPASS = env_bool("ALLOW_DEV_BYPASS", True)
+DEV_BYPASS_SUBSCRIPTION = env_bool("DEV_BYPASS_SUBSCRIPTION", False)
 
 
 # -----------------------------
