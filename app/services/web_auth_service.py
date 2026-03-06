@@ -58,7 +58,7 @@ def _hash_otp(otp: str) -> str:
 
 
 def _hash_token(token: str) -> str:
-    # IMPORTANT: must match app/core/auth.py
+    # MUST match app/core/auth.py
     return _sha256_hex(f"tok:{token}:{_token_pepper()}")
 
 
@@ -163,8 +163,7 @@ def request_web_otp(
     otp_plain = f"{secrets.randbelow(1000000):06d}"
     expires_at = _now_utc() + timedelta(minutes=int(WEB_OTP_TTL_MINUTES or 10))
 
-    # IMPORTANT:
-    # only include columns that exist in your current web_otps table
+    # Only columns that exist in web_otps
     row = {
         "contact": contact,
         "purpose": purpose,
@@ -296,7 +295,8 @@ def _get_or_create_web_account(contact: str) -> Tuple[Optional[Dict[str, Any]], 
 # -------------------- Sessions --------------------
 
 def _revoke_all_sessions_for_account(account_id: str) -> None:
-    _sb_request("PATCH", f"/{WEB_TOKEN_TABLE}?account_id=eq.{account_id}", json={"revoked": True, "revoked_at": _now_utc().isoformat()})
+    # Keep payload minimal so it works for both web_tokens and web_sessions
+    _sb_request("PATCH", f"/{WEB_TOKEN_TABLE}?account_id=eq.{account_id}", json={"revoked": True})
 
 
 def _insert_web_session(*, account_id: str, ip: Optional[str], user_agent: Optional[str]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
@@ -308,13 +308,13 @@ def _insert_web_session(*, account_id: str, ip: Optional[str], user_agent: Optio
         token_plain = secrets.token_urlsafe(48)
         token_hash = _hash_token(token_plain)
 
+        # IMPORTANT:
+        # only columns common to both web_tokens and web_sessions
         payload = {
             "token_hash": token_hash,
             "account_id": account_id,
             "expires_at": expires_at,
             "revoked": False,
-            "ip": ip,
-            "user_agent": user_agent,
         }
 
         ok, data, dbg = _sb_request("POST", f"/{WEB_TOKEN_TABLE}", json=payload)
@@ -411,6 +411,8 @@ def verify_web_otp_and_issue_token(*, contact: str, otp: str, purpose: str, ip: 
                 "table": WEB_TOKEN_TABLE,
                 "session_row_id": sess_res.get("session_row_id"),
                 "account_id": sess_res.get("account_id"),
+                "ip_present": bool(ip),
+                "user_agent_present": bool(user_agent),
             },
         },
     }
@@ -443,7 +445,7 @@ def _lookup_token_plain(token_plain: str) -> Tuple[Optional[str], Dict[str, Any]
     token_hash = _hash_token(token_plain)
 
     params = {
-        "select": "id,account_id,expires_at,revoked,revoked_at,last_seen_at,created_at",
+        "select": "id,account_id,expires_at,revoked,last_seen_at,created_at",
         "token_hash": f"eq.{token_hash}",
         "limit": "1",
     }
@@ -511,7 +513,7 @@ def logout_web_session(req: Request) -> Dict[str, Any]:
 
     token_hash = _hash_token(token)
 
-    ok, data, sb_dbg = _sb_request("PATCH", f"/{WEB_TOKEN_TABLE}?token_hash=eq.{token_hash}", json={"revoked": True, "revoked_at": _now_utc().isoformat()})
+    ok, data, sb_dbg = _sb_request("PATCH", f"/{WEB_TOKEN_TABLE}?token_hash=eq.{token_hash}", json={"revoked": True})
     if not ok:
         return _fail(stage="logout", error="logout_failed", root_cause=sb_dbg.get("error_body") or data, debug=sb_dbg, extra=src_dbg)
 
