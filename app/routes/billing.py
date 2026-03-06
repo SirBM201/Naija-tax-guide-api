@@ -15,7 +15,6 @@ from app.services.paystack_service import (
     verify_transaction,
     verify_webhook_signature,
 )
-from app.services.credits_service import init_credits_for_plan
 
 bp = Blueprint("billing", __name__)
 
@@ -41,9 +40,13 @@ def _clip(v: Any, n: int = 400) -> str:
     return s if len(s) <= n else s[:n] + "...<truncated>"
 
 
-def _looks_like_email(v: str) -> bool:
-    v = (v or "").strip()
-    return ("@" in v) and ("." in v.split("@")[-1])
+def _fail(*, error: str, root_cause: Any = None, extra: Dict[str, Any] | None = None, status: int = 400):
+    out: Dict[str, Any] = {"ok": False, "error": error}
+    if root_cause is not None:
+        out["root_cause"] = root_cause
+    if extra:
+        out.update(extra)
+    return jsonify(out), status
 
 
 def _store_paystack_event(
@@ -54,15 +57,16 @@ def _store_paystack_event(
     payload: Dict[str, Any],
 ) -> None:
     """
-    Table expected (recommended):
-      paystack_events:
-        id bigint pk
-        event_id text unique nullable
-        event_type text not null
-        reference text nullable
-        payload jsonb not null
+    Best-effort audit log.
+    Expected table:
+      paystack_events(
+        id bigint pk,
+        event_id text unique null,
+        event_type text not null,
+        reference text null,
+        payload jsonb not null,
         created_at timestamptz not null
-    Best-effort only.
+      )
     """
     row = {
         "event_id": event_id,
@@ -77,51 +81,86 @@ def _store_paystack_event(
         pass
 
 
-def _fetch_payer_email(account_id: str) -> Tuple[Optional[str], Dict[str, Any]]:
+def _get_account_row(account_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """
-    Determine payer email from accounts row.
-    Priority:
-      1) accounts.email (if present)
-      2) accounts.provider_user_id if it looks like email (web login uses email as provider_user_id)
+    account_id here is canonical accounts.account_id from web auth.
     """
+    account_id = (account_id or "").strip()
+    if not account_id:
+        return None, {"error": "account_id_required", "root_cause": "missing_account_id"}
+
+    # Preferred lookup by canonical account_id
     try:
         q = (
             _sb()
             .table("accounts")
-            .select("id,email,provider,provider_user_id,display_name")
+            .select("id,account_id,email,provider,provider_user_id,display_name,created_at,updated_at")
+            .eq("account_id", account_id)
+            .limit(1)
+            .execute()
+        )
+        rows = getattr(q, "data", None) or []
+        if rows:
+            return rows[0], None
+    except Exception as e:
+        return None, {
+            "error": "account_lookup_failed",
+            "root_cause": f"lookup by account_id failed: {type(e).__name__}: {_clip(e)}",
+        }
+
+    # Backward-compat fallback by id
+    try:
+        q = (
+            _sb()
+            .table("accounts")
+            .select("id,account_id,email,provider,provider_user_id,display_name,created_at,updated_at")
             .eq("id", account_id)
             .limit(1)
             .execute()
         )
         rows = getattr(q, "data", None) or []
-        if not rows:
-            return None, {"error": "account_not_found", "details": {"account_id": account_id}}
-
-        row = rows[0] or {}
-        email = (row.get("email") or "").strip().lower()
-        if _looks_like_email(email):
-            return email, {"source": "accounts.email", "account": {"id": row.get("id"), "provider": row.get("provider")}}
-
-        puid = (row.get("provider_user_id") or "").strip().lower()
-        if _looks_like_email(puid):
-            return puid, {
-                "source": "accounts.provider_user_id",
-                "account": {"id": row.get("id"), "provider": row.get("provider")},
-            }
-
-        return None, {
-            "error": "missing_payer_email",
-            "fix": "Set accounts.email for this user OR ensure provider_user_id is the email for web provider.",
-            "account_row": {"id": row.get("id"), "email": row.get("email"), "provider_user_id": row.get("provider_user_id")},
-        }
-
+        if rows:
+            return rows[0], None
     except Exception as e:
         return None, {
-            "error": "payer_email_lookup_failed",
-            "root_cause": f"{type(e).__name__}: {_clip(e)}",
-            "fix": "Check Supabase connectivity/RLS for accounts table and ensure service role key is used.",
-            "details": {"account_id": account_id},
+            "error": "account_lookup_failed",
+            "root_cause": f"lookup by id failed: {type(e).__name__}: {_clip(e)}",
         }
+
+    return None, {"error": "account_not_found", "root_cause": "no accounts row matched provided account_id"}
+
+
+def _resolve_checkout_email(account_id: str) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """
+    Resolve checkout email automatically from authenticated account.
+    Priority:
+      1. accounts.email
+      2. accounts.provider_user_id when provider=web and looks like email
+    """
+    row, err = _get_account_row(account_id)
+    if err:
+        return None, err
+
+    email = (row.get("email") or "").strip().lower()
+    if "@" in email:
+        return email, None
+
+    provider = (row.get("provider") or "").strip().lower()
+    provider_user_id = (row.get("provider_user_id") or "").strip().lower()
+    if provider == "web" and "@" in provider_user_id:
+        return provider_user_id, None
+
+    return None, {
+        "error": "checkout_email_missing",
+        "root_cause": "No valid email found on accounts.email or provider_user_id",
+        "details": {
+            "account_id": account_id,
+            "provider": provider,
+            "provider_user_id": provider_user_id,
+            "email": email,
+        },
+        "fix": "Ensure accounts.email is populated for this authenticated account.",
+    }
 
 
 def _upsert_user_subscription(
@@ -132,6 +171,9 @@ def _upsert_user_subscription(
     provider: str,
     provider_ref: str,
 ) -> Dict[str, Any]:
+    """
+    user_subscriptions uses canonical account_id (accounts.account_id).
+    """
     now = _now()
     expires = now + timedelta(days=int(duration_days))
     now_iso = now.isoformat()
@@ -209,23 +251,43 @@ def billing_me():
         return jsonify({"ok": False, "error": "unauthorized", "debug": debug}), 401
 
     sub = None
-    err = None
+    db_warning = None
     try:
-        q = _sb().table("user_subscriptions").select("*").eq("account_id", account_id).limit(1).execute()
+        q = (
+            _sb()
+            .table("user_subscriptions")
+            .select("*")
+            .eq("account_id", account_id)
+            .limit(1)
+            .execute()
+        )
         rows = getattr(q, "data", None) or []
         sub = rows[0] if rows else None
     except Exception as e:
-        err = f"{type(e).__name__}: {_clip(e)}"
+        db_warning = repr(e)
 
-    return jsonify({"ok": True, "account_id": account_id, "subscription": sub, "db_warning": err, "debug": debug}), 200
+    checkout_email, email_err = _resolve_checkout_email(account_id)
+
+    return jsonify(
+        {
+            "ok": True,
+            "account_id": account_id,
+            "subscription": sub,
+            "checkout_email": checkout_email,
+            "checkout_email_error": email_err,
+            "db_warning": db_warning,
+            "debug": debug,
+        }
+    ), 200
 
 
 @bp.post("/billing/checkout")
 def billing_checkout():
     """
-    Start Paystack transaction (requires web auth).
-    Body: { "plan_code": "monthly|quarterly|yearly" }
-    Email is fetched from accounts table (best practice).
+    Start Paystack transaction.
+    Email is resolved automatically from the authenticated account.
+    Body:
+      { "plan_code": "monthly|quarterly|yearly" }
     """
     account_id, debug = get_account_id_from_request(request)
     if not account_id:
@@ -233,45 +295,53 @@ def billing_checkout():
 
     body = _safe_json()
     plan_code = (body.get("plan_code") or "").strip().lower()
+
     if not plan_code:
-        return jsonify({"ok": False, "error": "plan_code_required"}), 400
+        return _fail(error="plan_code_required", status=400)
 
     plan = get_plan(plan_code)
     if not plan or not plan.get("active", True):
-        return jsonify({"ok": False, "error": "plan_not_found"}), 404
+        return _fail(error="plan_not_found", status=404)
 
     price_ngn = int(plan.get("price") or 0)
     if price_ngn <= 0:
-        return jsonify({"ok": False, "error": "plan_price_missing", "plan": plan}), 400
+        return _fail(error="plan_price_missing", status=400)
 
-    payer_email, email_dbg = _fetch_payer_email(account_id)
-    if not payer_email:
-        return jsonify({"ok": False, **email_dbg, "debug": debug}), 400
+    email, email_err = _resolve_checkout_email(account_id)
+    if email_err or not email:
+        return _fail(
+            error="checkout_email_missing",
+            root_cause=(email_err or {}).get("root_cause"),
+            extra={
+                "details": (email_err or {}).get("details"),
+                "fix": (email_err or {}).get("fix"),
+                "account_id": account_id,
+            },
+            status=400,
+        )
 
     reference = create_reference("NTG")
     metadata = {
         "product": "naija_tax_guide",
         "plan_code": plan_code,
-        "account_id": account_id,  # IMPORTANT
-        "email": payer_email,
+        "account_id": account_id,  # canonical account_id
+        "email": email,
     }
 
     try:
         ps = initialize_transaction(
-            email=payer_email,
+            email=email,
             amount_kobo=price_ngn * 100,
             reference=reference,
             metadata=metadata,
         )
     except Exception as e:
-        return jsonify(
-            {
-                "ok": False,
-                "error": "paystack_init_failed",
-                "root_cause": f"{type(e).__name__}: {_clip(e)}",
-                "details": {"reference": reference, "plan_code": plan_code, "amount_kobo": price_ngn * 100},
-            }
-        ), 400
+        return _fail(
+            error="paystack_init_failed",
+            root_cause=repr(e),
+            extra={"account_id": account_id, "email": email, "plan_code": plan_code},
+            status=400,
+        )
 
     data = (ps or {}).get("data") or {}
     return jsonify(
@@ -282,8 +352,7 @@ def billing_checkout():
             "access_code": data.get("access_code"),
             "plan": plan,
             "account_id": account_id,
-            "payer_email": payer_email,
-            "email_debug": email_dbg,
+            "email": email,
         }
     ), 200
 
@@ -291,20 +360,20 @@ def billing_checkout():
 @bp.get("/billing/verify")
 def billing_verify():
     """
-    Verify a reference (after Paystack redirect).
+    Verify a reference after Paystack redirect.
     GET /billing/verify?reference=...
     """
     reference = (request.args.get("reference") or "").strip()
     if not reference:
-        return jsonify({"ok": False, "error": "missing_reference"}), 400
+        return _fail(error="missing_reference", status=400)
 
     try:
         ps = verify_transaction(reference)
     except Exception as e:
-        return jsonify({"ok": False, "error": "paystack_verify_failed", "root_cause": f"{type(e).__name__}: {_clip(e)}"}), 400
+        return _fail(error="paystack_verify_failed", root_cause=repr(e), status=400)
 
     tx = (ps or {}).get("data") or {}
-    status = (tx.get("status") or "").strip().lower()
+    status_text = (tx.get("status") or "").strip().lower()
     tx_id = str(tx.get("id") or "") or None
     metadata = tx.get("metadata") or {}
 
@@ -313,15 +382,27 @@ def billing_verify():
 
     _store_paystack_event(event_id=tx_id, event_type="verify", reference=reference, payload=ps)
 
-    if status != "success":
-        return jsonify({"ok": True, "paid": False, "status": status, "reference": reference, "data": tx}), 200
+    if status_text != "success":
+        return jsonify(
+            {
+                "ok": True,
+                "paid": False,
+                "status": status_text,
+                "reference": reference,
+                "data": tx,
+            }
+        ), 200
 
     if not plan_code or not account_id:
-        return jsonify({"ok": False, "error": "missing_metadata", "metadata": metadata, "reference": reference}), 400
+        return _fail(
+            error="missing_metadata",
+            extra={"metadata": metadata, "reference": reference},
+            status=400,
+        )
 
     plan = get_plan(plan_code)
     if not plan:
-        return jsonify({"ok": False, "error": "plan_not_found", "plan_code": plan_code}), 404
+        return _fail(error="plan_not_found", extra={"plan_code": plan_code}, status=404)
 
     sub = _upsert_user_subscription(
         account_id=account_id,
@@ -331,19 +412,24 @@ def billing_verify():
         provider_ref=reference,
     )
 
-    # ✅ Recommended: initialize credits immediately based on plan
-    credits = init_credits_for_plan(account_id, plan_code)
-
-    return jsonify({"ok": True, "paid": True, "reference": reference, "subscription": sub, "plan": plan, "credits": credits}), 200
+    return jsonify(
+        {
+            "ok": True,
+            "paid": True,
+            "reference": reference,
+            "subscription": sub,
+            "plan": plan,
+        }
+    ), 200
 
 
 @bp.post("/billing/webhook")
 def billing_webhook():
     """
     Paystack webhook:
-    - validates signature (x-paystack-signature)
-    - stores event in paystack_events
-    - on charge.success -> activates subscription + initializes credits
+    - validates signature
+    - stores event
+    - on charge.success -> activates subscription
     """
     raw_body = request.get_data(cache=False) or b""
     sig = (request.headers.get("x-paystack-signature") or "").strip()
@@ -357,7 +443,12 @@ def billing_webhook():
     reference = (data.get("reference") or "").strip() or None
     tx_id = str(data.get("id") or "") or None
 
-    _store_paystack_event(event_id=tx_id, event_type=event_type or "unknown", reference=reference, payload=payload)
+    _store_paystack_event(
+        event_id=tx_id,
+        event_type=event_type or "unknown",
+        reference=reference,
+        payload=payload,
+    )
 
     if event_type == "charge.success":
         metadata = data.get("metadata") or {}
@@ -374,6 +465,5 @@ def billing_webhook():
                     provider="paystack",
                     provider_ref=reference,
                 )
-                init_credits_for_plan(account_id, plan_code)
 
     return jsonify({"ok": True}), 200
