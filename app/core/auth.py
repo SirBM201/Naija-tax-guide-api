@@ -44,7 +44,6 @@ def get_web_token_pepper() -> str:
 
 
 def token_hash(raw_token: str) -> str:
-    # MUST match app/services/web_auth_service.py
     pepper = get_web_token_pepper()
     return _sha256_hex(f"tok:{raw_token}:{pepper}")
 
@@ -82,16 +81,6 @@ def auth_debug_snapshot() -> Dict[str, Any]:
 
 
 def require_auth_plus(fn: Callable[..., Any]) -> Callable[..., Any]:
-    """
-    Cookie-first auth, Bearer fallback.
-    Sets:
-      g.account_id
-      g.web_token_hash
-      g.raw_token_source = "cookie" | "bearer"
-      g.token_row
-      g.auth_token
-      g.rotated_token (if future rotation is exposed here)
-    """
     @wraps(fn)
     def wrapper(*args, **kwargs):
         raw = _get_cookie_token()
