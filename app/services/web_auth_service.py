@@ -34,6 +34,14 @@ BEARER_FALLBACK_TO_COOKIE = str(__import__("os").getenv("WEB_BEARER_FALLBACK_TO_
     "1", "true", "yes", "y", "on"
 }
 
+SESSION_ROTATE_AFTER_MINUTES = int((__import__("os").getenv("WEB_SESSION_ROTATE_AFTER_MINUTES", "30") or "30"))
+SESSION_FINGERPRINT_MODE = ((__import__("os").getenv("WEB_SESSION_FINGERPRINT_MODE", "soft") or "soft").strip().lower())
+# soft = never block, only log mismatch
+# strict = block on mismatch
+# off = ignore fingerprint entirely
+
+
+# -------------------- time / hashing --------------------
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
@@ -56,6 +64,7 @@ def _hash_otp(otp: str) -> str:
 
 
 def _hash_token(token: str) -> str:
+    # MUST match app/core/auth.py
     return _sha256_hex(f"tok:{token}:{_token_pepper()}")
 
 
@@ -65,6 +74,41 @@ def _truncate(s: Any, n: int = 1800) -> str:
     s = str(s)
     return s if len(s) <= n else (s[:n] + "...<truncated>")
 
+
+def _safe_iso_to_dt(v: Any) -> Optional[datetime]:
+    try:
+        if not v:
+            return None
+        return datetime.fromisoformat(str(v).replace("Z", "+00:00")).astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+# -------------------- fingerprint helpers --------------------
+
+def _normalize_user_agent(user_agent: Optional[str]) -> str:
+    ua = (user_agent or "").strip()
+    if not ua:
+        return ""
+    return ua[:500]
+
+
+def _normalize_ip(ip: Optional[str]) -> str:
+    return (ip or "").strip()
+
+
+def _build_fingerprint(ip: Optional[str], user_agent: Optional[str]) -> str:
+    """
+    Privacy-conscious device/browser-ish fingerprint.
+    Stores only SHA-256 of a small normalized tuple, not raw secret material.
+    """
+    ip_n = _normalize_ip(ip)
+    ua_n = _normalize_user_agent(user_agent)
+    raw = f"fp:v1|ip:{ip_n}|ua:{ua_n}"
+    return _sha256_hex(raw)
+
+
+# -------------------- supabase postgrest --------------------
 
 def _postgrest_base() -> str:
     url = (SUPABASE_URL or "").strip().rstrip("/")
@@ -121,6 +165,8 @@ def _sb_request(
         return False, None, {"url": url, "method": method, "status": 0, "exception": repr(e)}
 
 
+# -------------------- error helper --------------------
+
 def _fail(*, stage: str, error: str, root_cause: Any = None, debug: Any = None, extra: Dict[str, Any] | None = None):
     out: Dict[str, Any] = {"ok": False, "error": error, "stage": stage}
     if root_cause is not None:
@@ -137,6 +183,24 @@ def _looks_like_unique_violation(dbg: Dict[str, Any]) -> bool:
     return ("23505" in body) or (dbg.get("status") == 409) or ("duplicate key" in body.lower()) or ("unique" in body.lower())
 
 
+# -------------------- auth_events logging --------------------
+
+def _log_auth_event(contact: Optional[str], ip: Optional[str], event: str, success: bool, reason: Optional[str] = None) -> None:
+    try:
+        payload = {
+            "contact": contact,
+            "ip": ip,
+            "event_type": event,
+            "success": bool(success),
+            "reason": reason,
+        }
+        _sb_request("POST", "/auth_events", json=payload)
+    except Exception:
+        pass
+
+
+# -------------------- OTP Request --------------------
+
 def request_web_otp(
     *,
     contact: str,
@@ -149,6 +213,7 @@ def request_web_otp(
     purpose = (purpose or "web_login").strip().lower()
 
     if "@" not in contact:
+        _log_auth_event(contact, ip, "request_otp", False, "invalid_contact_email")
         return _fail(stage="validate_contact", error="invalid_contact_email", extra={"contact": contact})
 
     otp_plain = f"{secrets.randbelow(1000000):06d}"
@@ -170,9 +235,12 @@ def request_web_otp(
 
     ok, data, dbg = _sb_request("POST", f"/{WEB_OTP_TABLE}", json=row)
     if not ok:
+        _log_auth_event(contact, ip, "request_otp", False, "otp_insert_failed")
         return _fail(stage="otp_insert", error="otp_insert_failed", root_cause=dbg.get("error_body") or data, debug=dbg)
 
     created = data[0] if isinstance(data, list) and data else data
+    _log_auth_event(contact, ip, "request_otp", True)
+
     return {
         "ok": True,
         "contact": contact,
@@ -213,6 +281,8 @@ def _mark_otp_used(otp_id: str) -> Dict[str, Any]:
         return {"ok": True}
     return _fail(stage="otp_mark_used", error="otp_mark_used_failed", root_cause=dbg.get("error_body") or data, debug=dbg)
 
+
+# -------------------- Accounts --------------------
 
 def _patch_account(accounts_row_id: str, patch: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
     ok, data, dbg = _sb_request("PATCH", f"/accounts?id=eq.{accounts_row_id}", json=patch)
@@ -275,18 +345,23 @@ def _get_or_create_web_account(contact: str) -> Tuple[Optional[Dict[str, Any]], 
     return created, None
 
 
+# -------------------- Sessions --------------------
+
 def _revoke_all_sessions_for_account(account_row_id: str) -> None:
     _sb_request("PATCH", f"/{WEB_TOKEN_TABLE}?account_id=eq.{account_row_id}", json={"revoked": True})
 
 
-def _insert_web_session(*, account_row_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+def _insert_web_session(*, account_row_id: str, ip: Optional[str], user_agent: Optional[str]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     expires_at = (_now_utc() + timedelta(days=int(WEB_SESSION_TTL_DAYS or 30))).isoformat()
     attempts: List[Dict[str, Any]] = []
+
+    fingerprint = _build_fingerprint(ip, user_agent)
 
     for n in range(1, TOKEN_INSERT_MAX_RETRIES + 1):
         token_plain = secrets.token_urlsafe(48)
         token_hash = _hash_token(token_plain)
 
+        # Minimal guaranteed columns for current schema.
         payload = {
             "token_hash": token_hash,
             "account_id": account_row_id,  # FK -> accounts.id
@@ -297,13 +372,26 @@ def _insert_web_session(*, account_row_id: str) -> Tuple[Optional[Dict[str, Any]
         ok, data, dbg = _sb_request("POST", f"/{WEB_TOKEN_TABLE}", json=payload)
         if ok:
             created = data[0] if isinstance(data, list) and data else data
+            session_row_id = (created or {}).get("id")
+
+            # Best-effort enrich session row with optional columns if they exist.
+            # These won't break login if columns are absent.
+            enrich_patch = {
+                "fingerprint": fingerprint,
+                "last_seen_at": _now_utc().isoformat(),
+                "ip": ip,
+                "user_agent": (user_agent or "")[:500] or None,
+            }
+            _sb_request("PATCH", f"/{WEB_TOKEN_TABLE}?id=eq.{session_row_id}", json=enrich_patch)
+
             return {
                 "ok": True,
                 "token": token_plain,
                 "token_hash": token_hash,
                 "expires_at": expires_at,
-                "session_row_id": (created or {}).get("id"),
+                "session_row_id": session_row_id,
                 "account_row_id": account_row_id,
+                "fingerprint": fingerprint,
             }, None
 
         attempts.append({"try": n, "status": dbg.get("status"), "root_cause": dbg.get("error_body") or data, "supabase": dbg})
@@ -323,41 +411,51 @@ def verify_web_otp_and_issue_token(*, contact: str, otp: str, purpose: str, ip: 
     otp = (otp or "").strip()
 
     if not contact or not otp:
+        _log_auth_event(contact, ip, "verify_failed", False, "contact_and_otp_required")
         return _fail(stage="validate_input", error="contact_and_otp_required")
 
     if "@" not in contact:
+        _log_auth_event(contact, ip, "verify_failed", False, "invalid_contact_email")
         return _fail(stage="validate_contact", error="invalid_contact_email", extra={"contact": contact})
 
     otp_row, otp_dbg = _find_latest_otp(contact, purpose)
     if not otp_row:
+        _log_auth_event(contact, ip, "verify_failed", False, "otp_not_found")
         return _fail(stage="otp_lookup", error="otp_not_found", debug=otp_dbg)
 
     if otp_row.get("used") is True:
+        _log_auth_event(contact, ip, "verify_failed", False, "otp_already_used")
         return _fail(stage="otp_state", error="otp_already_used", extra={"otp_id": otp_row.get("id")})
 
     try:
         exp = str(otp_row["expires_at"])
         exp_dt = datetime.fromisoformat(exp.replace("Z", "+00:00"))
         if _now_utc() >= exp_dt:
+            _log_auth_event(contact, ip, "verify_failed", False, "otp_expired")
             return _fail(stage="otp_expiry", error="otp_expired", extra={"expires_at": exp, "otp_id": otp_row.get("id")})
     except Exception as e:
+        _log_auth_event(contact, ip, "verify_failed", False, "otp_expiry_parse_failed")
         return _fail(stage="otp_expiry_parse", error="otp_expiry_parse_failed", root_cause=repr(e), extra={"otp_row": otp_row})
 
     if _hash_otp(otp) != (otp_row.get("code_hash") or ""):
+        _log_auth_event(contact, ip, "verify_failed", False, "invalid_otp")
         return _fail(stage="otp_compare", error="otp_invalid", extra={"otp_id": otp_row.get("id")})
 
     used_res = _mark_otp_used(str(otp_row["id"]))
     if not used_res.get("ok"):
+        _log_auth_event(contact, ip, "verify_failed", False, "otp_mark_used_failed")
         return _fail(stage="otp_mark_used", error="otp_mark_used_failed", root_cause=used_res.get("root_cause"), debug=used_res.get("debug"))
 
     acct, acct_err = _get_or_create_web_account(contact)
     if acct_err:
+        _log_auth_event(contact, ip, "verify_failed", False, "account_lookup_or_create_failed")
         return {"ok": False, **acct_err}
 
     account_row_id = str(acct.get("id") or "").strip()
     canonical_account_id = str(acct.get("account_id") or acct.get("id") or "").strip()
 
     if not account_row_id:
+        _log_auth_event(contact, ip, "verify_failed", False, "account_row_id_missing")
         return _fail(stage="account_state", error="account_row_id_missing", extra={"account_row": acct})
 
     if REVOKE_OLD_TOKENS_ON_LOGIN:
@@ -366,9 +464,12 @@ def verify_web_otp_and_issue_token(*, contact: str, otp: str, purpose: str, ip: 
         except Exception:
             pass
 
-    sess_res, sess_err = _insert_web_session(account_row_id=account_row_id)
+    sess_res, sess_err = _insert_web_session(account_row_id=account_row_id, ip=ip, user_agent=user_agent)
     if sess_err:
+        _log_auth_event(contact, ip, "verify_failed", False, "session_insert_failed")
         return {"ok": False, **sess_err}
+
+    _log_auth_event(contact, ip, "verify_success", True)
 
     return {
         "ok": True,
@@ -389,10 +490,13 @@ def verify_web_otp_and_issue_token(*, contact: str, otp: str, purpose: str, ip: 
                 "table": WEB_TOKEN_TABLE,
                 "session_row_id": sess_res.get("session_row_id"),
                 "account_row_id": sess_res.get("account_row_id"),
+                "fingerprint": sess_res.get("fingerprint"),
             },
         },
     }
 
+
+# -------------------- token extraction / session checks --------------------
 
 def _extract_token_candidates(req: Request) -> Tuple[str, str, Dict[str, Any]]:
     debug: Dict[str, Any] = {
@@ -415,7 +519,33 @@ def _extract_token_candidates(req: Request) -> Tuple[str, str, Dict[str, Any]]:
     return bearer, cookie, debug
 
 
-def _lookup_token_plain(token_plain: str) -> Tuple[Optional[str], Dict[str, Any]]:
+def _rotate_existing_session(row: Dict[str, Any], ip: Optional[str], user_agent: Optional[str]) -> Tuple[Optional[str], Dict[str, Any]]:
+    """
+    Session rotation:
+    - revoke current token row
+    - insert new token row for same account_row_id
+    - keep user online by returning new raw token (caller may set new cookie if desired)
+    """
+    account_row_id = str(row.get("account_id") or "").strip()
+    if not account_row_id:
+        return None, {"ok": False, "error": "rotate_missing_account_id"}
+
+    # revoke old
+    _sb_request("PATCH", f"/{WEB_TOKEN_TABLE}?id=eq.{row.get('id')}", json={"revoked": True})
+
+    ins, err = _insert_web_session(account_row_id=account_row_id, ip=ip, user_agent=user_agent)
+    if err:
+        return None, {"ok": False, **err}
+
+    return str(ins["token"]), {
+        "ok": True,
+        "rotated": True,
+        "session_row_id": ins.get("session_row_id"),
+        "expires_at": ins.get("expires_at"),
+    }
+
+
+def _lookup_token_plain(token_plain: str, *, ip: Optional[str] = None, user_agent: Optional[str] = None) -> Tuple[Optional[str], Dict[str, Any]]:
     token_hash = _hash_token(token_plain)
 
     params = {
@@ -442,6 +572,7 @@ def _lookup_token_plain(token_plain: str) -> Tuple[Optional[str], Dict[str, Any]
     except Exception as e:
         return None, _fail(stage="token_expiry_parse", error="token_expiry_parse_failed", root_cause=repr(e), extra={"token_row": row}, debug={"supabase": sb_dbg})
 
+    # Resolve canonical account id from joined accounts row if available
     canonical_account_id: Optional[str] = None
     embedded = row.get("accounts")
     if isinstance(embedded, list) and embedded:
@@ -456,33 +587,97 @@ def _lookup_token_plain(token_plain: str) -> Tuple[Optional[str], Dict[str, Any]
     if not canonical_account_id:
         canonical_account_id = str(row.get("account_id") or "").strip() or None
 
+    # -------------------- fingerprint check --------------------
+    req_fp = _build_fingerprint(ip, user_agent)
+    fp_dbg = {
+        "mode": SESSION_FINGERPRINT_MODE,
+        "request_fingerprint": req_fp,
+        "stored_fingerprint": None,
+        "matched": None,
+    }
+
+    # best-effort read stored fingerprint from optional column via raw row or patch attempt
+    stored_fp = str((row.get("fingerprint") or "")).strip() or None
+    fp_dbg["stored_fingerprint"] = stored_fp
+
+    if SESSION_FINGERPRINT_MODE != "off":
+        if stored_fp:
+            matched = (stored_fp == req_fp)
+            fp_dbg["matched"] = matched
+
+            if not matched:
+                reason = "fingerprint_mismatch"
+                _log_auth_event(None, ip, "fingerprint_mismatch", False, reason)
+
+                if SESSION_FINGERPRINT_MODE == "strict":
+                    return None, _fail(
+                        stage="fingerprint_check",
+                        error="fingerprint_mismatch",
+                        extra={"fingerprint": fp_dbg},
+                        debug={"supabase": sb_dbg},
+                    )
+        else:
+            # backfill if column exists; ignore failure if not
+            _sb_request("PATCH", f"/{WEB_TOKEN_TABLE}?id=eq.{row.get('id')}", json={"fingerprint": req_fp})
+            fp_dbg["matched"] = True
+
+    # -------------------- rotation check --------------------
+    rotate_dbg: Dict[str, Any] = {"rotated": False}
+    created_dt = _safe_iso_to_dt(row.get("created_at"))
+    last_seen_dt = _safe_iso_to_dt(row.get("last_seen_at"))
+    basis_dt = last_seen_dt or created_dt
+
+    if basis_dt and SESSION_ROTATE_AFTER_MINUTES > 0:
+        age_minutes = (_now_utc() - basis_dt).total_seconds() / 60.0
+        rotate_dbg["age_minutes"] = round(age_minutes, 2)
+        rotate_dbg["threshold_minutes"] = SESSION_ROTATE_AFTER_MINUTES
+
+        if age_minutes >= SESSION_ROTATE_AFTER_MINUTES:
+            new_token, rot = _rotate_existing_session(row, ip, user_agent)
+            rotate_dbg.update(rot if isinstance(rot, dict) else {})
+            if new_token:
+                rotate_dbg["new_token"] = new_token
+                row["__rotated_new_token"] = new_token
+                row["__rotated"] = True
+
+    # best-effort last_seen touch
     try:
         _sb_request("PATCH", f"/{WEB_TOKEN_TABLE}?id=eq.{row.get('id')}", json={"last_seen_at": _now_utc().isoformat()})
     except Exception:
         pass
 
-    return canonical_account_id, {"ok": True, "debug": {"supabase": sb_dbg}}
+    return canonical_account_id, {
+        "ok": True,
+        "debug": {
+            "supabase": sb_dbg,
+            "fingerprint": fp_dbg,
+            "rotation": rotate_dbg,
+            "token_row": row,
+        },
+    }
 
 
 def get_account_id_from_request(req: Request) -> Tuple[Optional[str], Dict[str, Any]]:
     bearer, cookie, src_dbg = _extract_token_candidates(req)
+    ip = _normalize_ip(req.remote_addr)
+    user_agent = _normalize_user_agent(req.headers.get("User-Agent"))
 
     if not bearer and not cookie:
         return None, {"ok": False, "error": "missing_token", **src_dbg}
 
     if bearer:
-        acc, dbg = _lookup_token_plain(bearer)
+        acc, dbg = _lookup_token_plain(bearer, ip=ip, user_agent=user_agent)
         if acc:
             return acc, {"ok": True, "token_source": "bearer", **src_dbg, "debug": dbg.get("debug")}
 
         if BEARER_FALLBACK_TO_COOKIE and cookie:
-            acc2, dbg2 = _lookup_token_plain(cookie)
+            acc2, dbg2 = _lookup_token_plain(cookie, ip=ip, user_agent=user_agent)
             if acc2:
                 return acc2, {"ok": True, "token_source": "cookie_fallback", **src_dbg, "debug": dbg2.get("debug")}
 
         return None, {"ok": False, "error": "invalid_token", "token_source": "bearer", **src_dbg}
 
-    acc3, dbg3 = _lookup_token_plain(cookie)
+    acc3, dbg3 = _lookup_token_plain(cookie, ip=ip, user_agent=user_agent)
     if acc3:
         return acc3, {"ok": True, "token_source": "cookie", **src_dbg, "debug": dbg3.get("debug")}
 
@@ -493,12 +688,15 @@ def logout_web_session(req: Request) -> Dict[str, Any]:
     bearer, cookie, src_dbg = _extract_token_candidates(req)
     token = bearer or cookie
     if not token:
+        _log_auth_event(None, _normalize_ip(req.remote_addr), "logout", False, "no_token")
         return {"ok": True, "logged_out": False, "reason": "no_token", **src_dbg}
 
     token_hash = _hash_token(token)
 
     ok, data, sb_dbg = _sb_request("PATCH", f"/{WEB_TOKEN_TABLE}?token_hash=eq.{token_hash}", json={"revoked": True})
     if not ok:
+        _log_auth_event(None, _normalize_ip(req.remote_addr), "logout", False, "logout_failed")
         return _fail(stage="logout", error="logout_failed", root_cause=sb_dbg.get("error_body") or data, debug=sb_dbg, extra=src_dbg)
 
+    _log_auth_event(None, _normalize_ip(req.remote_addr), "logout", True)
     return {"ok": True, "logged_out": True, **src_dbg}
