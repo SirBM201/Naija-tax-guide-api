@@ -44,7 +44,7 @@ def get_web_token_pepper() -> str:
 
 
 def token_hash(raw_token: str) -> str:
-    # IMPORTANT: must match app/services/web_auth_service.py
+    # MUST match app/services/web_auth_service.py
     pepper = get_web_token_pepper()
     return _sha256_hex(f"tok:{raw_token}:{pepper}")
 
@@ -90,6 +90,7 @@ def require_auth_plus(fn: Callable[..., Any]) -> Callable[..., Any]:
       g.raw_token_source = "cookie" | "bearer"
       g.token_row
       g.auth_token
+      g.rotated_token (if future rotation is exposed here)
     """
     @wraps(fn)
     def wrapper(*args, **kwargs):
@@ -147,6 +148,7 @@ def require_auth_plus(fn: Callable[..., Any]) -> Callable[..., Any]:
             g.raw_token_source = source
             g.token_row = row
             g.auth_token = raw
+            g.rotated_token = None
 
             _dbg(f"[auth] ok account_id={g.account_id} src={source} token_hash_prefix={th_prefix}")
             return fn(*args, **kwargs)
