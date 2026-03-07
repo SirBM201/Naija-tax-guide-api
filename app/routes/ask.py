@@ -1,4 +1,3 @@
-# app/routes/ask.py
 from __future__ import annotations
 
 import os
@@ -72,11 +71,9 @@ def ask():
     if not question:
         return jsonify({"ok": False, "error": "question_required"}), 400
 
-    # Explicit dev bypass token support
     if _is_dev_bypass_request():
         body["__bypass"] = True
 
-    # Derive authenticated account from cookie / bearer
     account_id, auth_debug = get_account_id_from_request(request)
     if not account_id:
         return jsonify({"ok": False, "error": "unauthorized", "debug": auth_debug}), 401
@@ -85,7 +82,6 @@ def ask():
     body.setdefault("provider", "web")
     body.setdefault("__auth_source", auth_debug)
 
-    # Subscription enforcement
     bypass_sub = _subscription_bypass_enabled() and bool(body.get("__bypass"))
     if not bypass_sub:
         sub = require_active_subscription(account_id)
@@ -108,6 +104,10 @@ def ask():
             )
 
         body["__subscription"] = sub.get("subscription")
+        body["__plan"] = sub.get("plan")
+        body["__plan_code"] = sub.get("plan_code")
+        body["__daily_answers_limit"] = sub.get("daily_answers_limit")
+        body["__ai_credits_total"] = sub.get("ai_credits_total")
     else:
         body["__subscription_bypass"] = True
 
@@ -116,12 +116,21 @@ def ask():
 
         status = 200
         if not resp.get("ok"):
-            if resp.get("error") in {"question_required", "invalid_request", "account_required", "account_invalid"}:
+            if resp.get("error") in {
+                "question_required",
+                "invalid_request",
+                "account_required",
+                "account_invalid",
+                "plan_context_failed",
+                "subscription_plan_missing",
+            }:
                 status = 400
             elif resp.get("error") in {"unauthorized", "missing_token", "invalid_token", "session_expired"}:
                 status = 401
             elif resp.get("error") in {"subscription_required", "insufficient_credits"}:
                 status = 402
+            elif resp.get("error") in {"daily_limit_reached"}:
+                status = 429
             else:
                 status = 500
 
@@ -134,7 +143,7 @@ def ask():
                     "ok": False,
                     "error": "ask_failed",
                     "root_cause": f"{type(e).__name__}: {str(e)}",
-                    "fix": "Check ask_service, subscription_guard, and dependent backend services.",
+                    "fix": "Check ask_service, subscription_guard, credits_service, and dependent backend services.",
                 }
             ), 500
 
