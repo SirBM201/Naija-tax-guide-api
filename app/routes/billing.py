@@ -40,6 +40,15 @@ def _clip(v: Any, n: int = 400) -> str:
     return s if len(s) <= n else s[:n] + "...<truncated>"
 
 
+def _safe_dt(v: Any) -> Optional[datetime]:
+    try:
+        if not v:
+            return None
+        return datetime.fromisoformat(str(v).replace("Z", "+00:00")).astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
 def _fail(*, error: str, root_cause: Any = None, extra: Dict[str, Any] | None = None, status: int = 400):
     out: Dict[str, Any] = {"ok": False, "error": error}
     if root_cause is not None:
@@ -89,7 +98,6 @@ def _get_account_row(account_id: str) -> Tuple[Optional[Dict[str, Any]], Optiona
     if not account_id:
         return None, {"error": "account_id_required", "root_cause": "missing_account_id"}
 
-    # Preferred lookup by canonical account_id
     try:
         q = (
             _sb()
@@ -108,7 +116,6 @@ def _get_account_row(account_id: str) -> Tuple[Optional[Dict[str, Any]], Optiona
             "root_cause": f"lookup by account_id failed: {type(e).__name__}: {_clip(e)}",
         }
 
-    # Backward-compat fallback by id
     try:
         q = (
             _sb()
@@ -161,6 +168,78 @@ def _resolve_checkout_email(account_id: str) -> Tuple[Optional[str], Optional[Di
         },
         "fix": "Ensure accounts.email is populated for this authenticated account.",
     }
+
+
+def _get_subscription_row(account_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    account_id = (account_id or "").strip()
+    if not account_id:
+        return None, {"error": "account_id_required", "root_cause": "missing_account_id"}
+
+    try:
+        q = (
+            _sb()
+            .table("user_subscriptions")
+            .select("*")
+            .eq("account_id", account_id)
+            .limit(1)
+            .execute()
+        )
+        rows = getattr(q, "data", None) or []
+        return (rows[0] if rows else None), None
+    except Exception as e:
+        return None, {
+            "error": "subscription_lookup_failed",
+            "root_cause": f"{type(e).__name__}: {_clip(e)}",
+        }
+
+
+def _same_active_plan_guard(account_id: str, requested_plan_code: str) -> Optional[Tuple[Any, int]]:
+    """
+    Block checkout if the user already has the same active plan and it hasn't expired.
+    """
+    sub, err = _get_subscription_row(account_id)
+    if err:
+        # Don't block checkout on lookup issues; expose warning elsewhere.
+        return None
+
+    if not sub:
+        return None
+
+    current_plan_code = (sub.get("plan_code") or "").strip().lower()
+    requested_plan_code = (requested_plan_code or "").strip().lower()
+    status = (sub.get("status") or "").strip().lower()
+    is_active = bool(sub.get("is_active"))
+    expires_at = _safe_dt(sub.get("expires_at"))
+
+    same_plan = current_plan_code and current_plan_code == requested_plan_code
+    still_valid = expires_at is None or _now() < expires_at
+
+    if same_plan and is_active and status == "active" and still_valid:
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "same_active_plan_exists",
+                    "root_cause": "requested_plan_matches_current_active_plan",
+                    "fix": "Use billing page to review the current subscription instead of purchasing the same active plan again.",
+                    "details": {
+                        "account_id": account_id,
+                        "current_subscription": {
+                            "id": sub.get("id"),
+                            "plan_code": sub.get("plan_code"),
+                            "status": sub.get("status"),
+                            "is_active": sub.get("is_active"),
+                            "expires_at": sub.get("expires_at"),
+                            "provider": sub.get("provider"),
+                            "provider_ref": sub.get("provider_ref"),
+                        },
+                    },
+                }
+            ),
+            409,
+        )
+
+    return None
 
 
 def _upsert_user_subscription(
@@ -303,6 +382,10 @@ def billing_checkout():
     if not plan or not plan.get("active", True):
         return _fail(error="plan_not_found", status=404)
 
+    same_plan_block = _same_active_plan_guard(account_id, plan_code)
+    if same_plan_block is not None:
+        return same_plan_block
+
     price_ngn = int(plan.get("price") or 0)
     if price_ngn <= 0:
         return _fail(error="plan_price_missing", status=400)
@@ -324,7 +407,7 @@ def billing_checkout():
     metadata = {
         "product": "naija_tax_guide",
         "plan_code": plan_code,
-        "account_id": account_id,  # canonical account_id
+        "account_id": account_id,
         "email": email,
     }
 
