@@ -14,7 +14,12 @@ from app.services.paystack_service import (
     verify_transaction,
     verify_webhook_signature,
 )
-from app.services.credits_service import init_credits_for_plan
+from app.services.credits_service import (
+    init_credits_for_plan,
+    get_credit_balance_details,
+    get_daily_usage,
+)
+from app.services.subscription_guard import get_subscription_snapshot
 
 bp = Blueprint("billing", __name__)
 
@@ -595,6 +600,40 @@ def billing_me():
             "checkout_email": checkout_email,
             "checkout_email_error": email_err,
             "db_warning": db_warning,
+            "debug": debug,
+        }
+    ), 200
+
+
+@bp.get("/billing/debug-state")
+def billing_debug_state():
+    """
+    Unified monetization state inspector.
+    Helps verify auth -> subscription -> credits -> daily usage in one response.
+    """
+    account_id, debug = get_account_id_from_request(request)
+    if not account_id:
+        return jsonify({"ok": False, "error": "unauthorized", "debug": debug}), 401
+
+    sub, sub_err = _get_subscription_row(account_id)
+    checkout_email, email_err = _resolve_checkout_email(account_id)
+    summary = _build_subscription_summary(sub)
+    guard = get_subscription_snapshot(account_id)
+    credit_details = get_credit_balance_details(account_id)
+    usage_today = get_daily_usage(account_id)
+
+    return jsonify(
+        {
+            "ok": True,
+            "account_id": account_id,
+            "subscription": sub,
+            "subscription_error": sub_err,
+            "subscription_summary": summary,
+            "subscription_guard_snapshot": guard,
+            "checkout_email": checkout_email,
+            "checkout_email_error": email_err,
+            "credit_balance": credit_details,
+            "daily_usage_today": usage_today,
             "debug": debug,
         }
     ), 200
