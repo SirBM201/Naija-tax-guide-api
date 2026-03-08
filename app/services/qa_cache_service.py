@@ -1,16 +1,4 @@
-# app/services/qa_cache_service.py
 from __future__ import annotations
-
-"""
-QA CACHE SERVICE (BOOT-SAFE + BACKWARD COMPAT)
-
-This module must export:
-  - find_cached_answer(...)
-  - touch_cache_best_effort(...)
-  - upsert_ai_answer_to_cache_best_effort(...)
-  - answer_from_cache(...)       (alias/wrapper)
-  - increment_cache_use(...)     (alias/wrapper)
-"""
 
 from typing import Optional, Dict, Any
 from datetime import datetime, timezone
@@ -38,16 +26,21 @@ def find_cached_answer(
     lang: str = "en",
     canonical_key: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    nq = (normalized_question or "").strip()
+
+    nq = _normalize_question(normalized_question)
     if not nq:
         return None
+
     lang = (lang or "en").strip() or "en"
 
     try:
         if canonical_key and canonical_key.strip():
+
             ck = canonical_key.strip()
+
             res = (
-                _sb().table("qa_cache")
+                _sb()
+                .table("qa_cache")
                 .select("*")
                 .eq("enabled", True)
                 .eq("canonical_key", ck)
@@ -56,11 +49,13 @@ def find_cached_answer(
                 .limit(1)
                 .execute()
             )
+
             if getattr(res, "data", None):
                 return res.data[0]
 
         res = (
-            _sb().table("qa_cache")
+            _sb()
+            .table("qa_cache")
             .select("*")
             .eq("enabled", True)
             .eq("normalized_question", nq)
@@ -69,26 +64,45 @@ def find_cached_answer(
             .limit(1)
             .execute()
         )
+
         if getattr(res, "data", None):
             return res.data[0]
+
         return None
+
     except Exception:
         return None
 
 
 def touch_cache_best_effort(cache_id: str) -> None:
+
     cid = (cache_id or "").strip()
     if not cid:
         return
+
     try:
-        res = _sb().table("qa_cache").select("use_count").eq("id", cid).limit(1).execute()
+
+        res = (
+            _sb()
+            .table("qa_cache")
+            .select("use_count")
+            .eq("id", cid)
+            .limit(1)
+            .execute()
+        )
+
         current = 0
+
         if getattr(res, "data", None):
             current = int(res.data[0].get("use_count") or 0)
 
         _sb().table("qa_cache").update(
-            {"use_count": current + 1, "last_used_at": _now_iso()}
+            {
+                "use_count": current + 1,
+                "last_used_at": _now_iso(),
+            }
         ).eq("id", cid).execute()
+
     except Exception:
         return
 
@@ -103,12 +117,15 @@ def upsert_ai_answer_to_cache_best_effort(
     enabled: bool = True,
     priority: int = 0,
 ) -> None:
-    nq = (normalized_question or "").strip()
+
+    nq = _normalize_question(normalized_question)
     ans = (answer or "").strip()
+
     if not nq or not ans:
         return
 
     lang = (lang or "en").strip() or "en"
+
     payload: Dict[str, Any] = {
         "normalized_question": nq,
         "answer": ans,
@@ -119,25 +136,48 @@ def upsert_ai_answer_to_cache_best_effort(
         "lang": lang,
         "last_used_at": _now_iso(),
     }
+
     if canonical_key and canonical_key.strip():
         payload["canonical_key"] = canonical_key.strip()
 
     try:
+
         if payload.get("canonical_key"):
-            _sb().table("qa_cache").upsert(payload, on_conflict="canonical_key,lang").execute()
+
+            _sb().table("qa_cache").upsert(
+                payload,
+                on_conflict="canonical_key,lang",
+            ).execute()
+
         else:
-            _sb().table("qa_cache").upsert(payload, on_conflict="normalized_question,lang").execute()
+
+            _sb().table("qa_cache").upsert(
+                payload,
+                on_conflict="normalized_question,lang",
+            ).execute()
+
     except Exception:
         return
 
 
-# Backward-compat exports
-def answer_from_cache(question: str, lang: str = "en", canonical_key: Optional[str] = None) -> Optional[Dict[str, Any]]:
+def answer_from_cache(
+    question: str,
+    lang: str = "en",
+    canonical_key: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+
     nq = _normalize_question(question)
-    return find_cached_answer(nq, lang=lang, canonical_key=canonical_key)
+
+    return find_cached_answer(
+        nq,
+        lang=lang,
+        canonical_key=canonical_key,
+    )
 
 
 def increment_cache_use(cache_id: Optional[str]) -> None:
+
     if not cache_id:
         return
+
     touch_cache_best_effort(cache_id)
