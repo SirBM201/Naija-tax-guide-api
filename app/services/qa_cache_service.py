@@ -45,7 +45,7 @@ def _drop_filler_words(q: str) -> str:
         "please", "pls", "abeg", "kindly", "help", "explain", "tell", "me",
         "can", "could", "you", "do", "i", "need", "to", "for", "about",
         "the", "a", "an", "is", "are", "be", "what", "whats", "meaning",
-        "of", "na", "wetin", "which", "where", "when"
+        "of", "na", "wetin", "which", "where", "when", "how"
     }
     parts = [p for p in q.split() if p not in fillers]
     return " ".join(parts).strip()
@@ -53,12 +53,12 @@ def _drop_filler_words(q: str) -> str:
 
 def normalize_question_for_cache(q: str) -> str:
     """
-    Stronger normalization than before:
+    Stronger normalization:
     - lowercase
     - remove punctuation
     - compress spaces
+    - normalize a few known variants / typos
     - remove filler words
-    - normalize common variants / typos
     """
     q = _clean_text(q)
 
@@ -67,8 +67,8 @@ def normalize_question_for_cache(q: str) -> str:
         r"\bmeaning\b": "meaning",
         r"\bwetin\b": "what",
         r"\bdey\b": "is",
-        r"\bvat\b": "vat",
         r"\bpaye\b": "paye",
+        r"\bvat\b": "vat",
         r"\btaxable income\b": "taxable_income",
         r"\bpersonal income tax\b": "personal_income_tax",
         r"\bpay as you earn\b": "paye",
@@ -86,11 +86,10 @@ def normalize_question_for_cache(q: str) -> str:
 
 def derive_canonical_key(question: str, lang: str = "en") -> Optional[str]:
     """
-    Maps variant phrasings to shared intent keys.
-    Keep this conservative to avoid wrong matches.
+    Conservative intent mapping for common repeated questions.
     """
     q = normalize_question_for_cache(question)
-    lang = (lang or "en").strip().lower() or "en"
+    _ = (lang or "en").strip().lower() or "en"
 
     rules = [
         ("taxable_income_meaning", [
@@ -115,8 +114,9 @@ def derive_canonical_key(question: str, lang: str = "en") -> Optional[str]:
         ]),
         ("how_to_file_vat_returns", [
             "file vat returns",
-            "how file vat returns",
+            "file vat return",
             "when file vat returns",
+            "when file vat return",
         ]),
         ("where_to_pay_personal_income_tax", [
             "pay personal_income_tax",
@@ -146,7 +146,6 @@ def find_cached_answer(
     lang = (lang or "en").strip() or "en"
 
     try:
-        # 1. exact canonical key + lang
         if canonical_key and canonical_key.strip():
             ck = canonical_key.strip()
             res = (
@@ -162,7 +161,6 @@ def find_cached_answer(
             if getattr(res, "data", None):
                 return res.data[0]
 
-        # 2. exact normalized question + lang
         if nq:
             res = (
                 _sb().table("qa_cache")
@@ -177,7 +175,6 @@ def find_cached_answer(
             if getattr(res, "data", None):
                 return res.data[0]
 
-        # 3. fallback canonical key without lang
         if canonical_key and canonical_key.strip():
             ck = canonical_key.strip()
             res = (
@@ -262,7 +259,11 @@ def upsert_ai_answer_to_cache_best_effort(
         return
 
 
-def answer_from_cache(question: str, lang: str = "en", canonical_key: Optional[str] = None) -> Optional[Dict[str, Any]]:
+def answer_from_cache(
+    question: str,
+    lang: str = "en",
+    canonical_key: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     nq = normalize_question_for_cache(question)
     ck = canonical_key.strip() if canonical_key and canonical_key.strip() else derive_canonical_key(question, lang=lang)
     return find_cached_answer(nq, lang=lang, canonical_key=ck)
