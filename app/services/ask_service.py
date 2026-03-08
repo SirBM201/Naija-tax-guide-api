@@ -12,7 +12,6 @@ ASK SERVICE (CANONICAL)
 - Charges:
   - cached answer -> counts toward daily limit, does NOT consume credits
   - fresh AI answer -> counts toward daily limit AND consumes 1 credit after success
-- Fresh AI answers are written into qa_cache best-effort for future reuse
 """
 
 import os
@@ -31,6 +30,7 @@ from app.services.qa_cache_service import (
     answer_from_cache,
     increment_cache_use,
     upsert_ai_answer_to_cache_best_effort,
+    derive_canonical_key,
 )
 from app.services.ai_service import call_ai
 
@@ -180,6 +180,9 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
             "fix": "Provide a non-empty question string.",
         }
 
+    lang = (body.get("lang") or "en").strip() or "en"
+    canonical_key = derive_canonical_key(question, lang=lang)
+
     raw_account_id = (body.get("account_id") or "").strip()
     resolved = resolve_canonical_account_id(raw_account_id)
     if not resolved.get("ok"):
@@ -196,7 +199,6 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
 
     bypass = bool(body.get("__bypass"))
     subscription_bypass = bool(body.get("__subscription_bypass"))
-    lang = (body.get("lang") or "en").strip() or "en"
 
     if bypass and not _truthy(os.getenv("ALLOW_DEV_BYPASS", "1")):
         return {
@@ -236,7 +238,7 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
                 "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code")},
             }
 
-    cached = answer_from_cache(question, lang=lang)
+    cached = answer_from_cache(question, lang=lang, canonical_key=canonical_key)
     if cached:
         try:
             increment_cache_use(cached.get("id"))
@@ -264,7 +266,7 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
             "plan_code": plan_ctx.get("plan_code"),
             "usage_charged": True if not subscription_bypass else False,
             "credits_consumed": 0,
-            "debug": {**translation_debug},
+            "debug": {**translation_debug, "canonical_key": canonical_key},
         }
 
     if not bypass and not subscription_bypass:
@@ -292,7 +294,7 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
             "root_cause": f"{type(e).__name__}: {_clip(str(e))}",
             "fix": "Check AI provider keys, network access, and ai_service configuration.",
             "details": {"account_id": account_id},
-            "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code")},
+            "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code"), "canonical_key": canonical_key},
         }
 
     if not isinstance(ai, dict) or not ai.get("ok"):
@@ -302,7 +304,7 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
             "root_cause": (ai or {}).get("root_cause") or (ai or {}).get("error") or "unknown_ai_failure",
             "fix": (ai or {}).get("fix") or "Inspect ai_service logs.",
             "details": {"account_id": account_id},
-            "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code")},
+            "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code"), "canonical_key": canonical_key},
         }
 
     answer_text = (ai.get("answer") or "").strip()
@@ -310,10 +312,10 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "ok": False,
             "error": "ai_empty_answer",
-            "root_cause": "AI provider returned success without answer text",
-            "fix": "Inspect ai_service provider response mapping.",
+            "root_cause": "AI returned ok=True but answer was empty",
+            "fix": "Check ai_service provider response parsing.",
             "details": {"account_id": account_id},
-            "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code")},
+            "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code"), "canonical_key": canonical_key},
         }
 
     if not subscription_bypass:
@@ -325,7 +327,7 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
                 "root_cause": usage.get("root_cause"),
                 "fix": usage.get("fix"),
                 "details": usage.get("details"),
-                "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code")},
+                "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code"), "canonical_key": canonical_key},
             }
 
     credits_consumed = 0
@@ -338,17 +340,17 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
                 "root_cause": consume.get("root_cause"),
                 "fix": consume.get("fix"),
                 "details": consume.get("details"),
-                "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code")},
+                "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code"), "canonical_key": canonical_key},
             }
         credits_consumed = 1
 
-    # IMPORTANT: save successful fresh AI answer into cache
     try:
         upsert_ai_answer_to_cache_best_effort(
             normalized_question=question,
             answer=answer_text,
             source="ai",
             lang=lang,
+            canonical_key=canonical_key,
             enabled=True,
             priority=0,
         )
@@ -364,5 +366,5 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
         "plan_code": plan_ctx.get("plan_code"),
         "usage_charged": True if not subscription_bypass else False,
         "credits_consumed": credits_consumed,
-        "debug": {**translation_debug},
+        "debug": {**translation_debug, "canonical_key": canonical_key},
     }
