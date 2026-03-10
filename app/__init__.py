@@ -1,298 +1,514 @@
 from __future__ import annotations
 
+"""
+ASK SERVICE (CANONICAL)
+
+- Uses ONLY canonical identity: accounts.account_id
+- If older clients send accounts.id, it translates to accounts.account_id and exposes it in debug
+- Enforces:
+  - active subscription injected by ask route
+  - daily plan limit
+  - credit balance
+- Charges:
+  - cached answer -> counts toward daily limit, does NOT consume credits
+  - fresh AI answer -> counts toward daily limit AND consumes 1 credit after success
+- Persists successful user-visible Q/A to qa_history best-effort
+"""
+
 import os
 import uuid
-from typing import Any, Dict, Optional, Tuple, List, Union
+from typing import Any, Dict
 
-from flask import Flask, jsonify, request
-from flask_cors import CORS
+from app.core.supabase_client import supabase
+from app.services.credits_service import (
+    check_credit_balance,
+    consume_credits,
+    enforce_daily_limit,
+    get_plan_limits,
+    increment_daily_usage,
+)
+from app.services.qa_cache_service import (
+    answer_from_cache,
+    increment_cache_use,
+    normalize_question_for_cache,
+    upsert_ai_answer_to_cache_best_effort,
+    derive_canonical_key,
+)
+from app.services.qa_history_service import log_history_item_best_effort
+from app.services.qa_logging_service import log_qa_event_best_effort
+from app.services.ai_service import call_ai
 
-from app.core.config import API_PREFIX, CORS_ORIGINS
 
-
-def _normalize_api_prefix(v: str) -> str:
-    v = (v or "").strip()
-    if not v:
-        return "/api"
-    if not v.startswith("/"):
-        v = "/" + v
-    return v.rstrip("/")
+def _sb():
+    return supabase() if callable(supabase) else supabase
 
 
 def _truthy(v: str | None) -> bool:
     return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-def _cookie_mode_enabled() -> bool:
-    if _truthy(os.getenv("COOKIE_AUTH_ENABLED", "1")):
-        return True
-    if _truthy(os.getenv("WEB_AUTH_ENABLED", "")) and (os.getenv("COOKIE_SAMESITE") or "").strip():
-        return True
-    return False
+def _clip(s: str, n: int = 240) -> str:
+    s = str(s or "")
+    return s if len(s) <= n else s[:n] + "…"
 
 
-def _parse_origins(
-    origins_raw: str, *, cookie_mode: bool
-) -> Tuple[Union[str, List[str]], bool, Optional[str]]:
-    raw = (origins_raw or "").strip()
-
-    if not raw:
-        if cookie_mode:
-            return [], True, "CORS_ORIGINS is empty but cookie auth requires explicit origins."
-        return "*", False, None
-
-    if raw == "*":
-        if cookie_mode:
-            return [], True, "CORS_ORIGINS='*' is not allowed with cookie auth. Use explicit comma-separated origins."
-        return "*", False, None
-
-    origins = [o.strip() for o in raw.split(",") if o.strip()]
-    if not origins:
-        if cookie_mode:
-            return [], True, "CORS_ORIGINS parsed empty but cookie auth requires explicit origins."
-        return "*", False, None
-
-    if cookie_mode:
-        return origins, True, None
-
-    return origins, False, None
-
-
-def _import_attr(dotted: str, attr: str):
+def _is_uuid(v: str) -> bool:
     try:
-        mod = __import__(dotted, fromlist=[attr])
-        return getattr(mod, attr), None
-    except Exception as e:
-        return None, f"{dotted}:{attr} -> {repr(e)}"
+        uuid.UUID(str(v))
+        return True
+    except Exception:
+        return False
 
 
-def _safe_get_env_bool(name: str) -> bool:
-    return _truthy(os.getenv(name, ""))
+def _has_column(table: str, col: str) -> bool:
+    try:
+        _sb().table(table).select(col).limit(1).execute()
+        return True
+    except Exception:
+        return False
 
 
-def create_app() -> Flask:
-    app = Flask(__name__)
-
-    api_prefix = _normalize_api_prefix(API_PREFIX)
-
-    cookie_mode = _cookie_mode_enabled()
-    origins, supports_credentials, cors_err = _parse_origins(CORS_ORIGINS, cookie_mode=cookie_mode)
-    if cors_err:
-        raise RuntimeError(f"[CORS] {cors_err}")
-
-    CORS(
-        app,
-        resources={rf"{api_prefix}/*": {"origins": origins}},
-        supports_credentials=supports_credentials,
-        allow_headers=[
-            "Content-Type",
-            "Authorization",
-            "X-Auth-Token",
-            "X-Requested-With",
-            "X-Admin-Key",
-            "X-Debug",
-            "X-Request-Id",
-        ],
-        expose_headers=["Set-Cookie", "X-Request-Id"],
-        methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        max_age=86400,
-        vary_header=True,
-    )
-
-    @app.before_request
-    def _assign_request_id():
-        rid = (request.headers.get("X-Request-Id") or "").strip()
-        if not rid:
-            rid = str(uuid.uuid4())
-        request.environ["REQUEST_ID"] = rid
-
-    @app.after_request
-    def _attach_request_id(resp):
-        rid = str(request.environ.get("REQUEST_ID") or "")
-        if rid:
-            resp.headers["X-Request-Id"] = rid
-
-        if request.path.startswith(f"{api_prefix}/web/auth/"):
-            resp.headers["Cache-Control"] = "no-store"
-
-        return resp
-
-    def _rid() -> str:
-        return str(request.environ.get("REQUEST_ID") or "")
-
-    def _debug_enabled() -> bool:
-        return (request.headers.get("X-Debug") or "").strip() == "1"
-
-    boot: Dict[str, Any] = {
-        "api_prefix": api_prefix,
-        "cookie_mode": cookie_mode,
-        "cors": {"origins": origins, "supports_credentials": supports_credentials},
-        "strict": (os.getenv("STRICT_BLUEPRINTS", "1").strip() != "0"),
-        "debug_routes_enabled": _safe_get_env_bool("ENABLE_DEBUG_ROUTES"),
-        "registered": [],
-        "failed": [],
-    }
-    strict = bool(boot["strict"])
-
-    def _register_bp(
-        dotted: str,
-        attr: str = "bp",
-        *,
-        alias_name: Optional[str] = None,
-        required: bool = True,
-        url_prefix: Optional[str] = api_prefix,
-    ):
-        obj, err = _import_attr(dotted, attr)
-        entry: Dict[str, Any] = {
-            "module": dotted,
-            "attr": attr,
-            "alias_name": alias_name or dotted.split(".")[-1],
-            "url_prefix": url_prefix,
-            "required": required,
-        }
-
-        if obj is None:
-            entry["error"] = err
-            boot["failed"].append(entry)
-            if required and strict:
-                raise RuntimeError(f"[boot] REQUIRED blueprint import failed: {err}")
-            return
-
-        bp_name = getattr(obj, "name", None) or f"{dotted}:{attr}"
-
-        if not hasattr(app, "_bp_names"):
-            app._bp_names = set()  # type: ignore[attr-defined]
-        if bp_name in app._bp_names:  # type: ignore[attr-defined]
-            msg = f"[boot] Duplicate blueprint name detected: {bp_name} from {dotted}:{attr}"
-            entry["error"] = msg
-            boot["failed"].append(entry)
-            if required and strict:
-                raise RuntimeError(msg)
-            return
-        app._bp_names.add(bp_name)  # type: ignore[attr-defined]
-
-        if url_prefix is not None:
-            app.register_blueprint(obj, url_prefix=url_prefix)
-        else:
-            app.register_blueprint(obj)
-
-        entry["bp_name"] = bp_name
-        boot["registered"].append(entry)
-
-    required_modules = [
-        "app.routes.health",
-        "app.routes.accounts",
-        "app.routes.subscriptions",
-        "app.routes.ask",
-        "app.routes.web",
-        "app.routes.webhooks",
-        "app.routes.plans",
-        "app.routes.billing",
-        "app.routes.link_tokens",
-        "app.routes.admin_link_tokens",
-        "app.routes.accounts_admin",
-        "app.routes.meta",
-        "app.routes.email_link",
-        "app.routes.web_auth",
-        "app.routes.web_session",
-    ]
-    for dotted in required_modules:
-        _register_bp(dotted, "bp", required=True, url_prefix=api_prefix)
-
-    _register_bp("app.routes.cron", "bp", alias_name="cron", required=False, url_prefix=api_prefix)
-    _register_bp("app.routes.support", "bp", alias_name="support", required=False, url_prefix=api_prefix)
-
-    if _safe_get_env_bool("ENABLE_DEBUG_ROUTES"):
-        _register_bp("app.routes._debug", "bp", required=False, url_prefix=api_prefix)
-        _register_bp("app.routes.debug_routes", "bp", required=False, url_prefix=api_prefix)
-
-    @app.get(f"{api_prefix}/_boot")
-    def boot_report():
-        admin_key_set = bool((os.getenv("ADMIN_KEY") or "").strip())
-        return jsonify(
-            {
-                "ok": True,
-                "request_id": _rid(),
-                "admin_key_set": admin_key_set,
-                "boot": boot,
-            }
-        ), 200
-
-    @app.get(f"{api_prefix}/_diag")
-    def runtime_diag():
-        hints: List[str] = []
-
-        cron_registered = any((r.get("alias_name") == "cron") for r in boot.get("registered", []))
-        if not cron_registered:
-            hints.append("Cron blueprint is NOT registered. Confirm app/routes/cron.py exists and exports bp = Blueprint(...).")
-
-        support_registered = any((r.get("alias_name") == "support") for r in boot.get("registered", []))
-        if not support_registered:
-            hints.append("Support blueprint is not registered. Confirm app/routes/support.py exists and exports bp = Blueprint(...).")
-
-        if cookie_mode and origins == "*":
-            hints.append("COOKIE_MODE is enabled but CORS origins are '*'. Use explicit origins when cookies are used.")
-
-        if cookie_mode and (isinstance(origins, list) and not origins):
-            hints.append("COOKIE_MODE is enabled but parsed origins list is empty. Set CORS_ORIGINS to your frontend URL(s).")
-
-        if not (os.getenv("SUPABASE_URL") or "").strip():
-            hints.append("SUPABASE_URL is missing -> Supabase RPC/table calls will fail.")
-        if not (os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY") or "").strip():
-            hints.append("Supabase service key is missing -> RPC/table calls may fail.")
-
-        if not (os.getenv("PAYSTACK_WEBHOOK_SECRET") or "").strip():
-            hints.append("PAYSTACK_WEBHOOK_SECRET is missing. Paystack signature verification will fail for /api/billing/webhook.")
-
-        if not (
-            (os.getenv("SUPPORT_TO_EMAIL") or "").strip()
-            or (os.getenv("SUPPORT_EMAIL") or "").strip()
-            or (os.getenv("MAIL_FROM_EMAIL") or "").strip()
-            or (os.getenv("SMTP_FROM") or "").strip()
-            or (os.getenv("MAIL_USER") or "").strip()
-            or (os.getenv("SMTP_USER") or "").strip()
-        ):
-            hints.append("Support inbox email is not configured. Set SUPPORT_TO_EMAIL for /api/support.")
-
-        env_view = {
-            "ADMIN_KEY_SET": bool((os.getenv("ADMIN_KEY") or "").strip()),
-            "API_PREFIX": api_prefix,
-            "COOKIE_MODE": cookie_mode,
-            "CORS_ORIGINS_MODE": ("*" if origins == "*" else "list"),
-            "ENABLE_DEBUG_ROUTES": _safe_get_env_bool("ENABLE_DEBUG_ROUTES"),
-            "STRICT_BLUEPRINTS": strict,
-            "SUPPORTS_CREDENTIALS": supports_credentials,
-            "WEB_AUTH_ENABLED": _safe_get_env_bool("WEB_AUTH_ENABLED"),
-        }
-
-        return jsonify({"ok": True, "request_id": _rid(), "env": env_view, "hints": hints}), 200
-
-    @app.route(f"{api_prefix}/<path:_any>", methods=["OPTIONS"])
-    def _api_preflight(_any: str):
-        return ("", 204)
-
-    @app.errorhandler(Exception)
-    def _handle_any_error(e: Exception):
-        status = getattr(e, "code", 500)
-        msg = str(e) or type(e).__name__
-
-        out: Dict[str, Any] = {
+def resolve_canonical_account_id(raw_account_id: str) -> Dict[str, Any]:
+    v = (raw_account_id or "").strip()
+    if not v:
+        return {
             "ok": False,
-            "request_id": _rid(),
-            "error": type(e).__name__,
-            "message": msg[:800],
+            "error": "account_required",
+            "root_cause": "missing_account_id",
+            "fix": "Provide account_id or authenticate via web cookie/bearer so the server can derive it.",
         }
 
-        if _debug_enabled():
-            import traceback as _tb
+    if not _is_uuid(v):
+        return {
+            "ok": False,
+            "error": "account_invalid",
+            "root_cause": "account_id_not_uuid",
+            "fix": "Send a valid UUID for account_id.",
+            "details": {"account_id": v},
+        }
 
-            out["debug"] = {
-                "path": request.path,
-                "method": request.method,
-                "content_type": request.content_type,
+    if _has_column("accounts", "account_id"):
+        try:
+            q = _sb().table("accounts").select("id,account_id").eq("account_id", v).limit(1).execute()
+            rows = getattr(q, "data", None) or []
+            if rows:
+                return {"ok": True, "account_id": str(rows[0].get("account_id") or v)}
+        except Exception as e:
+            return {
+                "ok": False,
+                "error": "account_lookup_failed",
+                "root_cause": f"accounts lookup by account_id failed: {type(e).__name__}: {_clip(str(e))}",
+                "fix": "Check Supabase connectivity/RLS for accounts table.",
             }
-            out["traceback"] = _tb.format_exc(limit=60)
 
-        return jsonify(out), status
+    try:
+        q = _sb().table("accounts").select("id,account_id").eq("id", v).limit(1).execute()
+        rows = getattr(q, "data", None) or []
+        if not rows:
+            return {
+                "ok": False,
+                "error": "account_not_found",
+                "root_cause": "no accounts row matches account_id nor id",
+                "fix": "Ensure the account exists. If using web auth, verify OTP first to create/resolve account.",
+                "details": {"provided": v},
+            }
 
-    return app
+        row = rows[0] or {}
+        canonical = str(row.get("account_id") or "").strip()
+        row_id = str(row.get("id") or "").strip()
+
+        if not canonical and row_id:
+            try:
+                _sb().table("accounts").update({"account_id": row_id}).eq("id", row_id).execute()
+                canonical = row_id
+            except Exception as e:
+                return {
+                    "ok": False,
+                    "error": "account_id_repair_failed",
+                    "root_cause": f"accounts.account_id was NULL and repair failed: {type(e).__name__}: {_clip(str(e))}",
+                    "fix": "Run SQL: update accounts set account_id=id where account_id is null; then UNIQUE index on account_id.",
+                    "details": {"row_id": row_id},
+                }
+
+        if not canonical:
+            return {
+                "ok": False,
+                "error": "account_id_missing",
+                "root_cause": "accounts row exists but account_id is empty",
+                "fix": "Ensure accounts.account_id exists and is populated.",
+                "details": {"row_id": row_id},
+            }
+
+        return {"ok": True, "account_id": canonical, "translated_from_id": v}
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": "account_lookup_failed",
+            "root_cause": f"accounts lookup by id failed: {type(e).__name__}: {_clip(str(e))}",
+            "fix": "Check Supabase connectivity/RLS for accounts table.",
+        }
+
+
+def _resolve_plan_context(body: Dict[str, Any]) -> Dict[str, Any]:
+    sub = body.get("__subscription") or {}
+    plan_code = (sub.get("plan_code") or "").strip().lower()
+    if not plan_code:
+        return {
+            "ok": False,
+            "error": "subscription_plan_missing",
+            "root_cause": "subscription was injected but plan_code is missing",
+            "fix": "Repair user_subscriptions.plan_code or subscription_guard response.",
+        }
+
+    limits = get_plan_limits(plan_code)
+    if not limits.get("ok"):
+        return limits
+
+    return {
+        "ok": True,
+        "plan_code": plan_code,
+        "daily_answers_limit": int(limits.get("daily_answers_limit") or 0),
+        "ai_credits_total": int(limits.get("ai_credits_total") or 0),
+        "plan_limits": limits,
+    }
+
+
+def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
+    question = (body.get("question") or "").strip()
+    if not question:
+        return {
+            "ok": False,
+            "error": "question_required",
+            "root_cause": "missing_question",
+            "fix": "Provide a non-empty question string.",
+        }
+
+    lang = (body.get("lang") or "en").strip() or "en"
+    channel = (body.get("channel") or "web").strip() or "web"
+    normalized_question = normalize_question_for_cache(question)
+    canonical_key = derive_canonical_key(question, lang=lang)
+
+    raw_account_id = (body.get("account_id") or "").strip()
+    resolved = resolve_canonical_account_id(raw_account_id)
+    if not resolved.get("ok"):
+        return resolved
+
+    account_id = str(resolved["account_id"]).strip()
+
+    translation_debug: Dict[str, Any] = {}
+    if resolved.get("translated_from_id"):
+        translation_debug = {
+            "note": "legacy accounts.id was supplied; translated to canonical accounts.account_id",
+            "translated_from_id": resolved.get("translated_from_id"),
+        }
+
+    bypass = bool(body.get("__bypass"))
+    subscription_bypass = bool(body.get("__subscription_bypass"))
+
+    if bypass and not _truthy(os.getenv("ALLOW_DEV_BYPASS", "1")):
+        return {
+            "ok": False,
+            "error": "bypass_disabled",
+            "root_cause": "__bypass provided but ALLOW_DEV_BYPASS=0",
+            "fix": "Remove bypass headers or set ALLOW_DEV_BYPASS=1 in backend env.",
+        }
+
+    plan_ctx: Dict[str, Any] = {
+        "ok": True,
+        "plan_code": None,
+        "daily_answers_limit": 0,
+        "ai_credits_total": 0,
+    }
+
+    if not subscription_bypass:
+        plan_ctx = _resolve_plan_context(body)
+        if not plan_ctx.get("ok"):
+            return {
+                "ok": False,
+                "error": plan_ctx.get("error") or "plan_context_failed",
+                "root_cause": plan_ctx.get("root_cause"),
+                "fix": plan_ctx.get("fix"),
+                "details": plan_ctx.get("details"),
+                "debug": {**translation_debug},
+            }
+
+        daily = enforce_daily_limit(account_id, int(plan_ctx.get("daily_answers_limit") or 0))
+        if not daily.get("ok"):
+            try:
+                log_qa_event_best_effort(
+                    account_id=account_id,
+                    mode="ask",
+                    lang=lang,
+                    question_raw=question,
+                    normalized_question=normalized_question,
+                    canonical_key=canonical_key,
+                    outcome="blocked",
+                    reason=daily.get("error") or "daily_limit_reached",
+                    source=None,
+                    cache_hit=False,
+                    library_hit=False,
+                    ai_used=False,
+                    ai_credit_cost=0,
+                    latency_ms=0,
+                )
+            except Exception:
+                pass
+
+            return {
+                "ok": False,
+                "error": daily.get("error") or "daily_limit_check_failed",
+                "root_cause": daily.get("root_cause"),
+                "fix": daily.get("fix"),
+                "details": daily.get("details"),
+                "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code")},
+            }
+
+    cached = answer_from_cache(question, lang=lang, canonical_key=canonical_key)
+    if cached:
+        try:
+            increment_cache_use(cached.get("id"))
+        except Exception:
+            pass
+
+        if not subscription_bypass:
+            usage = increment_daily_usage(account_id, inc=1)
+            if not usage.get("ok"):
+                return {
+                    "ok": False,
+                    "error": usage.get("error") or "daily_usage_update_failed",
+                    "root_cause": usage.get("root_cause"),
+                    "fix": usage.get("fix"),
+                    "details": usage.get("details"),
+                    "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code"), "from_cache": True},
+                }
+
+        answer_text = str(cached.get("answer") or "").strip()
+
+        try:
+            log_history_item_best_effort(
+                account_id=account_id,
+                question=question,
+                answer=answer_text,
+                lang=lang,
+                source="cache",
+                from_cache=True,
+                canonical_key=canonical_key,
+                normalized_question=normalized_question,
+                plan_code=plan_ctx.get("plan_code"),
+                credits_consumed=0,
+                usage_charged=not subscription_bypass,
+                channel=channel,
+            )
+        except Exception:
+            pass
+
+        try:
+            log_qa_event_best_effort(
+                account_id=account_id,
+                mode="ask",
+                lang=lang,
+                question_raw=question,
+                normalized_question=normalized_question,
+                canonical_key=canonical_key,
+                outcome="ok",
+                reason=None,
+                source="cache",
+                cache_hit=True,
+                library_hit=False,
+                ai_used=False,
+                ai_credit_cost=0,
+                latency_ms=0,
+            )
+        except Exception:
+            pass
+
+        return {
+            "ok": True,
+            "answer": answer_text,
+            "from_cache": True,
+            "account_id": account_id,
+            "subscription": body.get("__subscription"),
+            "plan_code": plan_ctx.get("plan_code"),
+            "usage_charged": True if not subscription_bypass else False,
+            "credits_consumed": 0,
+            "debug": {**translation_debug, "canonical_key": canonical_key},
+        }
+
+    if not bypass and not subscription_bypass:
+        bal = check_credit_balance(account_id, cost=1)
+        if not bal.get("ok"):
+            try:
+                log_qa_event_best_effort(
+                    account_id=account_id,
+                    mode="ask",
+                    lang=lang,
+                    question_raw=question,
+                    normalized_question=normalized_question,
+                    canonical_key=canonical_key,
+                    outcome="blocked",
+                    reason=bal.get("error") or "insufficient_credits",
+                    source=None,
+                    cache_hit=False,
+                    library_hit=False,
+                    ai_used=False,
+                    ai_credit_cost=0,
+                    latency_ms=0,
+                )
+            except Exception:
+                pass
+
+            return {
+                "ok": False,
+                "error": bal.get("error") or "credit_check_failed",
+                "root_cause": bal.get("root_cause") or bal.get("error"),
+                "fix": bal.get("fix") or "Fix credits table/RLS.",
+                "details": bal.get("details") or {"account_id": account_id},
+                "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code")},
+            }
+
+    try:
+        ai = call_ai(
+            question=question,
+            lang=lang,
+            channel=channel,
+        )
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": "ai_call_failed",
+            "root_cause": f"{type(e).__name__}: {_clip(str(e))}",
+            "fix": "Check AI provider keys, network access, and ai_service configuration.",
+            "details": {"account_id": account_id},
+            "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code"), "canonical_key": canonical_key},
+        }
+
+    if not isinstance(ai, dict) or not ai.get("ok"):
+        try:
+            log_qa_event_best_effort(
+                account_id=account_id,
+                mode="ask",
+                lang=lang,
+                question_raw=question,
+                normalized_question=normalized_question,
+                canonical_key=canonical_key,
+                outcome="error",
+                reason=(ai or {}).get("error") or "ai_failed",
+                source="ai",
+                cache_hit=False,
+                library_hit=False,
+                ai_used=True,
+                ai_credit_cost=0,
+                latency_ms=0,
+            )
+        except Exception:
+            pass
+
+        return {
+            "ok": False,
+            "error": "ai_failed",
+            "root_cause": (ai or {}).get("root_cause") or (ai or {}).get("error") or "unknown_ai_failure",
+            "fix": (ai or {}).get("fix") or "Inspect ai_service logs.",
+            "details": {"account_id": account_id},
+            "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code"), "canonical_key": canonical_key},
+        }
+
+    answer_text = (ai.get("answer") or "").strip()
+    if not answer_text:
+        return {
+            "ok": False,
+            "error": "ai_empty_answer",
+            "root_cause": "AI returned ok=True but answer was empty",
+            "fix": "Check ai_service provider response parsing.",
+            "details": {"account_id": account_id},
+            "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code"), "canonical_key": canonical_key},
+        }
+
+    if not subscription_bypass:
+        usage = increment_daily_usage(account_id, inc=1)
+        if not usage.get("ok"):
+            return {
+                "ok": False,
+                "error": usage.get("error") or "daily_usage_update_failed",
+                "root_cause": usage.get("root_cause"),
+                "fix": usage.get("fix"),
+                "details": usage.get("details"),
+                "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code"), "canonical_key": canonical_key},
+            }
+
+    credits_consumed = 0
+    if not bypass and not subscription_bypass:
+        consume = consume_credits(account_id, cost=1)
+        if not consume.get("ok"):
+            return {
+                "ok": False,
+                "error": consume.get("error") or "credit_consume_failed",
+                "root_cause": consume.get("root_cause"),
+                "fix": consume.get("fix"),
+                "details": consume.get("details"),
+                "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code"), "canonical_key": canonical_key},
+            }
+        credits_consumed = 1
+
+    try:
+        upsert_ai_answer_to_cache_best_effort(
+            normalized_question=question,
+            answer=answer_text,
+            source="ai",
+            lang=lang,
+            canonical_key=canonical_key,
+            enabled=True,
+            priority=0,
+        )
+    except Exception:
+        pass
+
+    try:
+        log_history_item_best_effort(
+            account_id=account_id,
+            question=question,
+            answer=answer_text,
+            lang=lang,
+            source="ai",
+            from_cache=False,
+            canonical_key=canonical_key,
+            normalized_question=normalized_question,
+            plan_code=plan_ctx.get("plan_code"),
+            credits_consumed=credits_consumed,
+            usage_charged=not subscription_bypass,
+            channel=channel,
+        )
+    except Exception:
+        pass
+
+    try:
+        log_qa_event_best_effort(
+            account_id=account_id,
+            mode="ask",
+            lang=lang,
+            question_raw=question,
+            normalized_question=normalized_question,
+            canonical_key=canonical_key,
+            outcome="ok",
+            reason=None,
+            source="ai",
+            cache_hit=False,
+            library_hit=False,
+            ai_used=True,
+            ai_credit_cost=credits_consumed,
+            latency_ms=0,
+        )
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "answer": answer_text,
+        "from_cache": False,
+        "account_id": account_id,
+        "subscription": body.get("__subscription"),
+        "plan_code": plan_ctx.get("plan_code"),
+        "usage_charged": True if not subscription_bypass else False,
+        "credits_consumed": credits_consumed,
+        "debug": {**translation_debug, "canonical_key": canonical_key},
+    }
