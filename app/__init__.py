@@ -196,6 +196,7 @@ def create_app() -> Flask:
         "app.routes.web_auth",
         "app.routes.web_session",
         "app.routes.feedback",
+        "app.routes.admin_semantic",
     ]
     for dotted in required_modules:
         _register_bp(dotted, "bp", required=True, url_prefix=api_prefix)
