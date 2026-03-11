@@ -1,51 +1,62 @@
 from __future__ import annotations
 
-"""
-ASK SERVICE (CANONICAL)
-
-- Uses ONLY canonical identity: accounts.account_id
-- If older clients send accounts.id, it translates to accounts.account_id and exposes it in debug
-- Enforces:
-  - active subscription injected by ask route
-  - daily plan limit
-  - credit balance
-- Charges:
-  - cached answer -> counts toward daily limit, does NOT consume credits
-  - fresh AI answer -> counts toward daily limit AND consumes 1 credit after success
-- Writes:
-  - qa_history
-  - qa_embeddings (when cache_id exists and embeddings are configured)
-"""
-
 import os
-import uuid
-from typing import Any, Dict, Optional
+import re
+import traceback
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.core.supabase_client import supabase
-from app.services.credits_service import (
-    check_credit_balance,
-    consume_credits,
-    enforce_daily_limit,
-    get_plan_limits,
-    increment_daily_usage,
-)
+from app.services.ai_service import call_ai
 from app.services.qa_cache_service import (
     answer_from_cache,
-    increment_cache_use,
-    upsert_ai_answer_to_cache_best_effort,
     derive_canonical_key,
+    increment_cache_use,
     normalize_question_for_cache,
 )
-from app.services.ai_service import call_ai
-from app.services.semantic_runtime_service import semantic_write_runtime
+from app.services.qa_logging_service import log_qa_event_best_effort
+from app.services.response_refiner import refine_answer
 
 
+# =========================================================
+# Boot-safe helpers
+# =========================================================
 def _sb():
     return supabase() if callable(supabase) else supabase
 
 
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _month_start_iso() -> str:
+    now = _now_utc()
+    month_start = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
+    return month_start.isoformat()
+
+
 def _truthy(v: str | None) -> bool:
     return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _env(name: str, default: str = "") -> str:
+    return (os.getenv(name, default) or default).strip()
+
+
+def _safe_int(v: Any, default: int = 0) -> int:
+    try:
+        n = int(v)
+        return n
+    except Exception:
+        return default
+
+
+def _safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        n = float(v)
+        return n
+    except Exception:
+        return default
 
 
 def _clip(s: str, n: int = 240) -> str:
@@ -53,385 +64,787 @@ def _clip(s: str, n: int = 240) -> str:
     return s if len(s) <= n else s[:n] + "…"
 
 
-def _is_uuid(v: str) -> bool:
-    try:
-        uuid.UUID(str(v))
+def _debug_enabled() -> bool:
+    return _truthy(_env("ASK_DEBUG", "1")) or _truthy(_env("DEBUG", "0"))
+
+
+def _dbg(msg: str) -> None:
+    if _debug_enabled():
+        print(msg, flush=True)
+
+
+# =========================================================
+# Tunables
+# =========================================================
+DEFAULT_MONTHLY_AI_LIMIT = _safe_int(_env("DEFAULT_MONTHLY_AI_LIMIT", "200"), 200)
+
+# Strict semantic rules:
+SEMANTIC_THRESHOLD_WITH_CREDITS = _safe_float(
+    _env("SEMANTIC_THRESHOLD_WITH_CREDITS", "0.88"), 0.88
+)
+SEMANTIC_THRESHOLD_NO_CREDITS = _safe_float(
+    _env("SEMANTIC_THRESHOLD_NO_CREDITS", "0.93"), 0.93
+)
+
+MIN_TRUST_WITH_CREDITS = _safe_float(_env("SEMANTIC_MIN_TRUST_WITH_CREDITS", "0.80"), 0.80)
+MIN_TRUST_NO_CREDITS = _safe_float(_env("SEMANTIC_MIN_TRUST_NO_CREDITS", "0.90"), 0.90)
+
+AI_CREDIT_COST_PER_ANSWER = _safe_int(_env("AI_CREDIT_COST_PER_ANSWER", "1"), 1)
+
+QA_HISTORY_TABLE = _env("QA_HISTORY_TABLE", "qa_history")
+AI_CREDIT_TABLE = _env("AI_CREDIT_TABLE", "ai_credit_balances")
+EMBED_MATCH_RPC = _env("EMBED_MATCH_RPC", "match_qa_embeddings")
+
+
+# =========================================================
+# Intent / topic classification
+# =========================================================
+def _clean_text(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = re.sub(r"[^\w\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _infer_topic(question: str, canonical_key: Optional[str] = None) -> str:
+    q = _clean_text(question)
+    ck = (canonical_key or "").strip().lower()
+
+    joined = f"{q} {ck}".strip()
+
+    if "vat" in joined or "value added tax" in joined:
+        return "vat"
+    if "paye" in joined or "pay as you earn" in joined:
+        return "paye"
+    if "withholding tax" in joined or "wht" in joined:
+        return "wht"
+    if "personal income tax" in joined or "pit" in joined:
+        return "pit"
+    if "company income tax" in joined or "cit" in joined:
+        return "cit"
+    if "tin" in joined or "tax identification" in joined:
+        return "tin"
+    if "deduct" in joined or "deductible" in joined or "expense" in joined:
+        return "deductions"
+    if "register" in joined or "registration" in joined:
+        return "registration"
+    if "file" in joined or "return" in joined or "remit" in joined:
+        return "filing"
+
+    return "general"
+
+
+def _infer_intent_type(question: str, canonical_key: Optional[str] = None) -> str:
+    q = _clean_text(question)
+    ck = (canonical_key or "").strip().lower()
+    joined = f"{q} {ck}".strip()
+
+    # Very important: registration/process should not match simple definition
+    if any(x in joined for x in ["how do i", "how to", "steps", "process", "procedure"]):
+        if any(x in joined for x in ["register", "registration", "sign up", "vat registration"]):
+            return "registration_process"
+        if any(x in joined for x in ["file", "filing", "return", "remit", "remittance"]):
+            return "filing_process"
+        return "how_to"
+
+    if any(x in joined for x in ["what is", "meaning", "define", "stands for", "explain meaning"]):
+        return "definition"
+
+    if "rate" in joined or "percentage" in joined:
+        return "rate_lookup"
+
+    if any(x in joined for x in ["where do i pay", "where to pay", "pay where"]):
+        return "payment_location"
+
+    if any(x in joined for x in ["can i deduct", "deduct", "expense", "allowable"]):
+        return "deductibility"
+
+    if any(x in joined for x in ["register", "registration"]):
+        return "registration_process"
+
+    if any(x in joined for x in ["file", "filing", "return", "remit"]):
+        return "filing_process"
+
+    return "general"
+
+
+def _intent_compatible(query_intent: str, candidate_intent: str) -> bool:
+    q = (query_intent or "general").strip().lower()
+    c = (candidate_intent or "general").strip().lower()
+
+    if q == c:
         return True
-    except Exception:
-        return False
+
+    compatible_groups = [
+        {"definition", "general"},
+        {"how_to", "general"},
+        {"registration_process", "how_to"},
+        {"filing_process", "how_to"},
+    ]
+
+    for group in compatible_groups:
+        if q in group and c in group:
+            return True
+
+    return False
 
 
-def _has_column(table: str, col: str) -> bool:
-    try:
-        _sb().table(table).select(col).limit(1).execute()
+def _topic_compatible(query_topic: str, candidate_topic: str) -> bool:
+    q = (query_topic or "general").strip().lower()
+    c = (candidate_topic or "general").strip().lower()
+
+    if q == c:
         return True
+
+    if q == "general" or c == "general":
+        return True
+
+    # registration/filing are process labels, not domain topics
+    if q in {"registration", "filing"} and c in {"vat", "paye", "pit", "cit", "wht", "tin"}:
+        return True
+    if c in {"registration", "filing"} and q in {"vat", "paye", "pit", "cit", "wht", "tin"}:
+        return True
+
+    return False
+
+
+# =========================================================
+# Billing / usage
+# =========================================================
+def _get_credit_balance(account_id: str) -> int:
+    """
+    Reads visible credit balance from ai_credit_balances.
+    Boot-safe and tolerant to column naming differences.
+    """
+    if not account_id:
+        return 0
+
+    try:
+        res = (
+            _sb()
+            .table(AI_CREDIT_TABLE)
+            .select("*")
+            .eq("account_id", account_id)
+            .limit(1)
+            .execute()
+        )
+        rows = getattr(res, "data", None) or []
+        if not rows:
+            return 0
+
+        row = rows[0]
+        for k in ("balance", "credits_left", "credit_balance", "available_credits"):
+            if k in row:
+                return max(_safe_int(row.get(k), 0), 0)
+
+        return 0
     except Exception:
-        return False
+        return 0
 
 
-def resolve_canonical_account_id(raw_account_id: str) -> Dict[str, Any]:
-    v = (raw_account_id or "").strip()
-    if not v:
+def _decrement_credit_best_effort(account_id: str, cost: int = 1) -> None:
+    if not account_id or cost <= 0:
+        return
+
+    try:
+        res = (
+            _sb()
+            .table(AI_CREDIT_TABLE)
+            .select("*")
+            .eq("account_id", account_id)
+            .limit(1)
+            .execute()
+        )
+        rows = getattr(res, "data", None) or []
+        if not rows:
+            return
+
+        row = rows[0]
+        current = None
+        key = None
+
+        for k in ("balance", "credits_left", "credit_balance", "available_credits"):
+            if k in row:
+                current = _safe_int(row.get(k), 0)
+                key = k
+                break
+
+        if key is None:
+            return
+
+        new_value = max(current - cost, 0)
+        (
+            _sb()
+            .table(AI_CREDIT_TABLE)
+            .update({key: new_value})
+            .eq("account_id", account_id)
+            .execute()
+        )
+    except Exception:
+        return
+
+
+def _get_monthly_ai_usage(account_id: str) -> int:
+    """
+    Monthly AI usage from qa_history.
+    Counts successful AI-generated responses in current month.
+    """
+    if not account_id:
+        return 0
+
+    try:
+        month_start = _month_start_iso()
+        res = (
+            _sb()
+            .table(QA_HISTORY_TABLE)
+            .select("id", count="exact")
+            .eq("account_id", account_id)
+            .eq("source", "ai")
+            .gte("created_at", month_start)
+            .execute()
+        )
+
+        count = getattr(res, "count", None)
+        if count is not None:
+            return _safe_int(count, 0)
+
+        rows = getattr(res, "data", None) or []
+        return len(rows)
+    except Exception:
+        return 0
+
+
+def _get_monthly_ai_limit(account_id: str) -> int:
+    """
+    For now, use a safe default or env.
+    Later you can make this plan-specific.
+    """
+    _ = account_id
+    return DEFAULT_MONTHLY_AI_LIMIT
+
+
+# =========================================================
+# Persistence / history
+# =========================================================
+def _save_history_best_effort(
+    *,
+    account_id: str,
+    question: str,
+    answer: str,
+    source: str,
+    provider: str,
+    lang: str,
+    normalized_question: Optional[str] = None,
+    canonical_key: Optional[str] = None,
+) -> None:
+    if not account_id or not question or not answer:
+        return
+
+    payload: Dict[str, Any] = {
+        "account_id": account_id,
+        "question": question,
+        "answer": answer,
+        "source": source,
+        "provider": provider,
+        "lang": lang,
+    }
+
+    if normalized_question is not None:
+        payload["normalized_question"] = normalized_question
+    if canonical_key is not None:
+        payload["canonical_key"] = canonical_key
+
+    try:
+        _sb().table(QA_HISTORY_TABLE).insert(payload).execute()
+    except Exception:
+        return
+
+
+# =========================================================
+# Semantic matching
+# =========================================================
+def _semantic_search_best_effort(
+    *,
+    question: str,
+    lang: str,
+    jurisdiction: str = "nigeria",
+    match_limit: int = 5,
+) -> List[Dict[str, Any]]:
+    """
+    Calls the semantic matcher RPC.
+    Assumes embedding generation happens elsewhere or in RPC pipeline.
+    Boot-safe: returns [] if anything fails.
+    """
+    try:
+        res = _sb().rpc(
+            EMBED_MATCH_RPC,
+            {
+                "input_question": question,
+                "match_limit": match_limit,
+                "match_lang": lang,
+                "match_jurisdiction": jurisdiction,
+            },
+        ).execute()
+
+        rows = getattr(res, "data", None) or []
+        return rows if isinstance(rows, list) else []
+    except Exception:
+        return []
+
+
+def _pick_semantic_candidate(
+    *,
+    question: str,
+    lang: str,
+    canonical_key: Optional[str],
+    credits_left: int,
+    semantic_rows: List[Dict[str, Any]],
+) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    query_intent = _infer_intent_type(question, canonical_key)
+    query_topic = _infer_topic(question, canonical_key)
+
+    threshold = SEMANTIC_THRESHOLD_WITH_CREDITS if credits_left > 0 else SEMANTIC_THRESHOLD_NO_CREDITS
+    min_trust = MIN_TRUST_WITH_CREDITS if credits_left > 0 else MIN_TRUST_NO_CREDITS
+
+    debug_rows: List[Dict[str, Any]] = []
+
+    best: Optional[Dict[str, Any]] = None
+
+    for row in semantic_rows:
+        similarity = _safe_float(
+            row.get("similarity")
+            or row.get("score")
+            or row.get("semantic_score")
+            or 0.0,
+            0.0,
+        )
+        trust_score = _safe_float(row.get("trust_score") or 0.0, 0.0)
+        candidate_intent = (row.get("intent_type") or "").strip().lower() or "general"
+        candidate_topic = (row.get("topic") or "").strip().lower() or "general"
+        review_status = (row.get("review_status") or "").strip().lower() or "unknown"
+
+        intent_ok = _intent_compatible(query_intent, candidate_intent)
+        topic_ok = _topic_compatible(query_topic, candidate_topic)
+        threshold_ok = similarity >= threshold
+        trust_ok = trust_score >= min_trust
+        review_ok = review_status in {"approved", "reviewed", "trusted", "verified", "high_confidence"}
+
+        debug_rows.append(
+            {
+                "cache_id": row.get("cache_id"),
+                "embedding_id": row.get("id"),
+                "similarity": round(similarity, 4),
+                "trust_score": round(trust_score, 4),
+                "intent_type": candidate_intent,
+                "topic": candidate_topic,
+                "review_status": review_status,
+                "intent_ok": intent_ok,
+                "topic_ok": topic_ok,
+                "threshold_ok": threshold_ok,
+                "trust_ok": trust_ok,
+                "review_ok": review_ok,
+            }
+        )
+
+        if not (intent_ok and topic_ok and threshold_ok and trust_ok and review_ok):
+            continue
+
+        if best is None:
+            best = row
+            continue
+
+        prev_score = _safe_float(best.get("similarity") or best.get("score") or 0.0, 0.0)
+        if similarity > prev_score:
+            best = row
+
+    debug = {
+        "query_intent": query_intent,
+        "query_topic": query_topic,
+        "threshold": threshold,
+        "min_trust": min_trust,
+        "candidates": debug_rows,
+    }
+    return best, debug
+
+
+def _get_answer_text_from_semantic_row(row: Dict[str, Any]) -> Optional[str]:
+    for k in ("answer", "cache_answer", "matched_answer", "response_text"):
+        v = (row.get(k) or "").strip()
+        if v:
+            return v
+    return None
+
+
+# =========================================================
+# Main service
+# =========================================================
+def ask_guarded(
+    *,
+    account_id: str,
+    question: str,
+    lang: str = "en",
+    channel: str = "web",
+    jurisdiction: str = "nigeria",
+) -> Dict[str, Any]:
+    started = _now_utc()
+    q = (question or "").strip()
+    lang = (lang or "en").strip().lower() or "en"
+    channel = (channel or "web").strip().lower() or "web"
+
+    if not account_id:
         return {
             "ok": False,
             "error": "account_required",
-            "root_cause": "missing_account_id",
-            "fix": "Provide account_id or authenticate via web cookie/bearer so the server can derive it.",
+            "fix": "Authenticate first before asking a question.",
         }
 
-    if not _is_uuid(v):
-        return {
-            "ok": False,
-            "error": "account_invalid",
-            "root_cause": "account_id_not_uuid",
-            "fix": "Send a valid UUID for account_id.",
-            "details": {"account_id": v},
-        }
-
-    if _has_column("accounts", "account_id"):
-        try:
-            q = _sb().table("accounts").select("id,account_id").eq("account_id", v).limit(1).execute()
-            rows = getattr(q, "data", None) or []
-            if rows:
-                return {"ok": True, "account_id": str(rows[0].get("account_id") or v)}
-        except Exception as e:
-            return {
-                "ok": False,
-                "error": "account_lookup_failed",
-                "root_cause": f"accounts lookup by account_id failed: {type(e).__name__}: {_clip(str(e))}",
-                "fix": "Check Supabase connectivity/RLS for accounts table.",
-            }
-
-    try:
-        q = _sb().table("accounts").select("id,account_id").eq("id", v).limit(1).execute()
-        rows = getattr(q, "data", None) or []
-        if not rows:
-            return {
-                "ok": False,
-                "error": "account_not_found",
-                "root_cause": "no accounts row matches account_id nor id",
-                "fix": "Ensure the account exists. If using web auth, verify OTP first to create/resolve account.",
-                "details": {"provided": v},
-            }
-
-        row = rows[0] or {}
-        canonical = str(row.get("account_id") or "").strip()
-        row_id = str(row.get("id") or "").strip()
-
-        if not canonical and row_id:
-            try:
-                _sb().table("accounts").update({"account_id": row_id}).eq("id", row_id).execute()
-                canonical = row_id
-            except Exception as e:
-                return {
-                    "ok": False,
-                    "error": "account_id_repair_failed",
-                    "root_cause": f"accounts.account_id was NULL and repair failed: {type(e).__name__}: {_clip(str(e))}",
-                    "fix": "Run SQL: update accounts set account_id=id where account_id is null; then UNIQUE index on account_id.",
-                    "details": {"row_id": row_id},
-                }
-
-        if not canonical:
-            return {
-                "ok": False,
-                "error": "account_id_missing",
-                "root_cause": "accounts row exists but account_id is empty",
-                "fix": "Ensure accounts.account_id exists and is populated.",
-                "details": {"row_id": row_id},
-            }
-
-        return {"ok": True, "account_id": canonical, "translated_from_id": v}
-
-    except Exception as e:
-        return {
-            "ok": False,
-            "error": "account_lookup_failed",
-            "root_cause": f"accounts lookup by id failed: {type(e).__name__}: {_clip(str(e))}",
-            "fix": "Check Supabase connectivity/RLS for accounts table.",
-        }
-
-
-def _resolve_plan_context(body: Dict[str, Any]) -> Dict[str, Any]:
-    sub = body.get("__subscription") or {}
-    plan_code = (sub.get("plan_code") or "").strip().lower()
-    if not plan_code:
-        return {
-            "ok": False,
-            "error": "subscription_plan_missing",
-            "root_cause": "subscription was injected but plan_code is missing",
-            "fix": "Repair user_subscriptions.plan_code or subscription_guard response.",
-        }
-
-    limits = get_plan_limits(plan_code)
-    if not limits.get("ok"):
-        return limits
-
-    return {
-        "ok": True,
-        "plan_code": plan_code,
-        "daily_answers_limit": int(limits.get("daily_answers_limit") or 0),
-        "ai_credits_total": int(limits.get("ai_credits_total") or 0),
-        "plan_limits": limits,
-    }
-
-
-def _extract_cache_id(row: Optional[Dict[str, Any]]) -> Optional[str]:
-    if not isinstance(row, dict):
-        return None
-    return str(row.get("id") or "").strip() or None
-
-
-def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
-    question = (body.get("question") or "").strip()
-    if not question:
+    if not q:
         return {
             "ok": False,
             "error": "question_required",
-            "root_cause": "missing_question",
-            "fix": "Provide a non-empty question string.",
+            "fix": "Please enter a question.",
         }
 
-    lang = (body.get("lang") or "en").strip() or "en"
-    provider = (body.get("provider") or "web").strip() or "web"
-    normalized_question = normalize_question_for_cache(question)
-    canonical_key = derive_canonical_key(question, lang=lang)
+    normalized_question = normalize_question_for_cache(q)
+    canonical_key = derive_canonical_key(q, lang=lang)
 
-    raw_account_id = (body.get("account_id") or "").strip()
-    resolved = resolve_canonical_account_id(raw_account_id)
-    if not resolved.get("ok"):
-        return resolved
-
-    account_id = str(resolved["account_id"]).strip()
-
-    translation_debug: Dict[str, Any] = {}
-    if resolved.get("translated_from_id"):
-        translation_debug = {
-            "note": "legacy accounts.id was supplied; translated to canonical accounts.account_id",
-            "translated_from_id": resolved.get("translated_from_id"),
-        }
-
-    bypass = bool(body.get("__bypass"))
-    subscription_bypass = bool(body.get("__subscription_bypass"))
-
-    if bypass and not _truthy(os.getenv("ALLOW_DEV_BYPASS", "1")):
-        return {
-            "ok": False,
-            "error": "bypass_disabled",
-            "root_cause": "__bypass provided but ALLOW_DEV_BYPASS=0",
-            "fix": "Remove bypass headers or set ALLOW_DEV_BYPASS=1 in backend env.",
-        }
-
-    plan_ctx: Dict[str, Any] = {
-        "ok": True,
-        "plan_code": None,
-        "daily_answers_limit": 0,
-        "ai_credits_total": 0,
+    debug: Dict[str, Any] = {
+        "canonical_key": canonical_key,
+        "normalized_question": normalized_question,
+        "channel": channel,
+        "lang": lang,
+        "jurisdiction": jurisdiction,
     }
 
-    if not subscription_bypass:
-        plan_ctx = _resolve_plan_context(body)
-        if not plan_ctx.get("ok"):
-            return {
-                "ok": False,
-                "error": plan_ctx.get("error") or "plan_context_failed",
-                "root_cause": plan_ctx.get("root_cause"),
-                "fix": plan_ctx.get("fix"),
-                "details": plan_ctx.get("details"),
-                "debug": {**translation_debug},
-            }
+    cache_hit = False
+    semantic_hit = False
+    ai_used = False
+    source = None
+    ai_credit_cost = 0
 
-        daily = enforce_daily_limit(account_id, int(plan_ctx.get("daily_answers_limit") or 0))
-        if not daily.get("ok"):
-            return {
-                "ok": False,
-                "error": daily.get("error") or "daily_limit_check_failed",
-                "root_cause": daily.get("root_cause"),
-                "fix": daily.get("fix"),
-                "details": daily.get("details"),
-                "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code")},
-            }
+    try:
+        credits_left = _get_credit_balance(account_id)
+        monthly_ai_usage = _get_monthly_ai_usage(account_id)
+        monthly_ai_limit = _get_monthly_ai_limit(account_id)
 
-    cached = answer_from_cache(question, lang=lang, canonical_key=canonical_key)
-    if cached:
-        try:
-            increment_cache_use(cached.get("id"))
-        except Exception:
-            pass
+        debug["billing"] = {
+            "credits_left": credits_left,
+            "monthly_ai_usage": monthly_ai_usage,
+            "monthly_ai_limit": monthly_ai_limit,
+        }
 
-        if not subscription_bypass:
-            usage = increment_daily_usage(account_id, inc=1)
-            if not usage.get("ok"):
+        # -------------------------------------------------
+        # STEP 1: exact / canonical cache (always allowed)
+        # -------------------------------------------------
+        cache_row = answer_from_cache(q, lang=lang, canonical_key=canonical_key)
+        if cache_row:
+            answer_text = (cache_row.get("answer") or "").strip()
+            if answer_text:
+                refined = refine_answer(answer_text, lang=lang, source="cache", provider=channel) or answer_text
+
+                increment_cache_use(cache_row.get("id"))
+                _save_history_best_effort(
+                    account_id=account_id,
+                    question=q,
+                    answer=refined,
+                    source="cache",
+                    provider=channel,
+                    lang=lang,
+                    normalized_question=normalized_question,
+                    canonical_key=canonical_key,
+                )
+
+                latency_ms = int((_now_utc() - started).total_seconds() * 1000)
+                log_qa_event_best_effort(
+                    account_id=account_id,
+                    mode=channel,
+                    lang=lang,
+                    question_raw=q,
+                    normalized_question=normalized_question,
+                    canonical_key=canonical_key,
+                    outcome="ok",
+                    reason=None,
+                    source="cache",
+                    cache_hit=True,
+                    library_hit=False,
+                    ai_used=False,
+                    ai_credit_cost=0,
+                    latency_ms=latency_ms,
+                )
+
+                debug["decision"] = "exact_cache"
+                debug["cache_id"] = cache_row.get("id")
+
                 return {
-                    "ok": False,
-                    "error": usage.get("error") or "daily_usage_update_failed",
-                    "root_cause": usage.get("root_cause"),
-                    "fix": usage.get("fix"),
-                    "details": usage.get("details"),
-                    "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code"), "from_cache": True},
+                    "ok": True,
+                    "answer": refined,
+                    "source": "cache",
+                    "canonical_key": canonical_key,
+                    "debug": debug,
                 }
 
-        semantic_runtime = semantic_write_runtime(
+        # -------------------------------------------------
+        # STEP 2: semantic cache
+        # -------------------------------------------------
+        semantic_rows = _semantic_search_best_effort(
+            question=q,
+            lang=lang,
+            jurisdiction=jurisdiction,
+            match_limit=5,
+        )
+        selected_semantic, semantic_debug = _pick_semantic_candidate(
+            question=q,
+            lang=lang,
+            canonical_key=canonical_key,
+            credits_left=credits_left,
+            semantic_rows=semantic_rows,
+        )
+        debug["semantic_runtime"] = semantic_debug
+
+        if selected_semantic:
+            semantic_answer = _get_answer_text_from_semantic_row(selected_semantic)
+            if semantic_answer:
+                refined = refine_answer(
+                    semantic_answer,
+                    lang=lang,
+                    source="semantic_cache",
+                    provider=channel,
+                ) or semantic_answer
+
+                cache_id = selected_semantic.get("cache_id")
+                if cache_id:
+                    increment_cache_use(cache_id)
+
+                _save_history_best_effort(
+                    account_id=account_id,
+                    question=q,
+                    answer=refined,
+                    source="semantic_cache",
+                    provider=channel,
+                    lang=lang,
+                    normalized_question=normalized_question,
+                    canonical_key=canonical_key,
+                )
+
+                latency_ms = int((_now_utc() - started).total_seconds() * 1000)
+                log_qa_event_best_effort(
+                    account_id=account_id,
+                    mode=channel,
+                    lang=lang,
+                    question_raw=q,
+                    normalized_question=normalized_question,
+                    canonical_key=canonical_key,
+                    outcome="ok",
+                    reason=None,
+                    source="semantic_cache",
+                    cache_hit=False,
+                    library_hit=True,
+                    ai_used=False,
+                    ai_credit_cost=0,
+                    latency_ms=latency_ms,
+                )
+
+                debug["decision"] = "semantic_cache"
+                debug["semantic_cache_id"] = selected_semantic.get("cache_id")
+                debug["semantic_embedding_id"] = selected_semantic.get("id")
+
+                return {
+                    "ok": True,
+                    "answer": refined,
+                    "source": "semantic_cache",
+                    "canonical_key": canonical_key,
+                    "debug": debug,
+                }
+
+        # -------------------------------------------------
+        # STEP 3: no credits -> friendly block
+        # -------------------------------------------------
+        if credits_left < AI_CREDIT_COST_PER_ANSWER:
+            latency_ms = int((_now_utc() - started).total_seconds() * 1000)
+            log_qa_event_best_effort(
+                account_id=account_id,
+                mode=channel,
+                lang=lang,
+                question_raw=q,
+                normalized_question=normalized_question,
+                canonical_key=canonical_key,
+                outcome="blocked",
+                reason="insufficient_credits",
+                source=None,
+                cache_hit=False,
+                library_hit=False,
+                ai_used=False,
+                ai_credit_cost=0,
+                latency_ms=latency_ms,
+            )
+
+            debug["decision"] = "blocked_insufficient_credits"
+
+            return {
+                "ok": False,
+                "error": "insufficient_credits",
+                "fix": (
+                    "This question needs a fresh AI answer, but your current AI credits are exhausted. "
+                    "Cached questions can still return answers. Please top up to continue with new questions."
+                ),
+                "canonical_key": canonical_key,
+                "debug": debug,
+            }
+
+        # -------------------------------------------------
+        # STEP 4: monthly AI cap check
+        # -------------------------------------------------
+        if monthly_ai_limit > 0 and monthly_ai_usage >= monthly_ai_limit:
+            latency_ms = int((_now_utc() - started).total_seconds() * 1000)
+            log_qa_event_best_effort(
+                account_id=account_id,
+                mode=channel,
+                lang=lang,
+                question_raw=q,
+                normalized_question=normalized_question,
+                canonical_key=canonical_key,
+                outcome="blocked",
+                reason="monthly_ai_limit_reached",
+                source=None,
+                cache_hit=False,
+                library_hit=False,
+                ai_used=False,
+                ai_credit_cost=0,
+                latency_ms=latency_ms,
+            )
+
+            debug["decision"] = "blocked_monthly_ai_limit"
+
+            return {
+                "ok": False,
+                "error": "monthly_ai_limit_reached",
+                "fix": (
+                    "You have reached your monthly AI generation allowance for this billing cycle. "
+                    "Cached questions can still return answers, but fresh AI generation is temporarily unavailable."
+                ),
+                "canonical_key": canonical_key,
+                "debug": debug,
+            }
+
+        # -------------------------------------------------
+        # STEP 5: fresh AI generation
+        # -------------------------------------------------
+        ai_res = call_ai(
+            question=q,
+            lang=lang,
+            channel=channel,
+            max_tokens=900,
+        )
+
+        if not ai_res.get("ok"):
+            latency_ms = int((_now_utc() - started).total_seconds() * 1000)
+            log_qa_event_best_effort(
+                account_id=account_id,
+                mode=channel,
+                lang=lang,
+                question_raw=q,
+                normalized_question=normalized_question,
+                canonical_key=canonical_key,
+                outcome="error",
+                reason=ai_res.get("error") or "ai_failed",
+                source="ai",
+                cache_hit=False,
+                library_hit=False,
+                ai_used=True,
+                ai_credit_cost=0,
+                latency_ms=latency_ms,
+            )
+
+            debug["decision"] = "ai_failed"
+            debug["ai_error"] = ai_res
+
+            return {
+                "ok": False,
+                "error": ai_res.get("error") or "ai_failed",
+                "fix": ai_res.get("fix") or "We could not generate a fresh answer right now.",
+                "canonical_key": canonical_key,
+                "debug": debug,
+            }
+
+        ai_answer = (ai_res.get("answer") or "").strip()
+        refined = refine_answer(ai_answer, lang=lang, source="ai", provider=channel) or ai_answer
+
+        _decrement_credit_best_effort(account_id, AI_CREDIT_COST_PER_ANSWER)
+        ai_credit_cost = AI_CREDIT_COST_PER_ANSWER
+
+        _save_history_best_effort(
             account_id=account_id,
-            question=question,
-            answer=str(cached.get("answer") or ""),
-            source="cache",
-            provider=provider,
+            question=q,
+            answer=refined,
+            source="ai",
+            provider=channel,
             lang=lang,
             normalized_question=normalized_question,
             canonical_key=canonical_key,
-            cache_id=_extract_cache_id(cached),
         )
+
+        latency_ms = int((_now_utc() - started).total_seconds() * 1000)
+        log_qa_event_best_effort(
+            account_id=account_id,
+            mode=channel,
+            lang=lang,
+            question_raw=q,
+            normalized_question=normalized_question,
+            canonical_key=canonical_key,
+            outcome="ok",
+            reason=None,
+            source="ai",
+            cache_hit=False,
+            library_hit=False,
+            ai_used=True,
+            ai_credit_cost=ai_credit_cost,
+            latency_ms=latency_ms,
+        )
+
+        debug["decision"] = "fresh_ai"
+        debug["ai_provider"] = ai_res.get("provider")
+        debug["ai_model"] = ai_res.get("model")
 
         return {
             "ok": True,
-            "answer": cached.get("answer"),
-            "from_cache": True,
-            "account_id": account_id,
-            "subscription": body.get("__subscription"),
-            "plan_code": plan_ctx.get("plan_code"),
-            "usage_charged": True if not subscription_bypass else False,
-            "credits_consumed": 0,
-            "history_written": bool((semantic_runtime.get("history_result") or {}).get("ok")),
-            "embedding_written": bool((semantic_runtime.get("embedding_result") or {}).get("ok")),
-            "embedding_id": semantic_runtime.get("embedding_id"),
-            "debug": {
-                **translation_debug,
-                "canonical_key": canonical_key,
-                "semantic_runtime": semantic_runtime,
-            },
+            "answer": refined,
+            "source": "ai",
+            "canonical_key": canonical_key,
+            "debug": debug,
         }
 
-    if not bypass and not subscription_bypass:
-        bal = check_credit_balance(account_id, cost=1)
-        if not bal.get("ok"):
-            return {
-                "ok": False,
-                "error": bal.get("error") or "credit_check_failed",
-                "root_cause": bal.get("root_cause") or bal.get("error"),
-                "fix": bal.get("fix") or "Fix credits table/RLS.",
-                "details": bal.get("details") or {"account_id": account_id},
-                "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code")},
-            }
-
-    try:
-        ai = call_ai(
-            question=question,
-            lang=lang,
-            channel=(body.get("channel") or "web"),
-        )
     except Exception as e:
-        return {
-            "ok": False,
-            "error": "ai_call_failed",
-            "root_cause": f"{type(e).__name__}: {_clip(str(e))}",
-            "fix": "Check AI provider keys, network access, and ai_service configuration.",
-            "details": {"account_id": account_id},
-            "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code"), "canonical_key": canonical_key},
-        }
+        _dbg(f"[ask_guarded] unexpected_error: {type(e).__name__}: {_clip(str(e), 500)}")
+        _dbg(traceback.format_exc())
 
-    if not isinstance(ai, dict) or not ai.get("ok"):
-        return {
-            "ok": False,
-            "error": "ai_failed",
-            "root_cause": (ai or {}).get("root_cause") or (ai or {}).get("error") or "unknown_ai_failure",
-            "fix": (ai or {}).get("fix") or "Inspect ai_service logs.",
-            "details": {"account_id": account_id},
-            "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code"), "canonical_key": canonical_key},
-        }
-
-    answer_text = (ai.get("answer") or "").strip()
-    if not answer_text:
-        return {
-            "ok": False,
-            "error": "ai_empty_answer",
-            "root_cause": "AI returned ok=True but answer was empty",
-            "fix": "Check ai_service provider response parsing.",
-            "details": {"account_id": account_id},
-            "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code"), "canonical_key": canonical_key},
-        }
-
-    if not subscription_bypass:
-        usage = increment_daily_usage(account_id, inc=1)
-        if not usage.get("ok"):
-            return {
-                "ok": False,
-                "error": usage.get("error") or "daily_usage_update_failed",
-                "root_cause": usage.get("root_cause"),
-                "fix": usage.get("fix"),
-                "details": usage.get("details"),
-                "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code"), "canonical_key": canonical_key},
-            }
-
-    credits_consumed = 0
-    if not bypass and not subscription_bypass:
-        consume = consume_credits(account_id, cost=1)
-        if not consume.get("ok"):
-            return {
-                "ok": False,
-                "error": consume.get("error") or "credit_consume_failed",
-                "root_cause": consume.get("root_cause"),
-                "fix": consume.get("fix"),
-                "details": consume.get("details"),
-                "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code"), "canonical_key": canonical_key},
-            }
-        credits_consumed = 1
-
-    cache_write_warning = None
-    cache_id: Optional[str] = None
-    try:
-        cache_res = upsert_ai_answer_to_cache_best_effort(
-            normalized_question=question,
-            answer=answer_text,
-            source="ai",
-            lang=lang,
-            canonical_key=canonical_key,
-            enabled=True,
-            priority=0,
-        )
-
-        if isinstance(cache_res, dict):
-            cache_row = cache_res.get("cache") or cache_res.get("row") or cache_res.get("data") or cache_res
-            if isinstance(cache_row, dict):
-                cache_id = str(cache_row.get("id") or "").strip() or None
-    except Exception as e:
-        cache_write_warning = f"{type(e).__name__}: {_clip(str(e))}"
-
-    if not cache_id:
+        latency_ms = int((_now_utc() - started).total_seconds() * 1000)
         try:
-            lookup = answer_from_cache(question, lang=lang, canonical_key=canonical_key)
-            cache_id = _extract_cache_id(lookup)
+            log_qa_event_best_effort(
+                account_id=account_id,
+                mode=channel,
+                lang=lang,
+                question_raw=q,
+                normalized_question=normalized_question,
+                canonical_key=canonical_key,
+                outcome="error",
+                reason="internal_error",
+                source=None,
+                cache_hit=False,
+                library_hit=False,
+                ai_used=False,
+                ai_credit_cost=0,
+                latency_ms=latency_ms,
+            )
         except Exception:
             pass
 
-    semantic_runtime = semantic_write_runtime(
-        account_id=account_id,
-        question=question,
-        answer=answer_text,
-        source="ai",
-        provider=provider,
-        lang=lang,
-        normalized_question=normalized_question,
-        canonical_key=canonical_key,
-        cache_id=cache_id,
-    )
-
-    return {
-        "ok": True,
-        "answer": answer_text,
-        "from_cache": False,
-        "account_id": account_id,
-        "subscription": body.get("__subscription"),
-        "plan_code": plan_ctx.get("plan_code"),
-        "usage_charged": True if not subscription_bypass else False,
-        "credits_consumed": credits_consumed,
-        "history_written": bool((semantic_runtime.get("history_result") or {}).get("ok")),
-        "embedding_written": bool((semantic_runtime.get("embedding_result") or {}).get("ok")),
-        "embedding_id": semantic_runtime.get("embedding_id"),
-        "debug": {
-            **translation_debug,
+        return {
+            "ok": False,
+            "error": "internal_error",
+            "fix": "We could not complete this request right now. Please try again.",
             "canonical_key": canonical_key,
-            "cache_id": cache_id,
-            "cache_write_warning": cache_write_warning,
-            "semantic_runtime": semantic_runtime,
-        },
-    }
+            "debug": {
+                **debug,
+                "exception": f"{type(e).__name__}: {_clip(str(e), 300)}",
+            },
+        }
