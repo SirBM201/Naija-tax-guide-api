@@ -1,90 +1,216 @@
 # app/services/response_refiner.py
+
 from __future__ import annotations
 
-import re
-from typing import Optional
-
-_BAD_PATTERNS = [
-    "ai temporarily unavailable",
-    "ai service not configured",
-    "openai_api_key not set",
-    "invalid_api_key",
-    "incorrect api key",
-    "quota",
-    "rate limit",
-    "request timed out",
-    "no answer generated",
-    "openai import failed",
-    "client init failed",
-    "something went wrong",
-    "unauthorized",
-    "401",
-]
-
-def looks_like_ai_failure(text: str) -> bool:
-    t = (text or "").strip().lower()
-    if not t:
-        return True
-    for p in _BAD_PATTERNS:
-        if p in t:
-            return True
-    return False
+from typing import Any, Dict, Optional
 
 
-def _cleanup_whitespace(txt: str) -> str:
-    txt = (txt or "").strip()
-    txt = "\n".join([line.rstrip() for line in txt.splitlines()])
-    txt = re.sub(r"\n{3,}", "\n\n", txt).strip()
-    return txt
+TRUST_THRESHOLD = 0.75
+CONFIDENCE_THRESHOLD = 0.72
+AUTHORITY_THRESHOLD = 0.60
 
 
-def _ensure_sentence_case_first_line(txt: str) -> str:
-    lines = txt.splitlines()
-    if not lines:
-        return txt
-    first = lines[0].strip()
-    if first and first[0].isalpha():
-        first = first[0].upper() + first[1:]
-    lines[0] = first
-    return "\n".join(lines).strip()
+def _normalize(value: Any) -> str:
+    return str(value or "").strip().lower()
 
 
-def _web_markdown_polish(txt: str) -> str:
-    # keep markdown, just clean spacing
-    return _ensure_sentence_case_first_line(_cleanup_whitespace(txt))
+def _float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
 
 
-def _wa_tg_polish(txt: str) -> str:
+def _same(a: Any, b: Any) -> bool:
+    return _normalize(a) == _normalize(b)
+
+
+def refine_response(
+    *,
+    question_meta: Dict[str, Any],
+    candidate: Optional[Dict[str, Any]],
+    grounded_result: Optional[Dict[str, Any]],
+    credits_available: bool,
+) -> Dict[str, Any]:
     """
-    WhatsApp/Telegram-safe:
-    - Avoid heavy markdown (**bold**) because WA uses *bold*
-    - Keep bullets clean
+    Final validation layer before the answer leaves the backend.
+
+    This blocks:
+    - unapproved answers
+    - low trust answers
+    - topic mismatch
+    - intent mismatch
+    - jurisdiction mismatch
+    - low-confidence grounded answers
+    - weak/no-credit uncached fallbacks
     """
-    txt = _cleanup_whitespace(txt)
 
-    # Convert markdown bold **x** -> *x*
-    txt = re.sub(r"\*\*(.+?)\*\*", r"*\1*", txt)
+    if not candidate:
+        return {
+            "allowed": False,
+            "decision": "no_candidate",
+            "reason": "no_candidate",
+            "user_message": (
+                "I could not find a sufficiently reliable answer for that question yet."
+            ),
+        }
 
-    # Convert headings like "Key points:" into WA-friendly emphasis
-    txt = re.sub(r"(?m)^(key points|next steps|summary|important)\s*:\s*$", r"*\1:*", txt, flags=re.I)
+    review_status = _normalize(candidate.get("review_status"))
+    trust_score = _float(candidate.get("trust_score"))
+    candidate_topic = candidate.get("topic")
+    candidate_intent = candidate.get("intent_type")
+    candidate_jurisdiction = candidate.get("jurisdiction")
 
-    # Normalize bullets
-    txt = re.sub(r"(?m)^\s*[-•]\s+", "- ", txt)
+    question_topic = question_meta.get("topic")
+    question_intent = question_meta.get("intent_type")
+    question_jurisdiction = question_meta.get("jurisdiction") or "nigeria"
 
-    return _ensure_sentence_case_first_line(txt)
+    if review_status != "approved":
+        return {
+            "allowed": False,
+            "decision": "reject",
+            "reason": "unapproved_answer",
+            "user_message": (
+                "That answer is not yet approved for reliable use."
+            ),
+        }
 
+    if trust_score < TRUST_THRESHOLD:
+        return {
+            "allowed": False,
+            "decision": "reject",
+            "reason": "low_trust",
+            "user_message": (
+                "I found a related answer, but it is not trusted enough to return safely."
+            ),
+        }
 
-def refine_answer(raw: str, *, lang: str = "en", source: str = "ai", provider: str = "web") -> Optional[str]:
-    txt = (raw or "").strip()
-    if not txt:
-        return None
-    if looks_like_ai_failure(txt):
-        return None
+    if not _same(candidate_topic, question_topic):
+        return {
+            "allowed": False,
+            "decision": "reject",
+            "reason": "topic_mismatch",
+            "user_message": (
+                "I found related material, but it does not match your exact tax topic closely enough."
+            ),
+        }
 
-    provider = (provider or "web").strip().lower()
-    if provider in ("wa", "whatsapp", "tg", "telegram"):
-        txt = _wa_tg_polish(txt)
-    else:
-        txt = _web_markdown_polish(txt)
+    if not _same(candidate_intent, question_intent):
+        return {
+            "allowed": False,
+            "decision": "reject",
+            "reason": "intent_mismatch",
+            "user_message": (
+                "I found related material, but it does not match the type of answer your question requires."
+            ),
+        }
 
-    return txt or None
+    if not _same(candidate_jurisdiction, question_jurisdiction):
+        return {
+            "allowed": False,
+            "decision": "reject",
+            "reason": "jurisdiction_mismatch",
+            "user_message": (
+                "I found related material, but it is not aligned with Nigerian tax context."
+            ),
+        }
+
+    if not grounded_result:
+        if credits_available:
+            return {
+                "allowed": False,
+                "decision": "needs_grounding",
+                "reason": "missing_grounding",
+                "user_message": (
+                    "I need to ground this answer more carefully before returning it."
+                ),
+            }
+
+        return {
+            "allowed": False,
+            "decision": "insufficient_credits_uncached",
+            "reason": "missing_grounding_and_no_credits",
+            "user_message": (
+                "Your available AI usage for this period is exhausted, and I do not have a sufficiently grounded cached answer for this question yet."
+            ),
+        }
+
+    grounded = bool(grounded_result.get("grounded"))
+    confidence = _float(grounded_result.get("confidence"))
+    authority_score = _float(grounded_result.get("authority_score"))
+    jurisdiction_ok = bool(grounded_result.get("jurisdiction_ok"))
+    topic_ok = bool(grounded_result.get("topic_ok"))
+    intent_ok = bool(grounded_result.get("intent_ok"))
+
+    if not grounded:
+        if credits_available:
+            return {
+                "allowed": False,
+                "decision": "needs_better_grounding",
+                "reason": grounded_result.get("refusal_reason") or "grounding_failed",
+                "user_message": (
+                    "I found related material, but it is not grounded strongly enough for a safe answer yet."
+                ),
+            }
+
+        return {
+            "allowed": False,
+            "decision": "insufficient_credits_uncached",
+            "reason": grounded_result.get("refusal_reason") or "grounding_failed_no_credits",
+            "user_message": (
+                "Your available AI usage for this period is exhausted, and I do not have a sufficiently reliable cached answer for this question yet."
+            ),
+        }
+
+    if not jurisdiction_ok or not topic_ok or not intent_ok:
+        if credits_available:
+            return {
+                "allowed": False,
+                "decision": "needs_grounded_synthesis",
+                "reason": "compatibility_failed",
+                "user_message": (
+                    "I need a better-grounded synthesis for this question before answering."
+                ),
+            }
+
+        return {
+            "allowed": False,
+            "decision": "insufficient_credits_uncached",
+            "reason": "compatibility_failed_no_credits",
+            "user_message": (
+                "Your available AI usage for this period is exhausted, and I do not have a safe cached answer for this question yet."
+            ),
+        }
+
+    if confidence < CONFIDENCE_THRESHOLD or authority_score < AUTHORITY_THRESHOLD:
+        if credits_available:
+            return {
+                "allowed": False,
+                "decision": "needs_grounded_synthesis",
+                "reason": "low_grounded_confidence",
+                "user_message": (
+                    "I found related material, but it is not strong enough to return directly."
+                ),
+            }
+
+        return {
+            "allowed": False,
+            "decision": "insufficient_credits_uncached",
+            "reason": "low_grounded_confidence_no_credits",
+            "user_message": (
+                "Your available AI usage for this period is exhausted, and I do not have a sufficiently trusted cached answer for this question yet."
+            ),
+        }
+
+    return {
+        "allowed": True,
+        "decision": "direct_cache",
+        "reason": "safe_grounded_answer",
+        "answer": grounded_result.get("answer_text") or candidate.get("answer"),
+        "source": candidate.get("match_type") or "cache",
+        "confidence": confidence,
+        "authority_score": authority_score,
+        "trust_score": trust_score,
+        "grounding_mode": grounded_result.get("grounding_mode"),
+        "evidence": grounded_result.get("evidence") or [],
+    }
