@@ -25,21 +25,48 @@ def decide_answer_mode(
     ]
 
     if classification.requires_clarification:
-        return DecisionResult(mode="clarification", best_candidate=best, reasons=reasons + ["requires_clarification=true"])
+        return DecisionResult(
+            mode="clarification",
+            best_candidate=best,
+            reasons=reasons + ["requires_clarification=true"],
+        )
 
     if classification.intent_type == "calculation":
-        return DecisionResult(mode="rules_engine", best_candidate=best, reasons=reasons + ["intent=calculation"])
+        return DecisionResult(
+            mode="rules_engine",
+            best_candidate=best,
+            reasons=reasons + ["intent=calculation"],
+        )
 
+    # Only very strong candidates should be considered for direct cache.
+    # Final safety will still be enforced later by grounding/refiner.
     if best and best.rank_score >= 85:
-        return DecisionResult(mode="direct_cache", best_candidate=best, reasons=reasons + [f"best_rank={best.rank_score}"])
+        return DecisionResult(
+            mode="direct_cache",
+            best_candidate=best,
+            reasons=reasons + [f"best_rank={best.rank_score}", "candidate_strong_enough_for_cache_review"],
+        )
 
+    # Medium-quality candidate can be used as grounding basis if AI credits exist.
     if best and best.rank_score >= 70 and has_ai_credit:
-        return DecisionResult(mode="grounded_synthesis", best_candidate=best, reasons=reasons + [f"best_rank={best.rank_score}"])
+        return DecisionResult(
+            mode="grounded_synthesis",
+            best_candidate=best,
+            reasons=reasons + [f"best_rank={best.rank_score}", "candidate_good_for_grounded_synthesis"],
+        )
 
-    if best and not has_ai_credit:
-        return DecisionResult(mode="direct_cache", best_candidate=best, reasons=reasons + ["credits_exhausted_but_cache_available"])
+    # IMPORTANT FIX:
+    # Do NOT auto-return cache just because credits are exhausted.
+    # If candidate is not strong enough for safe direct cache, return insufficient credits.
+    if not has_ai_credit:
+        return DecisionResult(
+            mode="insufficient_credits_uncached",
+            best_candidate=best,
+            reasons=reasons + ["no_ai_credit_and_no_safe_direct_cache"],
+        )
 
-    if not best and not has_ai_credit:
-        return DecisionResult(mode="insufficient_credits_uncached", best_candidate=None, reasons=reasons + ["no_cache_and_no_ai_credit"])
-
-    return DecisionResult(mode="grounded_synthesis", best_candidate=best, reasons=reasons + ["fallback_grounded_synthesis"])
+    return DecisionResult(
+        mode="grounded_synthesis",
+        best_candidate=best,
+        reasons=reasons + ["fallback_grounded_synthesis"],
+    )
