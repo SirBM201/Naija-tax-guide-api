@@ -91,18 +91,29 @@ def ask():
             500,
         )
 
-    if result.get("ok") is True:
-        return jsonify(result), 200
+    # Clean production response shape.
+    response = {
+        "ok": bool(result.get("ok")),
+        "answer": result.get("answer") or "",
+        "error": result.get("error"),
+        "meta": result.get("meta") or {},
+    }
 
-    error = str(result.get("error") or "").strip().lower()
+    if result.get("debug"):
+        response["debug"] = result.get("debug")
+
+    if response["ok"] is True:
+        return jsonify(response), 200
+
+    error = str(response.get("error") or "").strip().lower()
 
     if error in {"insufficient_credits", "insufficient_credits_uncached"}:
-        return jsonify(result), 402
+        return jsonify(response), 402
 
     if error in {"unauthorized", "auth_resolution_failed", "account_required"}:
-        return jsonify(result), 401
+        return jsonify(response), 401
 
     if error in {"question_required"}:
-        return jsonify(result), 400
+        return jsonify(response), 400
 
-    return jsonify(result), 200
+    return jsonify(response), 200
