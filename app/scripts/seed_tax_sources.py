@@ -45,7 +45,6 @@ def _chunk_payloads() -> List[Dict[str, Any]]:
             "text_content": "Value Added Tax (VAT) is a consumption tax charged on taxable goods and services in Nigeria.",
             "summary": "Definition of VAT",
             "keywords": ["vat", "value added tax", "vat meaning", "what is vat"],
-            "is_active": True,
         },
         {
             "chunk_id": "firs_vat_guidance_2024_vat_rate",
@@ -57,7 +56,6 @@ def _chunk_payloads() -> List[Dict[str, Any]]:
             "text_content": "The standard VAT rate in Nigeria is 7.5 percent.",
             "summary": "VAT rate in Nigeria",
             "keywords": ["vat rate", "7.5%", "nigeria vat rate"],
-            "is_active": True,
         },
         {
             "chunk_id": "firs_vat_guidance_2024_vat_exemptions",
@@ -69,7 +67,6 @@ def _chunk_payloads() -> List[Dict[str, Any]]:
             "text_content": "Certain supplies may be exempt or zero-rated depending on the applicable Nigerian tax rules, schedules, and current FIRS guidance.",
             "summary": "VAT exemptions",
             "keywords": ["vat exemptions", "vat exempt items", "zero rated vat"],
-            "is_active": True,
         },
         {
             "chunk_id": "firs_vat_guidance_2024_paye_definition",
@@ -81,7 +78,6 @@ def _chunk_payloads() -> List[Dict[str, Any]]:
             "text_content": "PAYE means Pay As You Earn, a system where employers deduct personal income tax from employee salaries and remit it to the relevant tax authority.",
             "summary": "PAYE definition",
             "keywords": ["paye", "what is paye", "paye meaning"],
-            "is_active": True,
         },
         {
             "chunk_id": "firs_vat_guidance_2024_paye_computation",
@@ -93,7 +89,6 @@ def _chunk_payloads() -> List[Dict[str, Any]]:
             "text_content": "PAYE is computed using taxable income after allowable reliefs and the applicable progressive tax bands under Nigerian personal income tax rules.",
             "summary": "PAYE computation basics",
             "keywords": ["paye calculation", "how to compute paye", "paye nigeria"],
-            "is_active": True,
         },
         {
             "chunk_id": "firs_vat_guidance_2024_freelancer_guidance",
@@ -105,7 +100,6 @@ def _chunk_payloads() -> List[Dict[str, Any]]:
             "text_content": "Freelancers in Nigeria may have personal income tax obligations depending on the nature of income, tax residence, and applicable state tax rules.",
             "summary": "Freelancer tax basics",
             "keywords": ["freelancer tax", "self employed tax", "creator tax nigeria"],
-            "is_active": True,
         },
     ]
 
@@ -192,7 +186,6 @@ def seed_sources(*, allow_reseed: bool = False) -> Dict[str, Any]:
         "chunks_skipped": chunks_skipped,
         "final_chunk_count": final_chunk_count,
     }
-
 
 
 if __name__ == "__main__":
