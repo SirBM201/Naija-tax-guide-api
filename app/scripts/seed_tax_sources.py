@@ -106,7 +106,7 @@ def _find_source(sb, source_id: str) -> List[Dict[str, Any]]:
 def _find_chunk_by_summary(sb, source_id: str, summary: str) -> List[Dict[str, Any]]:
     res = (
         sb.table("tax_source_chunks")
-        .select("id, source_id, summary")
+        .select("source_id, summary")
         .eq("source_id", source_id)
         .eq("summary", summary)
         .limit(1)
@@ -115,19 +115,20 @@ def _find_chunk_by_summary(sb, source_id: str, summary: str) -> List[Dict[str, A
     return _as_list(getattr(res, "data", None))
 
 
-def _delete_existing_chunks(sb, source_id: str) -> int:
-    existing = (
+def _count_existing_chunks(sb, source_id: str) -> int:
+    res = (
         sb.table("tax_source_chunks")
-        .select("id")
+        .select("source_id, summary")
         .eq("source_id", source_id)
         .execute()
     )
-    rows = _as_list(getattr(existing, "data", None))
-    count = len(rows)
+    return len(_as_list(getattr(res, "data", None)))
 
+
+def _delete_existing_chunks(sb, source_id: str) -> int:
+    count = _count_existing_chunks(sb, source_id)
     if count > 0:
         sb.table("tax_source_chunks").delete().eq("source_id", source_id).execute()
-
     return count
 
 
@@ -140,14 +141,7 @@ def seed_sources(*, allow_reseed: bool = False) -> Dict[str, Any]:
     existing_source = _find_source(sb, SOURCE_ID)
 
     if existing_source and not allow_reseed:
-        existing_chunk_count_res = (
-            sb.table("tax_source_chunks")
-            .select("id")
-            .eq("source_id", SOURCE_ID)
-            .execute()
-        )
-        existing_chunk_count = len(_as_list(getattr(existing_chunk_count_res, "data", None)))
-
+        existing_chunk_count = _count_existing_chunks(sb, SOURCE_ID)
         return {
             "status": "skipped_existing_source",
             "source_id": SOURCE_ID,
@@ -158,13 +152,11 @@ def seed_sources(*, allow_reseed: bool = False) -> Dict[str, Any]:
             "existing_chunk_count": existing_chunk_count,
         }
 
-    source_inserted = False
+    sb.table("tax_source_registry").upsert(source, on_conflict="source_id").execute()
+
     chunks_deleted = 0
     chunks_inserted = 0
     chunks_skipped = 0
-
-    sb.table("tax_source_registry").upsert(source, on_conflict="source_id").execute()
-    source_inserted = True
 
     if allow_reseed:
         chunks_deleted = _delete_existing_chunks(sb, SOURCE_ID)
@@ -179,18 +171,12 @@ def seed_sources(*, allow_reseed: bool = False) -> Dict[str, Any]:
         sb.table("tax_source_chunks").insert(chunk).execute()
         chunks_inserted += 1
 
-    final_chunk_count_res = (
-        sb.table("tax_source_chunks")
-        .select("id")
-        .eq("source_id", SOURCE_ID)
-        .execute()
-    )
-    final_chunk_count = len(_as_list(getattr(final_chunk_count_res, "data", None)))
+    final_chunk_count = _count_existing_chunks(sb, SOURCE_ID)
 
     return {
         "status": "seed_completed",
         "source_id": SOURCE_ID,
-        "source_inserted": source_inserted,
+        "source_inserted": True,
         "source_already_exists": bool(existing_source),
         "allow_reseed": allow_reseed,
         "chunks_deleted": chunks_deleted,
