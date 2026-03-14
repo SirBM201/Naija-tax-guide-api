@@ -1,160 +1,277 @@
-# app/routes/cron.py
 from __future__ import annotations
 
-import traceback
-from typing import Any, Dict, Optional
+import os
+from datetime import datetime, timezone
+from decimal import Decimal
+from typing import Any, Dict, List
 
 from flask import Blueprint, jsonify, request
 
-from app.core.security import require_admin_key
 from app.core.supabase_client import supabase
+from app.services.referral_service import mature_pending_rewards
 
 bp = Blueprint("cron", __name__)
 
-DEFAULT_BATCH = 1000
-MAX_BATCH = 5000
+
+def _sb():
+    return supabase() if callable(supabase) else supabase
 
 
-def _debug_enabled() -> bool:
-    return (request.headers.get("X-Debug") or "").strip() == "1"
+def _truthy(v: str | None) -> bool:
+    return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-def _rid() -> str:
-    # set by app/__init__.py before_request
-    return str(request.environ.get("REQUEST_ID") or "")
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
-def _get_json() -> Dict[str, Any]:
-    data = request.get_json(silent=True)
-    return data if isinstance(data, dict) else {}
+def _now_iso() -> str:
+    return _now().isoformat()
 
 
-def _get_batch_limit(payload: Dict[str, Any]) -> int:
-    v = payload.get("batch_limit", DEFAULT_BATCH)
+def _safe_int(value: Any, default: int = 0) -> int:
     try:
-        n = int(v)
+        return int(value)
     except Exception:
-        n = DEFAULT_BATCH
-    n = max(1, min(MAX_BATCH, n))
-    return n
+        return default
 
 
-def _err(e: Exception, *, where: str, extra: Optional[Dict[str, Any]] = None):
-    out: Dict[str, Any] = {
-        "ok": False,
-        "request_id": _rid(),
-        "error": type(e).__name__,
-        "message": str(e)[:800],
-        "where": where,
+def _to_decimal(value: Any, default: Decimal = Decimal("0")) -> Decimal:
+    try:
+        if value is None:
+            return default
+        return Decimal(str(value))
+    except Exception:
+        return default
+
+
+def _cron_secret() -> str:
+    return (os.getenv("CRON_SECRET") or os.getenv("ADMIN_CRON_SECRET") or "").strip()
+
+
+def _payout_enabled() -> bool:
+    return _truthy(os.getenv("REFERRAL_PAYOUT_ENABLED") or "1")
+
+
+def _payout_provider() -> str:
+    return (os.getenv("REFERRAL_PAYOUT_PROVIDER") or "paystack").strip().lower()
+
+
+def _min_payout_amount() -> Decimal:
+    return _to_decimal(os.getenv("REFERRAL_MIN_PAYOUT_AMOUNT") or "2000", Decimal("2000"))
+
+
+def _payout_currency() -> str:
+    return (os.getenv("REFERRAL_REWARD_CURRENCY") or "NGN").strip().upper()
+
+
+def _payout_days() -> List[int]:
+    raw = (os.getenv("REFERRAL_PAYOUT_DAYS") or "15,30").strip()
+    out: List[int] = []
+    for part in raw.split(","):
+        try:
+            day = int(part.strip())
+            if 1 <= day <= 31:
+                out.append(day)
+        except Exception:
+            continue
+    return out or [15, 30]
+
+
+def _cron_authorized() -> bool:
+    secret = _cron_secret()
+    if not secret:
+        return False
+    incoming = (request.headers.get("X-Cron-Secret") or request.args.get("cron_secret") or "").strip()
+    return bool(incoming) and incoming == secret
+
+
+def _approved_rewards_for_account(account_id: str) -> List[Dict[str, Any]]:
+    resp = (
+        _sb()
+        .table("referral_rewards")
+        .select("*")
+        .eq("account_id", account_id)
+        .eq("status", "approved")
+        .order("created_at", desc=False)
+        .execute()
+    )
+    return getattr(resp, "data", None) or []
+
+
+def _payout_account_for_user(account_id: str) -> Dict[str, Any] | None:
+    resp = (
+        _sb()
+        .table("referral_payout_accounts")
+        .select("*")
+        .eq("account_id", account_id)
+        .eq("is_verified", True)
+        .limit(1)
+        .execute()
+    )
+    rows = getattr(resp, "data", None) or []
+    return rows[0] if rows else None
+
+
+def _all_accounts_with_approved_rewards() -> List[str]:
+    resp = (
+        _sb()
+        .table("referral_rewards")
+        .select("account_id")
+        .eq("status", "approved")
+        .execute()
+    )
+    rows = getattr(resp, "data", None) or []
+    seen: set[str] = set()
+    account_ids: List[str] = []
+    for row in rows:
+        account_id = str(row.get("account_id") or "").strip()
+        if account_id and account_id not in seen:
+            seen.add(account_id)
+            account_ids.append(account_id)
+    return account_ids
+
+
+def _sum_rewards(rows: List[Dict[str, Any]]) -> Decimal:
+    total = Decimal("0")
+    for row in rows:
+        total += _to_decimal(row.get("reward_amount"))
+    return total
+
+
+def _create_pending_payout(account_id: str, amount: Decimal) -> Dict[str, Any] | None:
+    payload = {
+        "account_id": account_id,
+        "amount": str(amount),
+        "currency": _payout_currency(),
+        "provider": _payout_provider(),
+        "status": "pending",
+        "requested_at": _now_iso(),
+        "created_at": _now_iso(),
+        "updated_at": _now_iso(),
     }
-    if extra:
-        out["extra"] = extra
-    if _debug_enabled():
-        out["traceback"] = traceback.format_exc(limit=80)
-        out["debug"] = {
-            "path": request.path,
-            "method": request.method,
-            "content_type": request.content_type,
-            "headers": {
-                "X-Admin-Key": "present" if (request.headers.get("X-Admin-Key") or "") else "missing",
-                "X-Debug": request.headers.get("X-Debug"),
-            },
+    resp = _sb().table("referral_payouts").insert(payload).execute()
+    rows = getattr(resp, "data", None) or []
+    return rows[0] if rows else None
+
+
+def _mark_rewards_paid(reward_rows: List[Dict[str, Any]]) -> None:
+    for row in reward_rows:
+        reward_id = str(row.get("id") or "").strip()
+        if not reward_id:
+            continue
+        _sb().table("referral_rewards").update(
+            {
+                "status": "paid",
+                "paid_at": _now_iso(),
+                "updated_at": _now_iso(),
+            }
+        ).eq("id", reward_id).execute()
+
+
+def _mark_payout_processing(payout_id: str) -> None:
+    _sb().table("referral_payouts").update(
+        {
+            "status": "processing",
+            "processed_at": _now_iso(),
+            "updated_at": _now_iso(),
         }
-    return jsonify(out), 500
+    ).eq("id", payout_id).execute()
 
 
-@bp.get("/internal/cron/ping")
-def cron_ping():
-    try:
-        guard = require_admin_key()
-        if guard is not None:
-            return guard
-        return jsonify({"ok": True, "request_id": _rid(), "pong": True}), 200
-    except Exception as e:
-        return _err(e, where="cron.ping")
+def _is_payout_window_today() -> bool:
+    today_day = _now().day
+    return today_day in _payout_days()
 
 
-@bp.get("/internal/cron/selftest")
-def cron_selftest():
-    """
-    Helps you instantly see if:
-    - admin key guard passes
-    - request_id exists
-    - request headers are present
-    """
-    try:
-        guard = require_admin_key()
-        if guard is not None:
-            return guard
+@bp.post("/cron/referrals/mature")
+def cron_referrals_mature():
+    if not _cron_authorized():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    result = mature_pending_rewards(limit=2000)
+    return jsonify({"ok": True, "result": result}), 200
+
+
+@bp.post("/cron/referrals/payout-batch")
+def cron_referrals_payout_batch():
+    if not _cron_authorized():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    if not _payout_enabled():
+        return jsonify({"ok": True, "skipped": True, "reason": "payout_disabled"}), 200
+
+    mature_pending_rewards(limit=5000)
+
+    if not _is_payout_window_today():
         return jsonify(
             {
                 "ok": True,
-                "request_id": _rid(),
-                "path": request.path,
-                "method": request.method,
-                "admin_key_header_present": bool((request.headers.get("X-Admin-Key") or "").strip()),
-                "debug_header": (request.headers.get("X-Debug") or "").strip(),
+                "skipped": True,
+                "reason": "not_payout_window_today",
+                "allowed_days": _payout_days(),
+                "today": _now().day,
             }
         ), 200
-    except Exception as e:
-        return _err(e, where="cron.selftest")
 
+    min_amount = _min_payout_amount()
+    account_ids = _all_accounts_with_approved_rewards()
 
-@bp.post("/internal/cron/expire-subscriptions")
-def expire_subscriptions():
-    guard = require_admin_key()
-    if guard is not None:
-        return guard
+    prepared: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
 
-    payload = _get_json()
-    batch_limit = _get_batch_limit(payload)
+    for account_id in account_ids:
+        payout_account = _payout_account_for_user(account_id)
+        if not payout_account:
+            skipped.append({"account_id": account_id, "reason": "missing_verified_payout_account"})
+            continue
 
-    try:
-        res = supabase().rpc("expire_overdue_subscriptions", {"batch_limit": batch_limit}).execute()
-        data = getattr(res, "data", None)
+        reward_rows = _approved_rewards_for_account(account_id)
+        if not reward_rows:
+            skipped.append({"account_id": account_id, "reason": "no_approved_rewards"})
+            continue
 
-        if isinstance(data, list):
-            data = data[0] if data else {}
+        total = _sum_rewards(reward_rows)
+        if total < min_amount:
+            skipped.append(
+                {
+                    "account_id": account_id,
+                    "reason": "below_minimum_payout_amount",
+                    "amount": str(total),
+                    "minimum": str(min_amount),
+                }
+            )
+            continue
 
-        return jsonify(
+        payout_row = _create_pending_payout(account_id, total)
+        if not payout_row:
+            skipped.append({"account_id": account_id, "reason": "failed_to_create_payout_row"})
+            continue
+
+        payout_id = str(payout_row.get("id") or "").strip()
+        if payout_id:
+            _mark_payout_processing(payout_id)
+
+        _mark_rewards_paid(reward_rows)
+
+        prepared.append(
             {
-                "ok": True,
-                "request_id": _rid(),
-                "method": "rpc",
-                "rpc": "expire_overdue_subscriptions",
-                "batch_limit": batch_limit,
-                "result": data,
+                "account_id": account_id,
+                "payout": payout_row,
+                "reward_count": len(reward_rows),
+                "amount": str(total),
             }
-        ), 200
-    except Exception as e:
-        return _err(e, where="cron.expire_subscriptions(rpc)", extra={"batch_limit": batch_limit})
+        )
 
-
-@bp.post("/internal/cron/expire-credits")
-def expire_credits():
-    guard = require_admin_key()
-    if guard is not None:
-        return guard
-
-    payload = _get_json()
-    batch_limit = _get_batch_limit(payload)
-
-    try:
-        res = supabase().rpc("expire_ai_credits", {"batch_limit": batch_limit}).execute()
-        data = getattr(res, "data", None)
-
-        if isinstance(data, list):
-            data = data[0] if data else {}
-
-        return jsonify(
-            {
-                "ok": True,
-                "request_id": _rid(),
-                "method": "rpc",
-                "rpc": "expire_ai_credits",
-                "batch_limit": batch_limit,
-                "result": data,
-            }
-        ), 200
-    except Exception as e:
-        return _err(e, where="cron.expire_credits(rpc)", extra={"batch_limit": batch_limit})
+    return jsonify(
+        {
+            "ok": True,
+            "payout_provider": _payout_provider(),
+            "currency": _payout_currency(),
+            "minimum_payout_amount": str(min_amount),
+            "prepared_count": len(prepared),
+            "skipped_count": len(skipped),
+            "prepared": prepared,
+            "skipped": skipped,
+        }
+    ), 200
