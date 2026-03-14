@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Dict
 
 from app.services.referral_service import bootstrap_new_account_for_referrals
 
@@ -10,7 +10,7 @@ def bootstrap_account_referral_state(
     account_id: str,
     referral_code: str | None = None,
     source: str = "signup",
-) -> Dict[str, Any]:
+) -> Dict[str, object]:
     """
     Call this immediately after you create or resolve a new account.
 
