@@ -1167,3 +1167,4 @@ def compute_approved_payout_balance(account_id: str) -> Decimal:
     for row in rows:
         total += _to_decimal(row.get("reward_amount"))
     return total
+
