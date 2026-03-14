@@ -251,3 +251,5 @@ def create_app() -> Flask:
         ), 200
 
     return app
+
+
