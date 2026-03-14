@@ -37,3 +37,4 @@ def bootstrap_account_referral_state(
         "captured_referral": result.captured_referral,
         "skipped_reason": result.skipped_reason,
     }
+
