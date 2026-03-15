@@ -173,7 +173,6 @@ def generate_link_code():
     expires_at = now + timedelta(minutes=TOKEN_EXPIRY_MINUTES)
 
     try:
-        # Invalidate older unused codes for the same account/provider
         (
             sb.table("link_tokens")
             .update(
