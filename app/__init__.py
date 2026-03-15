@@ -206,6 +206,10 @@ def create_app() -> Flask:
     _register_bp("app.routes.history", "bp", alias_name="history", required=False, url_prefix=api_prefix)
     _register_bp("app.routes.dev_tools", "bp", alias_name="dev_tools", required=False, url_prefix=api_prefix)
 
+    # Reactivated messaging channels
+    _register_bp("app.routes.telegram", "bp", alias_name="telegram", required=False, url_prefix=api_prefix)
+    _register_bp("app.routes.whatsapp", "bp", alias_name="whatsapp", required=False, url_prefix=api_prefix)
+
     if _safe_get_env_bool("ENABLE_DEBUG_ROUTES"):
         _register_bp("app.routes._debug", "bp", required=False, url_prefix=api_prefix)
         _register_bp("app.routes.debug_routes", "bp", required=False, url_prefix=api_prefix)
@@ -239,6 +243,14 @@ def create_app() -> Flask:
         paystack_webhook_registered = any((r.get("alias_name") == "paystack_webhook") for r in boot.get("registered", []))
         if not paystack_webhook_registered:
             hints.append("Paystack webhook blueprint is NOT registered. Confirm app/routes/paystack_webhook.py exists and exports bp = Blueprint(...).")
+
+        telegram_registered = any((r.get("alias_name") == "telegram") for r in boot.get("registered", []))
+        if not telegram_registered:
+            hints.append("Telegram blueprint is NOT registered. Confirm app/routes/telegram.py exists and exports bp = Blueprint(...).")
+
+        whatsapp_registered = any((r.get("alias_name") == "whatsapp") for r in boot.get("registered", []))
+        if not whatsapp_registered:
+            hints.append("WhatsApp blueprint is NOT registered. Confirm app/routes/whatsapp.py exists and exports bp = Blueprint(...).")
 
         if cookie_mode and origins == "*":
             hints.append("COOKIE_MODE is enabled but CORS origins are '*'. Use explicit origins when cookies are used.")
