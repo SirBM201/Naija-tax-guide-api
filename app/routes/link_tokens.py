@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import secrets
 import string
+import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from flask import Blueprint, jsonify, request
 from supabase import create_client
@@ -29,14 +31,14 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def generate_code(length: int = TOKEN_LENGTH) -> str:
-    alphabet = string.ascii_uppercase + string.digits
-    return "".join(secrets.choice(alphabet) for _ in range(length))
+def _sha256_hex(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def _json_error(message: str, status: int = 400, **extra: Any):
     payload: Dict[str, Any] = {"ok": False, "error": message}
-    payload.update(extra)
+    if extra:
+        payload.update(extra)
     return jsonify(payload), status
 
 
@@ -49,64 +51,93 @@ def _normalize_provider(raw: str) -> str:
     return v
 
 
-def _iso_to_aware_utc(value: str) -> datetime:
-    text = (value or "").strip()
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    dt = datetime.fromisoformat(text)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+def _generate_code(length: int = TOKEN_LENGTH) -> str:
+    alphabet = string.ascii_uppercase + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(length))
 
 
-def _get_logged_in_account_id() -> Optional[str]:
+def _safe_iso_to_dt(value: Any) -> Optional[datetime]:
     try:
-        account_id = get_account_id_from_request()
-        return (account_id or "").strip() or None
+        if not value:
+            return None
+        text = str(value).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _get_logged_in_account_id() -> Tuple[Optional[str], Dict[str, Any]]:
+    try:
+        account_id, dbg = get_account_id_from_request(request)
+        account_id = (account_id or "").strip() or None
+        return account_id, dbg if isinstance(dbg, dict) else {}
+    except Exception as e:
+        return None, {"ok": False, "error": "auth_resolution_failed", "detail": repr(e)}
+
+
+def _find_account_row_for_provider(account_id: str, provider: str) -> Optional[Dict[str, Any]]:
+    try:
+        res = (
+            sb.table("accounts")
+            .select(
+                "id,account_id,auth_user_id,provider,provider_user_id,email,display_name,phone,phone_e164,updated_at,created_at"
+            )
+            .eq("account_id", account_id)
+            .eq("provider", provider)
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        return rows[0] if rows else None
+    except Exception:
+        return None
+
+
+def _find_account_row_by_provider_user(provider: str, provider_user_id: str) -> Optional[Dict[str, Any]]:
+    try:
+        res = (
+            sb.table("accounts")
+            .select(
+                "id,account_id,auth_user_id,provider,provider_user_id,email,display_name,phone,phone_e164,updated_at,created_at"
+            )
+            .eq("provider", provider)
+            .eq("provider_user_id", provider_user_id)
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        return rows[0] if rows else None
     except Exception:
         return None
 
 
 @bp.get("/status")
 def link_status():
-    account_id = _get_logged_in_account_id()
+    account_id, auth_dbg = _get_logged_in_account_id()
     if not account_id:
-        return _json_error("Unauthorized", 401)
+        return _json_error("Unauthorized", 401, auth=auth_dbg)
 
-    tg_rows = (
-        sb.table("accounts")
-        .select("id,provider,provider_user_id,updated_at")
-        .eq("account_id", account_id)
-        .eq("provider", "tg")
-        .limit(1)
-        .execute()
-    )
-
-    wa_rows = (
-        sb.table("accounts")
-        .select("id,provider,provider_user_id,updated_at")
-        .eq("account_id", account_id)
-        .eq("provider", "wa")
-        .limit(1)
-        .execute()
-    )
-
-    tg = (tg_rows.data or [None])[0]
-    wa = (wa_rows.data or [None])[0]
+    tg_row = _find_account_row_for_provider(account_id, "tg")
+    wa_row = _find_account_row_for_provider(account_id, "wa")
 
     return jsonify(
         {
             "ok": True,
             "account_id": account_id,
             "telegram": {
-                "linked": bool(tg),
-                "provider_user_id": (tg or {}).get("provider_user_id") if tg else None,
-                "updated_at": (tg or {}).get("updated_at") if tg else None,
+                "linked": bool(tg_row),
+                "provider_user_id": (tg_row or {}).get("provider_user_id") if tg_row else None,
+                "display_name": (tg_row or {}).get("display_name") if tg_row else None,
+                "updated_at": (tg_row or {}).get("updated_at") if tg_row else None,
             },
             "whatsapp": {
-                "linked": bool(wa),
-                "provider_user_id": (wa or {}).get("provider_user_id") if wa else None,
-                "updated_at": (wa or {}).get("updated_at") if wa else None,
+                "linked": bool(wa_row),
+                "provider_user_id": (wa_row or {}).get("provider_user_id") if wa_row else None,
+                "display_name": (wa_row or {}).get("display_name") if wa_row else None,
+                "updated_at": (wa_row or {}).get("updated_at") if wa_row else None,
             },
         }
     )
@@ -116,16 +147,19 @@ def link_status():
 def generate_link_code():
     """
     Website side.
-    Uses the logged-in session/account instead of trusting a posted auth_user_id.
 
     Body:
     {
         "provider": "wa" | "tg"
     }
+
+    Important:
+    - Uses authenticated web session identity from get_account_id_from_request(...)
+    - Stores canonical account id into link_tokens.auth_user_id because that is the live schema
     """
-    account_id = _get_logged_in_account_id()
+    account_id, auth_dbg = _get_logged_in_account_id()
     if not account_id:
-        return _json_error("Unauthorized", 401)
+        return _json_error("Unauthorized", 401, auth=auth_dbg)
 
     body = request.get_json(silent=True) or {}
     provider = _normalize_provider(body.get("provider") or "")
@@ -133,28 +167,50 @@ def generate_link_code():
     if provider not in {"wa", "tg"}:
         return _json_error("Invalid provider", 400)
 
-    code = generate_code()
-    expires_at = _utcnow() + timedelta(minutes=TOKEN_EXPIRY_MINUTES)
+    code = _generate_code()
+    code_hash = _sha256_hex(code)
+    now = _utcnow()
+    expires_at = now + timedelta(minutes=TOKEN_EXPIRY_MINUTES)
 
-    # Best-effort cleanup of old unused tokens for this account/provider
     try:
-        sb.table("link_tokens").delete().eq("account_id", account_id).eq("provider", provider).eq("used", False).execute()
+        # Invalidate older unused codes for the same account/provider
+        (
+            sb.table("link_tokens")
+            .update(
+                {
+                    "used_at": now.isoformat(),
+                }
+            )
+            .eq("auth_user_id", account_id)
+            .eq("provider", provider)
+            .is_("used_at", "null")
+            .execute()
+        )
     except Exception:
         pass
 
     insert_payload = {
-        "code": code,
-        "account_id": account_id,
+        "id": str(uuid.uuid4()),
+        "auth_user_id": account_id,
         "provider": provider,
+        "code": code,
+        "code_hash": code_hash,
         "expires_at": expires_at.isoformat(),
-        "used": False,
-        "created_at": _utcnow().isoformat(),
+        "used_at": None,
+        "provider_user_id": None,
+        "created_at": now.isoformat(),
     }
 
     try:
         sb.table("link_tokens").insert(insert_payload).execute()
     except Exception as e:
-        return _json_error("Failed to generate link code", 500, detail=repr(e))
+        return _json_error(
+            "Failed to generate link code",
+            500,
+            detail=repr(e),
+            account_id=account_id,
+            provider=provider,
+        )
 
     return jsonify(
         {
@@ -178,7 +234,9 @@ def consume_link_code():
         "code": "<8-char>",
         "provider": "wa" | "tg",
         "provider_user_id": "<chat id>",
-        "display_name": "<optional>"
+        "display_name": "<optional>",
+        "phone": "<optional>",
+        "phone_e164": "<optional>"
     }
     """
     body = request.get_json(silent=True) or {}
@@ -187,75 +245,134 @@ def consume_link_code():
     provider = _normalize_provider(body.get("provider") or "")
     provider_user_id = str(body.get("provider_user_id") or "").strip()
     display_name = (body.get("display_name") or "").strip() or None
+    phone = (body.get("phone") or "").strip() or None
+    phone_e164 = (body.get("phone_e164") or "").strip() or None
 
     if not code or provider not in {"wa", "tg"} or not provider_user_id:
         return _json_error("Invalid request", 400)
+
+    token: Optional[Dict[str, Any]] = None
 
     try:
         res = (
             sb.table("link_tokens")
             .select("*")
-            .eq("code", code)
             .eq("provider", provider)
-            .single()
+            .eq("code", code)
+            .limit(1)
             .execute()
         )
-        token = res.data
+        rows = res.data or []
+        token = rows[0] if rows else None
     except Exception:
         token = None
 
     if not token:
+        try:
+            code_hash = _sha256_hex(code)
+            res = (
+                sb.table("link_tokens")
+                .select("*")
+                .eq("provider", provider)
+                .eq("code_hash", code_hash)
+                .limit(1)
+                .execute()
+            )
+            rows = res.data or []
+            token = rows[0] if rows else None
+        except Exception:
+            token = None
+
+    if not token:
         return _json_error("Invalid code", 404)
 
-    if bool(token.get("used")):
+    if token.get("used_at"):
         return _json_error("Code already used", 400)
 
-    expires_at_raw = token.get("expires_at")
-    if not expires_at_raw:
+    expires_at = _safe_iso_to_dt(token.get("expires_at"))
+    if not expires_at:
         return _json_error("Code invalid", 400)
 
-    try:
-        expires_at = _iso_to_aware_utc(expires_at_raw)
-    except Exception:
-        return _json_error("Code invalid", 400)
-
-    if expires_at < _utcnow():
+    if expires_at <= _utcnow():
         return _json_error("Code expired", 400)
 
-    account_id = (token.get("account_id") or "").strip()
+    account_id = str(token.get("auth_user_id") or "").strip()
     if not account_id:
         return _json_error("Code invalid", 400)
 
-    upsert_payload = {
+    existing_same_account_provider = _find_account_row_for_provider(account_id, provider)
+    existing_same_provider_user = _find_account_row_by_provider_user(provider, provider_user_id)
+
+    now = _utcnow().isoformat()
+
+    row_payload: Dict[str, Any] = {
         "account_id": account_id,
+        "auth_user_id": account_id,
         "provider": provider,
         "provider_user_id": provider_user_id,
-        "updated_at": _utcnow().isoformat(),
+        "updated_at": now,
     }
 
     if display_name:
-        upsert_payload["display_name"] = display_name
+        row_payload["display_name"] = display_name
+    if phone:
+        row_payload["phone"] = phone
+    if phone_e164:
+        row_payload["phone_e164"] = phone_e164
 
     try:
-        sb.table("accounts").upsert(upsert_payload).execute()
+        if existing_same_account_provider and existing_same_account_provider.get("id"):
+            (
+                sb.table("accounts")
+                .update(row_payload)
+                .eq("id", existing_same_account_provider["id"])
+                .execute()
+            )
+        elif existing_same_provider_user and existing_same_provider_user.get("id"):
+            (
+                sb.table("accounts")
+                .update(row_payload)
+                .eq("id", existing_same_provider_user["id"])
+                .execute()
+            )
+        else:
+            insert_row = {
+                "id": str(uuid.uuid4()),
+                "created_at": now,
+                **row_payload,
+            }
+            sb.table("accounts").insert(insert_row).execute()
     except Exception as e:
-        return _json_error("Failed to link account", 500, detail=repr(e))
+        return _json_error(
+            "Failed to link account",
+            500,
+            detail=repr(e),
+            account_id=account_id,
+            provider=provider,
+            provider_user_id=provider_user_id,
+        )
 
     try:
         (
             sb.table("link_tokens")
             .update(
                 {
-                    "used": True,
-                    "used_at": _utcnow().isoformat(),
+                    "used_at": now,
                     "provider_user_id": provider_user_id,
                 }
             )
-            .eq("code", code)
+            .eq("id", token["id"])
             .execute()
         )
     except Exception as e:
-        return _json_error("Link created but token finalization failed", 500, detail=repr(e))
+        return _json_error(
+            "Link created but token finalization failed",
+            500,
+            detail=repr(e),
+            account_id=account_id,
+            provider=provider,
+            provider_user_id=provider_user_id,
+        )
 
     return jsonify(
         {
