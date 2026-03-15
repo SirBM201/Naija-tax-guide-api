@@ -19,6 +19,32 @@ def _normalize_api_prefix(v: str) -> str:
     return v.rstrip("/")
 
 
+def _normalize_joined_prefix(base: Optional[str], child: Optional[str]) -> Optional[str]:
+    base = (base or "").strip()
+    child = (child or "").strip()
+
+    if not base and not child:
+        return None
+
+    if base and not base.startswith("/"):
+        base = "/" + base
+    if child and not child.startswith("/"):
+        child = "/" + child
+
+    base = base.rstrip("/")
+    child = child.rstrip("/")
+
+    if not base:
+        return child or None
+    if not child:
+        return base or None
+
+    if child == "/":
+        return base
+
+    return f"{base}{child}"
+
+
 def _truthy(v: str | None) -> bool:
     return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
@@ -76,7 +102,9 @@ def create_app() -> Flask:
     api_prefix = _normalize_api_prefix(API_PREFIX)
 
     cookie_mode = _cookie_mode_enabled()
-    origins, supports_credentials, cors_err = _parse_origins(CORS_ORIGINS, cookie_mode=cookie_mode)
+    origins, supports_credentials, cors_err = _parse_origins(
+        CORS_ORIGINS, cookie_mode=cookie_mode
+    )
     if cors_err:
         raise RuntimeError(f"[CORS] {cors_err}")
 
@@ -124,7 +152,10 @@ def create_app() -> Flask:
     boot: Dict[str, Any] = {
         "api_prefix": api_prefix,
         "cookie_mode": cookie_mode,
-        "cors": {"origins": origins, "supports_credentials": supports_credentials},
+        "cors": {
+            "origins": origins,
+            "supports_credentials": supports_credentials,
+        },
         "strict": (os.getenv("STRICT_BLUEPRINTS", "1").strip() != "0"),
         "debug_routes_enabled": _safe_get_env_bool("ENABLE_DEBUG_ROUTES"),
         "registered": [],
@@ -145,7 +176,6 @@ def create_app() -> Flask:
             "module": dotted,
             "attr": attr,
             "alias_name": alias_name or dotted.split(".")[-1],
-            "url_prefix": url_prefix,
             "required": required,
         }
 
@@ -169,12 +199,17 @@ def create_app() -> Flask:
             return
         app._bp_names.add(bp_name)  # type: ignore[attr-defined]
 
-        if url_prefix is not None:
-            app.register_blueprint(obj, url_prefix=url_prefix)
+        bp_internal_prefix = getattr(obj, "url_prefix", None)
+        effective_prefix = _normalize_joined_prefix(url_prefix, bp_internal_prefix)
+
+        if effective_prefix is not None:
+            app.register_blueprint(obj, url_prefix=effective_prefix)
         else:
             app.register_blueprint(obj)
 
         entry["bp_name"] = bp_name
+        entry["bp_internal_prefix"] = bp_internal_prefix
+        entry["url_prefix"] = effective_prefix
         boot["registered"].append(entry)
 
     required_modules = [
@@ -206,7 +241,6 @@ def create_app() -> Flask:
     _register_bp("app.routes.history", "bp", alias_name="history", required=False, url_prefix=api_prefix)
     _register_bp("app.routes.dev_tools", "bp", alias_name="dev_tools", required=False, url_prefix=api_prefix)
 
-    # Reactivated messaging channels
     _register_bp("app.routes.telegram", "bp", alias_name="telegram", required=False, url_prefix=api_prefix)
     _register_bp("app.routes.whatsapp", "bp", alias_name="whatsapp", required=False, url_prefix=api_prefix)
 
@@ -234,29 +268,49 @@ def create_app() -> Flask:
 
         cron_registered = any((r.get("alias_name") == "cron") for r in boot.get("registered", []))
         if not cron_registered:
-            hints.append("Cron blueprint is NOT registered. Confirm app/routes/cron.py exists and exports bp = Blueprint(...).")
+            hints.append(
+                "Cron blueprint is NOT registered. Confirm app/routes/cron.py exists and exports bp = Blueprint(...)."
+            )
 
         referrals_registered = any((r.get("alias_name") == "referrals") for r in boot.get("registered", []))
         if not referrals_registered:
-            hints.append("Referrals blueprint is NOT registered. Confirm app/routes/referrals.py exists and exports bp = Blueprint(...).")
+            hints.append(
+                "Referrals blueprint is NOT registered. Confirm app/routes/referrals.py exists and exports bp = Blueprint(...)."
+            )
 
         paystack_webhook_registered = any((r.get("alias_name") == "paystack_webhook") for r in boot.get("registered", []))
         if not paystack_webhook_registered:
-            hints.append("Paystack webhook blueprint is NOT registered. Confirm app/routes/paystack_webhook.py exists and exports bp = Blueprint(...).")
+            hints.append(
+                "Paystack webhook blueprint is NOT registered. Confirm app/routes/paystack_webhook.py exists and exports bp = Blueprint(...)."
+            )
 
         telegram_registered = any((r.get("alias_name") == "telegram") for r in boot.get("registered", []))
         if not telegram_registered:
-            hints.append("Telegram blueprint is NOT registered. Confirm app/routes/telegram.py exists and exports bp = Blueprint(...).")
+            hints.append(
+                "Telegram blueprint is NOT registered. Confirm app/routes/telegram.py exists and exports bp = Blueprint(...)."
+            )
 
         whatsapp_registered = any((r.get("alias_name") == "whatsapp") for r in boot.get("registered", []))
         if not whatsapp_registered:
-            hints.append("WhatsApp blueprint is NOT registered. Confirm app/routes/whatsapp.py exists and exports bp = Blueprint(...).")
+            hints.append(
+                "WhatsApp blueprint is NOT registered. Confirm app/routes/whatsapp.py exists and exports bp = Blueprint(...)."
+            )
+
+        link_tokens_registered = any((r.get("alias_name") == "link_tokens") for r in boot.get("registered", []))
+        if not link_tokens_registered:
+            hints.append(
+                "Link tokens blueprint is NOT registered. Confirm app/routes/link_tokens.py exists and exports bp = Blueprint(...)."
+            )
 
         if cookie_mode and origins == "*":
-            hints.append("COOKIE_MODE is enabled but CORS origins are '*'. Use explicit origins when cookies are used.")
+            hints.append(
+                "COOKIE_MODE is enabled but CORS origins are '*'. Use explicit origins when cookies are used."
+            )
 
         if cookie_mode and (isinstance(origins, list) and not origins):
-            hints.append("COOKIE_MODE is enabled but parsed origins list is empty. Set CORS_ORIGINS to your frontend URL(s).")
+            hints.append(
+                "COOKIE_MODE is enabled but parsed origins list is empty. Set CORS_ORIGINS to your frontend URL(s)."
+            )
 
         return jsonify(
             {
