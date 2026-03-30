@@ -714,7 +714,7 @@ def qualify_referral_after_successful_payment(
             "referral_id": direct_referral_id,
         }
 
-    beneficiaries = _find_level_chain_for_paid_user(paid_account_id)
+    beneficiaries = _find_level_chain_for_paid_user(paying_account_id)
     if not beneficiaries:
         return {
             "ok": True,
