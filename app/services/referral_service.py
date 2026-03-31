@@ -799,9 +799,11 @@ def is_reward_ready_to_mature(reward_row: Dict[str, Any], now_dt: Optional[datet
 def mature_pending_rewards(
     *,
     account_id: str | None = None,
+    reward_ids: List[str] | None = None,
     limit: int = 500,
+    force: bool = False,
 ) -> Dict[str, Any]:
-    limit = max(1, min(_safe_int(limit, 500), 2000))
+    limit = max(1, min(_safe_int(limit, 500), 5000))
     q = (
         _sb()
         .table("referral_rewards")
@@ -814,20 +816,27 @@ def mature_pending_rewards(
     if account_id:
         q = q.eq("account_id", str(account_id).strip())
 
+    if reward_ids:
+        clean_ids = [str(r or "").strip() for r in reward_ids if str(r or "").strip()]
+        if clean_ids:
+            q = q.in_("id", clean_ids)
+
     resp = q.execute()
     rows = _response_data(resp)
 
     now_dt = _now()
+    now_iso = _now_iso()
     matured: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
 
     for row in rows:
-        if not is_reward_ready_to_mature(row, now_dt=now_dt):
-            skipped.append({"reward_id": row.get("id"), "reason": "hold_not_finished"})
-            continue
-
         reward_id = str(row.get("id") or "").strip()
         if not reward_id:
+            skipped.append({"reward_id": None, "reason": "missing_reward_id"})
+            continue
+
+        if not force and not is_reward_ready_to_mature(row, now_dt=now_dt):
+            skipped.append({"reward_id": reward_id, "reason": "hold_not_finished"})
             continue
 
         update_resp = (
@@ -836,8 +845,8 @@ def mature_pending_rewards(
             .update(
                 {
                     "status": _mature_reward_status(),
-                    "approved_at": _now_iso(),
-                    "updated_at": _now_iso(),
+                    "approved_at": row.get("approved_at") or now_iso,
+                    "updated_at": now_iso,
                 }
             )
             .eq("id", reward_id)
@@ -851,6 +860,7 @@ def mature_pending_rewards(
         "checked": len(rows),
         "matured_count": len(matured),
         "skipped_count": len(skipped),
+        "forced": bool(force),
         "matured": matured,
         "skipped": skipped,
     }
