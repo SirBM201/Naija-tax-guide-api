@@ -80,19 +80,6 @@ def payout_auto_release() -> bool:
     return _truthy(os.getenv("REFERRAL_PAYOUT_AUTO_RELEASE") or "0")
 
 
-def payout_days() -> List[int]:
-    raw = (os.getenv("REFERRAL_PAYOUT_DAYS") or "15,30").strip()
-    out: List[int] = []
-    for part in raw.split(","):
-        try:
-            day = int(part.strip())
-            if 1 <= day <= 31 and day not in out:
-                out.append(day)
-        except Exception:
-            continue
-    return out or [15, 30]
-
-
 # =========================================================
 # PAYOUT ACCOUNT HELPERS
 # =========================================================
@@ -194,19 +181,23 @@ def list_payout_rows_for_account(account_id: str, limit: int = 100) -> List[Dict
     return _rows(resp)
 
 
+def list_payout_queue(statuses: Optional[List[str]] = None, limit: int = 200) -> List[Dict[str, Any]]:
+    limit = max(1, min(_safe_int(limit, 200), 1000))
+    query = _sb().table("referral_payouts").select("*").order("created_at", desc=False).limit(limit)
+    statuses = [str(s or "").strip().lower() for s in (statuses or []) if str(s or "").strip()]
+    if len(statuses) == 1:
+        query = query.eq("status", statuses[0])
+    elif len(statuses) > 1:
+        query = query.in_("status", statuses)
+    resp = query.execute()
+    return _rows(resp)
+
+
 def get_payout_row(payout_id: str) -> Optional[Dict[str, Any]]:
     payout_id = str(payout_id or "").strip()
     if not payout_id:
         return None
-
-    resp = (
-        _sb()
-        .table("referral_payouts")
-        .select("*")
-        .eq("id", payout_id)
-        .limit(1)
-        .execute()
-    )
+    resp = _sb().table("referral_payouts").select("*").eq("id", payout_id).limit(1).execute()
     return _first(resp)
 
 
@@ -222,7 +213,6 @@ def get_pending_or_processing_payout(account_id: str) -> Optional[Dict[str, Any]
             .select("*")
             .eq("account_id", account_id)
             .eq("status", status)
-            .order("created_at", desc=True)
             .limit(1)
             .execute()
         )
@@ -298,6 +288,7 @@ def update_payout_status(
         patch["processed_at"] = now_iso
     elif status == "paid":
         patch["paid_at"] = now_iso
+        patch["processed_at"] = patch.get("processed_at") or now_iso
     elif status == "failed":
         patch["failed_at"] = now_iso
 
@@ -381,7 +372,6 @@ def payout_eligibility(account_id: str) -> Dict[str, Any]:
             "reason": "below_minimum_payout_amount",
             "approved_balance": str(balance),
             "minimum_required": str(minimum),
-            "currency": payout_currency(),
         }
 
     return {
@@ -429,79 +419,120 @@ def request_payout(account_id: str) -> Dict[str, Any]:
 
 
 # =========================================================
-# BATCH PREPARATION FOR 15TH / 30TH PAYOUT WINDOW
+# ADMIN PAYOUT PROCESSING
 # =========================================================
 
-def accounts_with_approved_rewards() -> List[str]:
-    resp = (
-        _sb()
-        .table("referral_rewards")
-        .select("account_id")
-        .eq("status", "approved")
-        .execute()
-    )
-    rows = _rows(resp)
-    seen: set[str] = set()
-    out: List[str] = []
+def _select_rewards_for_settlement(account_id: str, target_amount: Decimal) -> List[Dict[str, Any]]:
+    rows = list_approved_rewards_for_account(account_id)
+    selected: List[Dict[str, Any]] = []
+    running = Decimal("0")
     for row in rows:
-        account_id = str(row.get("account_id") or "").strip()
-        if account_id and account_id not in seen:
-            seen.add(account_id)
-            out.append(account_id)
-    return out
+        selected.append(row)
+        running += _to_decimal(row.get("reward_amount"))
+        if running >= target_amount:
+            break
+    return selected
 
 
-def prepare_scheduled_payouts() -> Dict[str, Any]:
-    if not payout_enabled():
-        return {"ok": True, "skipped": True, "reason": "payout_disabled"}
-
-    minimum = min_payout_amount()
-    prepared: List[Dict[str, Any]] = []
-    skipped: List[Dict[str, Any]] = []
-
-    for account_id in accounts_with_approved_rewards():
-        eligibility = payout_eligibility(account_id)
-        if not eligibility.get("eligible"):
-            skipped.append({
-                "account_id": account_id,
-                "reason": eligibility.get("reason") or "not_eligible",
-                "approved_balance": eligibility.get("approved_balance"),
-                "minimum_required": eligibility.get("minimum_required"),
-            })
+def _mark_reward_rows_paid(reward_rows: List[Dict[str, Any]]) -> int:
+    count = 0
+    now_iso = _now_iso()
+    for row in reward_rows:
+        reward_id = str(row.get("id") or "").strip()
+        if not reward_id:
             continue
+        _sb().table("referral_rewards").update(
+            {
+                "status": "paid",
+                "paid_at": now_iso,
+                "updated_at": now_iso,
+            }
+        ).eq("id", reward_id).eq("status", "approved").execute()
+        count += 1
+    return count
 
-        amount = _to_decimal(eligibility.get("approved_balance"), Decimal("0"))
-        if amount < minimum:
-            skipped.append({
-                "account_id": account_id,
-                "reason": "below_minimum_payout_amount",
-                "approved_balance": str(amount),
-                "minimum_required": str(minimum),
-            })
-            continue
 
-        payout = create_payout_row(
-            account_id=account_id,
-            amount=amount,
-            currency=payout_currency(),
-            provider=payout_provider(),
-            status="pending",
-        )
-        prepared.append({
-            "account_id": account_id,
-            "amount": str(amount),
-            "currency": payout_currency(),
-            "payout": payout,
-        })
+def admin_mark_payout_processing(
+    payout_id: str,
+    *,
+    provider_reference: str | None = None,
+    provider_transfer_code: str | None = None,
+) -> Dict[str, Any]:
+    payout = get_payout_row(payout_id)
+    if not payout:
+        raise ValueError("payout not found")
+
+    status = str(payout.get("status") or "").strip().lower()
+    if status not in {"pending", "failed", "processing"}:
+        raise ValueError("payout is not processable")
+
+    updated = update_payout_status(
+        payout_id=payout_id,
+        status="processing",
+        provider_reference=provider_reference,
+        provider_transfer_code=provider_transfer_code,
+        failure_reason=None,
+    )
+    return {"ok": True, "payout": updated or get_payout_row(payout_id)}
+
+
+def admin_mark_payout_paid(
+    payout_id: str,
+    *,
+    provider_reference: str | None = None,
+    provider_transfer_code: str | None = None,
+) -> Dict[str, Any]:
+    payout = get_payout_row(payout_id)
+    if not payout:
+        raise ValueError("payout not found")
+
+    status = str(payout.get("status") or "").strip().lower()
+    if status not in {"pending", "processing"}:
+        raise ValueError("only pending or processing payouts can be marked paid")
+
+    account_id = str(payout.get("account_id") or "").strip()
+    amount = _to_decimal(payout.get("amount"))
+    if not account_id or amount <= 0:
+        raise ValueError("invalid payout row")
+
+    selected_rewards = _select_rewards_for_settlement(account_id, amount)
+    selected_total = sum((_to_decimal(r.get("reward_amount")) for r in selected_rewards), Decimal("0"))
+    if selected_total < amount:
+        raise ValueError("approved rewards are below payout amount")
+
+    paid_count = _mark_reward_rows_paid(selected_rewards)
+    updated = update_payout_status(
+        payout_id=payout_id,
+        status="paid",
+        provider_reference=provider_reference,
+        provider_transfer_code=provider_transfer_code,
+        failure_reason=None,
+    )
 
     return {
         "ok": True,
-        "prepared_count": len(prepared),
-        "skipped_count": len(skipped),
-        "prepared": prepared,
-        "skipped": skipped,
-        "minimum_payout_amount": str(minimum),
-        "payout_days": payout_days(),
-        "provider": payout_provider(),
-        "currency": payout_currency(),
+        "payout": updated or get_payout_row(payout_id),
+        "reward_rows_marked_paid": paid_count,
+        "reward_amount_total": str(selected_total),
     }
+
+
+def admin_mark_payout_failed(
+    payout_id: str,
+    *,
+    failure_reason: str | None = None,
+    provider_reference: str | None = None,
+    provider_transfer_code: str | None = None,
+) -> Dict[str, Any]:
+    payout = get_payout_row(payout_id)
+    if not payout:
+        raise ValueError("payout not found")
+
+    updated = update_payout_status(
+        payout_id=payout_id,
+        status="failed",
+        provider_reference=provider_reference,
+        provider_transfer_code=provider_transfer_code,
+        failure_reason=(failure_reason or "admin_marked_failed").strip(),
+    )
+    return {"ok": True, "payout": updated or get_payout_row(payout_id)}
