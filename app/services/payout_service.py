@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
@@ -47,6 +48,14 @@ def _first(resp: Any) -> Optional[Dict[str, Any]]:
     return rows[0] if rows else None
 
 
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _now_iso() -> str:
+    return _now().isoformat()
+
+
 # =========================================================
 # ENV CONFIG
 # =========================================================
@@ -69,6 +78,19 @@ def min_payout_amount() -> Decimal:
 
 def payout_auto_release() -> bool:
     return _truthy(os.getenv("REFERRAL_PAYOUT_AUTO_RELEASE") or "0")
+
+
+def payout_days() -> List[int]:
+    raw = (os.getenv("REFERRAL_PAYOUT_DAYS") or "15,30").strip()
+    out: List[int] = []
+    for part in raw.split(","):
+        try:
+            day = int(part.strip())
+            if 1 <= day <= 31 and day not in out:
+                out.append(day)
+        except Exception:
+            continue
+    return out or [15, 30]
 
 
 # =========================================================
@@ -117,6 +139,7 @@ def upsert_payout_account(
         "recipient_code": recipient_code,
         "currency": (currency or payout_currency()).strip().upper(),
         "is_verified": bool(is_verified),
+        "updated_at": _now_iso(),
     }
 
     existing = get_payout_account(account_id)
@@ -136,6 +159,7 @@ def upsert_payout_account(
             return again
         raise RuntimeError("Failed to update payout account")
 
+    payload["created_at"] = _now_iso()
     resp = _sb().table("referral_payout_accounts").insert(payload).execute()
     row = _first(resp)
     if row:
@@ -170,6 +194,22 @@ def list_payout_rows_for_account(account_id: str, limit: int = 100) -> List[Dict
     return _rows(resp)
 
 
+def get_payout_row(payout_id: str) -> Optional[Dict[str, Any]]:
+    payout_id = str(payout_id or "").strip()
+    if not payout_id:
+        return None
+
+    resp = (
+        _sb()
+        .table("referral_payouts")
+        .select("*")
+        .eq("id", payout_id)
+        .limit(1)
+        .execute()
+    )
+    return _first(resp)
+
+
 def get_pending_or_processing_payout(account_id: str) -> Optional[Dict[str, Any]]:
     account_id = str(account_id or "").strip()
     if not account_id:
@@ -182,6 +222,7 @@ def get_pending_or_processing_payout(account_id: str) -> Optional[Dict[str, Any]
             .select("*")
             .eq("account_id", account_id)
             .eq("status", status)
+            .order("created_at", desc=True)
             .limit(1)
             .execute()
         )
@@ -207,6 +248,7 @@ def create_payout_row(
     if amount <= 0:
         raise ValueError("amount must be greater than zero")
 
+    now_iso = _now_iso()
     payload = {
         "account_id": account_id,
         "amount": str(amount),
@@ -215,11 +257,13 @@ def create_payout_row(
         "provider_reference": provider_reference,
         "provider_transfer_code": provider_transfer_code,
         "status": status,
-        "requested_at": None,
+        "requested_at": now_iso,
         "processed_at": None,
         "paid_at": None,
         "failed_at": None,
         "failure_reason": None,
+        "created_at": now_iso,
+        "updated_at": now_iso,
     }
 
     resp = _sb().table("referral_payouts").insert(payload).execute()
@@ -241,19 +285,21 @@ def update_payout_status(
     if not payout_id:
         raise ValueError("payout_id is required")
 
+    now_iso = _now_iso()
     patch: Dict[str, Any] = {
         "status": status,
         "provider_reference": provider_reference,
         "provider_transfer_code": provider_transfer_code,
         "failure_reason": failure_reason,
+        "updated_at": now_iso,
     }
 
     if status == "processing":
-        patch["processed_at"] = "now()"
+        patch["processed_at"] = now_iso
     elif status == "paid":
-        patch["paid_at"] = "now()"
+        patch["paid_at"] = now_iso
     elif status == "failed":
-        patch["failed_at"] = "now()"
+        patch["failed_at"] = now_iso
 
     resp = _sb().table("referral_payouts").update(patch).eq("id", payout_id).execute()
     return _first(resp)
@@ -335,6 +381,7 @@ def payout_eligibility(account_id: str) -> Dict[str, Any]:
             "reason": "below_minimum_payout_amount",
             "approved_balance": str(balance),
             "minimum_required": str(minimum),
+            "currency": payout_currency(),
         }
 
     return {
@@ -378,4 +425,83 @@ def request_payout(account_id: str) -> Dict[str, Any]:
         "requested": True,
         "eligibility": eligibility,
         "payout": payout_row,
+    }
+
+
+# =========================================================
+# BATCH PREPARATION FOR 15TH / 30TH PAYOUT WINDOW
+# =========================================================
+
+def accounts_with_approved_rewards() -> List[str]:
+    resp = (
+        _sb()
+        .table("referral_rewards")
+        .select("account_id")
+        .eq("status", "approved")
+        .execute()
+    )
+    rows = _rows(resp)
+    seen: set[str] = set()
+    out: List[str] = []
+    for row in rows:
+        account_id = str(row.get("account_id") or "").strip()
+        if account_id and account_id not in seen:
+            seen.add(account_id)
+            out.append(account_id)
+    return out
+
+
+def prepare_scheduled_payouts() -> Dict[str, Any]:
+    if not payout_enabled():
+        return {"ok": True, "skipped": True, "reason": "payout_disabled"}
+
+    minimum = min_payout_amount()
+    prepared: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
+
+    for account_id in accounts_with_approved_rewards():
+        eligibility = payout_eligibility(account_id)
+        if not eligibility.get("eligible"):
+            skipped.append({
+                "account_id": account_id,
+                "reason": eligibility.get("reason") or "not_eligible",
+                "approved_balance": eligibility.get("approved_balance"),
+                "minimum_required": eligibility.get("minimum_required"),
+            })
+            continue
+
+        amount = _to_decimal(eligibility.get("approved_balance"), Decimal("0"))
+        if amount < minimum:
+            skipped.append({
+                "account_id": account_id,
+                "reason": "below_minimum_payout_amount",
+                "approved_balance": str(amount),
+                "minimum_required": str(minimum),
+            })
+            continue
+
+        payout = create_payout_row(
+            account_id=account_id,
+            amount=amount,
+            currency=payout_currency(),
+            provider=payout_provider(),
+            status="pending",
+        )
+        prepared.append({
+            "account_id": account_id,
+            "amount": str(amount),
+            "currency": payout_currency(),
+            "payout": payout,
+        })
+
+    return {
+        "ok": True,
+        "prepared_count": len(prepared),
+        "skipped_count": len(skipped),
+        "prepared": prepared,
+        "skipped": skipped,
+        "minimum_payout_amount": str(minimum),
+        "payout_days": payout_days(),
+        "provider": payout_provider(),
+        "currency": payout_currency(),
     }
