@@ -192,6 +192,57 @@ def get_payout_row(payout_id: str) -> Optional[Dict[str, Any]]:
     return _first(resp)
 
 
+def list_payout_audit_logs(payout_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+    payout_id = str(payout_id or "").strip()
+    if not payout_id:
+        return []
+
+    limit = max(1, min(_safe_int(limit, 50), 200))
+    resp = (
+        _sb()
+        .table("referral_payout_audit_logs")
+        .select("*")
+        .eq("payout_id", payout_id)
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return _rows(resp)
+
+
+def create_payout_audit_log(
+    *,
+    payout_id: str,
+    account_id: str,
+    action: str,
+    old_status: str | None,
+    new_status: str,
+    provider_reference: str | None = None,
+    provider_transfer_code: str | None = None,
+    failure_reason: str | None = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    payout_id = str(payout_id or "").strip()
+    account_id = str(account_id or "").strip()
+    if not payout_id or not account_id:
+        return None
+
+    payload = {
+        "payout_id": payout_id,
+        "account_id": account_id,
+        "action": str(action or "").strip(),
+        "old_status": old_status,
+        "new_status": new_status,
+        "provider_reference": provider_reference,
+        "provider_transfer_code": provider_transfer_code,
+        "failure_reason": failure_reason,
+        "metadata": metadata or {},
+        "created_at": _now_iso(),
+    }
+    resp = _sb().table("referral_payout_audit_logs").insert(payload).execute()
+    return _first(resp)
+
+
 def get_pending_or_processing_payout(account_id: str) -> Optional[Dict[str, Any]]:
     account_id = str(account_id or "").strip()
     if not account_id:
@@ -250,6 +301,17 @@ def create_payout_row(
     resp = _sb().table("referral_payouts").insert(payload).execute()
     row = _first(resp)
     if row:
+        create_payout_audit_log(
+            payout_id=str(row.get("id") or ""),
+            account_id=account_id,
+            action="create_payout",
+            old_status=None,
+            new_status=status,
+            provider_reference=provider_reference,
+            provider_transfer_code=provider_transfer_code,
+            failure_reason=None,
+            metadata={"amount": str(amount), "currency": (currency or payout_currency()).strip().upper()},
+        )
         return row
     raise RuntimeError("Failed to create payout row")
 
@@ -463,7 +525,20 @@ def admin_mark_payout_processing(
         provider_transfer_code=provider_transfer_code,
         failure_reason=None,
     )
-    return {"ok": True, "payout": updated or get_payout_row(payout_id)}
+    updated = updated or get_payout_row(payout_id)
+
+    create_payout_audit_log(
+        payout_id=payout_id,
+        account_id=str((updated or payout).get("account_id") or ""),
+        action="mark_processing",
+        old_status=status,
+        new_status="processing",
+        provider_reference=provider_reference if provider_reference is not None else payout.get("provider_reference"),
+        provider_transfer_code=provider_transfer_code if provider_transfer_code is not None else payout.get("provider_transfer_code"),
+        failure_reason=None,
+        metadata={},
+    )
+    return {"ok": True, "payout": updated}
 
 
 def admin_mark_payout_paid(
@@ -505,10 +580,26 @@ def admin_mark_payout_paid(
         provider_transfer_code=provider_transfer_code,
         failure_reason=None,
     )
+    updated = updated or get_payout_row(payout_id)
+
+    create_payout_audit_log(
+        payout_id=payout_id,
+        account_id=account_id,
+        action="mark_paid",
+        old_status=status,
+        new_status="paid",
+        provider_reference=provider_reference if provider_reference is not None else payout.get("provider_reference"),
+        provider_transfer_code=provider_transfer_code if provider_transfer_code is not None else payout.get("provider_transfer_code"),
+        failure_reason=None,
+        metadata={
+            "reward_rows_marked_paid": paid_count,
+            "reward_amount_total": str(selected_total),
+        },
+    )
 
     return {
         "ok": True,
-        "payout": updated or get_payout_row(payout_id),
+        "payout": updated,
         "reward_rows_marked_paid": paid_count,
         "reward_amount_total": str(selected_total),
     }
@@ -529,13 +620,25 @@ def admin_mark_payout_failed(
     if status == "paid" or payout.get("paid_at"):
         raise ValueError("paid payouts cannot be marked failed")
 
+    reason = (failure_reason or "admin_marked_failed").strip()
     updated = update_payout_status(
         payout_id=payout_id,
         status="failed",
         provider_reference=provider_reference,
         provider_transfer_code=provider_transfer_code,
-        failure_reason=(failure_reason or "admin_marked_failed").strip(),
+        failure_reason=reason,
     )
-    return {"ok": True, "payout": updated or get_payout_row(payout_id)}
+    updated = updated or get_payout_row(payout_id)
 
-
+    create_payout_audit_log(
+        payout_id=payout_id,
+        account_id=str((updated or payout).get("account_id") or ""),
+        action="mark_failed",
+        old_status=status,
+        new_status="failed",
+        provider_reference=provider_reference if provider_reference is not None else payout.get("provider_reference"),
+        provider_transfer_code=provider_transfer_code if provider_transfer_code is not None else payout.get("provider_transfer_code"),
+        failure_reason=reason,
+        metadata={},
+    )
+    return {"ok": True, "payout": updated}
