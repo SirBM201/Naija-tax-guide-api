@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 from supabase import Client
 
@@ -408,3 +408,145 @@ class PayoutService:
             return float(value or 0)
         except (TypeError, ValueError):
             return 0.0
+
+
+# -------------------------------------------------------------------
+# legacy compatibility helpers for older route imports
+# -------------------------------------------------------------------
+
+def _svc() -> PayoutService:
+    from app.supabase_client import get_supabase_client
+    return PayoutService(get_supabase_client())
+
+
+def list_payout_queue(statuses: Sequence[str], limit: int = 200) -> List[Dict[str, Any]]:
+    return _svc().get_queue(statuses=statuses, limit=limit)
+
+
+def get_payout_row(payout_id: str) -> Dict[str, Any]:
+    return _svc().get_payout(payout_id)
+
+
+def list_payout_audit_logs(payout_id: str, limit: int = 100) -> List[Dict[str, Any]]:
+    return _svc().get_audit_history(payout_id=payout_id, limit=limit)
+
+
+def admin_mark_payout_processing(
+    payout_id: str,
+    provider_reference: Optional[str] = None,
+    provider_transfer_code: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    result = _svc().mark_processing(
+        payout_id=payout_id,
+        provider_reference=provider_reference,
+        provider_transfer_code=provider_transfer_code,
+        metadata=metadata,
+    )
+    return {
+        "ok": True,
+        "payout": result.payout,
+        "updated_reward_ids": result.updated_reward_ids,
+        "audit_logged": result.audit_logged,
+    }
+
+
+def admin_mark_payout_paid(
+    payout_id: str,
+    provider_reference: Optional[str] = None,
+    provider_transfer_code: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    result = _svc().mark_paid(
+        payout_id=payout_id,
+        provider_reference=provider_reference,
+        provider_transfer_code=provider_transfer_code,
+        metadata=metadata,
+    )
+    return {
+        "ok": True,
+        "payout": result.payout,
+        "updated_reward_ids": result.updated_reward_ids,
+        "audit_logged": result.audit_logged,
+    }
+
+
+def admin_mark_payout_failed(
+    payout_id: str,
+    failure_reason: str,
+    provider_reference: Optional[str] = None,
+    provider_transfer_code: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    result = _svc().mark_failed(
+        payout_id=payout_id,
+        failure_reason=failure_reason,
+        provider_reference=provider_reference,
+        provider_transfer_code=provider_transfer_code,
+        metadata=metadata,
+    )
+    return {
+        "ok": True,
+        "payout": result.payout,
+        "updated_reward_ids": result.updated_reward_ids,
+        "audit_logged": result.audit_logged,
+    }
+
+
+def admin_bulk_update_payouts(
+    action: str,
+    payout_ids: Sequence[str],
+    provider_reference: Optional[str] = None,
+    provider_transfer_code: Optional[str] = None,
+    failure_reason: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    result = _svc().bulk_update(
+        action=action,
+        payout_ids=payout_ids,
+        provider_reference=provider_reference,
+        provider_transfer_code=provider_transfer_code,
+        failure_reason=failure_reason,
+        metadata=metadata,
+    )
+    return {"ok": True, **result}
+
+
+def get_payout_account(account_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Legacy helper expected by app.routes.referrals.
+    Tries referral_payout_accounts first, then falls back to accounts.
+    """
+    from app.supabase_client import get_supabase_client
+
+    supabase = get_supabase_client()
+
+    try:
+        response = (
+            supabase.table("referral_payout_accounts")
+            .select("*")
+            .eq("account_id", account_id)
+            .limit(1)
+            .execute()
+        )
+        rows = response.data or []
+        if rows:
+            return rows[0]
+    except Exception:
+        pass
+
+    try:
+        response = (
+            supabase.table("accounts")
+            .select("*")
+            .eq("id", account_id)
+            .limit(1)
+            .execute()
+        )
+        rows = response.data or []
+        if rows:
+            return rows[0]
+    except Exception:
+        pass
+
+    return None
