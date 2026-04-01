@@ -7,6 +7,7 @@ from app.services.payout_service import (
     admin_mark_payout_paid,
     admin_mark_payout_processing,
     get_payout_row,
+    list_payout_audit_logs,
     list_payout_queue,
 )
 
@@ -80,6 +81,33 @@ def admin_get_referral_payout(payout_id: str):
     if not payout:
         return _bad("payout not found", 404)
     return jsonify({"ok": True, "payout": payout})
+
+
+@bp.get("/admin/referral-payouts/<payout_id>/audit")
+def admin_get_referral_payout_audit(payout_id: str):
+    if not _authorized():
+        return _bad("Unauthorized", 401)
+
+    payout = get_payout_row(payout_id)
+    if not payout:
+        return _bad("payout not found", 404)
+
+    try:
+        raw_limit = (request.args.get("limit") or "50").strip()
+        limit = int(raw_limit)
+    except Exception:
+        limit = 50
+
+    if limit < 1:
+        limit = 1
+    if limit > 200:
+        limit = 200
+
+    try:
+        rows = list_payout_audit_logs(payout_id=payout_id, limit=limit)
+        return jsonify({"ok": True, "count": len(rows), "rows": rows})
+    except Exception as e:
+        return _bad(str(e), 400)
 
 
 @bp.post("/admin/referral-payouts/<payout_id>/mark-processing")
