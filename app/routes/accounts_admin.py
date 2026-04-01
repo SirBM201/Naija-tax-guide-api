@@ -8,11 +8,10 @@ from app.services.payout_service import (
     PayoutValidationError,
 )
 
-
 admin_referral_payouts_bp = Blueprint(
     "admin_referral_payouts",
     __name__,
-    url_prefix="/api/admin/referral-payouts",
+    url_prefix="/admin/referral-payouts",
 )
 
 
@@ -21,7 +20,7 @@ def _get_admin_key() -> str:
 
 
 def _require_admin() -> None:
-    from app.config import settings  # adjust to your project config
+    from app.config import settings
     supplied = _get_admin_key()
     expected = (getattr(settings, "ADMIN_API_KEY", "") or "").strip()
     if not supplied or supplied != expected:
@@ -29,7 +28,7 @@ def _require_admin() -> None:
 
 
 def _get_service() -> PayoutService:
-    from app.supabase_client import get_supabase_client  # adjust import to your app
+    from app.supabase_client import get_supabase_client
     return PayoutService(get_supabase_client())
 
 
@@ -83,7 +82,9 @@ def mark_referral_payout_processing(payout_id: str):
         provider_transfer_code=body.get("provider_transfer_code"),
         metadata={"source": "admin_single", "request_body": body},
     )
-    return jsonify({"ok": True, "payout": result.payout, "updated_reward_ids": result.updated_reward_ids})
+    return jsonify(
+        {"ok": True, "payout": result.payout, "updated_reward_ids": result.updated_reward_ids}
+    )
 
 
 @admin_referral_payouts_bp.route("/<payout_id>/mark-paid", methods=["POST"])
@@ -96,7 +97,9 @@ def mark_referral_payout_paid(payout_id: str):
         provider_transfer_code=body.get("provider_transfer_code"),
         metadata={"source": "admin_single", "request_body": body},
     )
-    return jsonify({"ok": True, "payout": result.payout, "updated_reward_ids": result.updated_reward_ids})
+    return jsonify(
+        {"ok": True, "payout": result.payout, "updated_reward_ids": result.updated_reward_ids}
+    )
 
 
 @admin_referral_payouts_bp.route("/<payout_id>/mark-failed", methods=["POST"])
@@ -110,7 +113,9 @@ def mark_referral_payout_failed(payout_id: str):
         provider_transfer_code=body.get("provider_transfer_code"),
         metadata={"source": "admin_single", "request_body": body},
     )
-    return jsonify({"ok": True, "payout": result.payout, "updated_reward_ids": result.updated_reward_ids})
+    return jsonify(
+        {"ok": True, "payout": result.payout, "updated_reward_ids": result.updated_reward_ids}
+    )
 
 
 @admin_referral_payouts_bp.route("/bulk", methods=["POST"])
@@ -133,3 +138,6 @@ def bulk_update_referral_payouts():
         metadata={"source": "admin_bulk", "request_body": body},
     )
     return jsonify({"ok": True, **result})
+
+
+bp = admin_referral_payouts_bp
