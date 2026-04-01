@@ -1,162 +1,135 @@
-from flask import Blueprint, jsonify, request
-import os
+from __future__ import annotations
 
-from app.core.supabase_client import supabase
+from flask import Blueprint, jsonify, request
+
 from app.services.payout_service import (
-    admin_mark_payout_failed,
-    admin_mark_payout_paid,
-    admin_mark_payout_processing,
-    get_payout_row,
-    list_payout_audit_logs,
-    list_payout_queue,
+    PayoutNotFoundError,
+    PayoutService,
+    PayoutValidationError,
 )
 
-bp = Blueprint("accounts_admin", __name__)
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
+
+admin_referral_payouts_bp = Blueprint(
+    "admin_referral_payouts",
+    __name__,
+    url_prefix="/api/admin/referral-payouts",
+)
 
 
-def _bad(msg: str, status: int = 400, **extra):
-    payload = {"ok": False, "error": msg}
-    if extra:
-        payload.update(extra)
-    return jsonify(payload), status
+def _get_admin_key() -> str:
+    return (request.headers.get("X-Admin-Key") or "").strip()
 
 
-def _authorized() -> bool:
-    admin_key = (request.headers.get("X-Admin-Key") or "").strip()
-    return bool(ADMIN_API_KEY) and admin_key == ADMIN_API_KEY
+def _require_admin() -> None:
+    from app.config import settings  # adjust to your project config
+    supplied = _get_admin_key()
+    expected = (getattr(settings, "ADMIN_API_KEY", "") or "").strip()
+    if not supplied or supplied != expected:
+        raise PermissionError("Invalid or missing admin API key.")
 
 
-@bp.post("/admin/accounts/unlink")
-def admin_unlink_account():
-    if not _authorized():
-        return _bad("Unauthorized", 401)
-
-    body = request.get_json(silent=True) or {}
-    provider = (body.get("provider") or "").strip().lower()
-    provider_user_id = (body.get("provider_user_id") or "").strip()
-
-    if provider not in ("wa", "tg"):
-        return _bad("provider must be wa or tg")
-    if not provider_user_id:
-        return _bad("provider_user_id required")
-
-    try:
-        res = (
-            supabase()
-            .table("accounts")
-            .update({"auth_user_id": None})
-            .eq("provider", provider)
-            .eq("provider_user_id", provider_user_id)
-            .execute()
-        )
-    except Exception as e:
-        return _bad(f"DB error: {str(e)}", 500)
-
-    return jsonify({"ok": True, "unlinked": True, "rows": len(res.data or [])})
+def _get_service() -> PayoutService:
+    from app.supabase_client import get_supabase_client  # adjust import to your app
+    return PayoutService(get_supabase_client())
 
 
-@bp.get("/admin/referral-payouts")
-def admin_list_referral_payouts():
-    if not _authorized():
-        return _bad("Unauthorized", 401)
+@admin_referral_payouts_bp.errorhandler(PermissionError)
+def _handle_permission_error(exc: PermissionError):
+    return jsonify({"ok": False, "error": str(exc)}), 403
 
-    raw_status = (request.args.get("status") or "pending,processing,failed").strip()
-    statuses = [s.strip().lower() for s in raw_status.split(",") if s.strip()]
-    try:
-        limit = int((request.args.get("limit") or "200").strip())
-    except Exception:
-        limit = 200
 
-    rows = list_payout_queue(statuses=statuses, limit=limit)
+@admin_referral_payouts_bp.errorhandler(PayoutValidationError)
+def _handle_validation_error(exc: PayoutValidationError):
+    return jsonify({"ok": False, "error": str(exc)}), 400
+
+
+@admin_referral_payouts_bp.errorhandler(PayoutNotFoundError)
+def _handle_not_found_error(exc: PayoutNotFoundError):
+    return jsonify({"ok": False, "error": str(exc)}), 404
+
+
+@admin_referral_payouts_bp.route("", methods=["GET"])
+def get_referral_payout_queue():
+    _require_admin()
+    statuses_raw = (request.args.get("status") or "pending,processing,failed").strip()
+    statuses = [item.strip() for item in statuses_raw.split(",") if item.strip()]
+    limit = max(1, min(int(request.args.get("limit", 200)), 500))
+    rows = _get_service().get_queue(statuses=statuses, limit=limit)
     return jsonify({"ok": True, "count": len(rows), "rows": rows})
 
 
-@bp.get("/admin/referral-payouts/<payout_id>")
-def admin_get_referral_payout(payout_id: str):
-    if not _authorized():
-        return _bad("Unauthorized", 401)
-
-    payout = get_payout_row(payout_id)
-    if not payout:
-        return _bad("payout not found", 404)
+@admin_referral_payouts_bp.route("/<payout_id>", methods=["GET"])
+def get_referral_payout(payout_id: str):
+    _require_admin()
+    payout = _get_service().get_payout(payout_id)
     return jsonify({"ok": True, "payout": payout})
 
 
-@bp.get("/admin/referral-payouts/<payout_id>/audit")
-def admin_get_referral_payout_audit(payout_id: str):
-    if not _authorized():
-        return _bad("Unauthorized", 401)
-
-    payout = get_payout_row(payout_id)
-    if not payout:
-        return _bad("payout not found", 404)
-
-    try:
-        raw_limit = (request.args.get("limit") or "50").strip()
-        limit = int(raw_limit)
-    except Exception:
-        limit = 50
-
-    if limit < 1:
-        limit = 1
-    if limit > 200:
-        limit = 200
-
-    try:
-        rows = list_payout_audit_logs(payout_id=payout_id, limit=limit)
-        return jsonify({"ok": True, "count": len(rows), "rows": rows})
-    except Exception as e:
-        return _bad(str(e), 400)
+@admin_referral_payouts_bp.route("/<payout_id>/audit", methods=["GET"])
+def get_referral_payout_audit(payout_id: str):
+    _require_admin()
+    limit = max(1, min(int(request.args.get("limit", 100)), 300))
+    rows = _get_service().get_audit_history(payout_id=payout_id, limit=limit)
+    return jsonify({"ok": True, "rows": rows})
 
 
-@bp.post("/admin/referral-payouts/<payout_id>/mark-processing")
-def admin_referral_payout_mark_processing(payout_id: str):
-    if not _authorized():
-        return _bad("Unauthorized", 401)
-
+@admin_referral_payouts_bp.route("/<payout_id>/mark-processing", methods=["POST"])
+def mark_referral_payout_processing(payout_id: str):
+    _require_admin()
     body = request.get_json(silent=True) or {}
-    try:
-        result = admin_mark_payout_processing(
-            payout_id,
-            provider_reference=(body.get("provider_reference") or "").strip() or None,
-            provider_transfer_code=(body.get("provider_transfer_code") or "").strip() or None,
-        )
-        return jsonify(result)
-    except Exception as e:
-        return _bad(str(e), 400)
+    result = _get_service().mark_processing(
+        payout_id=payout_id,
+        provider_reference=body.get("provider_reference"),
+        provider_transfer_code=body.get("provider_transfer_code"),
+        metadata={"source": "admin_single", "request_body": body},
+    )
+    return jsonify({"ok": True, "payout": result.payout, "updated_reward_ids": result.updated_reward_ids})
 
 
-@bp.post("/admin/referral-payouts/<payout_id>/mark-paid")
-def admin_referral_payout_mark_paid(payout_id: str):
-    if not _authorized():
-        return _bad("Unauthorized", 401)
-
+@admin_referral_payouts_bp.route("/<payout_id>/mark-paid", methods=["POST"])
+def mark_referral_payout_paid(payout_id: str):
+    _require_admin()
     body = request.get_json(silent=True) or {}
-    try:
-        result = admin_mark_payout_paid(
-            payout_id,
-            provider_reference=(body.get("provider_reference") or "").strip() or None,
-            provider_transfer_code=(body.get("provider_transfer_code") or "").strip() or None,
-        )
-        return jsonify(result)
-    except Exception as e:
-        return _bad(str(e), 400)
+    result = _get_service().mark_paid(
+        payout_id=payout_id,
+        provider_reference=body.get("provider_reference"),
+        provider_transfer_code=body.get("provider_transfer_code"),
+        metadata={"source": "admin_single", "request_body": body},
+    )
+    return jsonify({"ok": True, "payout": result.payout, "updated_reward_ids": result.updated_reward_ids})
 
 
-@bp.post("/admin/referral-payouts/<payout_id>/mark-failed")
-def admin_referral_payout_mark_failed(payout_id: str):
-    if not _authorized():
-        return _bad("Unauthorized", 401)
-
+@admin_referral_payouts_bp.route("/<payout_id>/mark-failed", methods=["POST"])
+def mark_referral_payout_failed(payout_id: str):
+    _require_admin()
     body = request.get_json(silent=True) or {}
-    try:
-        result = admin_mark_payout_failed(
-            payout_id,
-            failure_reason=(body.get("failure_reason") or "").strip() or "admin_marked_failed",
-            provider_reference=(body.get("provider_reference") or "").strip() or None,
-            provider_transfer_code=(body.get("provider_transfer_code") or "").strip() or None,
-        )
-        return jsonify(result)
-    except Exception as e:
-        return _bad(str(e), 400)
+    result = _get_service().mark_failed(
+        payout_id=payout_id,
+        failure_reason=body.get("failure_reason") or "",
+        provider_reference=body.get("provider_reference"),
+        provider_transfer_code=body.get("provider_transfer_code"),
+        metadata={"source": "admin_single", "request_body": body},
+    )
+    return jsonify({"ok": True, "payout": result.payout, "updated_reward_ids": result.updated_reward_ids})
+
+
+@admin_referral_payouts_bp.route("/bulk", methods=["POST"])
+def bulk_update_referral_payouts():
+    _require_admin()
+    body = request.get_json(silent=True) or {}
+
+    action = (body.get("action") or "").strip()
+    payout_ids = body.get("payout_ids") or []
+    provider_reference = body.get("provider_reference")
+    provider_transfer_code = body.get("provider_transfer_code")
+    failure_reason = body.get("failure_reason")
+
+    result = _get_service().bulk_update(
+        action=action,
+        payout_ids=payout_ids,
+        provider_reference=provider_reference,
+        provider_transfer_code=provider_transfer_code,
+        failure_reason=failure_reason,
+        metadata={"source": "admin_bulk", "request_body": body},
+    )
+    return jsonify({"ok": True, **result})
