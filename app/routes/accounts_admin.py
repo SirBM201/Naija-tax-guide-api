@@ -141,3 +141,4 @@ def bulk_update_referral_payouts():
 
 
 bp = admin_referral_payouts_bp
+
