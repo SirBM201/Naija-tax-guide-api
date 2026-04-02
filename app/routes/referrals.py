@@ -24,7 +24,7 @@ from app.services.web_auth_service import get_account_id_from_request
 
 bp = Blueprint("referrals", __name__)
 logger = logging.getLogger(__name__)
-ROUTE_VERSION = "referrals_route_v4_payout_alignment"
+ROUTE_VERSION = "referrals_route_v4_user_payout_flow"
 
 
 def _auth_account_id() -> tuple[Optional[str], Dict[str, Any]]:
@@ -254,7 +254,6 @@ def referral_payout_account_upsert():
             recipient_code=_clean_text(body.get("recipient_code")),
             currency=_clean_text(body.get("currency")),
             is_verified=bool(body.get("is_verified") is True),
-            metadata=body.get("metadata") if isinstance(body.get("metadata"), dict) else {},
         )
         eligibility = payout_eligibility(account_id)
 
@@ -361,7 +360,6 @@ def referral_payout_request():
             provider=_clean_text(body.get("provider")),
             provider_reference=_clean_text(body.get("provider_reference")),
             provider_transfer_code=_clean_text(body.get("provider_transfer_code")),
-            metadata=body.get("metadata") if isinstance(body.get("metadata"), dict) else {},
         )
 
         return jsonify(
