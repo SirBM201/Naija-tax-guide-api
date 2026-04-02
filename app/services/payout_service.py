@@ -201,13 +201,14 @@ class PayoutService:
         if not cleaned_reason:
             raise PayoutValidationError("Failure reason is required when marking a payout as failed.")
 
+        now_iso = self._now_iso()
         update_payload = {
             "status": "failed",
-            "failed_at": self._now_iso(),
+            "failed_at": now_iso,
             "failure_reason": cleaned_reason,
             "provider_reference": self._coalesce(provider_reference, payout.get("provider_reference")),
             "provider_transfer_code": self._coalesce(provider_transfer_code, payout.get("provider_transfer_code")),
-            "updated_at": self._now_iso(),
+            "updated_at": now_iso,
         }
 
         updated = self._update_payout_row(str(payout["id"]), update_payload)
@@ -347,18 +348,8 @@ class PayoutService:
         ).eq("account_id", account_id).eq("status", approved_reward_status()).execute()
 
     def _update_payout_row(self, payout_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        response = (
-            self.supabase.table("referral_payouts")
-            .update(payload)
-            .eq("id", payout_id)
-            .select("*")
-            .limit(1)
-            .execute()
-        )
-        rows = response.data or []
-        if not rows:
-            raise PayoutNotFoundError(f"Payout {payout_id} was not found after update.")
-        return rows[0]
+        self.supabase.table("referral_payouts").update(payload).eq("id", payout_id).execute()
+        return self.get_payout(payout_id)
 
     def _log_audit(
         self,
@@ -402,11 +393,6 @@ class PayoutService:
 
     def _to_decimal(self, value: Any) -> Decimal:
         return _to_decimal(value)
-
-
-# ---------------------------------------------------------------------------
-# Shared helpers / compatibility layer
-# ---------------------------------------------------------------------------
 
 
 def _svc() -> PayoutService:
@@ -562,9 +548,8 @@ def get_payout_account(account_id: str) -> Optional[Dict[str, Any]]:
     if not account_id:
         return None
 
-    sb = _sb()
     response = (
-        sb.table("referral_payout_accounts")
+        _sb().table("referral_payout_accounts")
         .select("*")
         .eq("account_id", account_id)
         .limit(1)
@@ -572,6 +557,20 @@ def get_payout_account(account_id: str) -> Optional[Dict[str, Any]]:
     )
     rows = response.data or []
     return rows[0] if rows else None
+
+
+def _get_payout_account_by_id(row_id: str) -> Dict[str, Any]:
+    response = (
+        _sb().table("referral_payout_accounts")
+        .select("*")
+        .eq("id", row_id)
+        .limit(1)
+        .execute()
+    )
+    rows = response.data or []
+    if not rows:
+        raise PayoutNotFoundError(f"Payout account {row_id} was not found.")
+    return rows[0]
 
 
 def upsert_payout_account(
@@ -628,26 +627,24 @@ def upsert_payout_account(
     sb = _sb()
 
     if existing and existing.get("id"):
-        response = (
-            sb.table("referral_payout_accounts")
-            .update(payload)
-            .eq("id", existing["id"])
-            .select("*")
-            .limit(1)
-            .execute()
-        )
-    else:
-        payload["created_at"] = now_iso
-        response = (
-            sb.table("referral_payout_accounts")
-            .insert(payload)
-            .select("*")
-            .limit(1)
-            .execute()
-        )
+        row_id = str(existing["id"])
+        sb.table("referral_payout_accounts").update(payload).eq("id", row_id).execute()
+        return _get_payout_account_by_id(row_id)
 
-    rows = response.data or []
-    return rows[0] if rows else {**payload, "id": existing.get("id") if existing else None}
+    payload["created_at"] = now_iso
+    insert_response = sb.table("referral_payout_accounts").insert(payload).execute()
+    inserted_rows = insert_response.data or []
+    if inserted_rows:
+        inserted = inserted_rows[0]
+        if inserted.get("id"):
+            return _get_payout_account_by_id(str(inserted["id"]))
+        return inserted
+
+    created = get_payout_account(account_id)
+    if created:
+        return created
+
+    raise PayoutServiceError("Payout account insert succeeded but no row could be reloaded.")
 
 
 def approved_balance_for_account(account_id: str) -> Decimal:
@@ -785,15 +782,20 @@ def create_payout_row(
         "metadata": metadata or {},
     }
 
-    response = (
-        _sb().table("referral_payouts")
-        .insert(payload)
-        .select("*")
-        .limit(1)
-        .execute()
-    )
+    response = _sb().table("referral_payouts").insert(payload).execute()
     rows = response.data or []
-    return rows[0] if rows else payload
+    if rows:
+        inserted = rows[0]
+        payout_id = str(inserted.get("id") or "").strip()
+        if payout_id:
+            return _svc().get_payout(payout_id)
+        return inserted
+
+    created = get_pending_or_processing_payout(account_id)
+    if created and _to_decimal(created.get("amount")) == amount_decimal:
+        return created
+
+    raise PayoutServiceError("Payout insert succeeded but no row could be reloaded.")
 
 
 def request_payout(
