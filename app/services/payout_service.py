@@ -383,8 +383,7 @@ class PayoutService:
             "failure_reason": failure_reason,
             "created_at": self._now_iso(),
         }
-        if metadata:
-            payload["metadata"] = metadata
+        # Do not send metadata because live schema may not have that column.
         self.supabase.table("referral_payout_audit_logs").insert(payload).execute()
 
     def _now_iso(self) -> str:
@@ -791,9 +790,8 @@ def create_payout_row(
         "created_at": now_iso,
         "updated_at": now_iso,
     }
-    if metadata:
-        payload["metadata"] = metadata
 
+    # Do not attach metadata because live referral_payouts table has no metadata column.
     response = _sb().table("referral_payouts").insert(payload).execute()
     rows = response.data or []
     if rows:
@@ -872,10 +870,7 @@ def request_payout(
         status="pending",
         provider_reference=provider_reference,
         provider_transfer_code=provider_transfer_code,
-        metadata={
-            **(metadata or {}),
-            "source": (metadata or {}).get("source") or "user_request",
-        } if metadata is not None else {"source": "user_request"},
+        metadata=None,
     )
 
     return {
