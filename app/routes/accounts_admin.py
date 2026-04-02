@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 
 from flask import Blueprint, jsonify, request
+from supabase import Client, create_client
 
 from app.services.payout_service import (
     PayoutNotFoundError,
@@ -54,41 +55,34 @@ def _require_admin() -> None:
         raise PermissionError("Invalid or missing admin API key.")
 
 
-def _load_supabase_client_factory():
-    """
-    Tries multiple possible locations so this route keeps working
-    even if your project uses a different module layout.
-    """
-    candidates = [
-        ("app.supabase_client", "get_supabase_client"),
-        ("app.db.supabase_client", "get_supabase_client"),
-        ("app.db.supabase", "get_supabase_client"),
-        ("app.services.supabase_client", "get_supabase_client"),
-        ("app.services.supabase", "get_supabase_client"),
-        ("app.utils.supabase_client", "get_supabase_client"),
-        ("app.utils.supabase", "get_supabase_client"),
-    ]
+def _build_supabase_client() -> Client:
+    supabase_url = (
+        os.getenv("SUPABASE_URL")
+        or os.getenv("NEXT_PUBLIC_SUPABASE_URL")
+        or ""
+    ).strip()
 
-    last_error = None
+    supabase_key = (
+        os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+        or os.getenv("SUPABASE_SERVICE_KEY")
+        or os.getenv("SUPABASE_ANON_KEY")
+        or os.getenv("NEXT_PUBLIC_SUPABASE_ANON_KEY")
+        or ""
+    ).strip()
 
-    for module_name, attr_name in candidates:
-        try:
-            module = __import__(module_name, fromlist=[attr_name])
-            factory = getattr(module, attr_name, None)
-            if callable(factory):
-                return factory
-        except Exception as exc:  # noqa: BLE001
-            last_error = exc
+    if not supabase_url:
+        raise RuntimeError("SUPABASE_URL is not configured on the backend.")
 
-    raise RuntimeError(
-        "Could not locate get_supabase_client(). "
-        "Tried: " + ", ".join(f"{m}.{a}" for m, a in candidates)
-    ) from last_error
+    if not supabase_key:
+        raise RuntimeError(
+            "No Supabase key found. Set SUPABASE_SERVICE_ROLE_KEY or SUPABASE_ANON_KEY."
+        )
+
+    return create_client(supabase_url, supabase_key)
 
 
 def _get_service() -> PayoutService:
-    factory = _load_supabase_client_factory()
-    return PayoutService(factory())
+    return PayoutService(_build_supabase_client())
 
 
 @admin_referral_payouts_bp.errorhandler(PermissionError)
@@ -113,12 +107,25 @@ def _handle_runtime_error(exc: RuntimeError):
     return jsonify({"ok": False, "error": str(exc)}), 500
 
 
+@admin_referral_payouts_bp.errorhandler(Exception)
+def _handle_unexpected_error(exc: Exception):
+    return jsonify({"ok": False, "error": str(exc)}), 500
+
+
 @admin_referral_payouts_bp.route("", methods=["GET"])
 def get_referral_payout_queue():
     _require_admin()
+
     statuses_raw = (request.args.get("status") or "pending,processing,failed").strip()
     statuses = [item.strip() for item in statuses_raw.split(",") if item.strip()]
-    limit = max(1, min(int(request.args.get("limit", 200)), 500))
+
+    limit_raw = request.args.get("limit", "200")
+    try:
+        limit = int(limit_raw)
+    except (TypeError, ValueError):
+        limit = 200
+    limit = max(1, min(limit, 500))
+
     rows = _get_service().get_queue(statuses=statuses, limit=limit)
     return jsonify({"ok": True, "count": len(rows), "rows": rows})
 
@@ -133,7 +140,14 @@ def get_referral_payout(payout_id: str):
 @admin_referral_payouts_bp.route("/<payout_id>/audit", methods=["GET"])
 def get_referral_payout_audit(payout_id: str):
     _require_admin()
-    limit = max(1, min(int(request.args.get("limit", 100)), 300))
+
+    limit_raw = request.args.get("limit", "100")
+    try:
+        limit = int(limit_raw)
+    except (TypeError, ValueError):
+        limit = 100
+    limit = max(1, min(limit, 300))
+
     rows = _get_service().get_audit_history(payout_id=payout_id, limit=limit)
     return jsonify({"ok": True, "rows": rows})
 
@@ -142,14 +156,20 @@ def get_referral_payout_audit(payout_id: str):
 def mark_referral_payout_processing(payout_id: str):
     _require_admin()
     body = request.get_json(silent=True) or {}
+
     result = _get_service().mark_processing(
         payout_id=payout_id,
         provider_reference=body.get("provider_reference"),
         provider_transfer_code=body.get("provider_transfer_code"),
         metadata={"source": "admin_single", "request_body": body},
     )
+
     return jsonify(
-        {"ok": True, "payout": result.payout, "updated_reward_ids": result.updated_reward_ids}
+        {
+            "ok": True,
+            "payout": result.payout,
+            "updated_reward_ids": result.updated_reward_ids,
+        }
     )
 
 
@@ -157,14 +177,20 @@ def mark_referral_payout_processing(payout_id: str):
 def mark_referral_payout_paid(payout_id: str):
     _require_admin()
     body = request.get_json(silent=True) or {}
+
     result = _get_service().mark_paid(
         payout_id=payout_id,
         provider_reference=body.get("provider_reference"),
         provider_transfer_code=body.get("provider_transfer_code"),
         metadata={"source": "admin_single", "request_body": body},
     )
+
     return jsonify(
-        {"ok": True, "payout": result.payout, "updated_reward_ids": result.updated_reward_ids}
+        {
+            "ok": True,
+            "payout": result.payout,
+            "updated_reward_ids": result.updated_reward_ids,
+        }
     )
 
 
@@ -172,6 +198,7 @@ def mark_referral_payout_paid(payout_id: str):
 def mark_referral_payout_failed(payout_id: str):
     _require_admin()
     body = request.get_json(silent=True) or {}
+
     result = _get_service().mark_failed(
         payout_id=payout_id,
         failure_reason=body.get("failure_reason") or "",
@@ -179,8 +206,13 @@ def mark_referral_payout_failed(payout_id: str):
         provider_transfer_code=body.get("provider_transfer_code"),
         metadata={"source": "admin_single", "request_body": body},
     )
+
     return jsonify(
-        {"ok": True, "payout": result.payout, "updated_reward_ids": result.updated_reward_ids}
+        {
+            "ok": True,
+            "payout": result.payout,
+            "updated_reward_ids": result.updated_reward_ids,
+        }
     )
 
 
@@ -203,6 +235,7 @@ def bulk_update_referral_payouts():
         failure_reason=failure_reason,
         metadata={"source": "admin_bulk", "request_body": body},
     )
+
     return jsonify({"ok": True, **result})
 
 
