@@ -550,3 +550,56 @@ def get_payout_account(account_id: str) -> Optional[Dict[str, Any]]:
         pass
 
     return None
+
+
+def payout_eligibility(account_id: str) -> Dict[str, Any]:
+    """
+    Legacy helper expected by app.routes.referrals.
+    Returns a simple eligibility summary for referral payout flows.
+    """
+    from app.supabase_client import get_supabase_client
+
+    supabase = get_supabase_client()
+
+    payout_account = get_payout_account(account_id)
+
+    approved_rewards = (
+        supabase.table("referral_rewards")
+        .select("id,reward_amount,status,approved_at")
+        .eq("account_id", account_id)
+        .eq("status", "approved")
+        .execute()
+    )
+    approved_rows = approved_rewards.data or []
+    approved_amount = round(
+        sum(float(row.get("reward_amount") or 0) for row in approved_rows), 2
+    )
+
+    pending_processing = (
+        supabase.table("referral_payouts")
+        .select("id,amount,status,requested_at")
+        .eq("account_id", account_id)
+        .in_("status", ["pending", "processing"])
+        .order("requested_at", desc=True)
+        .execute()
+    )
+    pending_rows = pending_processing.data or []
+    pending_amount = round(
+        sum(float(row.get("amount") or 0) for row in pending_rows), 2
+    )
+
+    available_amount = round(max(approved_amount - pending_amount, 0), 2)
+
+    return {
+        "ok": True,
+        "account_id": account_id,
+        "payout_account": payout_account,
+        "has_payout_account": bool(payout_account),
+        "approved_reward_count": len(approved_rows),
+        "approved_reward_amount": approved_amount,
+        "open_payout_count": len(pending_rows),
+        "open_payout_amount": pending_amount,
+        "available_amount": available_amount,
+        "eligible": bool(payout_account) and available_amount > 0,
+        "minimum_reached": available_amount > 0,
+    }
