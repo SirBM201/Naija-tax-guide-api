@@ -54,10 +54,41 @@ def _require_admin() -> None:
         raise PermissionError("Invalid or missing admin API key.")
 
 
-def _get_service() -> PayoutService:
-    from app.supabase_client import get_supabase_client
+def _load_supabase_client_factory():
+    """
+    Tries multiple possible locations so this route keeps working
+    even if your project uses a different module layout.
+    """
+    candidates = [
+        ("app.supabase_client", "get_supabase_client"),
+        ("app.db.supabase_client", "get_supabase_client"),
+        ("app.db.supabase", "get_supabase_client"),
+        ("app.services.supabase_client", "get_supabase_client"),
+        ("app.services.supabase", "get_supabase_client"),
+        ("app.utils.supabase_client", "get_supabase_client"),
+        ("app.utils.supabase", "get_supabase_client"),
+    ]
 
-    return PayoutService(get_supabase_client())
+    last_error = None
+
+    for module_name, attr_name in candidates:
+        try:
+            module = __import__(module_name, fromlist=[attr_name])
+            factory = getattr(module, attr_name, None)
+            if callable(factory):
+                return factory
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+
+    raise RuntimeError(
+        "Could not locate get_supabase_client(). "
+        "Tried: " + ", ".join(f"{m}.{a}" for m, a in candidates)
+    ) from last_error
+
+
+def _get_service() -> PayoutService:
+    factory = _load_supabase_client_factory()
+    return PayoutService(factory())
 
 
 @admin_referral_payouts_bp.errorhandler(PermissionError)
@@ -75,6 +106,11 @@ def _handle_validation_error(exc: PayoutValidationError):
 @admin_referral_payouts_bp.errorhandler(PayoutNotFoundError)
 def _handle_not_found_error(exc: PayoutNotFoundError):
     return jsonify({"ok": False, "error": str(exc)}), 404
+
+
+@admin_referral_payouts_bp.errorhandler(RuntimeError)
+def _handle_runtime_error(exc: RuntimeError):
+    return jsonify({"ok": False, "error": str(exc)}), 500
 
 
 @admin_referral_payouts_bp.route("", methods=["GET"])
