@@ -7,7 +7,6 @@ from typing import Any, Dict, List, Optional, Sequence
 from supabase import Client
 
 
-ALLOWED_SINGLE_ACTIONS = {"mark-processing", "mark-paid", "mark-failed"}
 ALLOWED_BULK_ACTIONS = {"mark-processing", "mark-paid", "mark-failed"}
 
 
@@ -35,14 +34,14 @@ class PayoutService:
         self.supabase = supabase
 
     def get_queue(self, statuses: Sequence[str], limit: int = 200) -> List[Dict[str, Any]]:
-        query = (
+        response = (
             self.supabase.table("referral_payouts")
             .select("*")
             .in_("status", list(statuses))
             .order("requested_at", desc=True)
             .limit(limit)
+            .execute()
         )
-        response = query.execute()
         return response.data or []
 
     def get_payout(self, payout_id: str) -> Dict[str, Any]:
@@ -103,11 +102,7 @@ class PayoutService:
             failure_reason=None,
             metadata=metadata,
         )
-        return PayoutUpdateResult(
-            payout=updated,
-            updated_reward_ids=[],
-            audit_logged=True,
-        )
+        return PayoutUpdateResult(payout=updated, updated_reward_ids=[], audit_logged=True)
 
     def mark_paid(
         self,
@@ -124,8 +119,8 @@ class PayoutService:
         account_id = payout["account_id"]
         amount = self._to_number(payout.get("amount"))
         rewards = self._get_payable_rewards(account_id)
-
         total_payable = round(sum(self._to_number(row.get("reward_amount")) for row in rewards), 2)
+
         if total_payable < amount - 0.01:
             raise PayoutValidationError(
                 f"Approved rewards total {total_payable:.2f}, which is less than payout amount {amount:.2f}."
@@ -179,7 +174,7 @@ class PayoutService:
     ) -> PayoutUpdateResult:
         payout = self.get_payout(payout_id)
         old_status = self._normalize_status(payout.get("status"))
-        if old_status in {"paid"}:
+        if old_status == "paid":
             raise PayoutValidationError("Paid payouts cannot be marked failed.")
 
         cleaned_reason = (failure_reason or "").strip()
@@ -207,12 +202,7 @@ class PayoutService:
             failure_reason=cleaned_reason,
             metadata=metadata,
         )
-
-        return PayoutUpdateResult(
-            payout=updated,
-            updated_reward_ids=[],
-            audit_logged=True,
-        )
+        return PayoutUpdateResult(payout=updated, updated_reward_ids=[], audit_logged=True)
 
     def bulk_update(
         self,
@@ -226,7 +216,7 @@ class PayoutService:
         if action not in ALLOWED_BULK_ACTIONS:
             raise PayoutValidationError("Unsupported bulk payout action.")
 
-        unique_ids = [item for item in dict.fromkeys([str(x).strip() for x in payout_ids if str(x).strip()])]
+        unique_ids = [item for item in dict.fromkeys(str(x).strip() for x in payout_ids if str(x).strip())]
         if not unique_ids:
             raise PayoutValidationError("At least one payout ID is required for a bulk action.")
 
@@ -532,116 +522,7 @@ def get_payout_account(account_id: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def payout_eligibility(account_id: str) -> Dict[str, Any]:
-    from app.supabase_client import get_supabase_client
-
-    supabase = get_supabase_client()
-
-    payout_account = get_payout_account(account_id)
-
-    approved_rewards = (
-        supabase.table("referral_rewards")
-        .select("id,reward_amount,status,approved_at")
-        .eq("account_id", account_id)
-        .eq("status", "approved")
-        .execute()
-    )
-    approved_rows = approved_rewards.data or []
-    approved_amount = round(
-        sum(float(row.get("reward_amount") or 0) for row in approved_rows), 2
-    )
-
-    pending_processing = (
-        supabase.table("referral_payouts")
-        .select("id,amount,status,requested_at")
-        .eq("account_id", account_id)
-        .in_("status", ["pending", "processing"])
-        .order("requested_at", desc=True)
-        .execute()
-    )
-    pending_rows = pending_processing.data or []
-    pending_amount = round(
-        sum(float(row.get("amount") or 0) for row in pending_rows), 2
-    )
-
-    available_amount = round(max(approved_amount - pending_amount, 0), 2)
-
-    return {
-        "ok": True,
-        "account_id": account_id,
-        "payout_account": payout_account,
-        "has_payout_account": bool(payout_account),
-        "approved_reward_count": len(approved_rows),
-        "approved_reward_amount": approved_amount,
-        "open_payout_count": len(pending_rows),
-        "open_payout_amount": pending_amount,
-        "available_amount": available_amount,
-        "eligible": bool(payout_account) and available_amount > 0,
-        "minimum_reached": available_amount > 0,
-    }
-
-
-def request_payout(
-    account_id: str,
-    amount: float,
-    provider: Optional[str] = None,
-    provider_reference: Optional[str] = None,
-    provider_transfer_code: Optional[str] = None,
-    metadata: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    from app.supabase_client import get_supabase_client
-
-    supabase = get_supabase_client()
-
-    eligibility = payout_eligibility(account_id)
-    requested_amount = 0.0
-    try:
-        requested_amount = float(amount or 0)
-    except (TypeError, ValueError):
-        requested_amount = 0.0
-
-    if requested_amount <= 0:
-        raise PayoutValidationError("Payout amount must be greater than zero.")
-
-    available_amount = float(eligibility.get("available_amount") or 0)
-    if requested_amount > available_amount:
-        raise PayoutValidationError(
-            f"Requested payout amount {requested_amount:.2f} exceeds available amount {available_amount:.2f}."
-        )
-
-    now_iso = datetime.now(timezone.utc).isoformat()
-    payload = {
-        "account_id": account_id,
-        "amount": requested_amount,
-        "currency": "NGN",
-        "provider": (provider or "manual").strip() or "manual",
-        "provider_reference": (provider_reference or "").strip() or None,
-        "provider_transfer_code": (provider_transfer_code or "").strip() or None,
-        "status": "pending",
-        "requested_at": now_iso,
-        "processed_at": None,
-        "paid_at": None,
-        "failed_at": None,
-        "failure_reason": None,
-        "created_at": now_iso,
-        "updated_at": now_iso,
-        "metadata": metadata or {},
-    }
-
-    response = (
-        supabase.table("referral_payouts")
-        .insert(payload)
-        .execute()
-    )
-    rows = response.data or []
-    payout = rows[0] if rows else payload
-
-    return {
-        "ok": True,
-        "payout": payout,
-        "eligibility": eligibility,
-    }
-    def upsert_payout_account(
+def upsert_payout_account(
     account_id: str,
     bank_name: Optional[str] = None,
     account_name: Optional[str] = None,
@@ -651,15 +532,10 @@ def request_payout(
     recipient_code: Optional[str] = None,
     metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """
-    Legacy helper expected by app.routes.referrals.
-    Creates or updates a payout account row for an account_id.
-    """
     from app.supabase_client import get_supabase_client
 
     supabase = get_supabase_client()
     now_iso = datetime.now(timezone.utc).isoformat()
-
     existing = get_payout_account(account_id)
 
     payload = {
@@ -695,8 +571,101 @@ def request_payout(
 
     rows = response.data or []
     row = rows[0] if rows else payload
+    return {"ok": True, "payout_account": row}
+
+
+def payout_eligibility(account_id: str) -> Dict[str, Any]:
+    from app.supabase_client import get_supabase_client
+
+    supabase = get_supabase_client()
+    payout_account = get_payout_account(account_id)
+
+    approved_rewards = (
+        supabase.table("referral_rewards")
+        .select("id,reward_amount,status,approved_at")
+        .eq("account_id", account_id)
+        .eq("status", "approved")
+        .execute()
+    )
+    approved_rows = approved_rewards.data or []
+    approved_amount = round(sum(float(row.get("reward_amount") or 0) for row in approved_rows), 2)
+
+    pending_processing = (
+        supabase.table("referral_payouts")
+        .select("id,amount,status,requested_at")
+        .eq("account_id", account_id)
+        .in_("status", ["pending", "processing"])
+        .order("requested_at", desc=True)
+        .execute()
+    )
+    pending_rows = pending_processing.data or []
+    pending_amount = round(sum(float(row.get("amount") or 0) for row in pending_rows), 2)
+
+    available_amount = round(max(approved_amount - pending_amount, 0), 2)
 
     return {
         "ok": True,
-        "payout_account": row,
+        "account_id": account_id,
+        "payout_account": payout_account,
+        "has_payout_account": bool(payout_account),
+        "approved_reward_count": len(approved_rows),
+        "approved_reward_amount": approved_amount,
+        "open_payout_count": len(pending_rows),
+        "open_payout_amount": pending_amount,
+        "available_amount": available_amount,
+        "eligible": bool(payout_account) and available_amount > 0,
+        "minimum_reached": available_amount > 0,
     }
+
+
+def request_payout(
+    account_id: str,
+    amount: float,
+    provider: Optional[str] = None,
+    provider_reference: Optional[str] = None,
+    provider_transfer_code: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    from app.supabase_client import get_supabase_client
+
+    supabase = get_supabase_client()
+    eligibility = payout_eligibility(account_id)
+
+    try:
+        requested_amount = float(amount or 0)
+    except (TypeError, ValueError):
+        requested_amount = 0.0
+
+    if requested_amount <= 0:
+        raise PayoutValidationError("Payout amount must be greater than zero.")
+
+    available_amount = float(eligibility.get("available_amount") or 0)
+    if requested_amount > available_amount:
+        raise PayoutValidationError(
+            f"Requested payout amount {requested_amount:.2f} exceeds available amount {available_amount:.2f}."
+        )
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    payload = {
+        "account_id": account_id,
+        "amount": requested_amount,
+        "currency": "NGN",
+        "provider": (provider or "manual").strip() or "manual",
+        "provider_reference": (provider_reference or "").strip() or None,
+        "provider_transfer_code": (provider_transfer_code or "").strip() or None,
+        "status": "pending",
+        "requested_at": now_iso,
+        "processed_at": None,
+        "paid_at": None,
+        "failed_at": None,
+        "failure_reason": None,
+        "created_at": now_iso,
+        "updated_at": now_iso,
+        "metadata": metadata or {},
+    }
+
+    response = supabase.table("referral_payouts").insert(payload).execute()
+    rows = response.data or []
+    payout = rows[0] if rows else payload
+
+    return {"ok": True, "payout": payout, "eligibility": eligibility}
