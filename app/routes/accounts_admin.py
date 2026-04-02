@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from flask import Blueprint, jsonify, request
 
 from app.services.payout_service import (
@@ -15,26 +17,54 @@ admin_referral_payouts_bp = Blueprint(
 )
 
 
-def _get_admin_key() -> str:
-    return (request.headers.get("X-Admin-Key") or "").strip()
+def _get_expected_admin_key() -> str:
+    return (
+        os.getenv("ADMIN_API_KEY")
+        or os.getenv("INTERNAL_ADMIN_API_KEY")
+        or os.getenv("REFERRAL_ADMIN_API_KEY")
+        or ""
+    ).strip()
+
+
+def _get_supplied_admin_key() -> str:
+    header_key = (request.headers.get("X-Admin-Key") or "").strip()
+    if header_key:
+        return header_key
+
+    auth_header = (request.headers.get("Authorization") or "").strip()
+    if auth_header.lower().startswith("bearer "):
+        return auth_header[7:].strip()
+
+    query_key = (request.args.get("admin_key") or "").strip()
+    if query_key:
+        return query_key
+
+    body = request.get_json(silent=True) or {}
+    return str(body.get("admin_key") or "").strip()
 
 
 def _require_admin() -> None:
-    from app.config import settings
-    supplied = _get_admin_key()
-    expected = (getattr(settings, "ADMIN_API_KEY", "") or "").strip()
+    supplied = _get_supplied_admin_key()
+    expected = _get_expected_admin_key()
+
+    if not expected:
+        raise PermissionError("Admin API key is not configured on the backend.")
+
     if not supplied or supplied != expected:
         raise PermissionError("Invalid or missing admin API key.")
 
 
 def _get_service() -> PayoutService:
     from app.supabase_client import get_supabase_client
+
     return PayoutService(get_supabase_client())
 
 
 @admin_referral_payouts_bp.errorhandler(PermissionError)
 def _handle_permission_error(exc: PermissionError):
-    return jsonify({"ok": False, "error": str(exc)}), 403
+    message = str(exc) or "Forbidden"
+    status_code = 500 if "not configured" in message.lower() else 403
+    return jsonify({"ok": False, "error": message}), status_code
 
 
 @admin_referral_payouts_bp.errorhandler(PayoutValidationError)
@@ -141,4 +171,3 @@ def bulk_update_referral_payouts():
 
 
 bp = admin_referral_payouts_bp
-
