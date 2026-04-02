@@ -34,9 +34,6 @@ class PayoutService:
     def __init__(self, supabase: Client):
         self.supabase = supabase
 
-    # ----------------------------
-    # reads
-    # ----------------------------
     def get_queue(self, statuses: Sequence[str], limit: int = 200) -> List[Dict[str, Any]]:
         query = (
             self.supabase.table("referral_payouts")
@@ -72,9 +69,6 @@ class PayoutService:
         )
         return response.data or []
 
-    # ----------------------------
-    # single action entry points
-    # ----------------------------
     def mark_processing(
         self,
         payout_id: str,
@@ -220,9 +214,6 @@ class PayoutService:
             audit_logged=True,
         )
 
-    # ----------------------------
-    # bulk action entry point
-    # ----------------------------
     def bulk_update(
         self,
         action: str,
@@ -284,7 +275,7 @@ class PayoutService:
                         "reward_count": len(result.updated_reward_ids),
                     }
                 )
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 failures.append({"payout_id": payout_id, "error": str(exc)})
 
         return {
@@ -296,9 +287,6 @@ class PayoutService:
             "failures": failures,
         }
 
-    # ----------------------------
-    # internals
-    # ----------------------------
     def _validate_bulk_action(
         self,
         action: str,
@@ -410,10 +398,6 @@ class PayoutService:
             return 0.0
 
 
-# -------------------------------------------------------------------
-# legacy compatibility helpers for older route imports
-# -------------------------------------------------------------------
-
 def _svc() -> PayoutService:
     from app.supabase_client import get_supabase_client
     return PayoutService(get_supabase_client())
@@ -513,10 +497,6 @@ def admin_bulk_update_payouts(
 
 
 def get_payout_account(account_id: str) -> Optional[Dict[str, Any]]:
-    """
-    Legacy helper expected by app.routes.referrals.
-    Tries referral_payout_accounts first, then falls back to accounts.
-    """
     from app.supabase_client import get_supabase_client
 
     supabase = get_supabase_client()
@@ -553,10 +533,6 @@ def get_payout_account(account_id: str) -> Optional[Dict[str, Any]]:
 
 
 def payout_eligibility(account_id: str) -> Dict[str, Any]:
-    """
-    Legacy helper expected by app.routes.referrals.
-    Returns a simple eligibility summary for referral payout flows.
-    """
     from app.supabase_client import get_supabase_client
 
     supabase = get_supabase_client()
@@ -602,4 +578,66 @@ def payout_eligibility(account_id: str) -> Dict[str, Any]:
         "available_amount": available_amount,
         "eligible": bool(payout_account) and available_amount > 0,
         "minimum_reached": available_amount > 0,
+    }
+
+
+def request_payout(
+    account_id: str,
+    amount: float,
+    provider: Optional[str] = None,
+    provider_reference: Optional[str] = None,
+    provider_transfer_code: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    from app.supabase_client import get_supabase_client
+
+    supabase = get_supabase_client()
+
+    eligibility = payout_eligibility(account_id)
+    requested_amount = 0.0
+    try:
+        requested_amount = float(amount or 0)
+    except (TypeError, ValueError):
+        requested_amount = 0.0
+
+    if requested_amount <= 0:
+        raise PayoutValidationError("Payout amount must be greater than zero.")
+
+    available_amount = float(eligibility.get("available_amount") or 0)
+    if requested_amount > available_amount:
+        raise PayoutValidationError(
+            f"Requested payout amount {requested_amount:.2f} exceeds available amount {available_amount:.2f}."
+        )
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    payload = {
+        "account_id": account_id,
+        "amount": requested_amount,
+        "currency": "NGN",
+        "provider": (provider or "manual").strip() or "manual",
+        "provider_reference": (provider_reference or "").strip() or None,
+        "provider_transfer_code": (provider_transfer_code or "").strip() or None,
+        "status": "pending",
+        "requested_at": now_iso,
+        "processed_at": None,
+        "paid_at": None,
+        "failed_at": None,
+        "failure_reason": None,
+        "created_at": now_iso,
+        "updated_at": now_iso,
+        "metadata": metadata or {},
+    }
+
+    response = (
+        supabase.table("referral_payouts")
+        .insert(payload)
+        .execute()
+    )
+    rows = response.data or []
+    payout = rows[0] if rows else payload
+
+    return {
+        "ok": True,
+        "payout": payout,
+        "eligibility": eligibility,
     }
