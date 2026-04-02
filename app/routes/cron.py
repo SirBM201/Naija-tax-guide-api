@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from flask import Blueprint, jsonify, request
 
@@ -21,7 +21,7 @@ from app.services.payout_service import (
 from app.services.referral_service import mature_pending_rewards
 
 bp = Blueprint("cron", __name__)
-ROUTE_VERSION = "cron_route_v2_payout_alignment"
+ROUTE_VERSION = "cron_route_v2_user_payout_flow"
 
 
 def _truthy(v: str | None) -> bool:
@@ -114,10 +114,7 @@ def _pick_account_ids(body: Dict[str, Any]) -> List[str]:
         single = (body.get("account_id") or request.args.get("account_id") or "").strip()
         return [single] if single else []
 
-    if isinstance(raw, list):
-        values = raw
-    else:
-        values = [raw]
+    values = raw if isinstance(raw, list) else [raw]
 
     out: List[str] = []
     seen = set()
@@ -223,12 +220,7 @@ def cron_referrals_payout_batch():
         for account_id in account_ids:
             payout_account = get_payout_account(account_id)
             if not payout_account:
-                skipped.append(
-                    {
-                        "account_id": account_id,
-                        "reason": "missing_payout_account",
-                    }
-                )
+                skipped.append({"account_id": account_id, "reason": "missing_payout_account"})
                 continue
 
             if not bool(payout_account.get("is_verified")):
