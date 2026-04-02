@@ -38,7 +38,11 @@ class PayoutService:
         self.supabase = supabase
 
     def get_queue(self, statuses: Sequence[str], limit: int = 200) -> List[Dict[str, Any]]:
-        normalized_statuses = [self._normalize_status(item) for item in statuses if self._normalize_status(item) != "unknown"]
+        normalized_statuses = [
+            self._normalize_status(item)
+            for item in statuses
+            if self._normalize_status(item) != "unknown"
+        ]
         if not normalized_statuses:
             normalized_statuses = ["pending", "processing", "failed"]
 
@@ -147,7 +151,11 @@ class PayoutService:
             )
 
         paid_at = self._now_iso()
-        updated_reward_ids = [str(row.get("id")) for row in rewards if str(row.get("id") or "").strip()]
+        updated_reward_ids = [
+            str(row.get("id"))
+            for row in rewards
+            if str(row.get("id") or "").strip()
+        ]
 
         update_payload = {
             "status": "paid",
@@ -278,6 +286,7 @@ class PayoutService:
                         provider_transfer_code=provider_transfer_code,
                         metadata={**(metadata or {}), "bulk": True},
                     )
+
                 successes.append(
                     {
                         "payout_id": payout_id,
@@ -372,9 +381,10 @@ class PayoutService:
             "provider_reference": provider_reference,
             "provider_transfer_code": provider_transfer_code,
             "failure_reason": failure_reason,
-            "metadata": metadata or {},
             "created_at": self._now_iso(),
         }
+        if metadata:
+            payload["metadata"] = metadata
         self.supabase.table("referral_payout_audit_logs").insert(payload).execute()
 
     def _now_iso(self) -> str:
@@ -559,7 +569,7 @@ def get_payout_account(account_id: str) -> Optional[Dict[str, Any]]:
     return rows[0] if rows else None
 
 
-def _get_payout_account_by_id(row_id: str) -> Dict[str, Any]:
+def _get_payout_account_by_row_id(row_id: str) -> Optional[Dict[str, Any]]:
     response = (
         _sb().table("referral_payout_accounts")
         .select("*")
@@ -568,9 +578,7 @@ def _get_payout_account_by_id(row_id: str) -> Dict[str, Any]:
         .execute()
     )
     rows = response.data or []
-    if not rows:
-        raise PayoutNotFoundError(f"Payout account {row_id} was not found.")
-    return rows[0]
+    return rows[0] if rows else None
 
 
 def upsert_payout_account(
@@ -597,12 +605,11 @@ def upsert_payout_account(
     clean_bank_name = (bank_name or "").strip() or None
     clean_bank_code = (bank_code or "").strip() or None
     clean_account_name = (account_name or "").strip() or None
-    clean_account_number = (account_number or "").strip() or None
     clean_account_number_masked = (account_number_masked or "").strip() or None
     clean_recipient_code = (recipient_code or "").strip() or None
 
-    if not clean_account_number_masked and clean_account_number:
-        digits_only = "".join(ch for ch in clean_account_number if ch.isdigit())
+    if not clean_account_number_masked and account_number:
+        digits_only = "".join(ch for ch in str(account_number) if ch.isdigit())
         if len(digits_only) >= 4:
             clean_account_number_masked = f"****{digits_only[-4:]}"
         elif digits_only:
@@ -614,12 +621,10 @@ def upsert_payout_account(
         "bank_code": clean_bank_code,
         "bank_name": clean_bank_name,
         "account_name": clean_account_name,
-        "account_number": clean_account_number,
         "account_number_masked": clean_account_number_masked,
         "recipient_code": clean_recipient_code,
         "currency": normalized_currency,
         "is_verified": bool(is_verified),
-        "metadata": metadata or {},
         "updated_at": now_iso,
     }
 
@@ -629,15 +634,21 @@ def upsert_payout_account(
     if existing and existing.get("id"):
         row_id = str(existing["id"])
         sb.table("referral_payout_accounts").update(payload).eq("id", row_id).execute()
-        return _get_payout_account_by_id(row_id)
+        reloaded = _get_payout_account_by_row_id(row_id)
+        if reloaded:
+            return reloaded
+        return get_payout_account(account_id) or {**existing, **payload}
 
     payload["created_at"] = now_iso
     insert_response = sb.table("referral_payout_accounts").insert(payload).execute()
     inserted_rows = insert_response.data or []
     if inserted_rows:
         inserted = inserted_rows[0]
-        if inserted.get("id"):
-            return _get_payout_account_by_id(str(inserted["id"]))
+        row_id = str(inserted.get("id") or "").strip()
+        if row_id:
+            reloaded = _get_payout_account_by_row_id(row_id)
+            if reloaded:
+                return reloaded
         return inserted
 
     created = get_payout_account(account_id)
@@ -779,8 +790,9 @@ def create_payout_row(
         "failure_reason": None,
         "created_at": now_iso,
         "updated_at": now_iso,
-        "metadata": metadata or {},
     }
+    if metadata:
+        payload["metadata"] = metadata
 
     response = _sb().table("referral_payouts").insert(payload).execute()
     rows = response.data or []
@@ -863,7 +875,7 @@ def request_payout(
         metadata={
             **(metadata or {}),
             "source": (metadata or {}).get("source") or "user_request",
-        },
+        } if metadata is not None else {"source": "user_request"},
     )
 
     return {
