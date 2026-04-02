@@ -641,4 +641,62 @@ def request_payout(
         "payout": payout,
         "eligibility": eligibility,
     }
+    def upsert_payout_account(
+    account_id: str,
+    bank_name: Optional[str] = None,
+    account_name: Optional[str] = None,
+    account_number: Optional[str] = None,
+    currency: Optional[str] = None,
+    provider: Optional[str] = None,
+    recipient_code: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Legacy helper expected by app.routes.referrals.
+    Creates or updates a payout account row for an account_id.
+    """
+    from app.supabase_client import get_supabase_client
 
+    supabase = get_supabase_client()
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    existing = get_payout_account(account_id)
+
+    payload = {
+        "account_id": account_id,
+        "bank_name": (bank_name or "").strip() or None,
+        "account_name": (account_name or "").strip() or None,
+        "account_number": (account_number or "").strip() or None,
+        "currency": (currency or "NGN").strip() or "NGN",
+        "provider": (provider or "paystack").strip() or "paystack",
+        "recipient_code": (recipient_code or "").strip() or None,
+        "metadata": metadata or {},
+        "updated_at": now_iso,
+    }
+
+    if existing and existing.get("id"):
+        response = (
+            supabase.table("referral_payout_accounts")
+            .update(payload)
+            .eq("id", existing["id"])
+            .select("*")
+            .limit(1)
+            .execute()
+        )
+    else:
+        payload["created_at"] = now_iso
+        response = (
+            supabase.table("referral_payout_accounts")
+            .insert(payload)
+            .select("*")
+            .limit(1)
+            .execute()
+        )
+
+    rows = response.data or []
+    row = rows[0] if rows else payload
+
+    return {
+        "ok": True,
+        "payout_account": row,
+    }
