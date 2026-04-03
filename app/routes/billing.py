@@ -553,6 +553,36 @@ def _start_checkout_for_plan_change(
     }, None
 
 
+def _payment_already_applied(*, account_id: str, plan_code: str, reference: str) -> bool:
+    account_id = (account_id or "").strip()
+    plan_code = (plan_code or "").strip().lower()
+    reference = (reference or "").strip()
+
+    if not (account_id and plan_code and reference):
+        return False
+
+    try:
+        q = (
+            _sb()
+            .table("user_subscriptions")
+            .select("id,account_id,plan_code,status,is_active,provider_ref")
+            .eq("account_id", account_id)
+            .eq("plan_code", plan_code)
+            .eq("provider_ref", reference)
+            .limit(1)
+            .execute()
+        )
+        rows = getattr(q, "data", None) or []
+        if not rows:
+            return False
+
+        row = rows[0] or {}
+        status = str(row.get("status") or "").strip().lower()
+        return bool(row.get("is_active")) and status == "active"
+    except Exception:
+        return False
+
+
 def _extract_reference(data: Dict[str, Any]) -> str:
     return (data.get("reference") or "").strip()
 
@@ -875,8 +905,13 @@ def billing_clear_pending_change():
 @bp.get("/billing/verify")
 def billing_verify():
     """
-    Verify a reference after Paystack redirect.
-    GET /billing/verify?reference=...
+    Read-only verification endpoint for frontend redirect handling.
+
+    Important:
+    - verifies the Paystack reference
+    - stores a verify event for debugging
+    - DOES NOT activate subscription or initialize credits
+    - webhook remains the single writer for subscription / credits / referral effects
     """
     reference = (request.args.get("reference") or "").strip()
     if not reference:
@@ -903,9 +938,12 @@ def billing_verify():
             {
                 "ok": True,
                 "paid": False,
+                "applied": False,
+                "activation_state": "payment_not_successful",
                 "status": status_text,
                 "reference": reference,
                 "data": tx,
+                "message": "Payment is not marked successful yet.",
             }
         ), 200
 
@@ -916,31 +954,51 @@ def billing_verify():
             status=400,
         )
 
+    if _payment_already_applied(account_id=account_id, plan_code=plan_code, reference=reference):
+        result.update(
+            {
+                "skipped": True,
+                "reason": "payment_already_applied",
+                "subscription": _get_subscription_row(account_id)[0],
+            }
+        )
+        logger.info("[%s] duplicate payment application skipped reference=%s", ROUTE_VERSION, reference)
+        return jsonify(result), 200
+
     plan = get_plan(plan_code)
     if not plan:
         return _fail(error="plan_not_found", extra={"plan_code": plan_code}, status=404)
 
-    sub = _upsert_user_subscription(
+    sub, sub_err = _get_subscription_row(account_id)
+    already_applied = _payment_already_applied(
         account_id=account_id,
         plan_code=plan_code,
-        duration_days=int(plan["duration_days"]),
-        provider="paystack",
-        provider_ref=reference,
+        reference=reference,
     )
 
-    credit_init = _init_plan_credits_safe(account_id, plan_code)
+    applied_subscription = sub if already_applied else None
+    summary = _build_subscription_summary(applied_subscription or sub)
 
     return jsonify(
         {
             "ok": True,
             "paid": True,
+            "applied": already_applied,
+            "activation_state": "applied" if already_applied else "awaiting_webhook",
             "reference": reference,
             "change_mode": change_mode,
-            "subscription": sub,
-            "subscription_summary": _build_subscription_summary(sub),
+            "status": status_text,
             "plan": plan,
-            "credits_initialized": bool(credit_init.get("ok")),
-            "credit_init_result": credit_init,
+            "plan_code": plan_code,
+            "account_id": account_id,
+            "subscription": applied_subscription,
+            "subscription_summary": summary,
+            "subscription_lookup_error": sub_err,
+            "message": (
+                "Payment verified and subscription already applied."
+                if already_applied
+                else "Payment verified. Waiting for webhook to finalize subscription and credits."
+            ),
         }
     ), 200
 
