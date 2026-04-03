@@ -153,6 +153,53 @@ def _support_from_name() -> str:
     return _env("SUPPORT_FROM_NAME", "Naija Tax Guide Support")
 
 
+def _compose_message_with_live_context(
+    *,
+    message: str,
+    issue_type: str,
+    plan_name: str = "",
+    plan_status: str = "",
+    latest_payment_reference: str = "",
+    latest_payment_date: str = "",
+    expires_at: str = "",
+    credit_balance: Any = 0,
+    channel_state: str = "",
+) -> str:
+    base_message = (message or "").strip()
+    if not base_message:
+        return ""
+
+    first_block = base_message.split("\n\n")[0].strip() or base_message
+
+    should_append_context = any(
+        [
+            (plan_name or "").strip(),
+            (plan_status or "").strip(),
+            (latest_payment_reference or "").strip(),
+            (latest_payment_date or "").strip(),
+            (expires_at or "").strip(),
+            channel_state,
+            credit_balance not in (None, ""),
+            (issue_type or "").strip().lower() in {"billing", "credits"},
+        ]
+    )
+
+    if not should_append_context:
+        return base_message
+
+    context_lines = [
+        f"Current plan: {(plan_name or '').strip() or 'Not visible'}",
+        f"Plan status: {(plan_status or '').strip() or 'Not visible'}",
+        f"Latest payment reference: {(latest_payment_reference or '').strip() or 'Not visible'}",
+        f"Latest payment date: {(latest_payment_date or '').strip() or 'Not visible'}",
+        f"Visible credits: {credit_balance if credit_balance not in (None, '') else 'Not visible'}",
+        f"Channel state: {(channel_state or '').strip() or 'Not visible'}",
+        f"Subscription expiry: {(expires_at or '').strip() or 'Not visible'}",
+    ]
+
+    return "\n\n".join([first_block, "\n".join(context_lines)]).strip()
+
+
 def _build_support_subject(issue_type: str, priority: str, subject: str, account_id: str) -> str:
     issue_type = (issue_type or "general").strip()
     priority = (priority or "normal").strip().upper()
@@ -173,6 +220,10 @@ def _build_support_text(
     subject: str,
     message: str,
     plan_name: str = "",
+    plan_status: str = "",
+    latest_payment_reference: str = "",
+    latest_payment_date: str = "",
+    expires_at: str = "",
     credit_balance: Any = 0,
     channel_state: str = "",
 ) -> str:
@@ -191,6 +242,10 @@ def _build_support_text(
         f"Priority: {priority or '—'}",
         f"Channel: {channel or '—'}",
         f"Visible Plan: {plan_name or '—'}",
+        f"Visible Plan Status: {plan_status or '—'}",
+        f"Latest Payment Reference: {latest_payment_reference or '—'}",
+        f"Latest Payment Date: {latest_payment_date or '—'}",
+        f"Visible Subscription Expiry: {expires_at or '—'}",
         f"Visible Credits: {credit_balance}",
         f"Visible Channel State: {channel_state or '—'}",
         f"Subject: {subject or '—'}",
@@ -214,6 +269,10 @@ def _build_support_html(
     subject: str,
     message: str,
     plan_name: str = "",
+    plan_status: str = "",
+    latest_payment_reference: str = "",
+    latest_payment_date: str = "",
+    expires_at: str = "",
     credit_balance: Any = 0,
     channel_state: str = "",
 ) -> str:
@@ -247,6 +306,10 @@ def _build_support_html(
         <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Priority</td><td style="padding:8px;border:1px solid #ddd;">{cell(priority)}</td></tr>
         <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Channel</td><td style="padding:8px;border:1px solid #ddd;">{cell(channel)}</td></tr>
         <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Visible Plan</td><td style="padding:8px;border:1px solid #ddd;">{cell(plan_name)}</td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Visible Plan Status</td><td style="padding:8px;border:1px solid #ddd;">{cell(plan_status)}</td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Latest Payment Reference</td><td style="padding:8px;border:1px solid #ddd;">{cell(latest_payment_reference)}</td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Latest Payment Date</td><td style="padding:8px;border:1px solid #ddd;">{cell(latest_payment_date)}</td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Visible Subscription Expiry</td><td style="padding:8px;border:1px solid #ddd;">{cell(expires_at)}</td></tr>
         <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Visible Credits</td><td style="padding:8px;border:1px solid #ddd;">{cell(credit_balance)}</td></tr>
         <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Visible Channel State</td><td style="padding:8px;border:1px solid #ddd;">{cell(channel_state)}</td></tr>
         <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Subject</td><td style="padding:8px;border:1px solid #ddd;">{cell(subject)}</td></tr>
@@ -726,6 +789,28 @@ def submit_support():
     subject = (body.get("subject") or "").strip()
     message = (body.get("message") or "").strip()
     plan_name = (body.get("planName") or body.get("plan_name") or "").strip()
+    plan_status = (body.get("planStatus") or body.get("plan_status") or "").strip()
+    latest_payment_reference = (
+        body.get("latestPaymentReference")
+        or body.get("latest_payment_reference")
+        or body.get("paymentReference")
+        or body.get("payment_reference")
+        or ""
+    ).strip()
+    latest_payment_date = (
+        body.get("latestPaymentDate")
+        or body.get("latest_payment_date")
+        or body.get("paymentDate")
+        or body.get("payment_date")
+        or ""
+    ).strip()
+    expires_at = (
+        body.get("expiresAt")
+        or body.get("expires_at")
+        or body.get("subscriptionExpires")
+        or body.get("subscription_expires")
+        or ""
+    ).strip()
     credit_balance = body.get("creditBalance") or body.get("credit_balance") or 0
     channel_state = (body.get("channelState") or body.get("channel_state") or "").strip()
 
@@ -756,6 +841,18 @@ def submit_support():
             extra={"min_length": 10},
             status=400,
         )
+
+    message = _compose_message_with_live_context(
+        message=message,
+        issue_type=issue_type,
+        plan_name=plan_name,
+        plan_status=plan_status,
+        latest_payment_reference=latest_payment_reference,
+        latest_payment_date=latest_payment_date,
+        expires_at=expires_at,
+        credit_balance=credit_balance,
+        channel_state=channel_state,
+    )
 
     account, acct_err = _get_account_row(account_id)
     if acct_err:
@@ -805,6 +902,10 @@ def submit_support():
         subject=subject,
         message=message,
         plan_name=plan_name,
+        plan_status=plan_status,
+        latest_payment_reference=latest_payment_reference,
+        latest_payment_date=latest_payment_date,
+        expires_at=expires_at,
         credit_balance=credit_balance,
         channel_state=channel_state,
     )
@@ -821,6 +922,10 @@ def submit_support():
         subject=subject,
         message=message,
         plan_name=plan_name,
+        plan_status=plan_status,
+        latest_payment_reference=latest_payment_reference,
+        latest_payment_date=latest_payment_date,
+        expires_at=expires_at,
         credit_balance=credit_balance,
         channel_state=channel_state,
     )
