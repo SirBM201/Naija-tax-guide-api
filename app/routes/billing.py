@@ -614,6 +614,77 @@ def billing_plan(plan_code: str):
     return jsonify({"ok": True, "plan": p}), 200
 
 
+def _monthly_ai_used_safe(account_id: str) -> int:
+    try:
+        from app.repositories.monthly_usage_repo import get_monthly_ai_usage
+        return int(get_monthly_ai_usage(account_id) or 0)
+    except Exception:
+        return 0
+
+
+def _normalized_billing_payload(
+    *,
+    account_id: str,
+    sub: Optional[Dict[str, Any]],
+    checkout_email: Optional[str],
+    email_err: Optional[Dict[str, Any]],
+    debug: Dict[str, Any],
+    db_warning: Optional[str] = None,
+    sub_err: Optional[Dict[str, Any]] = None,
+    credit_details: Optional[Dict[str, Any]] = None,
+    usage_today: Optional[Dict[str, Any]] = None,
+    guard: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    guard = guard or get_subscription_snapshot(account_id)
+    plan_code = (sub or {}).get("plan_code") or (guard or {}).get("plan_code")
+    plan = get_plan(plan_code) if plan_code else None
+    summary = _build_subscription_summary(sub)
+    active_now = bool(summary.get("is_active_now")) or bool(((guard or {}).get("access") or {}).get("allowed"))
+    status = (sub or {}).get("status") or (((guard or {}).get("access") or {}).get("status"))
+    provider = (sub or {}).get("provider") or "paystack"
+    provider_ref = (sub or {}).get("provider_ref")
+    daily_usage_count = int(((usage_today or {}).get("count") or (usage_today or {}).get("daily_usage") or 0) or 0)
+    included_credits = int((plan or {}).get("credits") or 0)
+    daily_answers_limit = int((plan or {}).get("daily_answers_limit") or (guard or {}).get("daily_answers_limit") or 0)
+    monthly_ai_used = _monthly_ai_used_safe(account_id)
+
+    return {
+        "ok": True,
+        "account_id": account_id,
+        "subscription": sub,
+        "subscription_summary": summary,
+        "checkout_email": checkout_email,
+        "checkout_email_error": email_err,
+        "db_warning": db_warning,
+        "subscription_error": sub_err,
+        "debug": debug,
+        "guard": guard,
+        "plan_code": plan_code,
+        "plan_name": (plan or {}).get("name") or plan_code,
+        "status": status,
+        "active": active_now,
+        "starts_at": (sub or {}).get("started_at") or (sub or {}).get("starts_at"),
+        "started_at": (sub or {}).get("started_at") or (sub or {}).get("starts_at"),
+        "expires_at": (sub or {}).get("expires_at"),
+        "current_period_end": (sub or {}).get("current_period_end") or (sub or {}).get("expires_at"),
+        "pending_plan_code": (sub or {}).get("pending_plan_code"),
+        "pending_starts_at": (sub or {}).get("pending_starts_at"),
+        "payment_reference": provider_ref,
+        "last_payment_reference": provider_ref,
+        "payment_method": provider,
+        "provider": provider,
+        "provider_name": provider.title() if provider else None,
+        "auto_renew": False,
+        "included_credits": included_credits,
+        "ai_used_month": monthly_ai_used,
+        "credit_balance": int(((credit_details or {}).get("balance") or 0) or 0),
+        "credit_exists": bool((credit_details or {}).get("exists")),
+        "credit_updated_at": (credit_details or {}).get("updated_at"),
+        "daily_usage_count": daily_usage_count,
+        "daily_answers_limit": daily_answers_limit,
+    }
+
+
 @bp.get("/billing/me")
 @bp.get("/billing/subscription")
 def billing_me():
@@ -638,19 +709,22 @@ def billing_me():
         db_warning = repr(e)
 
     checkout_email, email_err = _resolve_checkout_email(account_id)
-    summary = _build_subscription_summary(sub)
+    credit_details = get_credit_balance_details(account_id)
+    usage_today = get_daily_usage(account_id)
+    guard = get_subscription_snapshot(account_id)
 
     return jsonify(
-        {
-            "ok": True,
-            "account_id": account_id,
-            "subscription": sub,
-            "subscription_summary": summary,
-            "checkout_email": checkout_email,
-            "checkout_email_error": email_err,
-            "db_warning": db_warning,
-            "debug": debug,
-        }
+        _normalized_billing_payload(
+            account_id=account_id,
+            sub=sub,
+            checkout_email=checkout_email,
+            email_err=email_err,
+            debug=debug,
+            db_warning=db_warning,
+            credit_details=credit_details,
+            usage_today=usage_today,
+            guard=guard,
+        )
     ), 200
 
 
@@ -666,26 +740,30 @@ def billing_debug_state():
 
     sub, sub_err = _get_subscription_row(account_id)
     checkout_email, email_err = _resolve_checkout_email(account_id)
-    summary = _build_subscription_summary(sub)
     guard = get_subscription_snapshot(account_id)
     credit_details = get_credit_balance_details(account_id)
     usage_today = get_daily_usage(account_id)
 
-    return jsonify(
+    payload = _normalized_billing_payload(
+        account_id=account_id,
+        sub=sub,
+        checkout_email=checkout_email,
+        email_err=email_err,
+        debug=debug,
+        sub_err=sub_err,
+        credit_details=credit_details,
+        usage_today=usage_today,
+        guard=guard,
+    )
+    payload.update(
         {
-            "ok": True,
-            "account_id": account_id,
-            "subscription": sub,
-            "subscription_error": sub_err,
-            "subscription_summary": summary,
             "subscription_guard_snapshot": guard,
-            "checkout_email": checkout_email,
-            "checkout_email_error": email_err,
             "credit_balance": credit_details,
             "daily_usage_today": usage_today,
-            "debug": debug,
         }
-    ), 200
+    )
+
+    return jsonify(payload), 200
 
 
 @bp.post("/billing/checkout")
