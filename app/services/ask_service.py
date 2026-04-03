@@ -24,6 +24,13 @@ from app.services.answer_composer import (
 from app.services.usage_guard_service import get_ai_usage_state
 from app.services.billing_guard_service import get_billing_state
 from app.services.ai_service import generate_grounded_answer
+from app.services.credits_service import (
+    check_credit_balance,
+    consume_credits,
+    get_credit_balance_details,
+    get_daily_usage,
+    increment_daily_usage,
+)
 from app.services.tax_grounding_service import (
     build_grounded_answer,
     grounding_prompt_context,
@@ -68,6 +75,79 @@ INTENT_ALIASES = {
     "computation": {"calculation", "computation"},
     "exemption": {"exemption", "definition", "guidance"},
 }
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        try:
+            return int(float(value))
+        except Exception:
+            return default
+
+
+def _with_usage_meta(result: Dict[str, Any], *, usage_state: Dict[str, Any], balance: int | None = None, daily_usage: int | None = None) -> Dict[str, Any]:
+    payload = dict(result or {})
+    meta = dict(payload.get("meta") or {})
+    meta.setdefault("ai_used_month", _safe_int(usage_state.get("monthly_ai_usage"), 0))
+    meta.setdefault("monthly_ai_used", _safe_int(usage_state.get("monthly_ai_usage"), 0))
+    meta.setdefault("daily_usage", _safe_int(daily_usage if daily_usage is not None else usage_state.get("daily_ai_usage"), 0))
+    meta.setdefault("daily_limit", _safe_int(usage_state.get("daily_ai_limit"), 0))
+    meta.setdefault("credit_balance", _safe_int(balance if balance is not None else usage_state.get("credits_left"), 0))
+    payload["meta"] = meta
+    return payload
+
+
+def _build_uncached_block_response(*, question_meta: Dict[str, Any], debug: Dict[str, Any], usage_state: Dict[str, Any], balance: int, error: str) -> Dict[str, Any]:
+    res = compose_insufficient_uncached(question_meta=question_meta, debug=_filtered_debug(debug))
+    payload = res.__dict__
+    payload["error"] = error
+    return _with_usage_meta(payload, usage_state=usage_state, balance=balance)
+
+
+def _finalize_ai_success(*, result: Dict[str, Any], account_id: str, usage_state: Dict[str, Any], debug: Dict[str, Any]) -> Dict[str, Any]:
+    consume_result = consume_credits(account_id, cost=1)
+    if not consume_result.get("ok"):
+        debug["credit_consume_result"] = consume_result
+        payload = dict(result or {})
+        payload.update(
+            {
+                "ok": False,
+                "error": consume_result.get("error") or "credit_consume_failed",
+                "message": "Your answer was generated but credit finalization failed.",
+                "fix": consume_result.get("fix"),
+                "root_cause": consume_result.get("root_cause"),
+                "details": consume_result.get("details"),
+                "answer": "",
+            }
+        )
+        return _with_usage_meta(payload, usage_state=usage_state)
+
+    daily_result = increment_daily_usage(account_id, inc=1)
+    debug["credit_consume_result"] = consume_result
+    debug["daily_usage_increment_result"] = daily_result
+
+    balance_after = _safe_int(consume_result.get("balance_after"), 0)
+    daily_after = _safe_int((daily_result or {}).get("count"), _safe_int(usage_state.get("daily_ai_usage"), 0) + 1)
+    monthly_after = _safe_int(usage_state.get("monthly_ai_usage"), 0) + 1
+
+    next_usage_state = dict(usage_state or {})
+    next_usage_state["credits_left"] = balance_after
+    next_usage_state["daily_ai_usage"] = daily_after
+    next_usage_state["monthly_ai_usage"] = monthly_after
+    next_usage_state["has_ai_credit"] = balance_after > 0
+
+    payload = dict(result or {})
+    meta = dict(payload.get("meta") or {})
+    meta["ai_used_month"] = monthly_after
+    meta["monthly_ai_used"] = monthly_after
+    meta["daily_usage"] = daily_after
+    meta["daily_limit"] = _safe_int(usage_state.get("daily_ai_limit"), 0)
+    meta["credit_balance"] = balance_after
+    meta["credits_left"] = balance_after
+    payload["meta"] = meta
+    return payload
 
 
 def _truthy(v: str | None) -> bool:
@@ -782,7 +862,16 @@ def ask_guarded(*args: Any, **kwargs: Any) -> Dict[str, Any]:
 
     usage_state = get_ai_usage_state(account_id)
     billing_state = get_billing_state(account_id)
-    credits_available = bool(usage_state.get("has_ai_credit"))
+    credit_details = get_credit_balance_details(account_id)
+    current_balance = _safe_int(credit_details.get("balance"), _safe_int(usage_state.get("credits_left"), 0))
+    usage_state["credits_left"] = current_balance
+    usage_today = get_daily_usage(account_id)
+    if usage_today.get("ok"):
+        usage_state["daily_ai_usage"] = _safe_int(usage_today.get("count"), _safe_int(usage_state.get("daily_ai_usage"), 0))
+    credit_precheck = check_credit_balance(account_id, cost=1)
+    credits_available = bool(usage_state.get("subscription_active")) and bool(credit_precheck.get("ok"))
+    usage_state["has_ai_credit"] = credits_available
+    usage_state["raw_has_ai_credit"] = credits_available
     standalone_mode = _is_standalone_mode(channel)
     generic_process_question = _is_generic_process_question(question, question_meta)
 
@@ -794,6 +883,9 @@ def ask_guarded(*args: Any, **kwargs: Any) -> Dict[str, Any]:
         "question_meta": question_meta,
         "billing_state": billing_state,
         "usage_state": usage_state,
+        "credit_details": credit_details,
+        "credit_precheck": credit_precheck,
+        "usage_today": usage_today,
     }
 
     temp_ranked = retrieve_ranked_candidates(classification)
@@ -814,13 +906,13 @@ def ask_guarded(*args: Any, **kwargs: Any) -> Dict[str, Any]:
 
     if classification.requires_clarification:
         res = compose_clarification(question_meta=question_meta, debug=_filtered_debug(debug))
-        return res.__dict__
+        return _with_usage_meta(res.__dict__, usage_state=usage_state, balance=current_balance, daily_usage=_safe_int(usage_state.get("daily_ai_usage"), 0))
 
     rule_answer = _resolve_rules(question, question_meta["topic"], question_meta["intent_type"])
     if rule_answer:
         debug["final_path"] = "rules_engine"
         res = compose_rules_engine_answer(rule_answer, question_meta=question_meta, debug=_filtered_debug(debug))
-        return res.__dict__
+        return _with_usage_meta(res.__dict__, usage_state=usage_state, balance=current_balance, daily_usage=_safe_int(usage_state.get("daily_ai_usage"), 0))
 
     process_result = _try_process_composer(question)
     if process_result:
@@ -839,7 +931,7 @@ def ask_guarded(*args: Any, **kwargs: Any) -> Dict[str, Any]:
             question_meta=process_question_meta,
             debug=_filtered_debug(debug),
         )
-        return res.__dict__
+        return _with_usage_meta(res.__dict__, usage_state=usage_state, balance=current_balance, daily_usage=_safe_int(usage_state.get("daily_ai_usage"), 0))
 
     tax_matches = _retrieve_tax_knowledge_matches(question, question_meta)
     debug["tax_matches"] = tax_matches
@@ -889,7 +981,7 @@ def ask_guarded(*args: Any, **kwargs: Any) -> Dict[str, Any]:
                 question_meta=tax_question_meta,
                 debug=_filtered_debug(debug),
             )
-            return res.__dict__
+            return _with_usage_meta(res.__dict__, usage_state=usage_state, balance=current_balance, daily_usage=_safe_int(usage_state.get("daily_ai_usage"), 0))
 
     ranked = temp_ranked
     decision = decide_answer_mode(
@@ -925,7 +1017,7 @@ def ask_guarded(*args: Any, **kwargs: Any) -> Dict[str, Any]:
                 question_meta=question_meta,
                 debug=_filtered_debug(debug),
             )
-            return res.__dict__
+            return _with_usage_meta(res.__dict__, usage_state=usage_state, balance=current_balance, daily_usage=_safe_int(usage_state.get("daily_ai_usage"), 0))
 
     if decision.mode == "insufficient_credits_uncached" or not credits_available:
         fallback_answer = _best_safe_fallback_answer(
@@ -942,11 +1034,16 @@ def ask_guarded(*args: Any, **kwargs: Any) -> Dict[str, Any]:
                 question_meta=question_meta,
                 debug=_filtered_debug(debug),
             )
-            return res.__dict__
+            return _with_usage_meta(res.__dict__, usage_state=usage_state, balance=current_balance, daily_usage=_safe_int(usage_state.get("daily_ai_usage"), 0))
 
         debug["final_path"] = "insufficient_uncached"
-        res = compose_insufficient_uncached(question_meta=question_meta, debug=_filtered_debug(debug))
-        return res.__dict__
+        return _build_uncached_block_response(
+            question_meta=question_meta,
+            debug=debug,
+            usage_state=usage_state,
+            balance=current_balance,
+            error=(credit_precheck.get("error") or "insufficient_credits_uncached"),
+        )
 
     grounded_candidates = [_candidate_to_dict(c) for c in ranked[:3]]
     grounding_context_parts: List[str] = []
@@ -1002,7 +1099,7 @@ def ask_guarded(*args: Any, **kwargs: Any) -> Dict[str, Any]:
                 question_meta=question_meta,
                 debug=_filtered_debug(debug),
             )
-            return res.__dict__
+            return _with_usage_meta(res.__dict__, usage_state=usage_state, balance=current_balance, daily_usage=_safe_int(usage_state.get("daily_ai_usage"), 0))
 
         graceful = (
             "I do not yet have enough reliable guidance in the system to answer that accurately. "
@@ -1010,7 +1107,7 @@ def ask_guarded(*args: Any, **kwargs: Any) -> Dict[str, Any]:
             "I can guide you more precisely."
         )
         res = compose_ai_answer(graceful, question_meta=question_meta, debug=_filtered_debug(debug))
-        return res.__dict__
+        return _with_usage_meta(res.__dict__, usage_state=usage_state, balance=current_balance, daily_usage=_safe_int(usage_state.get("daily_ai_usage"), 0))
 
     rendered_ai = render_answer(answer_text, question_meta=question_meta)
     if looks_like_internal_or_broken_answer(rendered_ai):
@@ -1027,7 +1124,12 @@ def ask_guarded(*args: Any, **kwargs: Any) -> Dict[str, Any]:
                 question_meta=question_meta,
                 debug=_filtered_debug(debug),
             )
-            return res.__dict__
+            return _with_usage_meta(res.__dict__, usage_state=usage_state, balance=current_balance, daily_usage=_safe_int(usage_state.get("daily_ai_usage"), 0))
 
     res = compose_ai_answer(answer_text, question_meta=question_meta, debug=_filtered_debug(debug))
-    return res.__dict__
+    return _finalize_ai_success(
+        result=res.__dict__,
+        account_id=account_id,
+        usage_state=usage_state,
+        debug=debug,
+    )
