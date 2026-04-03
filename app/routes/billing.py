@@ -1033,15 +1033,27 @@ def billing_verify():
         )
 
     if _payment_already_applied(account_id=account_id, plan_code=plan_code, reference=reference):
-        result.update(
+        existing_sub, existing_sub_err = _get_subscription_row(account_id)
+        logger.info("[%s] duplicate payment application skipped reference=%s", ROUTE_VERSION, reference)
+        return jsonify(
             {
+                "ok": True,
+                "paid": True,
+                "applied": True,
+                "activation_state": "applied",
+                "reference": reference,
+                "change_mode": change_mode,
+                "status": status_text,
+                "plan_code": plan_code,
+                "account_id": account_id,
+                "subscription": existing_sub,
+                "subscription_summary": _build_subscription_summary(existing_sub),
+                "subscription_lookup_error": existing_sub_err,
                 "skipped": True,
                 "reason": "payment_already_applied",
-                "subscription": _get_subscription_row(account_id)[0],
+                "message": "Payment verified and subscription was already applied earlier.",
             }
-        )
-        logger.info("[%s] duplicate payment application skipped reference=%s", ROUTE_VERSION, reference)
-        return jsonify(result), 200
+        ), 200
 
     plan = get_plan(plan_code)
     if not plan:
