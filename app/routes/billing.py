@@ -685,6 +685,185 @@ def _normalized_billing_payload(
     }
 
 
+
+def _plan_name_from_code(plan_code: Optional[str]) -> Optional[str]:
+    code = (plan_code or "").strip().lower()
+    if not code:
+        return None
+    plan = get_plan(code)
+    return (plan or {}).get("name") or code
+
+
+def _event_preference_score(event_type: str, status: str) -> int:
+    event = (event_type or "").strip().lower()
+    state = (status or "").strip().lower()
+    if event == "charge.success" and state == "success":
+        return 300
+    if event == "charge.success":
+        return 250
+    if event == "verify" and state == "success":
+        return 200
+    if event == "verify":
+        return 150
+    return 100
+
+
+def _normalize_payment_history_row(
+    *,
+    row: Dict[str, Any],
+    account_id: str,
+    checkout_email: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    payload = row.get("payload") if isinstance(row, dict) else {}
+    payload = payload if isinstance(payload, dict) else {}
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+
+    metadata = _extract_metadata(data)
+    metadata_account_id = (metadata.get("account_id") or "").strip()
+    metadata_email = (metadata.get("email") or "").strip().lower()
+    customer = data.get("customer") if isinstance(data.get("customer"), dict) else {}
+    customer_email = (customer.get("email") or "").strip().lower()
+    expected_email = (checkout_email or "").strip().lower()
+
+    reference = (row.get("reference") or data.get("reference") or "").strip()
+    if not reference:
+        return None
+
+    if metadata_account_id and metadata_account_id != account_id:
+        return None
+
+    if not metadata_account_id and expected_email:
+        if metadata_email and metadata_email != expected_email:
+            return None
+        if customer_email and customer_email != expected_email:
+            return None
+
+    event_type = (row.get("event_type") or "").strip().lower()
+    status = _extract_status(data) or ("success" if event_type == "charge.success" else "")
+    amount_kobo = data.get("amount")
+    try:
+        amount_ngn = int(round(float(amount_kobo or 0) / 100.0))
+    except Exception:
+        amount_ngn = 0
+
+    paid_at = (
+        data.get("paid_at")
+        or data.get("transaction_date")
+        or data.get("created_at")
+        or row.get("created_at")
+    )
+
+    plan_code = (metadata.get("plan_code") or "").strip().lower() or None
+    gateway_response = data.get("gateway_response") or data.get("message") or None
+
+    return {
+        "reference": reference,
+        "event_type": event_type or "unknown",
+        "status": status or "unknown",
+        "amount_ngn": amount_ngn,
+        "currency": (data.get("currency") or "NGN"),
+        "paid_at": paid_at,
+        "created_at": row.get("created_at"),
+        "plan_code": plan_code,
+        "plan_name": _plan_name_from_code(plan_code),
+        "payment_method": (data.get("channel") or "paystack"),
+        "channel_type": (metadata.get("channel_type") or "").strip().lower() or None,
+        "gateway_response": gateway_response,
+        "source": "paystack_events",
+        "_score": _event_preference_score(event_type, status),
+    }
+
+
+def _load_payment_history(
+    *,
+    account_id: str,
+    checkout_email: Optional[str],
+    current_sub: Optional[Dict[str, Any]] = None,
+    limit: int = 10,
+) -> Dict[str, Any]:
+    limit = max(1, min(int(limit or 10), 50))
+    rows = []
+    db_warning = None
+
+    try:
+        res = (
+            _sb()
+            .table("paystack_events")
+            .select("event_id,event_type,reference,payload,created_at")
+            .order("created_at", desc=True)
+            .limit(250)
+            .execute()
+        )
+        rows = getattr(res, "data", None) or []
+    except Exception as e:
+        db_warning = f"{type(e).__name__}: {_clip(e)}"
+
+    deduped: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        normalized = _normalize_payment_history_row(
+            row=row,
+            account_id=account_id,
+            checkout_email=checkout_email,
+        )
+        if not normalized:
+            continue
+        reference = normalized["reference"]
+        existing = deduped.get(reference)
+        if not existing:
+            deduped[reference] = normalized
+            continue
+        existing_score = int(existing.get("_score") or 0)
+        incoming_score = int(normalized.get("_score") or 0)
+        existing_date = str(existing.get("paid_at") or existing.get("created_at") or "")
+        incoming_date = str(normalized.get("paid_at") or normalized.get("created_at") or "")
+        if incoming_score > existing_score or (incoming_score == existing_score and incoming_date > existing_date):
+            deduped[reference] = normalized
+
+    current_reference = ((current_sub or {}).get("provider_ref") or "").strip()
+    if current_reference and current_reference not in deduped:
+        deduped[current_reference] = {
+            "reference": current_reference,
+            "event_type": "subscription_snapshot",
+            "status": (current_sub or {}).get("status") or "active",
+            "amount_ngn": int((get_plan((current_sub or {}).get("plan_code") or "") or {}).get("price") or 0),
+            "currency": "NGN",
+            "paid_at": (current_sub or {}).get("started_at") or (current_sub or {}).get("updated_at"),
+            "created_at": (current_sub or {}).get("created_at"),
+            "plan_code": (current_sub or {}).get("plan_code"),
+            "plan_name": _plan_name_from_code((current_sub or {}).get("plan_code")),
+            "payment_method": (current_sub or {}).get("provider") or "paystack",
+            "channel_type": None,
+            "gateway_response": "Visible from active subscription snapshot.",
+            "source": "user_subscriptions",
+            "_score": 50,
+        }
+
+    history_rows = sorted(
+        deduped.values(),
+        key=lambda item: str(item.get("paid_at") or item.get("created_at") or ""),
+        reverse=True,
+    )[:limit]
+
+    cleaned_rows = []
+    for item in history_rows:
+        x = dict(item)
+        x.pop("_score", None)
+        cleaned_rows.append(x)
+
+    latest_success = next(
+        (item for item in cleaned_rows if str(item.get("status") or "").lower() == "success"),
+        None,
+    )
+
+    return {
+        "ok": True,
+        "count": len(cleaned_rows),
+        "rows": cleaned_rows,
+        "latest_success": latest_success,
+        "db_warning": db_warning,
+    }
+
+
 @bp.get("/billing/me")
 @bp.get("/billing/subscription")
 def billing_me():
@@ -713,18 +892,65 @@ def billing_me():
     usage_today = get_daily_usage(account_id)
     guard = get_subscription_snapshot(account_id)
 
+    payload = _normalized_billing_payload(
+        account_id=account_id,
+        sub=sub,
+        checkout_email=checkout_email,
+        email_err=email_err,
+        debug=debug,
+        db_warning=db_warning,
+        credit_details=credit_details,
+        usage_today=usage_today,
+        guard=guard,
+    )
+    history = _load_payment_history(
+        account_id=account_id,
+        checkout_email=checkout_email,
+        current_sub=sub,
+        limit=8,
+    )
+    payload["payment_history"] = history
+    latest_success = history.get("latest_success") if isinstance(history, dict) else None
+    if latest_success and not payload.get("payment_reference"):
+        payload["payment_reference"] = latest_success.get("reference")
+        payload["last_payment_reference"] = latest_success.get("reference")
+    if latest_success and not payload.get("payment_method"):
+        payload["payment_method"] = latest_success.get("payment_method")
+    return jsonify(payload), 200
+
+
+
+@bp.get("/billing/history")
+def billing_history():
+    account_id, debug = get_account_id_from_request(request)
+    if not account_id:
+        return jsonify({"ok": False, "error": "unauthorized", "debug": debug}), 401
+
+    sub, _ = _get_subscription_row(account_id)
+    checkout_email, email_err = _resolve_checkout_email(account_id)
+    limit_raw = request.args.get("limit") or "12"
+    try:
+        limit = int(limit_raw)
+    except Exception:
+        limit = 12
+
+    history = _load_payment_history(
+        account_id=account_id,
+        checkout_email=checkout_email,
+        current_sub=sub,
+        limit=limit,
+    )
+
     return jsonify(
-        _normalized_billing_payload(
-            account_id=account_id,
-            sub=sub,
-            checkout_email=checkout_email,
-            email_err=email_err,
-            debug=debug,
-            db_warning=db_warning,
-            credit_details=credit_details,
-            usage_today=usage_today,
-            guard=guard,
-        )
+        {
+            "ok": True,
+            "account_id": account_id,
+            "checkout_email": checkout_email,
+            "checkout_email_error": email_err,
+            "subscription_summary": _build_subscription_summary(sub),
+            "history": history,
+            "debug": debug,
+        }
     ), 200
 
 
@@ -1033,27 +1259,15 @@ def billing_verify():
         )
 
     if _payment_already_applied(account_id=account_id, plan_code=plan_code, reference=reference):
-        existing_sub, existing_sub_err = _get_subscription_row(account_id)
-        logger.info("[%s] duplicate payment application skipped reference=%s", ROUTE_VERSION, reference)
-        return jsonify(
+        result.update(
             {
-                "ok": True,
-                "paid": True,
-                "applied": True,
-                "activation_state": "applied",
-                "reference": reference,
-                "change_mode": change_mode,
-                "status": status_text,
-                "plan_code": plan_code,
-                "account_id": account_id,
-                "subscription": existing_sub,
-                "subscription_summary": _build_subscription_summary(existing_sub),
-                "subscription_lookup_error": existing_sub_err,
                 "skipped": True,
                 "reason": "payment_already_applied",
-                "message": "Payment verified and subscription was already applied earlier.",
+                "subscription": _get_subscription_row(account_id)[0],
             }
-        ), 200
+        )
+        logger.info("[%s] duplicate payment application skipped reference=%s", ROUTE_VERSION, reference)
+        return jsonify(result), 200
 
     plan = get_plan(plan_code)
     if not plan:
