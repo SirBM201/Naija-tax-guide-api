@@ -1,46 +1,45 @@
 from __future__ import annotations
 
-import hashlib
-import re
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any
+from typing import Any, Dict, Optional
 
-from app.core.supabase_client import supabase
-from app.services.accounts_service import upsert_account_link
-
-# 8 chars, NON-ambiguous: 23456789 + A-HJ-NP-Z (no I, O)
-CODE_RE = re.compile(r"\b([2-9A-HJ-NP-Z]{8})\b", re.IGNORECASE)
-
-
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+from app.services.accounts_service import (
+    find_account_by_provider_user_id,
+    mark_channel_claimed_for_auth_user,
+    upsert_account_link,
+)
+from app.services.supabase_service import sb_request
 
 
-def _sha256_hex(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
-def _safe_iso_to_dt(value: Any) -> Optional[datetime]:
-    try:
-        if not value:
-            return None
-        text = str(value).strip().replace("Z", "+00:00")
-        dt = datetime.fromisoformat(text)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
-    except Exception:
-        return None
+def _get_link_token(provider: str, code: str) -> Optional[Dict[str, Any]]:
+    r = sb_request(
+        "GET",
+        "/rest/v1/link_tokens",
+        params={
+            "select": "*",
+            "provider": f"eq.{provider}",
+            "code": f"eq.{code}",
+            "limit": "1",
+        },
+    )
+    rows = r.json() or []
+    return rows[0] if rows else None
 
 
-def extract_code(text: str) -> Optional[str]:
-    t = (text or "").strip()
-    if not t:
-        return None
-    m = CODE_RE.search(t)
-    if not m:
-        return None
-    return (m.group(1) or "").strip().upper()
+def _mark_token_used(token_id: str, provider_user_id: str) -> None:
+    sb_request(
+        "PATCH",
+        "/rest/v1/link_tokens",
+        params={"id": f"eq.{token_id}"},
+        json={
+            "used_at": _now_iso(),
+            "used_by_provider_user_id": provider_user_id,
+        },
+    )
 
 
 def consume_and_link(
@@ -48,108 +47,78 @@ def consume_and_link(
     provider: str,
     code: str,
     provider_user_id: str,
-    display_name: Optional[str] = None,
-    phone: Optional[str] = None,
+    display_name: Optional[str],
+    phone: Optional[str],
 ) -> Dict[str, Any]:
-    provider = (provider or "").strip().lower()
-    code = (code or "").strip().upper()
-    provider_user_id = (provider_user_id or "").strip()
-
-    if provider not in ("wa", "tg", "msgr", "ig", "email"):
-        return {"ok": False, "error": "provider_not_supported"}
-    if not code:
-        return {"ok": False, "error": "code_required"}
-    if not provider_user_id:
-        return {"ok": False, "error": "provider_user_id_required"}
-
-    sb = supabase
-
-    token = None
-
-    try:
-        res = (
-            sb.table("link_tokens")
-            .select("*")
-            .eq("provider", provider)
-            .eq("code", code)
-            .limit(1)
-            .execute()
-        )
-        rows = res.data or []
-        token = rows[0] if rows else None
-    except Exception:
-        token = None
-
+    token = _get_link_token(provider, code)
     if not token:
-        try:
-            code_hash = _sha256_hex(code)
-            res = (
-                sb.table("link_tokens")
-                .select("*")
-                .eq("provider", provider)
-                .eq("code_hash", code_hash)
-                .limit(1)
-                .execute()
-            )
-            rows = res.data or []
-            token = rows[0] if rows else None
-        except Exception as e:
-            return {"ok": False, "error": f"token_lookup_error:{str(e)}"}
-
-    if not token:
-        return {"ok": False, "error": "invalid_or_expired_code"}
+        return {"ok": False, "reason": "invalid_code"}
 
     if token.get("used_at"):
-        return {"ok": False, "error": "invalid_or_expired_code"}
+        return {"ok": False, "reason": "used_code"}
 
-    expires_at = _safe_iso_to_dt(token.get("expires_at"))
-    if not expires_at:
-        return {"ok": False, "error": "invalid_or_expired_code"}
-
-    if expires_at <= _utcnow():
-        return {"ok": False, "error": "invalid_or_expired_code"}
+    expires_at = token.get("expires_at")
+    if expires_at:
+        try:
+            if datetime.fromisoformat(str(expires_at).replace("Z", "+00:00")) <= datetime.now(timezone.utc):
+                return {"ok": False, "reason": "expired_code"}
+        except Exception:
+            pass
 
     auth_user_id = str(token.get("auth_user_id") or "").strip()
     if not auth_user_id:
-        return {"ok": False, "error": "consume_missing_auth_user_id"}
+        return {"ok": False, "reason": "missing_auth_user"}
 
-    link = upsert_account_link(
+    existing = find_account_by_provider_user_id(provider=provider, provider_user_id=provider_user_id)
+
+    # If already linked to another auth user, block.
+    if existing and str(existing.get("auth_user_id") or "").strip():
+        existing_auth = str(existing.get("auth_user_id") or "").strip()
+        if existing_auth != auth_user_id:
+            return {"ok": False, "reason": "channel_belongs_to_another_user"}
+
+        # Already linked to same user: mark token used and succeed idempotently.
+        _mark_token_used(str(token["id"]), provider_user_id)
+        return {
+            "ok": True,
+            "linked": True,
+            "already_linked": True,
+            "account_id": existing.get("account_id"),
+        }
+
+    # If a provisional row exists for this WhatsApp number, claim it in place.
+    if existing and not str(existing.get("auth_user_id") or "").strip():
+        claimed = mark_channel_claimed_for_auth_user(
+            provider=provider,
+            provider_user_id=provider_user_id,
+            auth_user_id=auth_user_id,
+            display_name=display_name,
+            phone=phone,
+        )
+        if claimed.get("ok"):
+            _mark_token_used(str(token["id"]), provider_user_id)
+            return {
+                "ok": True,
+                "linked": True,
+                "claimed_existing_channel": True,
+                "account_id": claimed.get("account_id"),
+            }
+        return {"ok": False, "reason": claimed.get("reason") or "claim_failed"}
+
+    # Otherwise create/update the provider row for this auth user.
+    linked = upsert_account_link(
         provider=provider,
         provider_user_id=provider_user_id,
         auth_user_id=auth_user_id,
         display_name=display_name,
         phone=phone,
     )
-    if not link.get("ok"):
-        return {
-            "ok": False,
-            "error": link.get("error") or "failed_to_link",
-            "reason": link.get("reason"),
-        }
+    if not linked.get("ok"):
+        return {"ok": False, "reason": linked.get("reason") or "link_failed"}
 
-    now = _utcnow().isoformat()
-
-    try:
-        (
-            sb.table("link_tokens")
-            .update(
-                {
-                    "used_at": now,
-                    "provider_user_id": provider_user_id,
-                }
-            )
-            .eq("id", token["id"])
-            .execute()
-        )
-    except Exception as e:
-        return {"ok": False, "error": f"token_finalize_error:{str(e)}"}
-
+    _mark_token_used(str(token["id"]), provider_user_id)
     return {
         "ok": True,
-        "provider": provider,
-        "provider_user_id": provider_user_id,
-        "auth_user_id": auth_user_id,
-        "token_id": token.get("id"),
-        "expires_at": token.get("expires_at"),
-        "account": link.get("account"),
+        "linked": True,
+        "account_id": linked.get("account_id"),
     }
