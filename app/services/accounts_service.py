@@ -325,6 +325,29 @@ def lookup_account(*, provider: str, provider_user_id: str) -> Dict[str, Any]:
     }
 
 
+def _read_account_by_auth_provider(auth_user_id: str, provider: str, select_cols: str) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    try:
+        res = (
+            _sb().table("accounts")
+            .select(select_cols)
+            .eq("auth_user_id", auth_user_id)
+            .eq("provider", provider)
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        return (rows[0] if rows else None), None
+    except Exception as e:
+        return None, {
+            "ok": False,
+            "error": "db_error",
+            "root_cause": f"{type(e).__name__}: {_clip(str(e))}",
+            "fix": "Check accounts read permissions for auth_user_id/provider lookup.",
+            "details": {"auth_user_id": auth_user_id, "provider": provider, "stage": "auth_provider_read"},
+            "debug": _safe_debug_meta(),
+        }
+
+
 def upsert_account_link(
     *,
     provider: str,
@@ -345,40 +368,57 @@ def upsert_account_link(
     if not _is_uuid(auth_user_id):
         return {"ok": False, "error": "auth_user_id must be a valid uuid"}
 
+    select_cols = _select_cols_existing(
+        "accounts",
+        ["id", "account_id", "provider", "provider_user_id", "auth_user_id", "display_name", "phone", "phone_e164", "updated_at", "created_at"],
+    )
+
     existing = lookup_account(provider=provider, provider_user_id=provider_user_id)
     if existing.get("ok") and existing.get("found"):
         old = (existing.get("auth_user_id") or "").strip()
         if old and old != auth_user_id:
             return {"ok": False, "error": "This channel is already linked to another account.", "reason": "channel_already_linked"}
 
-    payload: Dict[str, Any] = {
+    current_row, current_err = _read_account_by_auth_provider(auth_user_id, provider, select_cols)
+    if current_err:
+        return current_err
+
+    update_payload: Dict[str, Any] = {
         "provider": provider,
         "provider_user_id": provider_user_id,
         "auth_user_id": auth_user_id,
         "updated_at": _now_iso(),
     }
     if display_name is not None and _has_column("accounts", "display_name"):
-        payload["display_name"] = display_name
+        update_payload["display_name"] = display_name
     if phone is not None:
         if _has_column("accounts", "phone"):
-            payload["phone"] = phone
+            update_payload["phone"] = phone
         if _has_column("accounts", "phone_e164"):
-            payload["phone_e164"] = phone
-
-    select_cols = _select_cols_existing(
-        "accounts",
-        ["id", "account_id", "provider", "provider_user_id", "auth_user_id", "display_name", "phone", "phone_e164", "updated_at", "created_at"],
-    )
+            update_payload["phone_e164"] = phone
 
     try:
-        _sb().table("accounts").upsert(payload, on_conflict="provider,provider_user_id").execute()
+        if current_row and str(current_row.get("id") or "").strip():
+            row_id = str(current_row.get("id") or "").strip()
+            _sb().table("accounts").update(update_payload).eq("id", row_id).execute()
+        else:
+            _sb().table("accounts").upsert(update_payload, on_conflict="provider,provider_user_id").execute()
     except Exception as e:
         return {
             "ok": False,
             "error": "db_error",
             "root_cause": f"{type(e).__name__}: {_clip(str(e))}",
-            "fix": "Check accounts RLS and unique constraint on (provider,provider_user_id).",
-            "details": {"provider": provider, "provider_user_id": provider_user_id, "stage": "link_write"},
+            "fix": (
+                "Check accounts RLS and uniqueness rules. If you enforce one row per (auth_user_id, provider), "
+                "the linker now updates that row first; otherwise ensure unique constraints align with the app logic."
+            ),
+            "details": {
+                "provider": provider,
+                "provider_user_id": provider_user_id,
+                "auth_user_id": auth_user_id,
+                "existing_auth_provider_row": bool(current_row),
+                "stage": "link_write",
+            },
             "debug": _safe_debug_meta(),
         }
 
@@ -390,7 +430,7 @@ def upsert_account_link(
             "ok": False,
             "error": "db_error",
             "root_cause": "link write succeeded but read-back returned no row",
-            "fix": "Check accounts select permissions and verify row visibility after upsert.",
+            "fix": "Check accounts select permissions and verify row visibility after link update/upsert.",
             "details": {"provider": provider, "provider_user_id": provider_user_id, "stage": "link_readback"},
             "debug": _safe_debug_meta(),
         }
