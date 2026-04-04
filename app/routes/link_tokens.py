@@ -3,18 +3,19 @@ from __future__ import annotations
 import hashlib
 import os
 import secrets
-import string
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple
+from urllib.parse import quote
 
 from flask import Blueprint, jsonify, request
 from supabase import create_client
 
+from app.services.channel_linking_service import consume_and_link
 from app.services.web_auth_service import get_account_id_from_request
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").strip()
+SUPABASE_SERVICE_ROLE_KEY = (os.getenv("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
     raise RuntimeError("SUPABASE env vars missing")
@@ -27,13 +28,20 @@ TOKEN_LENGTH = 8
 TOKEN_EXPIRY_MINUTES = 30
 SAFE_CODE_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
 
+WHATSAPP_TEST_LINE_E164 = (os.getenv("WHATSAPP_TEST_LINE_E164") or "").strip()
+WHATSAPP_DEEP_LINK = (os.getenv("WHATSAPP_DEEP_LINK") or "").strip()
+TELEGRAM_BOT_USERNAME = (os.getenv("TELEGRAM_BOT_USERNAME") or "").strip().lstrip("@")
+TELEGRAM_BOT_URL = (os.getenv("TELEGRAM_BOT_URL") or "").strip()
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+
 def _sha256_hex(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
 
 
 def _json_error(message: str, status: int = 400, **extra: Any):
@@ -43,17 +51,24 @@ def _json_error(message: str, status: int = 400, **extra: Any):
     return jsonify(payload), status
 
 
+
 def _normalize_provider(raw: str) -> str:
     v = (raw or "").strip().lower()
     if v in {"tg", "telegram"}:
         return "tg"
     if v in {"wa", "whatsapp"}:
         return "wa"
+    if v in {"msgr", "messenger"}:
+        return "msgr"
+    if v in {"ig", "instagram"}:
+        return "ig"
     return v
+
 
 
 def _generate_code(length: int = TOKEN_LENGTH) -> str:
     return "".join(secrets.choice(SAFE_CODE_ALPHABET) for _ in range(length))
+
 
 
 def _safe_iso_to_dt(value: Any) -> Optional[datetime]:
@@ -69,6 +84,7 @@ def _safe_iso_to_dt(value: Any) -> Optional[datetime]:
         return None
 
 
+
 def _get_logged_in_account_id() -> Tuple[Optional[str], Dict[str, Any]]:
     try:
         account_id, dbg = get_account_id_from_request(request)
@@ -76,6 +92,7 @@ def _get_logged_in_account_id() -> Tuple[Optional[str], Dict[str, Any]]:
         return account_id, dbg if isinstance(dbg, dict) else {}
     except Exception as e:
         return None, {"ok": False, "error": "auth_resolution_failed", "detail": repr(e)}
+
 
 
 def _find_account_row_for_provider(account_id: str, provider: str) -> Optional[Dict[str, Any]]:
@@ -96,6 +113,7 @@ def _find_account_row_for_provider(account_id: str, provider: str) -> Optional[D
         return None
 
 
+
 def _find_account_row_by_provider_user(provider: str, provider_user_id: str) -> Optional[Dict[str, Any]]:
     try:
         res = (
@@ -112,6 +130,39 @@ def _find_account_row_by_provider_user(provider: str, provider_user_id: str) -> 
         return rows[0] if rows else None
     except Exception:
         return None
+
+
+
+def _build_whatsapp_link(code: str) -> Optional[str]:
+    message = quote(code)
+
+    if WHATSAPP_DEEP_LINK:
+        separator = "&" if "?" in WHATSAPP_DEEP_LINK else "?"
+        if "text=" in WHATSAPP_DEEP_LINK:
+            return WHATSAPP_DEEP_LINK
+        return f"{WHATSAPP_DEEP_LINK}{separator}text={message}"
+
+    phone = "".join(ch for ch in WHATSAPP_TEST_LINE_E164 if ch.isdigit())
+    if phone:
+        return f"https://wa.me/{phone}?text={message}"
+
+    return f"https://wa.me/?text={message}"
+
+
+
+def _build_telegram_link(code: str) -> Optional[str]:
+    message = quote(code)
+
+    if TELEGRAM_BOT_URL:
+        separator = "&" if "?" in TELEGRAM_BOT_URL else "?"
+        if "start=" in TELEGRAM_BOT_URL or "text=" in TELEGRAM_BOT_URL:
+            return TELEGRAM_BOT_URL
+        return f"{TELEGRAM_BOT_URL}{separator}text={message}"
+
+    if TELEGRAM_BOT_USERNAME:
+        return f"https://t.me/{TELEGRAM_BOT_USERNAME}?text={message}"
+
+    return None
 
 
 @bp.get("/status")
@@ -145,19 +196,6 @@ def link_status():
 
 @bp.post("/generate")
 def generate_link_code():
-    """
-    Website side.
-
-    Body:
-    {
-        "provider": "wa" | "tg"
-    }
-
-    Important:
-    - Uses authenticated web session identity from get_account_id_from_request(...)
-    - Stores canonical account id into link_tokens.auth_user_id because that is the live schema
-    - Generates only non-ambiguous 8-character codes compatible with Telegram extractor
-    """
     account_id, auth_dbg = _get_logged_in_account_id()
     if not account_id:
         return _json_error("Unauthorized", 401, auth=auth_dbg)
@@ -176,11 +214,7 @@ def generate_link_code():
     try:
         (
             sb.table("link_tokens")
-            .update(
-                {
-                    "used_at": now.isoformat(),
-                }
-            )
+            .update({"used_at": now.isoformat()})
             .eq("auth_user_id", account_id)
             .eq("provider", provider)
             .is_("used_at", "null")
@@ -212,6 +246,10 @@ def generate_link_code():
             provider=provider,
         )
 
+    whatsapp_url = _build_whatsapp_link(code) if provider == "wa" else None
+    telegram_url = _build_telegram_link(code) if provider == "tg" else None
+    deep_link = whatsapp_url if provider == "wa" else telegram_url
+
     return jsonify(
         {
             "ok": True,
@@ -220,25 +258,17 @@ def generate_link_code():
             "code": code,
             "expires_in_minutes": TOKEN_EXPIRY_MINUTES,
             "expires_at": expires_at.isoformat(),
+            "deep_link": deep_link,
+            "link_url": deep_link,
+            "whatsapp_url": whatsapp_url,
+            "telegram_url": telegram_url,
+            "bot_url": telegram_url,
         }
     )
 
 
 @bp.post("/consume")
 def consume_link_code():
-    """
-    Chat side.
-
-    Body:
-    {
-        "code": "<8-char>",
-        "provider": "wa" | "tg",
-        "provider_user_id": "<chat id>",
-        "display_name": "<optional>",
-        "phone": "<optional>",
-        "phone_e164": "<optional>"
-    }
-    """
     body = request.get_json(silent=True) or {}
 
     code = (body.get("code") or "").strip().upper()
@@ -248,138 +278,33 @@ def consume_link_code():
     phone = (body.get("phone") or "").strip() or None
     phone_e164 = (body.get("phone_e164") or "").strip() or None
 
-    if not code or provider not in {"wa", "tg"} or not provider_user_id:
+    if not code or provider not in {"wa", "tg", "msgr", "ig"} or not provider_user_id:
         return _json_error("Invalid request", 400)
 
-    token: Optional[Dict[str, Any]] = None
+    link = consume_and_link(
+        provider=provider,
+        code=code,
+        provider_user_id=provider_user_id,
+        display_name=display_name,
+        phone=phone_e164 or phone,
+    )
 
-    try:
-        res = (
-            sb.table("link_tokens")
-            .select("*")
-            .eq("provider", provider)
-            .eq("code", code)
-            .limit(1)
-            .execute()
-        )
-        rows = res.data or []
-        token = rows[0] if rows else None
-    except Exception:
-        token = None
+    if not link.get("ok"):
+        error = str(link.get("error") or "link_failed").strip()
+        if error == "invalid_or_expired_code":
+            return _json_error("Invalid or expired code", 404, details=link)
+        return _json_error("Failed to link account", 400, details=link)
 
-    if not token:
-        try:
-            code_hash = _sha256_hex(code)
-            res = (
-                sb.table("link_tokens")
-                .select("*")
-                .eq("provider", provider)
-                .eq("code_hash", code_hash)
-                .limit(1)
-                .execute()
-            )
-            rows = res.data or []
-            token = rows[0] if rows else None
-        except Exception:
-            token = None
-
-    if not token:
-        return _json_error("Invalid code", 404)
-
-    if token.get("used_at"):
-        return _json_error("Code already used", 400)
-
-    expires_at = _safe_iso_to_dt(token.get("expires_at"))
-    if not expires_at:
-        return _json_error("Code invalid", 400)
-
-    if expires_at <= _utcnow():
-        return _json_error("Code expired", 400)
-
-    account_id = str(token.get("auth_user_id") or "").strip()
-    if not account_id:
-        return _json_error("Code invalid", 400)
-
-    existing_same_account_provider = _find_account_row_for_provider(account_id, provider)
-    existing_same_provider_user = _find_account_row_by_provider_user(provider, provider_user_id)
-
-    now = _utcnow().isoformat()
-
-    row_payload: Dict[str, Any] = {
-        "account_id": account_id,
-        "auth_user_id": account_id,
-        "provider": provider,
-        "provider_user_id": provider_user_id,
-        "updated_at": now,
-    }
-
-    if display_name:
-        row_payload["display_name"] = display_name
-    if phone:
-        row_payload["phone"] = phone
-    if phone_e164:
-        row_payload["phone_e164"] = phone_e164
-
-    try:
-        if existing_same_account_provider and existing_same_account_provider.get("id"):
-            (
-                sb.table("accounts")
-                .update(row_payload)
-                .eq("id", existing_same_account_provider["id"])
-                .execute()
-            )
-        elif existing_same_provider_user and existing_same_provider_user.get("id"):
-            (
-                sb.table("accounts")
-                .update(row_payload)
-                .eq("id", existing_same_provider_user["id"])
-                .execute()
-            )
-        else:
-            insert_row = {
-                "id": str(uuid.uuid4()),
-                "created_at": now,
-                **row_payload,
-            }
-            sb.table("accounts").insert(insert_row).execute()
-    except Exception as e:
-        return _json_error(
-            "Failed to link account",
-            500,
-            detail=repr(e),
-            account_id=account_id,
-            provider=provider,
-            provider_user_id=provider_user_id,
-        )
-
-    try:
-        (
-            sb.table("link_tokens")
-            .update(
-                {
-                    "used_at": now,
-                    "provider_user_id": provider_user_id,
-                }
-            )
-            .eq("id", token["id"])
-            .execute()
-        )
-    except Exception as e:
-        return _json_error(
-            "Link created but token finalization failed",
-            500,
-            detail=repr(e),
-            account_id=account_id,
-            provider=provider,
-            provider_user_id=provider_user_id,
-        )
+    linked_account = _find_account_row_by_provider_user(provider, provider_user_id)
 
     return jsonify(
         {
             "ok": True,
             "linked": True,
-            "account_id": account_id,
+            "account_id": (linked_account or {}).get("account_id") or link.get("auth_user_id"),
             "provider": provider,
             "provider_user_id": provider_user_id,
+            "account": linked_account,
+            "link": link,
         }
     )
