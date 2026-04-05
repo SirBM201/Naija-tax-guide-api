@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-from app.services.supabase_service import sb_request
+from app.supabase import sb_admin_request as sb_request
 
 
 def _now_iso() -> str:
@@ -189,4 +189,3 @@ def upsert_account_link(
     if not row:
         return {"ok": False, "reason": "link_failed"}
     return {"ok": True, "account_id": row.get("account_id"), "row": row}
-
