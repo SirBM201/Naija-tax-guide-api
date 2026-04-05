@@ -189,3 +189,4 @@ def upsert_account_link(
     if not row:
         return {"ok": False, "reason": "link_failed"}
     return {"ok": True, "account_id": row.get("account_id"), "row": row}
+
