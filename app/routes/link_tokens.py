@@ -308,3 +308,4 @@ def consume_link_code():
             "link": link,
         }
     )
+
