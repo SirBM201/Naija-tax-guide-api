@@ -3,21 +3,12 @@ from __future__ import annotations
 """
 Accounts service for Naija Tax Guide.
 
-This version preserves the repo's real Supabase import path:
-    from app.core.supabase_client import supabase
-
-And adds the helper functions required by the newer WhatsApp/channel-link flow:
-- find_account_by_provider_user_id
-- find_account_by_auth_user_and_provider
-- mark_channel_claimed_for_auth_user
-
-It also keeps the public functions expected elsewhere in the app:
-- upsert_account
-- lookup_account
-- upsert_account_link
+This full replacement keeps the repo's real Supabase import path and fixes
+WhatsApp/channel linking conflicts by removing stale provider rows for the same
+user before claiming or re-linking a channel.
 """
 
-from typing import Optional, Dict, Any, Tuple, List
+from typing import Optional, Dict, Any, List
 from datetime import datetime, timezone
 import uuid
 import os
@@ -228,6 +219,13 @@ def _public_row(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     return row
 
 
+def _delete_row_by_id(row_id: str) -> None:
+    row_id = (row_id or "").strip()
+    if not row_id:
+        return
+    _sb().table("accounts").delete().eq("id", row_id).execute()
+
+
 # ---------------------------------------------------------
 # Public API used elsewhere in app
 # ---------------------------------------------------------
@@ -327,15 +325,26 @@ def mark_channel_claimed_for_auth_user(
     if existing_auth and existing_auth != auth_user_id:
         return {"ok": False, "reason": "channel_belongs_to_another_user"}
 
-    patch: Dict[str, Any] = {"auth_user_id": auth_user_id, "updated_at": _now_iso()}
-    if _has_column("accounts", "display_name"):
-        patch["display_name"] = display_name if display_name is not None else existing.get("display_name")
-    if _has_column("accounts", "phone"):
-        patch["phone"] = phone if phone is not None else existing.get("phone")
-    if _has_column("accounts", "phone_e164"):
-        patch["phone_e164"] = _normalize_phone_e164(phone or existing.get("phone") or provider_user_id)
-
     try:
+        # Remove stale row for same user/provider before claiming provisional row.
+        by_user = find_account_by_auth_user_and_provider(auth_user_id=auth_user_id, provider=provider)
+        existing_id = str(existing.get("id") or "").strip()
+        if by_user:
+            by_user_id = str(by_user.get("id") or "").strip()
+            if by_user_id and existing_id and by_user_id != existing_id:
+                _delete_row_by_id(by_user_id)
+
+        patch: Dict[str, Any] = {
+            "auth_user_id": auth_user_id,
+            "updated_at": _now_iso(),
+        }
+        if _has_column("accounts", "display_name"):
+            patch["display_name"] = display_name if display_name is not None else existing.get("display_name")
+        if _has_column("accounts", "phone"):
+            patch["phone"] = phone if phone is not None else existing.get("phone")
+        if _has_column("accounts", "phone_e164"):
+            patch["phone_e164"] = _normalize_phone_e164(phone or existing.get("phone") or provider_user_id)
+
         _sb().table("accounts").update(patch).eq("id", existing["id"]).execute()
         row = find_account_by_provider_user_id(provider=provider, provider_user_id=provider_user_id)
         row = _public_row(row)
@@ -362,42 +371,27 @@ def upsert_account_link(
         if channel_auth and channel_auth != auth_user_id:
             return {"ok": False, "reason": "channel_belongs_to_another_user"}
 
-    by_user = find_account_by_auth_user_and_provider(auth_user_id=auth_user_id, provider=provider)
-    if by_user:
-        patch: Dict[str, Any] = {
+    try:
+        by_user = find_account_by_auth_user_and_provider(auth_user_id=auth_user_id, provider=provider)
+        if by_user:
+            by_user_id = str(by_user.get("id") or "").strip()
+            by_user_provider_user_id = str(by_user.get("provider_user_id") or "").strip()
+            if by_user_id and by_user_provider_user_id != provider_user_id:
+                _delete_row_by_id(by_user_id)
+
+        payload: Dict[str, Any] = {
+            "provider": provider,
             "provider_user_id": provider_user_id,
+            "auth_user_id": auth_user_id,
             "updated_at": _now_iso(),
         }
         if _has_column("accounts", "display_name"):
-            patch["display_name"] = display_name if display_name is not None else by_user.get("display_name")
+            payload["display_name"] = display_name
         if _has_column("accounts", "phone"):
-            patch["phone"] = phone if phone is not None else by_user.get("phone")
+            payload["phone"] = phone
         if _has_column("accounts", "phone_e164"):
-            patch["phone_e164"] = _normalize_phone_e164(phone or by_user.get("phone") or provider_user_id)
-        try:
-            _sb().table("accounts").update(patch).eq("id", by_user["id"]).execute()
-            row = find_account_by_provider_user_id(provider=provider, provider_user_id=provider_user_id) or find_account_by_auth_user_and_provider(auth_user_id=auth_user_id, provider=provider)
-            row = _public_row(row)
-            if not row:
-                return {"ok": False, "reason": "update_failed"}
-            return {"ok": True, "account_id": row.get("account_id"), "row": row}
-        except Exception as e:
-            return {"ok": False, "reason": f"update_failed:{type(e).__name__}:{_clip(e)}"}
+            payload["phone_e164"] = _normalize_phone_e164(phone or provider_user_id)
 
-    payload: Dict[str, Any] = {
-        "provider": provider,
-        "provider_user_id": provider_user_id,
-        "auth_user_id": auth_user_id,
-        "updated_at": _now_iso(),
-    }
-    if _has_column("accounts", "display_name"):
-        payload["display_name"] = display_name
-    if _has_column("accounts", "phone"):
-        payload["phone"] = phone
-    if _has_column("accounts", "phone_e164"):
-        payload["phone_e164"] = _normalize_phone_e164(phone or provider_user_id)
-
-    try:
         _sb().table("accounts").upsert(payload, on_conflict="provider,provider_user_id").execute()
         row = find_account_by_provider_user_id(provider=provider, provider_user_id=provider_user_id)
         row = _public_row(row)
