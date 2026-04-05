@@ -11,6 +11,7 @@ from urllib.parse import quote
 from flask import Blueprint, jsonify, request
 from supabase import create_client
 
+from app.services.channel_identity_runtime_service import get_channel_identity_by_account
 from app.services.channel_linking_service import consume_and_link
 from app.services.web_auth_service import get_account_id_from_request
 
@@ -38,10 +39,8 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-
 def _sha256_hex(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
-
 
 
 def _json_error(message: str, status: int = 400, **extra: Any):
@@ -49,7 +48,6 @@ def _json_error(message: str, status: int = 400, **extra: Any):
     if extra:
         payload.update(extra)
     return jsonify(payload), status
-
 
 
 def _normalize_provider(raw: str) -> str:
@@ -65,24 +63,8 @@ def _normalize_provider(raw: str) -> str:
     return v
 
 
-
 def _generate_code(length: int = TOKEN_LENGTH) -> str:
     return "".join(secrets.choice(SAFE_CODE_ALPHABET) for _ in range(length))
-
-
-
-def _safe_iso_to_dt(value: Any) -> Optional[datetime]:
-    try:
-        if not value:
-            return None
-        text = str(value).strip().replace("Z", "+00:00")
-        dt = datetime.fromisoformat(text)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
-    except Exception:
-        return None
-
 
 
 def _get_logged_in_account_id() -> Tuple[Optional[str], Dict[str, Any]]:
@@ -92,45 +74,6 @@ def _get_logged_in_account_id() -> Tuple[Optional[str], Dict[str, Any]]:
         return account_id, dbg if isinstance(dbg, dict) else {}
     except Exception as e:
         return None, {"ok": False, "error": "auth_resolution_failed", "detail": repr(e)}
-
-
-
-def _find_account_row_for_provider(account_id: str, provider: str) -> Optional[Dict[str, Any]]:
-    try:
-        res = (
-            sb.table("accounts")
-            .select(
-                "id,account_id,auth_user_id,provider,provider_user_id,email,display_name,phone,phone_e164,updated_at,created_at"
-            )
-            .eq("account_id", account_id)
-            .eq("provider", provider)
-            .limit(1)
-            .execute()
-        )
-        rows = res.data or []
-        return rows[0] if rows else None
-    except Exception:
-        return None
-
-
-
-def _find_account_row_by_provider_user(provider: str, provider_user_id: str) -> Optional[Dict[str, Any]]:
-    try:
-        res = (
-            sb.table("accounts")
-            .select(
-                "id,account_id,auth_user_id,provider,provider_user_id,email,display_name,phone,phone_e164,updated_at,created_at"
-            )
-            .eq("provider", provider)
-            .eq("provider_user_id", provider_user_id)
-            .limit(1)
-            .execute()
-        )
-        rows = res.data or []
-        return rows[0] if rows else None
-    except Exception:
-        return None
-
 
 
 def _build_whatsapp_link(code: str) -> Optional[str]:
@@ -149,7 +92,6 @@ def _build_whatsapp_link(code: str) -> Optional[str]:
     return f"https://wa.me/?text={message}"
 
 
-
 def _build_telegram_link(code: str) -> Optional[str]:
     message = quote(code)
 
@@ -165,30 +107,40 @@ def _build_telegram_link(code: str) -> Optional[str]:
     return None
 
 
+def _find_channel_identity_for_account(account_id: str, provider: str) -> Optional[Dict[str, Any]]:
+    channel_type = "telegram" if provider == "tg" else "whatsapp" if provider == "wa" else None
+    if not channel_type:
+        return None
+    try:
+        return get_channel_identity_by_account(account_id=account_id, channel_type=channel_type)
+    except Exception:
+        return None
+
+
 @bp.get("/status")
 def link_status():
     account_id, auth_dbg = _get_logged_in_account_id()
     if not account_id:
         return _json_error("Unauthorized", 401, auth=auth_dbg)
 
-    tg_row = _find_account_row_for_provider(account_id, "tg")
-    wa_row = _find_account_row_for_provider(account_id, "wa")
+    tg_identity = _find_channel_identity_for_account(account_id, "tg")
+    wa_identity = _find_channel_identity_for_account(account_id, "wa")
 
     return jsonify(
         {
             "ok": True,
             "account_id": account_id,
             "telegram": {
-                "linked": bool(tg_row),
-                "provider_user_id": (tg_row or {}).get("provider_user_id") if tg_row else None,
-                "display_name": (tg_row or {}).get("display_name") if tg_row else None,
-                "updated_at": (tg_row or {}).get("updated_at") if tg_row else None,
+                "linked": bool(tg_identity),
+                "provider_user_id": (tg_identity or {}).get("provider_user_id") if tg_identity else None,
+                "display_name": ((tg_identity or {}).get("metadata") or {}).get("display_name") if tg_identity else None,
+                "updated_at": (tg_identity or {}).get("last_seen_at") if tg_identity else None,
             },
             "whatsapp": {
-                "linked": bool(wa_row),
-                "provider_user_id": (wa_row or {}).get("provider_user_id") if wa_row else None,
-                "display_name": (wa_row or {}).get("display_name") if wa_row else None,
-                "updated_at": (wa_row or {}).get("updated_at") if wa_row else None,
+                "linked": bool(wa_identity),
+                "provider_user_id": (wa_identity or {}).get("provider_user_id") if wa_identity else None,
+                "display_name": ((wa_identity or {}).get("metadata") or {}).get("display_name") if wa_identity else None,
+                "updated_at": (wa_identity or {}).get("last_seen_at") if wa_identity else None,
             },
         }
     )
@@ -225,6 +177,7 @@ def generate_link_code():
 
     insert_payload = {
         "id": str(uuid.uuid4()),
+        # Historical column name, but the app stores canonical website account_id here.
         "auth_user_id": account_id,
         "provider": provider,
         "code": code,
@@ -290,21 +243,18 @@ def consume_link_code():
     )
 
     if not link.get("ok"):
-        error = str(link.get("error") or "link_failed").strip()
-        if error == "invalid_or_expired_code":
+        reason = str(link.get("reason") or link.get("error") or "link_failed").strip()
+        if reason in {"invalid_code", "expired_code", "used_code"}:
             return _json_error("Invalid or expired code", 404, details=link)
         return _json_error("Failed to link account", 400, details=link)
-
-    linked_account = _find_account_row_by_provider_user(provider, provider_user_id)
 
     return jsonify(
         {
             "ok": True,
             "linked": True,
-            "account_id": (linked_account or {}).get("account_id") or link.get("auth_user_id"),
+            "account_id": link.get("account_id"),
             "provider": provider,
             "provider_user_id": provider_user_id,
-            "account": linked_account,
             "link": link,
         }
     )
