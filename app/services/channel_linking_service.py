@@ -3,12 +3,12 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
+from app.core.supabase_client import supabase
 from app.services.accounts_service import (
     find_account_by_provider_user_id,
     mark_channel_claimed_for_auth_user,
     upsert_account_link,
 )
-from app.services.supabase_service import sb_request
 
 
 def _now_iso() -> str:
@@ -16,29 +16,29 @@ def _now_iso() -> str:
 
 
 def _get_link_token(provider: str, code: str) -> Optional[Dict[str, Any]]:
-    r = sb_request(
-        "GET",
-        "/rest/v1/link_tokens",
-        params={
-            "select": "*",
-            "provider": f"eq.{provider}",
-            "code": f"eq.{code}",
-            "limit": "1",
-        },
+    resp = (
+        supabase.table("link_tokens")
+        .select("*")
+        .eq("provider", provider)
+        .eq("code", code)
+        .limit(1)
+        .execute()
     )
-    rows = r.json() or []
+    rows = getattr(resp, "data", None) or []
     return rows[0] if rows else None
 
 
 def _mark_token_used(token_id: str, provider_user_id: str) -> None:
-    sb_request(
-        "PATCH",
-        "/rest/v1/link_tokens",
-        params={"id": f"eq.{token_id}"},
-        json={
-            "used_at": _now_iso(),
-            "used_by_provider_user_id": provider_user_id,
-        },
+    (
+        supabase.table("link_tokens")
+        .update(
+            {
+                "used_at": _now_iso(),
+                "used_by_provider_user_id": provider_user_id,
+            }
+        )
+        .eq("id", token_id)
+        .execute()
     )
 
 
@@ -71,13 +71,11 @@ def consume_and_link(
 
     existing = find_account_by_provider_user_id(provider=provider, provider_user_id=provider_user_id)
 
-    # If already linked to another auth user, block.
     if existing and str(existing.get("auth_user_id") or "").strip():
         existing_auth = str(existing.get("auth_user_id") or "").strip()
         if existing_auth != auth_user_id:
             return {"ok": False, "reason": "channel_belongs_to_another_user"}
 
-        # Already linked to same user: mark token used and succeed idempotently.
         _mark_token_used(str(token["id"]), provider_user_id)
         return {
             "ok": True,
@@ -86,7 +84,6 @@ def consume_and_link(
             "account_id": existing.get("account_id"),
         }
 
-    # If a provisional row exists for this WhatsApp number, claim it in place.
     if existing and not str(existing.get("auth_user_id") or "").strip():
         claimed = mark_channel_claimed_for_auth_user(
             provider=provider,
@@ -105,7 +102,6 @@ def consume_and_link(
             }
         return {"ok": False, "reason": claimed.get("reason") or "claim_failed"}
 
-    # Otherwise create/update the provider row for this auth user.
     linked = upsert_account_link(
         provider=provider,
         provider_user_id=provider_user_id,
