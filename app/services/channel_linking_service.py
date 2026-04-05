@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
@@ -9,6 +10,15 @@ from app.services.accounts_service import (
     mark_channel_claimed_for_auth_user,
     upsert_account_link,
 )
+
+LINK_CODE_RE = re.compile(r"\b([A-Z0-9]{8})\b")
+
+
+def extract_code(text: Optional[str]) -> Optional[str]:
+    if not text:
+        return None
+    m = LINK_CODE_RE.search(str(text).upper())
+    return m.group(1) if m else None
 
 
 def _now_iso() -> str:
@@ -69,7 +79,10 @@ def consume_and_link(
     if not auth_user_id:
         return {"ok": False, "reason": "missing_auth_user"}
 
-    existing = find_account_by_provider_user_id(provider=provider, provider_user_id=provider_user_id)
+    existing = find_account_by_provider_user_id(
+        provider=provider,
+        provider_user_id=provider_user_id,
+    )
 
     if existing and str(existing.get("auth_user_id") or "").strip():
         existing_auth = str(existing.get("auth_user_id") or "").strip()
