@@ -106,32 +106,32 @@ def consume_and_link(
     code = str(code or "").strip().upper()
 
     if provider not in {"wa", "tg", "msgr", "ig"}:
-        return {"ok": False, "reason": "invalid_provider"}
+        return {"ok": False, "reason": "invalid_provider", "error": "invalid_provider", "fix": "Use one of wa, tg, msgr, or ig."}
     if not provider_user_id:
-        return {"ok": False, "reason": "missing_provider_user_id"}
+        return {"ok": False, "reason": "missing_provider_user_id", "error": "missing_provider_user_id", "fix": "Pass the stable platform user id for the inbound channel."}
     if not code:
-        return {"ok": False, "reason": "missing_code"}
+        return {"ok": False, "reason": "missing_code", "error": "missing_code", "fix": "Send the 8-character link code from the website."}
 
     token = _get_link_token(provider, code)
     if not token:
-        return {"ok": False, "reason": "invalid_code"}
+        return {"ok": False, "reason": "invalid_code", "error": "invalid_code", "fix": "Generate a fresh code on the website and send it immediately."}
 
     if token.get("used_at"):
-        return {"ok": False, "reason": "used_code"}
+        return {"ok": False, "reason": "used_code", "error": "used_code", "fix": "Generate a fresh code because this one has already been used."}
 
     expires_at = _safe_iso_to_dt(token.get("expires_at"))
     if expires_at and expires_at <= datetime.now(timezone.utc):
-        return {"ok": False, "reason": "expired_code"}
+        return {"ok": False, "reason": "expired_code", "error": "expired_code", "fix": "Generate a fresh code because this one has expired."}
 
     # IMPORTANT:
     # link_tokens.auth_user_id is being used by this app as the canonical website account_id.
     owner_account_id = str(token.get("auth_user_id") or "").strip()
     if not owner_account_id:
-        return {"ok": False, "reason": "missing_account_id_on_token"}
+        return {"ok": False, "reason": "missing_account_id_on_token", "error": "missing_account_id_on_token", "fix": "Check /api/link/generate and confirm it stores the website account_id on the token."}
 
     channel_type = PROVIDER_TO_CHANNEL.get(provider)
     if not channel_type:
-        return {"ok": False, "reason": "unsupported_channel_type"}
+        return {"ok": False, "reason": "unsupported_channel_type", "error": "unsupported_channel_type", "fix": "Map the provider to a supported channel type before linking."}
 
     try:
         existing_identity = get_channel_identity(
@@ -142,12 +142,15 @@ def consume_and_link(
         return {
             "ok": False,
             "reason": f"identity_lookup_failed:{type(e).__name__}:{_clip(e)}",
+            "error": "identity_lookup_failed",
+            "root_cause": repr(e),
+            "fix": "Check channel_identities read access and schema.",
         }
 
     if existing_identity:
         existing_account_id = str(existing_identity.get("account_id") or "").strip()
         if existing_account_id and existing_account_id != owner_account_id:
-            return {"ok": False, "reason": "channel_belongs_to_another_user"}
+            return {"ok": False, "reason": "channel_belongs_to_another_user", "error": "channel_belongs_to_another_user", "fix": "Unlink the channel from the old account first or test with a clean channel identity."}
 
     try:
         linked = create_or_update_channel_identity(
@@ -162,13 +165,19 @@ def consume_and_link(
         return {
             "ok": False,
             "reason": f"channel_link_failed:{type(e).__name__}:{_clip(e)}",
+            "error": "channel_link_failed",
+            "root_cause": repr(e),
+            "fix": "Check channel_identities write path and account ownership resolution.",
         }
 
     if not linked.get("ok"):
         return {
             "ok": False,
             "reason": str(linked.get("error") or linked.get("reason") or "channel_link_failed"),
+            "error": str(linked.get("error") or linked.get("reason") or "channel_link_failed"),
             "details": linked,
+            "root_cause": linked.get("root_cause"),
+            "fix": linked.get("fix") or "Check channel_identities insert/update logic.",
         }
 
     try:
@@ -177,7 +186,10 @@ def consume_and_link(
         return {
             "ok": False,
             "reason": f"token_mark_used_failed:{type(e).__name__}:{_clip(e)}",
+            "error": "token_mark_used_failed",
             "details": linked,
+            "root_cause": repr(e),
+            "fix": "Check link_tokens write path and permissions.",
         }
 
     identity = linked.get("channel_identity") or existing_identity or {}
