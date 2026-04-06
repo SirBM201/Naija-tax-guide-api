@@ -22,6 +22,7 @@ WA_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "").strip()
 WA_APP_SECRET = os.getenv("WHATSAPP_APP_SECRET", "").strip()
 LINK_CODE_RE = re.compile(r"^[A-Z0-9]{8}$")
 MENU_TRIGGERS = {"menu", "start", "help", "hi", "hello"}
+NUMERIC_OPTIONS = {"1", "2", "3", "4", "5", "6", "7"}
 
 
 def _sb():
@@ -92,11 +93,7 @@ def _link_failure_text(reason: str) -> str:
 
 
 def _welcome_menu(linked: bool) -> str:
-    if linked:
-        action_line = "5 — Unlink website account"
-    else:
-        action_line = "5 — Link website account"
-
+    action_line = "5 — Unlink website account" if linked else "5 — Link website account"
     return (
         "Welcome to Naija Tax Guide ✅\n\n"
         "Reply with:\n"
@@ -307,7 +304,7 @@ def wa_webhook_receive():
             send_whatsapp_text(from_phone, _welcome_menu(bool(linked_account_id)))
             return jsonify({"ok": True, "linked": bool(linked_account_id), "mode": "menu"})
 
-        if lowered in {"1", "2", "3", "4", "5", "6", "7"}:
+        if lowered in NUMERIC_OPTIONS:
             handled = _handle_menu_option(from_phone, linked_account_id, lowered)
             if handled is not None:
                 return handled
