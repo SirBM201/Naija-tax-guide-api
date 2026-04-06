@@ -14,7 +14,7 @@ from app.services.channel_identity_service import (
     get_channel_identity,
     initialize_channel_subscription_context,
 )
-from app.services.channel_linking_service import consume_and_link, extract_code
+from app.services.channel_linking_service import consume_and_link, extract_code, unlink_channel
 from app.services.outbound_service import send_telegram_text
 
 bp = Blueprint("telegram", __name__)
@@ -101,7 +101,8 @@ WELCOME_MENU = (
     "4 — Upgrade subscription\n"
     "5 — Link website account\n"
     "6 — Referral / invite a friend\n"
-    "7 — Help / how to use this bot\n\n"
+    "7 — Help / how to use this bot\n"
+    "8 — Unlink website account\n\n"
     "You can also type your tax question directly at any time."
 )
 
@@ -113,7 +114,8 @@ HELP_TEXT = (
     "• Send 4 to view upgrade options\n"
     "• Send 5 if you want to link your website account\n"
     "• Send 6 for referral / invite a friend\n"
-    "• Send 7 to see this help again\n\n"
+    "• Send 7 to see this help again\n"
+    "• Send 8 to unlink this Telegram from the website account\n\n"
     "You can also type a full tax question directly.\n"
     "You can also type a plan naturally, for example:\n"
     "• starter quarterly\n"
@@ -1508,6 +1510,14 @@ def _handle_menu_option(
             }
         )
 
+    if option == "8":
+        result = unlink_channel(provider="tg", provider_user_id=tg_user_id)
+        if result.get("ok"):
+            send_telegram_text(chat_id, "✅ This Telegram account has been unlinked. Generate a fresh code on the website and send it here as your first message to relink.")
+        else:
+            send_telegram_text(chat_id, "❌ Could not unlink this Telegram account right now. Please try again later.")
+        return jsonify({"ok": True, "linked": False, "mode": "unlink", "unlink": result})
+
     return _handle_question(
         chat_id=chat_id,
         account_id=account_id,
@@ -1589,16 +1599,9 @@ def tg_webhook():
     resolved = _resolve_effective_account_id(base_account_id, tg_user_id)
     effective_account_id = _clean(resolved.get("account_id")) or base_account_id
 
-    runtime_sync = _safe_sync_runtime_identity(
-        account_id=effective_account_id,
-        tg_user_id=tg_user_id,
-        telegram_chat_id=str(chat_id),
-        display_name=display_name,
-        username=tg_username,
-        chat_type=chat_type,
-    )
-
-    linked = bool(lk.get("linked"))
+    linked_identity = get_channel_identity(channel_type="telegram", provider_user_id=tg_user_id) or {}
+    linked = bool(str((linked_identity or {}).get("account_id") or "").strip())
+    runtime_sync = {"ok": True, "skipped": True, "reason": "not_linked_yet"}
 
     code = extract_code(text)
     if code:
@@ -1641,11 +1644,21 @@ def tg_webhook():
         send_telegram_text(
             chat_id,
             "❌ Link failed.\n"
-            f"Reason: {attempt.get('error', 'unknown_error')}\n"
+            f"Reason: {attempt.get('error') or attempt.get('reason') or 'unknown_error'}\n"
             f"Details: {_clip(attempt.get('root_cause') or attempt.get('details') or 'n/a')}\n"
             f"Fix: {_clip(attempt.get('fix') or 'Check link token flow and accounts link update.')}",
         )
         return jsonify({"ok": True, "linked": linked, "link_attempt": attempt}), 200
+
+    if linked:
+        runtime_sync = _safe_sync_runtime_identity(
+            account_id=effective_account_id,
+            tg_user_id=tg_user_id,
+            telegram_chat_id=str(chat_id),
+            display_name=display_name,
+            username=tg_username,
+            chat_type=chat_type,
+        )
 
     if not text:
         send_telegram_text(chat_id, "Send a message to continue.\n\n" + WELCOME_MENU)
@@ -1700,7 +1713,7 @@ def tg_webhook():
             runtime_sync=runtime_sync,
         )
 
-    if lowered in {"1", "2", "3", "4", "5", "6", "7"}:
+    if lowered in {"1", "2", "3", "4", "5", "6", "7", "8"}:
         return _handle_menu_option(
             option=lowered,
             chat_id=chat_id,
