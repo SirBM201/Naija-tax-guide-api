@@ -249,6 +249,7 @@ def create_app() -> Flask:
     _register_bp("app.routes.channel_profile", "bp", alias_name="channel_profile", required=False, url_prefix=api_prefix)
     _register_bp("app.routes.channel_payment", "bp", alias_name="channel_payment", required=False, url_prefix=api_prefix)
     _register_bp("app.routes.channel_notifications", "bp", alias_name="channel_notifications", required=False, url_prefix=api_prefix)
+    _register_bp("app.routes.workspace_members", "bp", alias_name="workspace_members", required=False, url_prefix=api_prefix)
 
     if _safe_get_env_bool("ENABLE_DEBUG_ROUTES"):
         _register_bp("app.routes._debug", "bp", required=False, url_prefix=api_prefix)
@@ -272,81 +273,9 @@ def create_app() -> Flask:
     def runtime_diag():
         hints: List[str] = []
 
-        cron_registered = any((r.get("alias_name") == "cron") for r in boot.get("registered", []))
-        if not cron_registered:
-            hints.append(
-                "Cron blueprint is NOT registered. Confirm app/routes/cron.py exists and exports bp = Blueprint(...)."
-            )
-
-        referrals_registered = any((r.get("alias_name") == "referrals") for r in boot.get("registered", []))
-        if not referrals_registered:
-            hints.append(
-                "Referrals blueprint is NOT registered. Confirm app/routes/referrals.py exists and exports bp = Blueprint(...)."
-            )
-
-        paystack_webhook_registered = any((r.get("alias_name") == "paystack_webhook") for r in boot.get("registered", []))
-        if not paystack_webhook_registered:
-            hints.append(
-                "Paystack webhook blueprint is NOT registered. Confirm app/routes/paystack_webhook.py exists and exports bp = Blueprint(...)."
-            )
-
-        telegram_registered = any((r.get("alias_name") == "telegram") for r in boot.get("registered", []))
-        if not telegram_registered:
-            hints.append(
-                "Telegram blueprint is NOT registered. Confirm app/routes/telegram.py exists and exports bp = Blueprint(...)."
-            )
-
-        whatsapp_registered = any((r.get("alias_name") == "whatsapp") for r in boot.get("registered", []))
-        if not whatsapp_registered:
-            hints.append(
-                "WhatsApp blueprint is NOT registered. Confirm app/routes/whatsapp.py exists and exports bp = Blueprint(...)."
-            )
-
-        link_tokens_registered = any((r.get("alias_name") == "link_tokens") for r in boot.get("registered", []))
-        if not link_tokens_registered:
-            hints.append(
-                "Link tokens blueprint is NOT registered. Confirm app/routes/link_tokens.py exists and exports bp = Blueprint(...)."
-            )
-
-        entry_registered = any((r.get("alias_name") == "entry") for r in boot.get("registered", []))
-        if not entry_registered:
-            hints.append(
-                "Entry blueprint is NOT registered. Confirm app/routes/entry.py exists and exports bp = Blueprint(...)."
-            )
-
-        channel_access_registered = any((r.get("alias_name") == "channel_access") for r in boot.get("registered", []))
-        if not channel_access_registered:
-            hints.append(
-                "Channel access blueprint is NOT registered. Confirm app/routes/channel_access.py exists and exports bp = Blueprint(...)."
-            )
-
-        channel_profile_registered = any((r.get("alias_name") == "channel_profile") for r in boot.get("registered", []))
-        if not channel_profile_registered:
-            hints.append(
-                "Channel profile blueprint is NOT registered. Confirm app/routes/channel_profile.py exists and exports bp = Blueprint(...)."
-            )
-
-        channel_payment_registered = any((r.get("alias_name") == "channel_payment") for r in boot.get("registered", []))
-        if not channel_payment_registered:
-            hints.append(
-                "Channel payment blueprint is NOT registered. Confirm app/routes/channel_payment.py exists and exports bp = Blueprint(...)."
-            )
-
-        channel_notifications_registered = any((r.get("alias_name") == "channel_notifications") for r in boot.get("registered", []))
-        if not channel_notifications_registered:
-            hints.append(
-                "Channel notifications blueprint is NOT registered. Confirm app/routes/channel_notifications.py exists and exports bp = Blueprint(...)."
-            )
-
-        if cookie_mode and origins == "*":
-            hints.append(
-                "COOKIE_MODE is enabled but CORS origins are '*'. Use explicit origins when cookies are used."
-            )
-
-        if cookie_mode and (isinstance(origins, list) and not origins):
-            hints.append(
-                "COOKIE_MODE is enabled but parsed origins list is empty. Set CORS_ORIGINS to your frontend URL(s)."
-            )
+        workspace_registered = any((r.get("alias_name") == "workspace_members") for r in boot.get("registered", []))
+        if not workspace_registered:
+            hints.append("Workspace members blueprint is NOT registered. Confirm app/routes/workspace_members.py exists and exports bp = Blueprint(...).")
 
         return jsonify(
             {
