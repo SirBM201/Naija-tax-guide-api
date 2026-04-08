@@ -205,9 +205,15 @@ def get_subscription_snapshot(account_id: str) -> Dict[str, Any]:
             "subscription": None,
             "plan": None,
             "plan_code": None,
+            "plan_family": None,
             "daily_answers_limit": 0,
             "ai_credits_total": 0,
             "active_now": False,
+            "channel_limits": {
+                "max_total_channels": 0,
+                "max_whatsapp_channels": 0,
+                "max_telegram_channels": 0,
+            },
             "access": {
                 "allowed": False,
                 "reason": "no_subscription",
@@ -221,6 +227,11 @@ def get_subscription_snapshot(account_id: str) -> Dict[str, Any]:
 
     plan_code = (sub.get("plan_code") or "").strip().lower()
     plan = get_plan(plan_code) if plan_code else None
+    channel_limits = {
+        "max_total_channels": int((plan or {}).get("max_total_channels") or 0),
+        "max_whatsapp_channels": int((plan or {}).get("max_whatsapp_channels") or 0),
+        "max_telegram_channels": int((plan or {}).get("max_telegram_channels") or 0),
+    }
 
     return {
         "ok": True,
@@ -228,9 +239,11 @@ def get_subscription_snapshot(account_id: str) -> Dict[str, Any]:
         "subscription": sub,
         "plan": plan,
         "plan_code": plan_code or None,
+        "plan_family": (plan or {}).get("plan_family") or (plan or {}).get("tier"),
         "daily_answers_limit": int((plan or {}).get("daily_answers_limit") or 0),
         "ai_credits_total": int((plan or {}).get("ai_credits_total") or 0),
         "active_now": active_now,
+        "channel_limits": channel_limits,
         "access": access,
     }
 
@@ -291,6 +304,8 @@ def require_active_subscription(account_id: str) -> Dict[str, Any]:
             "active_now": bool(snap.get("active_now")),
             "plan": plan,
             "plan_code": plan_code,
+            "plan_family": snap.get("plan_family"),
+            "channel_limits": snap.get("channel_limits") or {},
             "daily_answers_limit": int(snap.get("daily_answers_limit") or 0),
             "ai_credits_total": int(snap.get("ai_credits_total") or 0),
         }
