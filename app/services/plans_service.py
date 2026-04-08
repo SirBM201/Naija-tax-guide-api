@@ -3,6 +3,33 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 
+def _tier_channel_limits(tier: str) -> Dict[str, int]:
+    tier = str(tier or "").strip().lower()
+    if tier == "starter":
+        return {
+            "max_total_channels": 2,
+            "max_whatsapp_channels": 1,
+            "max_telegram_channels": 1,
+        }
+    if tier == "professional":
+        return {
+            "max_total_channels": 4,
+            "max_whatsapp_channels": 2,
+            "max_telegram_channels": 2,
+        }
+    if tier == "business":
+        return {
+            "max_total_channels": 8,
+            "max_whatsapp_channels": 4,
+            "max_telegram_channels": 4,
+        }
+    return {
+        "max_total_channels": 0,
+        "max_whatsapp_channels": 0,
+        "max_telegram_channels": 0,
+    }
+
+
 PLAN_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "code": "starter_monthly",
@@ -155,8 +182,16 @@ def _normalize_code(plan_code: str | None) -> str:
     return str(plan_code or "").strip().lower()
 
 
+def _enriched_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(plan)
+    tier = _normalize_code(out.get("tier"))
+    out["plan_family"] = tier or None
+    out.update(_tier_channel_limits(tier))
+    return out
+
+
 def list_plans(active_only: bool = True) -> List[Dict[str, Any]]:
-    plans = [dict(plan) for plan in PLAN_DEFINITIONS]
+    plans = [_enriched_plan(plan) for plan in PLAN_DEFINITIONS]
     if active_only:
         plans = [plan for plan in plans if bool(plan.get("active", True))]
     return sorted(plans, key=lambda p: int(p.get("sort_order") or 0))
@@ -169,7 +204,7 @@ def get_plan(plan_code: str | None) -> Optional[Dict[str, Any]]:
 
     for plan in PLAN_DEFINITIONS:
         if _normalize_code(plan.get("code")) == code:
-            return dict(plan)
+            return _enriched_plan(plan)
 
     return None
 
