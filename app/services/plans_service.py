@@ -30,6 +30,34 @@ def _tier_channel_limits(tier: str) -> Dict[str, int]:
     }
 
 
+def _tier_user_limits(tier: str) -> Dict[str, int]:
+    """
+    User/account entitlement is defined by plan family, not billing cycle.
+    These values are now part of the plan payload and can be enforced anywhere
+    the app later supports workspace members or linked web accounts.
+    """
+    tier = str(tier or "").strip().lower()
+    if tier == "starter":
+        return {
+            "max_workspace_users": 1,
+            "max_linked_web_accounts": 1,
+        }
+    if tier == "professional":
+        return {
+            "max_workspace_users": 3,
+            "max_linked_web_accounts": 3,
+        }
+    if tier == "business":
+        return {
+            "max_workspace_users": 10,
+            "max_linked_web_accounts": 10,
+        }
+    return {
+        "max_workspace_users": 0,
+        "max_linked_web_accounts": 0,
+    }
+
+
 PLAN_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "code": "starter_monthly",
@@ -187,6 +215,7 @@ def _enriched_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
     tier = _normalize_code(out.get("tier"))
     out["plan_family"] = tier or None
     out.update(_tier_channel_limits(tier))
+    out.update(_tier_user_limits(tier))
     return out
 
 
