@@ -1258,17 +1258,6 @@ def billing_verify():
             status=400,
         )
 
-    if _payment_already_applied(account_id=account_id, plan_code=plan_code, reference=reference):
-        result.update(
-            {
-                "skipped": True,
-                "reason": "payment_already_applied",
-                "subscription": _get_subscription_row(account_id)[0],
-            }
-        )
-        logger.info("[%s] duplicate payment application skipped reference=%s", ROUTE_VERSION, reference)
-        return jsonify(result), 200
-
     plan = get_plan(plan_code)
     if not plan:
         return _fail(error="plan_not_found", extra={"plan_code": plan_code}, status=404)
@@ -1283,28 +1272,39 @@ def billing_verify():
     applied_subscription = sub if already_applied else None
     summary = _build_subscription_summary(applied_subscription or sub)
 
-    return jsonify(
-        {
-            "ok": True,
-            "paid": True,
-            "applied": already_applied,
-            "activation_state": "applied" if already_applied else "awaiting_webhook",
-            "reference": reference,
-            "change_mode": change_mode,
-            "status": status_text,
-            "plan": plan,
-            "plan_code": plan_code,
-            "account_id": account_id,
-            "subscription": applied_subscription,
-            "subscription_summary": summary,
-            "subscription_lookup_error": sub_err,
-            "message": (
-                "Payment verified and subscription already applied."
-                if already_applied
-                else "Payment verified. Waiting for webhook to finalize subscription and credits."
-            ),
-        }
-    ), 200
+    result = {
+        "ok": True,
+        "paid": True,
+        "applied": already_applied,
+        "activation_state": "applied" if already_applied else "awaiting_webhook",
+        "reference": reference,
+        "change_mode": change_mode,
+        "status": status_text,
+        "plan": plan,
+        "plan_code": plan_code,
+        "account_id": account_id,
+        "subscription": applied_subscription,
+        "subscription_summary": summary,
+        "subscription_lookup_error": sub_err,
+        "message": (
+            "Payment verified and subscription already applied."
+            if already_applied
+            else "Payment verified. Waiting for webhook to finalize subscription and credits."
+        ),
+        "data": tx,
+    }
+
+    if already_applied:
+        result.update(
+            {
+                "skipped": True,
+                "reason": "payment_already_applied",
+                "subscription": applied_subscription or sub,
+            }
+        )
+        logger.info("[%s] duplicate payment application skipped reference=%s", ROUTE_VERSION, reference)
+
+    return jsonify(result), 200
 
 
 @bp.post("/billing/webhook")
