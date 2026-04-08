@@ -125,7 +125,6 @@ def _build_access(sub: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         }
 
     now = _now_utc()
-
     expires_at = _safe_dt(sub.get("expires_at"))
     trial_until = _safe_dt(sub.get("trial_until"))
     grace_until = _safe_dt(sub.get("grace_until"))
@@ -143,7 +142,6 @@ def _build_access(sub: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         else:
             allowed = False
             reason = "expired"
-
     elif status == "trial":
         if trial_until and now < trial_until:
             allowed = True
@@ -151,7 +149,6 @@ def _build_access(sub: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         else:
             allowed = False
             reason = "trial_expired"
-
     elif status in {"grace", "past_due"}:
         if grace_until and now < grace_until:
             allowed = True
@@ -159,15 +156,12 @@ def _build_access(sub: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         else:
             allowed = False
             reason = "grace_expired"
-
     elif status == "expired":
         allowed = False
         reason = "expired"
-
     elif status == "inactive":
         allowed = False
         reason = "inactive"
-
     elif status == "cancelled":
         if expires_at and now < expires_at:
             allowed = True
@@ -214,6 +208,10 @@ def get_subscription_snapshot(account_id: str) -> Dict[str, Any]:
                 "max_whatsapp_channels": 0,
                 "max_telegram_channels": 0,
             },
+            "user_limits": {
+                "max_workspace_users": 0,
+                "max_linked_web_accounts": 0,
+            },
             "access": {
                 "allowed": False,
                 "reason": "no_subscription",
@@ -232,6 +230,10 @@ def get_subscription_snapshot(account_id: str) -> Dict[str, Any]:
         "max_whatsapp_channels": int((plan or {}).get("max_whatsapp_channels") or 0),
         "max_telegram_channels": int((plan or {}).get("max_telegram_channels") or 0),
     }
+    user_limits = {
+        "max_workspace_users": int((plan or {}).get("max_workspace_users") or 0),
+        "max_linked_web_accounts": int((plan or {}).get("max_linked_web_accounts") or 0),
+    }
 
     return {
         "ok": True,
@@ -244,6 +246,7 @@ def get_subscription_snapshot(account_id: str) -> Dict[str, Any]:
         "ai_credits_total": int((plan or {}).get("ai_credits_total") or 0),
         "active_now": active_now,
         "channel_limits": channel_limits,
+        "user_limits": user_limits,
         "access": access,
     }
 
@@ -306,6 +309,7 @@ def require_active_subscription(account_id: str) -> Dict[str, Any]:
             "plan_code": plan_code,
             "plan_family": snap.get("plan_family"),
             "channel_limits": snap.get("channel_limits") or {},
+            "user_limits": snap.get("user_limits") or {},
             "daily_answers_limit": int(snap.get("daily_answers_limit") or 0),
             "ai_credits_total": int(snap.get("ai_credits_total") or 0),
         }
