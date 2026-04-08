@@ -24,15 +24,12 @@ LINK_CODE_RE = re.compile(r"^[A-Z0-9]{8}$")
 MENU_TRIGGERS = {"menu", "start", "help", "hi", "hello"}
 NUMERIC_OPTIONS = {"1", "2", "3", "4", "5", "6", "7"}
 
-
 def _sb():
     return supabase() if callable(supabase) else supabase
-
 
 def _clip(value: Any, n: int = 220) -> str:
     s = str(value or "")
     return s if len(s) <= n else s[:n] + "…"
-
 
 def _verify_meta_signature(raw_body: bytes) -> bool:
     if not WA_APP_SECRET:
@@ -42,7 +39,6 @@ def _verify_meta_signature(raw_body: bytes) -> bool:
         return False
     expected = "sha256=" + hmac.new(WA_APP_SECRET.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(signature, expected)
-
 
 def _extract_message(body: Dict[str, Any]) -> Tuple[str, str]:
     entry = (body.get("entry") or [None])[0] or {}
@@ -59,10 +55,8 @@ def _extract_message(body: Dict[str, Any]) -> Tuple[str, str]:
         text = str((msg.get("text") or {}).get("body") or "").strip()
     return from_phone, text
 
-
 def _is_link_code(text: str) -> bool:
     return bool(LINK_CODE_RE.match(str(text or "").strip().upper()))
-
 
 def _get_linked_identity(from_phone: str) -> Optional[Dict[str, Any]]:
     try:
@@ -70,11 +64,9 @@ def _get_linked_identity(from_phone: str) -> Optional[Dict[str, Any]]:
     except Exception:
         return None
 
-
 def _resolve_linked_account_id(from_phone: str) -> str:
     identity = _get_linked_identity(from_phone)
     return str((identity or {}).get("account_id") or "").strip()
-
 
 def _link_failure_text(reason: str) -> str:
     reason = str(reason or "").strip().lower()
@@ -86,11 +78,11 @@ def _link_failure_text(reason: str) -> str:
         return "❌ Link failed. That code has expired. Please generate a fresh WhatsApp LINK CODE on the website and send it here again."
     if reason == "channel_belongs_to_another_user":
         return "❌ This WhatsApp number is already linked to another account. Reply 5 to unlink it first, then send a fresh code."
-    return (
-        "❌ Link failed. Please generate a fresh WhatsApp LINK CODE on the website and send it here again.\n"
-        f"Reason: {_clip(reason)}"
-    )
-
+    if reason in {"channel_limit_reached", "telegram_channel_limit_reached", "whatsapp_channel_limit_reached"}:
+        return "❌ Link failed. You have reached your current plan channel limit. Unlink an existing channel or upgrade your plan."
+    if reason == "subscription_required_for_channel_linking":
+        return "❌ Link failed. Activate a paid plan on the website before linking channels."
+    return "❌ Link failed. Please generate a fresh WhatsApp LINK CODE on the website and send it here again.\n" + f"Reason: {_clip(reason)}"
 
 def _welcome_menu(linked: bool) -> str:
     action_line = "5 — Unlink website account" if linked else "5 — Link website account"
@@ -107,7 +99,6 @@ def _welcome_menu(linked: bool) -> str:
         "You can also type your tax question directly at any time."
     )
 
-
 def _send_onboarding(from_phone: str) -> None:
     send_whatsapp_text(
         from_phone,
@@ -119,7 +110,6 @@ def _send_onboarding(from_phone: str) -> None:
         "Example: 7K9M2H8P\n\n"
         "Reply 7 anytime to see the menu.",
     )
-
 
 def _credit_summary(account_id: str) -> str:
     try:
@@ -137,18 +127,9 @@ def _credit_summary(account_id: str) -> str:
     except Exception as e:
         return f"❌ Could not check AI credits right now.\nReason: {_clip(e)}"
 
-
 def _plan_summary(account_id: str) -> str:
     try:
-        r = (
-            _sb()
-            .table("user_subscriptions")
-            .select("*")
-            .eq("account_id", account_id)
-            .order("created_at", desc=True)
-            .limit(1)
-            .execute()
-        )
+        r = _sb().table("user_subscriptions").select("*").eq("account_id", account_id).order("created_at", desc=True).limit(1).execute()
         rows = getattr(r, "data", None) or []
         row = rows[0] if rows else {}
         if not row:
@@ -163,7 +144,6 @@ def _plan_summary(account_id: str) -> str:
     except Exception as e:
         return f"❌ Could not check your current plan right now.\nReason: {_clip(e)}"
 
-
 def _referral_summary(account_id: str) -> str:
     try:
         prof = _sb().table("referral_profiles").select("*").eq("account_id", account_id).limit(1).execute()
@@ -173,85 +153,55 @@ def _referral_summary(account_id: str) -> str:
         count = getattr(refs, "count", None)
         if count is None:
             count = len(getattr(refs, "data", None) or [])
-        return (
-            "Referral / Invite a Friend:\n\n"
-            f"Referral code: {code}\n"
-            f"Total referrals: {int(count or 0)}"
-        )
+        return "Referral / Invite a Friend:\n\n" + f"Referral code: {code}\n" + f"Total referrals: {int(count or 0)}"
     except Exception as e:
         return f"❌ Could not load your referral details right now.\nReason: {_clip(e)}"
-
 
 def _handle_link_or_unlink(from_phone: str, linked_account_id: str):
     if linked_account_id:
         result = unlink_channel(provider="wa", provider_user_id=from_phone)
         if result.get("ok"):
-            send_whatsapp_text(
-                from_phone,
-                "✅ This WhatsApp number has been unlinked.\n"
-                "Generate a fresh WhatsApp LINK CODE on the website and send it here as your first message to relink."
-            )
+            send_whatsapp_text(from_phone, "✅ This WhatsApp number has been unlinked.\nGenerate a fresh WhatsApp LINK CODE on the website and send it here as your first message to relink.")
             return jsonify({"ok": True, "linked": False, "mode": "unlink", "unlink": result})
-
         send_whatsapp_text(from_phone, "❌ Could not unlink this WhatsApp right now. Please try again later.")
         return jsonify({"ok": True, "linked": True, "mode": "unlink_failed", "unlink": result})
-
-    send_whatsapp_text(
-        from_phone,
-        "To link this WhatsApp number to your website account:\n"
-        "1) Login on the website\n"
-        "2) Generate your WhatsApp LINK CODE\n"
-        "3) Send the 8-character code here\n\n"
-        "Example: 7K9M2H8P"
-    )
+    send_whatsapp_text(from_phone, "To link this WhatsApp number to your website account:\n1) Login on the website\n2) Generate your WhatsApp LINK CODE\n3) Send the 8-character code here\n\nExample: 7K9M2H8P")
     return jsonify({"ok": True, "linked": False, "mode": "link_help"})
-
 
 def _handle_menu_option(from_phone: str, linked_account_id: str, option: str):
     if option == "1":
         send_whatsapp_text(from_phone, "Please type your tax question and I will answer.")
         return jsonify({"ok": True, "linked": bool(linked_account_id), "mode": "ask_prompt"})
-
     if option == "2":
         if not linked_account_id:
             _send_onboarding(from_phone)
             return jsonify({"ok": True, "linked": False, "mode": "needs_link_for_credits"})
         send_whatsapp_text(from_phone, _credit_summary(linked_account_id))
         return jsonify({"ok": True, "linked": True, "mode": "credits"})
-
     if option == "3":
         if not linked_account_id:
             _send_onboarding(from_phone)
             return jsonify({"ok": True, "linked": False, "mode": "needs_link_for_plan"})
         send_whatsapp_text(from_phone, _plan_summary(linked_account_id))
         return jsonify({"ok": True, "linked": True, "mode": "plan"})
-
     if option == "4":
         if not linked_account_id:
             _send_onboarding(from_phone)
             return jsonify({"ok": True, "linked": False, "mode": "needs_link_for_upgrade"})
-        send_whatsapp_text(
-            from_phone,
-            "Upgrade subscription on the website dashboard or send a plan name like starter quarterly."
-        )
+        send_whatsapp_text(from_phone, "Upgrade subscription on the website dashboard or send a plan name like starter quarterly.")
         return jsonify({"ok": True, "linked": True, "mode": "upgrade"})
-
     if option == "5":
         return _handle_link_or_unlink(from_phone, linked_account_id)
-
     if option == "6":
         if not linked_account_id:
             _send_onboarding(from_phone)
             return jsonify({"ok": True, "linked": False, "mode": "needs_link_for_referral"})
         send_whatsapp_text(from_phone, _referral_summary(linked_account_id))
         return jsonify({"ok": True, "linked": True, "mode": "referral"})
-
     if option == "7":
         send_whatsapp_text(from_phone, _welcome_menu(bool(linked_account_id)))
         return jsonify({"ok": True, "linked": bool(linked_account_id), "mode": "help"})
-
     return None
-
 
 @bp.get("/whatsapp/webhook")
 def wa_webhook_verify():
@@ -262,106 +212,54 @@ def wa_webhook_verify():
         return (challenge or ""), 200
     return "Forbidden", 403
 
-
 @bp.post("/whatsapp/webhook")
 def wa_webhook_receive():
     raw_body = request.get_data(cache=True, as_text=False) or b""
     if not _verify_meta_signature(raw_body):
         return jsonify({"ok": False, "error": "invalid_signature"}), 403
-
     body = request.get_json(silent=True) or {}
-
     try:
         from_phone, text = _extract_message(body)
         if not from_phone:
             return jsonify({"ok": True, "ignored": True})
-
-        upsert_account(
-            provider="wa",
-            provider_user_id=from_phone,
-            display_name=None,
-            phone=from_phone,
-        )
-
+        upsert_account(provider="wa", provider_user_id=from_phone, display_name=None, phone=from_phone)
         linked_account_id = _resolve_linked_account_id(from_phone)
         normalized = (text or "").strip()
         lowered = normalized.lower()
-
         if lowered == "unlink":
             result = unlink_channel(provider="wa", provider_user_id=from_phone)
             if result.get("ok"):
-                send_whatsapp_text(
-                    from_phone,
-                    "✅ This WhatsApp number has been unlinked.\n"
-                    "Generate a fresh WhatsApp LINK CODE on the website and send it here as your first message to relink."
-                )
+                send_whatsapp_text(from_phone, "✅ This WhatsApp number has been unlinked.\nGenerate a fresh WhatsApp LINK CODE on the website and send it here as your first message to relink.")
                 return jsonify({"ok": True, "linked": False, "mode": "unlink", "unlink": result})
-
             send_whatsapp_text(from_phone, "❌ Could not unlink this WhatsApp right now. Please try again later.")
             return jsonify({"ok": True, "linked": bool(linked_account_id), "mode": "unlink_failed", "unlink": result})
-
         if lowered in MENU_TRIGGERS:
             send_whatsapp_text(from_phone, _welcome_menu(bool(linked_account_id)))
             return jsonify({"ok": True, "linked": bool(linked_account_id), "mode": "menu"})
-
         if lowered in NUMERIC_OPTIONS:
             handled = _handle_menu_option(from_phone, linked_account_id, lowered)
             if handled is not None:
                 return handled
-
         if not linked_account_id:
             if normalized and _is_link_code(normalized):
-                attempt = consume_and_link(
-                    provider="wa",
-                    code=normalized.upper(),
-                    provider_user_id=from_phone,
-                    display_name=None,
-                    phone=from_phone,
-                )
+                attempt = consume_and_link(provider="wa", code=normalized.upper(), provider_user_id=from_phone, display_name=None, phone=from_phone)
                 if attempt.get("ok"):
-                    send_whatsapp_text(
-                        from_phone,
-                        "✅ WhatsApp linked successfully!\n"
-                        "Now send your tax question here anytime.\n\n"
-                        "Reply 7 anytime to see the menu."
-                    )
-                    return jsonify(
-                        {
-                            "ok": True,
-                            "linked": True,
-                            "linked_now": True,
-                            "account_id": attempt.get("account_id"),
-                        }
-                    )
-
+                    send_whatsapp_text(from_phone, "✅ WhatsApp linked successfully!\nNow send your tax question here anytime.\n\nReply 7 anytime to see the menu.")
+                    return jsonify({"ok": True, "linked": True, "linked_now": True, "account_id": attempt.get("account_id")})
                 send_whatsapp_text(from_phone, _link_failure_text(attempt.get("reason") or attempt.get("error")))
                 return jsonify({"ok": True, "linked": False, "attempt": attempt})
-
             _send_onboarding(from_phone)
             return jsonify({"ok": True, "linked": False, "mode": "onboarding"})
-
         if not normalized:
             send_whatsapp_text(from_phone, _welcome_menu(True))
             return jsonify({"ok": True, "linked": True, "ignored": True, "reason": "no_text"})
-
         if _is_link_code(normalized):
-            send_whatsapp_text(
-                from_phone,
-                "✅ This WhatsApp number is already linked.\n"
-                "Reply 5 if you want to unlink it first."
-            )
+            send_whatsapp_text(from_phone, "✅ This WhatsApp number is already linked.\nReply 5 if you want to unlink it first.")
             return jsonify({"ok": True, "linked": True, "ignored": True, "reason": "already_linked"})
-
-        resp = ask_guarded(
-            account_id=linked_account_id,
-            question=normalized,
-            lang="en",
-            channel="whatsapp",
-        )
+        resp = ask_guarded(account_id=linked_account_id, question=normalized, lang="en", channel="whatsapp")
         answer = str(resp.get("answer") or resp.get("message") or "").strip() or "I couldn't process that right now. Please try again."
         send_whatsapp_text(from_phone, answer)
         return jsonify({"ok": True, "linked": True, "account_id": linked_account_id, "ask": resp})
-
     except Exception as e:
         logging.exception("WA webhook error: %s", e)
         return jsonify({"ok": True})
