@@ -54,13 +54,24 @@ def _normalize_provider(raw: str) -> str:
     v = (raw or "").strip().lower()
     if v in {"tg", "telegram"}:
         return "tg"
-    if v in {"wa", "whatsapp"}:
+    if v in {"wa", "whatsapp", "waba"}:
         return "wa"
     if v in {"msgr", "messenger"}:
         return "msgr"
     if v in {"ig", "instagram"}:
         return "ig"
     return v
+
+
+def _requested_provider() -> str:
+    body = request.get_json(silent=True) or {}
+    provider_from_query = _normalize_provider(request.args.get("provider") or "")
+    provider_from_body = _normalize_provider(body.get("provider") or "")
+
+    if provider_from_query and provider_from_body and provider_from_query != provider_from_body:
+        return "__mismatch__"
+
+    return provider_from_query or provider_from_body
 
 
 def _generate_code(length: int = TOKEN_LENGTH) -> str:
@@ -154,8 +165,10 @@ def generate_link_code():
     if not account_id:
         return _json_error("Unauthorized", 401, auth=auth_dbg)
 
-    body = request.get_json(silent=True) or {}
-    provider = _normalize_provider(body.get("provider") or "")
+    provider = _requested_provider()
+
+    if provider == "__mismatch__":
+        return _json_error("Provider mismatch between query and body", 400)
 
     if provider not in {"wa", "tg"}:
         return _json_error("Invalid provider", 400)
@@ -179,7 +192,6 @@ def generate_link_code():
 
     insert_payload = {
         "id": str(uuid.uuid4()),
-        # Historical column name, but the app stores canonical website account_id here.
         "auth_user_id": account_id,
         "provider": provider,
         "code": code,
@@ -222,16 +234,16 @@ def generate_link_code():
     )
 
 
-
-
 @bp.post("/unlink")
 def unlink_linked_channel():
     account_id, auth_dbg = _get_logged_in_account_id()
     if not account_id:
         return _json_error("Unauthorized", 401, auth=auth_dbg)
 
-    body = request.get_json(silent=True) or {}
-    provider = _normalize_provider(body.get("provider") or "")
+    provider = _requested_provider()
+    if provider == "__mismatch__":
+        return _json_error("Provider mismatch between query and body", 400)
+
     if provider not in {"wa", "tg"}:
         return _json_error("Invalid provider", 400)
 
@@ -245,16 +257,20 @@ def unlink_linked_channel():
         return _json_error("Failed to unlink channel", 400, details=result)
     return jsonify({"ok": True, "unlinked": True, "provider": provider, "provider_user_id": provider_user_id})
 
+
 @bp.post("/consume")
 def consume_link_code():
     body = request.get_json(silent=True) or {}
 
     code = (body.get("code") or "").strip().upper()
-    provider = _normalize_provider(body.get("provider") or "")
+    provider = _requested_provider()
     provider_user_id = str(body.get("provider_user_id") or "").strip()
     display_name = (body.get("display_name") or "").strip() or None
     phone = (body.get("phone") or "").strip() or None
     phone_e164 = (body.get("phone_e164") or "").strip() or None
+
+    if provider == "__mismatch__":
+        return _json_error("Provider mismatch between query and body", 400)
 
     if not code or provider not in {"wa", "tg", "msgr", "ig"} or not provider_user_id:
         return _json_error("Invalid request", 400)
