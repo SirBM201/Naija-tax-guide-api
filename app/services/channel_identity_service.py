@@ -63,6 +63,16 @@ def _safe_email_from_channel(
     return f"channel_{digits}@naijataxguide.local"
 
 
+def _verified_after_site_link(channel: str) -> bool:
+    """
+    A channel-first identity may start unverified.
+    Once the user successfully links that channel to a website account,
+    the identity should become verified for supported first-party channels.
+    """
+    channel = _clean(channel).lower()
+    return channel in {"whatsapp", "telegram"}
+
+
 def _fail(where: str, error: Any, fix: str, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     payload = {
         "ok": False,
@@ -395,6 +405,13 @@ def create_or_update_channel_identity(
     referral_code: Optional[str] = None,
     guest_session_id: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """
+    This function is used during successful website-account linking.
+
+    Important behavior:
+    - if the channel identity already exists, we update it and mark it verified
+    - if it does not exist, we create it and mark it verified for supported linked channels
+    """
     sb = _sb()
     acct = _clean(account_id)
     channel = _clean(channel_type).lower()
@@ -419,8 +436,12 @@ def create_or_update_channel_identity(
         "provider_user_id": provider_id,
         "last_seen_at": _now_iso(),
         "guest_session_id": guest_id,
+        "is_verified": _verified_after_site_link(channel),
         "metadata": {
+            **((existing or {}).get("metadata") or {}),
             "display_name": name,
+            "verified_via_link_code": True,
+            "verified_at": _now_iso(),
         },
     }
 
@@ -453,7 +474,6 @@ def create_or_update_channel_identity(
         payload["referral_locked"] = True
 
     payload["first_seen_at"] = _now_iso()
-    payload["is_verified"] = channel == "whatsapp"
 
     try:
         created = sb.table("channel_identities").insert(payload).execute()
