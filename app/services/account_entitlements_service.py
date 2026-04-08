@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from app.core.supabase_client import supabase
 from app.services.subscription_guard import require_active_subscription
@@ -10,83 +10,100 @@ def _sb():
     return supabase() if callable(supabase) else supabase
 
 
-def _clip(value: Any, n: int = 240) -> str:
-    s = str(value or "")
-    return s if len(s) <= n else s[:n] + "…"
+def _reason_payload(reason: str, *, details: Any = None, fix: Optional[str] = None, root_cause: Optional[str] = None) -> Dict[str, Any]:
+    payload = {"ok": False, "reason": reason, "error": reason}
+    if details is not None:
+        payload["details"] = details
+    if fix:
+        payload["fix"] = fix
+    if root_cause:
+        payload["root_cause"] = root_cause
+    return payload
 
 
-def get_workspace_user_counts(owner_account_id: str) -> Dict[str, int]:
-    """
-    Current repo does not yet have a dedicated workspace_members table.
-    So current enforcement is grounded on canonical accounts.account_id presence only.
+def get_account_entitlements(account_id: str) -> Dict[str, Any]:
+    sub = require_active_subscription(account_id)
+    if not sub.get("ok"):
+        return sub
 
-    This makes the entitlement layer real now:
-    - Starter => only 1 linked web account/workspace user
-    - Professional/Business => future-ready values already exposed
+    plan = sub.get("plan") or {}
+    channel_limits = sub.get("channel_limits") or {}
 
-    Once a workspace/team table is added, only this function needs expansion.
-    """
-    owner_account_id = str(owner_account_id or "").strip()
-    if not owner_account_id:
-        return {"workspace_users": 0, "linked_web_accounts": 0}
+    max_workspace_users = int(plan.get("max_workspace_users") or plan.get("max_linked_web_accounts") or 1)
+    max_linked_web_accounts = int(plan.get("max_linked_web_accounts") or max_workspace_users)
 
+    return {
+        "ok": True,
+        "account_id": account_id,
+        "plan_code": sub.get("plan_code"),
+        "plan_family": sub.get("plan_family"),
+        "channel_limits": channel_limits,
+        "workspace_limits": {
+            "max_workspace_users": max_workspace_users,
+            "max_linked_web_accounts": max_linked_web_accounts,
+        },
+        "subscription": sub.get("subscription"),
+        "plan": plan,
+    }
+
+
+def count_workspace_members(owner_account_id: str) -> Dict[str, int]:
+    counts = {
+        "owner_included_total": 1,
+        "active_members_only": 0,
+    }
     try:
         res = (
             _sb()
-            .table("accounts")
-            .select("account_id,provider")
-            .eq("account_id", owner_account_id)
-            .eq("provider", "web")
-            .limit(1)
+            .table("workspace_members")
+            .select("member_account_id,status")
+            .eq("owner_account_id", owner_account_id)
             .execute()
         )
         rows = getattr(res, "data", None) or []
-        count = 1 if rows else 0
-        return {
-            "workspace_users": count,
-            "linked_web_accounts": count,
-        }
     except Exception:
-        return {"workspace_users": 0, "linked_web_accounts": 0}
+        return counts
+
+    active_rows = []
+    for row in rows:
+        status = str((row or {}).get("status") or "").strip().lower()
+        if status in {"active", "invited"}:
+            active_rows.append(row)
+
+    counts["active_members_only"] = len(active_rows)
+    counts["owner_included_total"] = 1 + len(active_rows)
+    return counts
 
 
-def enforce_user_entitlements(owner_account_id: str) -> Dict[str, Any]:
-    sub = require_active_subscription(owner_account_id)
-    if not sub.get("ok"):
-        return {
-            "ok": False,
-            "error": "subscription_required_for_user_entitlements",
-            "root_cause": str(sub.get("root_cause") or sub.get("error") or ""),
-            "fix": "Activate a paid plan before adding extra linked users or linked web accounts.",
-            "details": sub,
-        }
+def enforce_workspace_member_limit(owner_account_id: str) -> Dict[str, Any]:
+    ent = get_account_entitlements(owner_account_id)
+    if not ent.get("ok"):
+        return ent
 
-    user_limits = sub.get("user_limits") or {}
-    max_workspace_users = int(user_limits.get("max_workspace_users") or 0)
-    max_linked_web_accounts = int(user_limits.get("max_linked_web_accounts") or 0)
-    counts = get_workspace_user_counts(owner_account_id)
+    limits = ent.get("workspace_limits") or {}
+    max_workspace_users = int(limits.get("max_workspace_users") or 1)
 
-    workspace_users = int(counts.get("workspace_users") or 0)
-    linked_web_accounts = int(counts.get("linked_web_accounts") or 0)
+    counts = count_workspace_members(owner_account_id)
+    current_total = int(counts.get("owner_included_total") or 1)
 
-    blocked = False
-    reasons = []
-
-    if max_workspace_users > 0 and workspace_users >= max_workspace_users:
-        blocked = True
-        reasons.append("workspace_user_limit_reached")
-
-    if max_linked_web_accounts > 0 and linked_web_accounts >= max_linked_web_accounts:
-        blocked = True
-        reasons.append("linked_web_account_limit_reached")
+    if max_workspace_users > 0 and current_total >= max_workspace_users:
+        return _reason_payload(
+            "workspace_member_limit_reached",
+            details={
+                "owner_account_id": owner_account_id,
+                "plan_code": ent.get("plan_code"),
+                "plan_family": ent.get("plan_family"),
+                "counts": counts,
+                "limits": limits,
+            },
+            fix="Remove an existing workspace member or upgrade to a higher plan.",
+        )
 
     return {
-        "ok": not blocked,
-        "blocked": blocked,
-        "reasons": reasons,
-        "plan_code": sub.get("plan_code"),
-        "plan_family": sub.get("plan_family"),
+        "ok": True,
+        "owner_account_id": owner_account_id,
+        "plan_code": ent.get("plan_code"),
+        "plan_family": ent.get("plan_family"),
         "counts": counts,
-        "limits": user_limits,
-        "fix": "Upgrade plan before adding more linked users/accounts." if blocked else None,
+        "limits": limits,
     }
