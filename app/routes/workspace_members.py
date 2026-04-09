@@ -3,7 +3,10 @@ from __future__ import annotations
 from flask import Blueprint, jsonify, request
 
 from app.services.web_auth_service import get_account_id_from_request
-from app.services.account_entitlements_service import get_account_entitlements, count_workspace_members
+from app.services.account_entitlements_service import (
+    count_workspace_members,
+    get_account_entitlements,
+)
 from app.services.workspace_members_service import (
     add_workspace_member,
     list_workspace_members,
@@ -50,9 +53,8 @@ def workspace_limits():
 
     ent = get_account_entitlements(account_id)
     counts = count_workspace_members(account_id)
-    if not ent.get("ok"):
-        return jsonify({"ok": False, "account_id": account_id, "counts": counts, "entitlements": ent, "debug": debug}), 400
 
+    # Always return 200 here for authenticated users, even when they are on free/no-plan fallback.
     return jsonify(
         {
             "ok": True,
