@@ -10,7 +10,13 @@ def _sb():
     return supabase() if callable(supabase) else supabase
 
 
-def _reason_payload(reason: str, *, details: Any = None, fix: Optional[str] = None, root_cause: Optional[str] = None) -> Dict[str, Any]:
+def _reason_payload(
+    reason: str,
+    *,
+    details: Any = None,
+    fix: Optional[str] = None,
+    root_cause: Optional[str] = None,
+) -> Dict[str, Any]:
     payload = {"ok": False, "reason": reason, "error": reason}
     if details is not None:
         payload["details"] = details
@@ -21,23 +27,91 @@ def _reason_payload(reason: str, *, details: Any = None, fix: Optional[str] = No
     return payload
 
 
+def _to_int(value: Any, default: int) -> int:
+    try:
+        if value is None or value == "":
+            return default
+        return int(value)
+    except Exception:
+        return default
+
+
+def _free_entitlements(account_id: str, sub_payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Return a safe default entitlement payload for accounts without an active subscription.
+
+    This keeps workspace endpoints stable for free/unpaid users instead of returning
+    a hard 400 response from /api/workspace/limits.
+    """
+    reason = (sub_payload or {}).get("reason") or "no_active_subscription"
+
+    plan = {
+        "name": "Free",
+        "code": "free",
+        "plan_family": "free",
+        "tier": "free",
+        "active": False,
+        "currency": "NGN",
+        "cycle": None,
+        "price": 0,
+        "description": "Default free access with owner-only workspace access.",
+        "max_workspace_users": 1,
+        "max_linked_web_accounts": 1,
+        "max_total_channels": 0,
+        "max_whatsapp_channels": 0,
+        "max_telegram_channels": 0,
+    }
+
+    return {
+        "ok": True,
+        "account_id": account_id,
+        "plan_code": None,
+        "plan_family": "free",
+        "channel_limits": {
+            "max_total_channels": 0,
+            "max_whatsapp_channels": 0,
+            "max_telegram_channels": 0,
+        },
+        "workspace_limits": {
+            "max_workspace_users": 1,
+            "max_linked_web_accounts": 1,
+        },
+        "subscription": None,
+        "plan": plan,
+        "inactive_reason": reason,
+        "access_mode": "free_fallback",
+    }
+
+
 def get_account_entitlements(account_id: str) -> Dict[str, Any]:
     sub = require_active_subscription(account_id)
+
+    # Important: no active subscription should not break workspace limits endpoint.
     if not sub.get("ok"):
-        return sub
+        return _free_entitlements(account_id, sub)
 
     plan = sub.get("plan") or {}
     channel_limits = sub.get("channel_limits") or {}
 
-    max_workspace_users = int(plan.get("max_workspace_users") or plan.get("max_linked_web_accounts") or 1)
-    max_linked_web_accounts = int(plan.get("max_linked_web_accounts") or max_workspace_users)
+    max_workspace_users = _to_int(
+        plan.get("max_workspace_users") or plan.get("max_linked_web_accounts"),
+        1,
+    )
+    max_linked_web_accounts = _to_int(
+        plan.get("max_linked_web_accounts") or max_workspace_users,
+        max_workspace_users,
+    )
 
     return {
         "ok": True,
         "account_id": account_id,
         "plan_code": sub.get("plan_code"),
         "plan_family": sub.get("plan_family"),
-        "channel_limits": channel_limits,
+        "channel_limits": {
+            "max_total_channels": _to_int(channel_limits.get("max_total_channels"), 0),
+            "max_whatsapp_channels": _to_int(channel_limits.get("max_whatsapp_channels"), 0),
+            "max_telegram_channels": _to_int(channel_limits.get("max_telegram_channels"), 0),
+        },
         "workspace_limits": {
             "max_workspace_users": max_workspace_users,
             "max_linked_web_accounts": max_linked_web_accounts,
@@ -81,10 +155,10 @@ def enforce_workspace_member_limit(owner_account_id: str) -> Dict[str, Any]:
         return ent
 
     limits = ent.get("workspace_limits") or {}
-    max_workspace_users = int(limits.get("max_workspace_users") or 1)
+    max_workspace_users = _to_int(limits.get("max_workspace_users"), 1)
 
     counts = count_workspace_members(owner_account_id)
-    current_total = int(counts.get("owner_included_total") or 1)
+    current_total = _to_int(counts.get("owner_included_total"), 1)
 
     if max_workspace_users > 0 and current_total >= max_workspace_users:
         return _reason_payload(
