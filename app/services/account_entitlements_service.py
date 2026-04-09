@@ -36,12 +36,15 @@ def _to_int(value: Any, default: int) -> int:
         return default
 
 
-def _free_entitlements(account_id: str, sub_payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def _free_entitlements(
+    account_id: str,
+    sub_payload: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """
     Return a safe default entitlement payload for accounts without an active subscription.
 
-    This keeps workspace endpoints stable for free/unpaid users instead of returning
-    a hard 400 response from /api/workspace/limits.
+    Free users are allowed one total channel, and they may choose either
+    WhatsApp or Telegram. They still remain limited to owner-only workspace access.
     """
     reason = (sub_payload or {}).get("reason") or "no_active_subscription"
 
@@ -54,23 +57,23 @@ def _free_entitlements(account_id: str, sub_payload: Optional[Dict[str, Any]] = 
         "currency": "NGN",
         "cycle": None,
         "price": 0,
-        "description": "Default free access with owner-only workspace access.",
+        "description": "Default free access with owner-only workspace access and one user-selected channel.",
         "max_workspace_users": 1,
         "max_linked_web_accounts": 1,
-        "max_total_channels": 0,
-        "max_whatsapp_channels": 0,
-        "max_telegram_channels": 0,
+        "max_total_channels": 1,
+        "max_whatsapp_channels": 1,
+        "max_telegram_channels": 1,
     }
 
     return {
         "ok": True,
         "account_id": account_id,
-        "plan_code": None,
+        "plan_code": "free",
         "plan_family": "free",
         "channel_limits": {
-            "max_total_channels": 0,
-            "max_whatsapp_channels": 0,
-            "max_telegram_channels": 0,
+            "max_total_channels": 1,
+            "max_whatsapp_channels": 1,
+            "max_telegram_channels": 1,
         },
         "workspace_limits": {
             "max_workspace_users": 1,
@@ -86,7 +89,8 @@ def _free_entitlements(account_id: str, sub_payload: Optional[Dict[str, Any]] = 
 def get_account_entitlements(account_id: str) -> Dict[str, Any]:
     sub = require_active_subscription(account_id)
 
-    # Important: no active subscription should not break workspace limits endpoint.
+    # No active subscription should not break workspace or channel limits endpoints.
+    # Instead, return the free fallback entitlement payload.
     if not sub.get("ok"):
         return _free_entitlements(account_id, sub)
 
