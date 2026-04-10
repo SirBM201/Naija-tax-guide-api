@@ -60,6 +60,53 @@ TOPIC_ALIASES = {
 
 GENERIC_INTENTS = {"", "general", "guidance", "definition"}
 
+STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "can",
+    "do",
+    "does",
+    "for",
+    "from",
+    "how",
+    "i",
+    "in",
+    "is",
+    "it",
+    "me",
+    "my",
+    "of",
+    "on",
+    "or",
+    "the",
+    "to",
+    "we",
+    "what",
+    "when",
+    "where",
+    "who",
+    "why",
+    "you",
+    "your",
+}
+
+ACTION_KEYWORDS = {
+    "verify": {"verify", "verification", "validate", "validation", "confirm", "check", "authenticity", "genuine", "status"},
+    "apply": {"apply", "application", "obtain", "get", "request"},
+    "register": {"register", "registration", "enrol", "enroll", "enrollment"},
+    "file": {"file", "filing", "submit", "return"},
+    "pay": {"pay", "payment", "remit", "remittance"},
+    "calculate": {"calculate", "computation", "compute", "rate", "percentage"},
+    "exempt": {"exempt", "exemption", "zero", "rated", "zero-rated", "zero-rated"},
+    "use": {"use", "used", "purpose", "needed"},
+}
+
 
 def _sb():
     return supabase() if callable(supabase) else supabase
@@ -131,6 +178,27 @@ def _tokenize(value: str) -> List[str]:
     if not text:
         return []
     return [t for t in text.split(" ") if t]
+
+
+def _meaningful_tokens(value: str) -> List[str]:
+    return [t for t in _tokenize(value) if t not in STOPWORDS]
+
+
+def _detect_action_label(value: str) -> Optional[str]:
+    tokens = set(_meaningful_tokens(value))
+    if not tokens:
+        return None
+
+    for label, keywords in ACTION_KEYWORDS.items():
+        if tokens.intersection(keywords):
+            return label
+    return None
+
+
+def _action_conflicts(question: str, row_text: str) -> bool:
+    q_action = _detect_action_label(question)
+    row_action = _detect_action_label(row_text)
+    return bool(q_action and row_action and q_action != row_action)
 
 
 def _infer_topic_from_question(question: str, fallback: str = "general") -> str:
@@ -406,14 +474,18 @@ def _library_row_question_text(row: Dict[str, Any]) -> str:
 
 
 def _library_overlap_count(row: Dict[str, Any], question: str) -> int:
-    row_tokens = set(_tokenize(_library_row_question_text(row)))
-    q_tokens = set(_tokenize(question))
+    row_tokens = set(_meaningful_tokens(_library_row_question_text(row)))
+    q_tokens = set(_meaningful_tokens(question))
     return len(row_tokens.intersection(q_tokens))
 
 
 def _is_strong_library_direct_match(row: Dict[str, Any], question_meta: Dict[str, Any], question: str) -> bool:
     norm_q = _normalize_text(question)
-    row_norm = _normalize_text(_library_row_question_text(row))
+    row_text = _library_row_question_text(row)
+    row_norm = _normalize_text(row_text)
+
+    if _action_conflicts(question, row_text):
+        return False
 
     meta_topic = _safe_str(question_meta.get("topic")).lower()
     row_topic = _safe_str(row.get("topic")).lower()
@@ -449,7 +521,11 @@ def _is_strong_library_direct_match(row: Dict[str, Any], question_meta: Dict[str
 def _is_strong_library_candidate_match(row: Dict[str, Any], question_meta: Dict[str, Any], question: str) -> bool:
     score = _safe_int(row.get("library_score"), 0)
     norm_q = _normalize_text(question)
-    row_norm = _normalize_text(_library_row_question_text(row))
+    row_text = _library_row_question_text(row)
+    row_norm = _normalize_text(row_text)
+
+    if _action_conflicts(question, row_text):
+        return False
 
     meta_topic = _safe_str(question_meta.get("topic")).lower()
     row_topic = _safe_str(row.get("topic")).lower()
@@ -480,7 +556,7 @@ def _is_strong_library_candidate_match(row: Dict[str, Any], question_meta: Dict[
 
 
 def _keyword_overlap_count(row: Dict[str, Any], question: str) -> int:
-    q_tokens = set(_tokenize(question))
+    q_tokens = set(_meaningful_tokens(question))
     keywords = row.get("keywords") or []
     keyword_tokens: List[str] = []
 
@@ -490,7 +566,7 @@ def _keyword_overlap_count(row: Dict[str, Any], question: str) -> int:
     else:
         keyword_tokens.extend(_tokenize(str(keywords)))
 
-    return len(q_tokens.intersection(set(keyword_tokens)))
+    return len(q_tokens.intersection({t for t in keyword_tokens if t not in STOPWORDS}))
 
 
 def _fetch_tax_source_rows(question_meta: Dict[str, Any], question: str, limit: int = 5) -> List[Dict[str, Any]]:
@@ -590,6 +666,10 @@ def _is_strong_kb_direct_match(row: Dict[str, Any], question_meta: Dict[str, Any
     score = _safe_float(row.get("kb_score"), 0.0)
     overlap = _safe_int(row.get("keyword_overlap_count"), 0)
     short_q = _question_is_short(question)
+    row_text = _safe_str(row.get("summary") or row.get("text_content") or row.get("source_title"))
+
+    if _action_conflicts(question, row_text):
+        return False
 
     row_topic = _safe_str(row.get("topic")).lower()
     meta_topic = _safe_str(question_meta.get("topic")).lower()
