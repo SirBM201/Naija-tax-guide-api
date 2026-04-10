@@ -2,16 +2,12 @@ from __future__ import annotations
 
 import os
 import re
+import inspect
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.core.supabase_client import supabase
 from app.services.accounts_service import lookup_account
 from app.services.query_classifier import classify_query
-from app.services.semantic_cache_service import (
-    retrieve_ranked_candidates,
-    ranked_debug_dump,
-)
-from app.services.decision_engine import decide_answer_mode
 from app.services.answer_composer import (
     compose_ai_answer,
     compose_clarification,
@@ -21,6 +17,8 @@ from app.services.answer_composer import (
     looks_like_internal_or_broken_answer,
     render_answer,
 )
+from app.services.qa_library_service import find_library_answer, find_library_candidates
+from app.services.semantic_cache_service import retrieve_ranked_candidates, ranked_debug_dump
 from app.services.usage_guard_service import get_ai_usage_state
 from app.services.billing_guard_service import get_billing_state
 from app.services.ai_service import generate_grounded_answer
@@ -31,10 +29,7 @@ from app.services.credits_service import (
     get_daily_usage,
     increment_daily_usage,
 )
-from app.services.tax_grounding_service import (
-    build_grounded_answer,
-    grounding_prompt_context,
-)
+from app.services.tax_grounding_service import build_grounded_answer, grounding_prompt_context
 from app.services.response_refiner import refine_response
 from app.services.tax_rules.vat_rules import can_handle_vat_rule, resolve_vat_rule
 from app.services.tax_rules.paye_rules import can_handle_paye_rule, resolve_paye_rule
@@ -61,6 +56,9 @@ TOPIC_ALIASES = {
     "company_income_tax": {"company_income_tax", "company income tax", "cit"},
     "freelancer": {"freelancer", "self_employed", "self employed", "sole proprietor"},
     "self_employed": {"freelancer", "self_employed", "self employed", "sole proprietor"},
+    "tin": {"tin", "tax identification number"},
+    "tax_clearance_certificate": {"tcc", "tax clearance certificate", "tax_clearance_certificate"},
+    "general": {"general"},
 }
 
 INTENT_ALIASES = {
@@ -77,6 +75,14 @@ INTENT_ALIASES = {
 }
 
 
+def _sb():
+    return supabase() if callable(supabase) else supabase
+
+
+def _safe_str(value: Any) -> str:
+    return str(value or "").strip()
+
+
 def _safe_int(value: Any, default: int = 0) -> int:
     try:
         return int(value)
@@ -87,7 +93,127 @@ def _safe_int(value: Any, default: int = 0) -> int:
             return default
 
 
-def _with_usage_meta(result: Dict[str, Any], *, usage_state: Dict[str, Any], balance: int | None = None, daily_usage: int | None = None) -> Dict[str, Any]:
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _truthy(v: str | None) -> bool:
+    return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _include_debug() -> bool:
+    return _truthy(os.getenv("DEBUG_AI")) or _truthy(os.getenv("SHOW_ASK_DEBUG"))
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = str(os.getenv(name, "")).strip()
+    try:
+        return int(raw) if raw else default
+    except Exception:
+        return default
+
+
+def _tax_kb_enabled() -> bool:
+    return _truthy(os.getenv("ENABLE_TAX_KB", "1"))
+
+
+def _tax_kb_direct_threshold() -> int:
+    return _env_int("TAX_KB_DIRECT_THRESHOLD", 45)
+
+
+def _tax_kb_result_limit() -> int:
+    return _env_int("TAX_KB_RESULT_LIMIT", 5)
+
+
+def _normalize_channel(channel: Optional[str]) -> str:
+    raw = _safe_str(channel).lower()
+    return CHANNEL_ALIASES.get(raw, raw or "web")
+
+
+def _normalize_text(value: str) -> str:
+    text = (value or "").strip().lower()
+    text = re.sub(r"[^a-z0-9\s]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _tokenize(value: str) -> List[str]:
+    text = _normalize_text(value)
+    if not text:
+        return []
+    return [t for t in text.split(" ") if t]
+
+
+def _infer_topic_from_question(question: str, fallback: str = "general") -> str:
+    q = _normalize_text(question)
+
+    if any(x in q for x in ["vat", "value added tax", "value_added_tax"]):
+        return "vat"
+    if any(x in q for x in ["paye", "pay as you earn", "personal income tax"]):
+        return "paye"
+    if any(x in q for x in ["withholding tax", "wht"]):
+        return "withholding_tax"
+    if any(x in q for x in ["company income tax", "cit"]):
+        return "company_income_tax"
+    if any(x in q for x in ["freelancer", "self employed", "sole proprietor"]):
+        return "freelancer"
+    if any(x in q for x in ["tin", "tax identification number"]):
+        return "tin"
+    if any(x in q for x in ["tcc", "tax clearance certificate"]):
+        return "tax_clearance_certificate"
+
+    return str(fallback or "general").strip().lower()
+
+
+def _infer_intent_from_question(question: str, fallback: str = "general") -> str:
+    q = _normalize_text(question)
+
+    if q.startswith("what is ") or q.startswith("define "):
+        return "definition"
+    if q.startswith("how do i ") or q.startswith("how to ") or "process" in q or "procedure" in q:
+        return "procedure"
+    if any(x in q for x in ["rate", "percentage"]):
+        return "rate"
+    if any(x in q for x in ["exempt", "exemption", "zero rated", "zero-rated"]):
+        return "exemption"
+    if any(x in q for x in ["calculate", "computation", "compute"]):
+        return "calculation"
+    if any(x in q for x in ["do i need", "must i", "am i required", "should i charge"]):
+        return "obligation"
+
+    return str(fallback or "general").strip().lower()
+
+
+def _classification_to_meta(classification: Any, question: str = "") -> Dict[str, Any]:
+    raw_topic = _safe_str(getattr(classification, "topic", "")).lower()
+    raw_intent = _safe_str(getattr(classification, "intent_type", "")).lower()
+
+    normalized_topic = _infer_topic_from_question(question, raw_topic or "general")
+    normalized_intent = _infer_intent_from_question(question, raw_intent or "general")
+
+    return {
+        "topic": normalized_topic,
+        "intent_type": normalized_intent,
+        "jurisdiction": _safe_str(getattr(classification, "jurisdiction", "") or "nigeria") or "nigeria",
+        "complexity": _safe_str(getattr(classification, "complexity", "")),
+        "risk_level": _safe_str(getattr(classification, "risk_level", "")),
+        "normalized_question": _safe_str(getattr(classification, "normalized_question", "") or _normalize_text(question)),
+        "canonical_key": _safe_str(getattr(classification, "canonical_key", "")),
+        "classifier_topic": raw_topic,
+        "classifier_intent_type": raw_intent,
+    }
+
+
+def _with_usage_meta(
+    result: Dict[str, Any],
+    *,
+    usage_state: Dict[str, Any],
+    balance: int | None = None,
+    daily_usage: int | None = None,
+) -> Dict[str, Any]:
     payload = dict(result or {})
     meta = dict(payload.get("meta") or {})
     meta.setdefault("ai_used_month", _safe_int(usage_state.get("monthly_ai_usage"), 0))
@@ -99,14 +225,332 @@ def _with_usage_meta(result: Dict[str, Any], *, usage_state: Dict[str, Any], bal
     return payload
 
 
-def _build_uncached_block_response(*, question_meta: Dict[str, Any], debug: Dict[str, Any], usage_state: Dict[str, Any], balance: int, error: str) -> Dict[str, Any]:
+def _filtered_debug(debug: Dict[str, Any]) -> Dict[str, Any]:
+    if _include_debug():
+        return debug
+    return {}
+
+
+def _credit_balance_for_account(account_id: Optional[str]) -> int:
+    if not account_id:
+        return 0
+
+    try:
+        bal = get_credit_balance_details(account_id)
+        if isinstance(bal, dict):
+            for key in ["balance", "credits_left", "credit_balance"]:
+                if key in bal:
+                    return _safe_int(bal.get(key), 0)
+    except Exception:
+        pass
+
+    try:
+        bal = check_credit_balance(account_id)
+        if isinstance(bal, dict):
+            for key in ["balance", "credits_left", "credit_balance"]:
+                if key in bal:
+                    return _safe_int(bal.get(key), 0)
+        return _safe_int(bal, 0)
+    except Exception:
+        return 0
+
+
+def _daily_usage_for_account(account_id: Optional[str]) -> int:
+    if not account_id:
+        return 0
+    try:
+        result = get_daily_usage(account_id)
+        if isinstance(result, dict):
+            for key in ["count", "daily_usage", "used", "usage"]:
+                if key in result:
+                    return _safe_int(result.get(key), 0)
+        return _safe_int(result, 0)
+    except Exception:
+        return 0
+
+
+def _usage_state_for_account(account_id: Optional[str]) -> Dict[str, Any]:
+    state = {
+        "monthly_ai_usage": 0,
+        "daily_ai_usage": 0,
+        "daily_ai_limit": 0,
+        "credits_left": 0,
+        "has_ai_credit": False,
+    }
+
+    if not account_id:
+        return state
+
+    try:
+        raw = get_ai_usage_state(account_id)
+        if isinstance(raw, dict):
+            state.update(raw)
+    except Exception:
+        pass
+
+    balance = _credit_balance_for_account(account_id)
+    daily_usage = _daily_usage_for_account(account_id)
+
+    state["credits_left"] = balance
+    state["has_ai_credit"] = balance > 0
+    state["daily_ai_usage"] = daily_usage if daily_usage >= 0 else _safe_int(state.get("daily_ai_usage"), 0)
+    return state
+
+
+def _billing_state_for_account(account_id: Optional[str]) -> Dict[str, Any]:
+    if not account_id:
+        return {"ok": False}
+    try:
+        raw = get_billing_state(account_id)
+        return raw if isinstance(raw, dict) else {"ok": False}
+    except Exception:
+        return {"ok": False}
+
+
+def _candidate_to_dict(candidate: Any) -> Dict[str, Any]:
+    if isinstance(candidate, dict):
+        return dict(candidate)
+
+    return {
+        "candidate_id": getattr(candidate, "candidate_id", None),
+        "question": getattr(candidate, "question", None),
+        "answer": getattr(candidate, "answer", None),
+        "canonical_key": getattr(candidate, "canonical_key", None),
+        "intent_type": getattr(candidate, "intent_type", None),
+        "topic": getattr(candidate, "topic", None),
+        "jurisdiction": getattr(candidate, "jurisdiction", None),
+        "lang": getattr(candidate, "lang", None),
+        "trust_score": getattr(candidate, "trust_score", None),
+        "review_status": getattr(candidate, "review_status", None),
+        "source_authority_score": getattr(candidate, "source_authority_score", None),
+        "authority_score": getattr(candidate, "source_authority_score", None),
+        "similarity": getattr(candidate, "similarity", None),
+        "match_type": getattr(candidate, "match_type", None),
+        "rank_score": getattr(candidate, "rank_score", None),
+        "source": "cache",
+    }
+
+
+def _topic_matches(question_meta: Dict[str, Any], row: Dict[str, Any], question: str) -> bool:
+    row_topic = _safe_str(row.get("topic")).lower()
+    meta_topic = _safe_str(question_meta.get("topic")).lower()
+    inferred_topic = _infer_topic_from_question(question, meta_topic or "general")
+
+    if not row_topic:
+        return False
+    if row_topic == meta_topic or row_topic == inferred_topic:
+        return True
+
+    row_aliases = TOPIC_ALIASES.get(row_topic, {row_topic})
+    meta_aliases = TOPIC_ALIASES.get(meta_topic, {meta_topic}) | TOPIC_ALIASES.get(inferred_topic, {inferred_topic})
+    return bool(row_aliases.intersection(meta_aliases))
+
+
+def _intent_matches(question_meta: Dict[str, Any], row: Dict[str, Any], question: str) -> bool:
+    row_intent = _safe_str(row.get("intent_type")).lower()
+    meta_intent = _safe_str(question_meta.get("intent_type")).lower()
+    inferred_intent = _infer_intent_from_question(question, meta_intent or "general")
+
+    if not row_intent:
+        return False
+    if row_intent == meta_intent or row_intent == inferred_intent:
+        return True
+
+    row_aliases = INTENT_ALIASES.get(row_intent, {row_intent})
+    meta_aliases = INTENT_ALIASES.get(meta_intent, {meta_intent}) | INTENT_ALIASES.get(inferred_intent, {inferred_intent})
+    return bool(row_aliases.intersection(meta_aliases))
+
+
+def _question_is_short(question: str) -> bool:
+    nq = _normalize_text(question)
+    return bool(nq) and len(_tokenize(nq)) <= 3
+
+
+def _looks_already_structured(text: str) -> bool:
+    raw = _safe_str(text).lower()
+    return (
+        "answer:" in raw
+        or "what this means:" in raw
+        or "what to do next:" in raw
+        or "steps:" in raw
+    )
+
+
+def _render_once(answer_text: str, question_meta: Dict[str, Any]) -> str:
+    raw = _safe_str(answer_text)
+    if not raw:
+        return ""
+
+    # Prevent double composition.
+    if _looks_already_structured(raw):
+        return raw
+
+    return render_answer(raw, question_meta=question_meta)
+
+
+def _build_source_line(source_title: Optional[str]) -> str:
+    title = _safe_str(source_title)
+    return f"Source: {title}" if title else ""
+
+
+def _chunk_to_direct_answer(row: Dict[str, Any], question_meta: Dict[str, Any]) -> str:
+    summary = _safe_str(row.get("summary"))
+    text_content = _safe_str(row.get("text_content"))
+    source_title = _safe_str(row.get("source_title") or row.get("title"))
+
+    base = summary or text_content
+    if not base:
+        return ""
+
+    cleaned = re.sub(r"\s+", " ", base).strip()
+
+    # Keep direct chunk answers short and clean before composition.
+    if len(cleaned) > 520:
+        cleaned = cleaned[:520].rsplit(" ", 1)[0].strip() + "."
+
+    if source_title and "source:" not in cleaned.lower():
+        cleaned = f"{cleaned}\n\nSource: {source_title}"
+
+    return _render_once(cleaned, question_meta)
+
+
+def _fetch_tax_source_rows(question_meta: Dict[str, Any], question: str, limit: int = 5) -> List[Dict[str, Any]]:
+    if not _tax_kb_enabled():
+        return []
+
+    try:
+        res = (
+            _sb()
+            .table("tax_source_chunks")
+            .select("chunk_id,source_id,topic,subtopic,intent_type,risk_level,jurisdiction,text_content,summary,keywords,law_version,is_current,source_priority")
+            .eq("approved", True)
+            .eq("is_current", True)
+            .order("source_priority", desc=True)
+            .limit(max(20, limit * 4))
+            .execute()
+        )
+        rows = getattr(res, "data", None) or []
+    except Exception:
+        return []
+
+    if not isinstance(rows, list):
+        return []
+
+    source_ids = [str(r.get("source_id") or "").strip() for r in rows if str(r.get("source_id") or "").strip()]
+    titles_by_source: Dict[str, str] = {}
+
+    if source_ids:
+        try:
+            src_res = (
+                _sb()
+                .table("tax_source_registry")
+                .select("source_id,title")
+                .in_("source_id", list(dict.fromkeys(source_ids)))
+                .execute()
+            )
+            src_rows = getattr(src_res, "data", None) or []
+            for row in src_rows:
+                sid = _safe_str((row or {}).get("source_id"))
+                if sid:
+                    titles_by_source[sid] = _safe_str((row or {}).get("title"))
+        except Exception:
+            pass
+
+    q_tokens = set(_tokenize(question))
+    results: List[Dict[str, Any]] = []
+
+    for row in rows:
+        score = 0.0
+        reasons: List[str] = []
+
+        if _topic_matches(question_meta, row, question):
+            score += 40
+            reasons.append("topic_match:+40")
+
+        if _intent_matches(question_meta, row, question):
+            score += 18
+            reasons.append("intent_match:+18")
+
+        keywords = row.get("keywords") or []
+        keyword_tokens: List[str] = []
+        if isinstance(keywords, list):
+            for item in keywords:
+                keyword_tokens.extend(_tokenize(str(item)))
+        else:
+            keyword_tokens.extend(_tokenize(str(keywords)))
+
+        overlap = len(q_tokens.intersection(set(keyword_tokens)))
+        if overlap > 0:
+            bonus = min(20, overlap * 4)
+            score += bonus
+            reasons.append(f"keyword_overlap:+{bonus}")
+
+        priority_bonus = min(12, _safe_int(row.get("source_priority"), 0))
+        if priority_bonus:
+            score += priority_bonus
+            reasons.append(f"source_priority:+{priority_bonus}")
+
+        summary = _safe_str(row.get("summary"))
+        if summary:
+            score += 4
+            reasons.append("has_summary:+4")
+
+        if score <= 0:
+            continue
+
+        item = dict(row)
+        item["source_title"] = titles_by_source.get(_safe_str(row.get("source_id")), "")
+        item["kb_score"] = round(score, 3)
+        item["kb_reasons"] = reasons
+        results.append(item)
+
+    results.sort(
+        key=lambda r: (
+            _safe_float(r.get("kb_score"), 0.0),
+            _safe_int(r.get("source_priority"), 0),
+        ),
+        reverse=True,
+    )
+    return results[:limit]
+
+
+def _resolve_rules(question: str, topic: str, intent_type: str) -> Optional[str]:
+    try:
+        if can_handle_vat_rule(question, topic, intent_type):
+            return resolve_vat_rule(question, intent_type)
+    except Exception:
+        pass
+
+    try:
+        if can_handle_paye_rule(question, topic, intent_type):
+            return resolve_paye_rule(question, intent_type)
+    except Exception:
+        pass
+
+    return None
+
+
+def _build_uncached_block_response(
+    *,
+    question_meta: Dict[str, Any],
+    debug: Dict[str, Any],
+    usage_state: Dict[str, Any],
+    balance: int,
+    error: str,
+) -> Dict[str, Any]:
     res = compose_insufficient_uncached(question_meta=question_meta, debug=_filtered_debug(debug))
     payload = res.__dict__
     payload["error"] = error
     return _with_usage_meta(payload, usage_state=usage_state, balance=balance)
 
 
-def _finalize_ai_success(*, result: Dict[str, Any], account_id: str, usage_state: Dict[str, Any], debug: Dict[str, Any]) -> Dict[str, Any]:
+def _finalize_ai_success(
+    *,
+    result: Dict[str, Any],
+    account_id: str,
+    usage_state: Dict[str, Any],
+    debug: Dict[str, Any],
+) -> Dict[str, Any]:
     consume_result = consume_credits(account_id, cost=1)
     if not consume_result.get("ok"):
         debug["credit_consume_result"] = consume_result
@@ -150,986 +594,523 @@ def _finalize_ai_success(*, result: Dict[str, Any], account_id: str, usage_state
     return payload
 
 
-def _truthy(v: str | None) -> bool:
-    return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+def _library_result_to_payload(
+    *,
+    row: Dict[str, Any],
+    question_meta: Dict[str, Any],
+    usage_state: Dict[str, Any],
+    debug: Dict[str, Any],
+) -> Dict[str, Any]:
+    answer_text = _safe_str(row.get("resolved_answer") or row.get("answer_en") or row.get("answer"))
+    rendered = _render_once(answer_text, question_meta)
+
+    res = compose_direct_cache_answer(
+        row,
+        answer_text=rendered,
+        debug=_filtered_debug(debug),
+        question_meta=question_meta,
+    )
+    payload = res.__dict__
+    payload["citations"] = [_build_source_line(_safe_str(row.get("source") or "Curated knowledge base"))]
+    return _with_usage_meta(payload, usage_state=usage_state)
 
 
-def _include_debug() -> bool:
-    return _truthy(os.getenv("DEBUG_AI")) or _truthy(os.getenv("SHOW_ASK_DEBUG"))
+def _cache_result_to_payload(
+    *,
+    row: Dict[str, Any],
+    question_meta: Dict[str, Any],
+    usage_state: Dict[str, Any],
+    debug: Dict[str, Any],
+) -> Dict[str, Any]:
+    answer_text = _safe_str(row.get("answer"))
+    rendered = _render_once(answer_text, question_meta)
+
+    res = compose_direct_cache_answer(
+        row,
+        answer_text=rendered,
+        debug=_filtered_debug(debug),
+        question_meta=question_meta,
+    )
+    payload = res.__dict__
+    source_title = _safe_str(row.get("source_title") or row.get("source") or "Approved cache")
+    payload["citations"] = [_build_source_line(source_title)]
+    return _with_usage_meta(payload, usage_state=usage_state)
 
 
-def _env_int(name: str, default: int) -> int:
-    raw = str(os.getenv(name, "")).strip()
+def _chunk_result_to_payload(
+    *,
+    row: Dict[str, Any],
+    question_meta: Dict[str, Any],
+    usage_state: Dict[str, Any],
+    debug: Dict[str, Any],
+) -> Dict[str, Any]:
+    rendered = _chunk_to_direct_answer(row, question_meta)
+
+    res = compose_direct_cache_answer(
+        row,
+        answer_text=rendered,
+        debug=_filtered_debug(debug),
+        question_meta=question_meta,
+    )
+    payload = res.__dict__
+    payload["citations"] = [_build_source_line(_safe_str(row.get("source_title")))]
+    return _with_usage_meta(payload, usage_state=usage_state)
+
+
+def _try_tax_process_composer(question: str, question_meta: Dict[str, Any], lang: str, channel: str) -> Optional[str]:
     try:
-        return int(raw) if raw else default
+        result = try_compose(
+            question=question,
+            topic=question_meta.get("topic"),
+            intent_type=question_meta.get("intent_type"),
+            lang=lang,
+            channel=channel,
+        )
+        if isinstance(result, dict):
+            answer = _safe_str(result.get("answer"))
+            if result.get("ok") and answer:
+                return answer
+        elif isinstance(result, str):
+            answer = _safe_str(result)
+            if answer:
+                return answer
     except Exception:
-        return default
+        return None
+    return None
 
 
-def _tax_kb_enabled() -> bool:
-    return _truthy(os.getenv("ENABLE_TAX_KB", "1"))
+def _safe_refine_response(answer_text: str, question: str, question_meta: Dict[str, Any]) -> str:
+    clean = _safe_str(answer_text)
+    if not clean:
+        return ""
+
+    # Never re-refine content that is already structured.
+    if _looks_already_structured(clean):
+        return clean
+
+    try:
+        refined = refine_response(
+            answer=clean,
+            question=question,
+            question_meta=question_meta,
+        )
+        refined_text = _safe_str(refined if isinstance(refined, str) else getattr(refined, "answer", "") or "")
+        return refined_text or clean
+    except Exception:
+        return clean
 
 
-def _tax_kb_direct_threshold() -> int:
-    return _env_int("TAX_KB_DIRECT_THRESHOLD", 45)
+def _try_ai_generation(
+    *,
+    question: str,
+    question_meta: Dict[str, Any],
+    lang: str,
+    channel: str,
+    tax_rows: List[Dict[str, Any]],
+    debug: Dict[str, Any],
+) -> Optional[str]:
+    grounded_context = ""
+    try:
+        grounded_context = grounding_prompt_context(question=question, supporting_rows=tax_rows)
+    except Exception:
+        try:
+            grounded_context = grounding_prompt_context(question, tax_rows)
+        except Exception:
+            grounded_context = ""
 
+    if not grounded_context and tax_rows:
+        grounded_context = "\n\n".join(
+            _safe_str(r.get("summary") or r.get("text_content")) for r in tax_rows[:3]
+        ).strip()
 
-def _tax_kb_result_limit() -> int:
-    return _env_int("TAX_KB_RESULT_LIMIT", 5)
+    builder_attempts = [
+        lambda: build_grounded_answer(
+            question=question,
+            question_meta=question_meta,
+            lang=lang,
+            channel=channel,
+            supporting_rows=tax_rows,
+        ),
+        lambda: build_grounded_answer(question, question_meta, tax_rows),
+    ]
 
+    for attempt in builder_attempts:
+        try:
+            built = attempt()
+            if isinstance(built, dict):
+                ans = _safe_str(built.get("answer"))
+                if ans:
+                    return ans
+            else:
+                ans = _safe_str(built)
+                if ans:
+                    return ans
+        except Exception:
+            continue
 
-def _sb():
-    return supabase() if callable(supabase) else supabase
+    ai_attempts = [
+        lambda: generate_grounded_answer(
+            question=question,
+            context=grounded_context,
+            lang=lang,
+            channel=channel,
+        ),
+        lambda: generate_grounded_answer(question, grounded_context),
+    ]
 
-
-def _normalize_text(value: str) -> str:
-    text = (value or "").strip().lower()
-    text = re.sub(r"[^a-z0-9\s]+", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-
-def _tokenize(value: str) -> List[str]:
-    text = _normalize_text(value)
-    if not text:
-        return []
-    return [t for t in text.split(" ") if t]
-
-
-def _candidate_to_dict(c) -> Dict[str, Any]:
-    if isinstance(c, dict):
-        return c
-
-    return {
-        "candidate_id": c.candidate_id,
-        "question": c.question,
-        "answer": c.answer,
-        "canonical_key": c.canonical_key,
-        "intent_type": c.intent_type,
-        "topic": c.topic,
-        "jurisdiction": c.jurisdiction,
-        "lang": c.lang,
-        "trust_score": c.trust_score,
-        "review_status": c.review_status,
-        "source_authority_score": c.source_authority_score,
-        "authority_score": c.source_authority_score,
-        "similarity": c.similarity,
-        "match_type": c.match_type,
-        "rank_score": c.rank_score,
-        "source": "cache",
-    }
-
-
-def _infer_topic_from_question(question: str, fallback: str = "general") -> str:
-    q = _normalize_text(question)
-
-    if any(x in q for x in ["vat", "value added tax", "value_added_tax"]):
-        return "vat"
-    if any(x in q for x in ["paye", "pay as you earn", "personal income tax"]):
-        return "paye"
-    if any(x in q for x in ["withholding tax", "wht"]):
-        return "withholding_tax"
-    if any(x in q for x in ["company income tax", "cit"]):
-        return "company_income_tax"
-    if any(x in q for x in ["freelancer", "self employed", "sole proprietor"]):
-        return "freelancer"
-
-    return str(fallback or "general").strip().lower()
-
-
-def _infer_intent_from_question(question: str, fallback: str = "general") -> str:
-    q = _normalize_text(question)
-
-    if q.startswith("what is ") or q.startswith("define "):
-        return "definition"
-    if q.startswith("how do i ") or q.startswith("how to ") or "process" in q or "procedure" in q:
-        return "procedure"
-    if any(x in q for x in ["rate", "percentage"]):
-        return "rate"
-    if any(x in q for x in ["exempt", "exemption", "zero rated", "zero rated"]):
-        return "exemption"
-    if any(x in q for x in ["calculate", "computation", "compute"]):
-        return "calculation"
-    if any(x in q for x in ["do i need", "must i", "am i required", "should i charge"]):
-        return "obligation"
-
-    return str(fallback or "general").strip().lower()
-
-
-def _classification_to_meta(classification, question: str = "") -> Dict[str, Any]:
-    raw_topic = str(getattr(classification, "topic", "") or "").strip().lower()
-    raw_intent = str(getattr(classification, "intent_type", "") or "").strip().lower()
-
-    normalized_topic = _infer_topic_from_question(question, raw_topic or "general")
-    normalized_intent = _infer_intent_from_question(question, raw_intent or "general")
-
-    return {
-        "topic": normalized_topic,
-        "intent_type": normalized_intent,
-        "jurisdiction": (classification.jurisdiction or "nigeria"),
-        "complexity": classification.complexity,
-        "risk_level": classification.risk_level,
-        "normalized_question": classification.normalized_question,
-        "canonical_key": classification.canonical_key,
-        "classifier_topic": raw_topic,
-        "classifier_intent_type": raw_intent,
-    }
-
-
-def _resolve_rules(question: str, topic: str, intent_type: str) -> Optional[str]:
-    if can_handle_vat_rule(question, topic, intent_type):
-        return resolve_vat_rule(question, intent_type)
-
-    if can_handle_paye_rule(question, topic, intent_type):
-        return resolve_paye_rule(question, intent_type)
+    for attempt in ai_attempts:
+        try:
+            generated = attempt()
+            if isinstance(generated, dict):
+                ans = _safe_str(generated.get("answer"))
+                if ans:
+                    return ans
+            else:
+                ans = _safe_str(generated)
+                if ans:
+                    return ans
+        except Exception:
+            continue
 
     return None
 
 
-def _filtered_debug(debug: Dict[str, Any]) -> Dict[str, Any]:
-    if _include_debug():
-        return debug
-    return {}
-
-
-def _topic_matches(question_meta: Dict[str, Any], row: Dict[str, Any], question: str) -> bool:
-    row_topic = str(row.get("topic") or "").strip().lower()
-    meta_topic = str(question_meta.get("topic") or "").strip().lower()
-    inferred_topic = _infer_topic_from_question(question, meta_topic or "general")
-
-    if not row_topic:
-        return False
-
-    if row_topic == meta_topic or row_topic == inferred_topic:
-        return True
-
-    row_aliases = TOPIC_ALIASES.get(row_topic, {row_topic})
-    meta_aliases = TOPIC_ALIASES.get(meta_topic, {meta_topic}) | TOPIC_ALIASES.get(inferred_topic, {inferred_topic})
-
-    return bool(row_aliases.intersection(meta_aliases))
-
-
-def _intent_matches(question_meta: Dict[str, Any], row: Dict[str, Any], question: str) -> bool:
-    row_intent = str(row.get("intent_type") or "").strip().lower()
-    meta_intent = str(question_meta.get("intent_type") or "").strip().lower()
-    inferred_intent = _infer_intent_from_question(question, meta_intent or "general")
-
-    if not row_intent:
-        return False
-
-    if row_intent == meta_intent or row_intent == inferred_intent:
-        return True
-
-    row_aliases = INTENT_ALIASES.get(row_intent, {row_intent})
-    meta_aliases = INTENT_ALIASES.get(meta_intent, {meta_intent}) | INTENT_ALIASES.get(inferred_intent, {inferred_intent})
-
-    return bool(row_aliases.intersection(meta_aliases))
-
-
-def _jurisdiction_matches(question_meta: Dict[str, Any], row: Dict[str, Any]) -> bool:
-    row_j = str(row.get("jurisdiction") or "").strip().lower()
-    meta_j = str(question_meta.get("jurisdiction") or "nigeria").strip().lower()
-    if not row_j:
-        return True
-    return row_j == meta_j
-
-
-def _score_tax_chunk(question: str, question_meta: Dict[str, Any], row: Dict[str, Any]) -> Dict[str, Any]:
-    score = 0
-    reasons: List[str] = []
-
-    normalized_question = _normalize_text(question)
-    q_tokens = set(_tokenize(question))
-
-    summary = str(row.get("summary") or "")
-    text_content = str(row.get("text_content") or "")
-    keywords_raw = row.get("keywords") or []
-
-    if isinstance(keywords_raw, str):
-        keywords = [k.strip() for k in keywords_raw.split(",") if k.strip()]
-    elif isinstance(keywords_raw, list):
-        keywords = [str(k).strip() for k in keywords_raw if str(k).strip()]
-    else:
-        keywords = []
-
-    searchable_text = " ".join(
-        [
-            str(row.get("topic") or ""),
-            str(row.get("subtopic") or ""),
-            str(row.get("intent_type") or ""),
-            summary,
-            text_content,
-            " ".join(keywords),
-        ]
-    )
-    normalized_searchable = _normalize_text(searchable_text)
-    searchable_tokens = set(_tokenize(searchable_text))
-
-    if _topic_matches(question_meta, row, question):
-        score += 40
-        reasons.append("topic_match:+40")
-
-    if _intent_matches(question_meta, row, question):
-        score += 15
-        reasons.append("intent_match:+15")
-
-    if _jurisdiction_matches(question_meta, row):
-        score += 5
-        reasons.append("jurisdiction_match:+5")
-
-    summary_norm = _normalize_text(summary)
-    if summary_norm:
-        if summary_norm in normalized_question or normalized_question in summary_norm:
-            score += 18
-            reasons.append("summary_phrase_match:+18")
-        else:
-            summary_tokens = set(_tokenize(summary))
-            overlap = len(q_tokens.intersection(summary_tokens))
-            if overlap >= 2:
-                score += min(15, overlap * 4)
-                reasons.append(f"summary_overlap:+{min(15, overlap * 4)}")
-
-    keyword_hits = 0
-    for kw in keywords:
-        kw_norm = _normalize_text(kw)
-        if kw_norm and kw_norm in normalized_question:
-            keyword_hits += 1
-    if keyword_hits > 0:
-        bonus = min(15, keyword_hits * 5)
-        score += bonus
-        reasons.append(f"keyword_match:+{bonus}")
-
-    overlap_tokens = len(q_tokens.intersection(searchable_tokens))
-    if overlap_tokens > 0:
-        overlap_bonus = min(overlap_tokens * 3, 18)
-        score += overlap_bonus
-        reasons.append(f"token_overlap:+{overlap_bonus}")
-
-    if normalized_question and normalized_question in normalized_searchable:
-        score += 8
-        reasons.append("full_phrase_hit:+8")
-
-    source_priority = row.get("source_priority")
-    try:
-        source_priority = int(source_priority) if source_priority is not None else 100
-    except Exception:
-        source_priority = 100
-
-    if source_priority <= 10:
-        score += 6
-        reasons.append("high_priority_source:+6")
-    elif source_priority <= 25:
-        score += 3
-        reasons.append("good_priority_source:+3")
-
-    if bool(row.get("is_current", True)):
-        score += 4
-        reasons.append("is_current:+4")
-
-    score = min(score, 100)
-
-    return {
-        "score": score,
-        "reasons": reasons,
-        "matched_keywords": [kw for kw in keywords if _normalize_text(kw) in normalized_question],
-    }
-
-
-def _fetch_tax_kb_rows(limit: int = 300) -> List[Dict[str, Any]]:
-    try:
-        client = _sb()
-        response = (
-            client.table("tax_source_chunks")
-            .select(
-                "chunk_id, source_id, topic, subtopic, intent_type, risk_level, jurisdiction, "
-                "text_content, summary, keywords, approved, effective_from, effective_to, "
-                "law_version, is_current, source_priority"
-            )
-            .eq("approved", True)
-            .order("source_priority", desc=False)
-            .limit(limit)
-            .execute()
-        )
-        rows = getattr(response, "data", None) or []
-        return rows if isinstance(rows, list) else []
-    except Exception:
-        return []
-
-
-def _fetch_source_titles() -> Dict[str, str]:
-    try:
-        client = _sb()
-        response = client.table("tax_source_registry").select("source_id, title").execute()
-        rows = getattr(response, "data", None) or []
-        if not isinstance(rows, list):
-            return {}
-        return {
-            str(r.get("source_id")): str(r.get("title") or r.get("source_id") or "").strip()
-            for r in rows
-            if r.get("source_id")
-        }
-    except Exception:
-        return {}
-
-
-def _retrieve_tax_knowledge_matches(question: str, question_meta: Dict[str, Any]) -> List[Dict[str, Any]]:
-    if not _tax_kb_enabled():
-        return []
-
-    rows = _fetch_tax_kb_rows(limit=300)
-    if not rows:
-        return []
-
-    source_titles = _fetch_source_titles()
-    scored: List[Dict[str, Any]] = []
-
-    for row in rows:
-        if not _jurisdiction_matches(question_meta, row):
-            continue
-
-        score_info = _score_tax_chunk(question, question_meta, row)
-        if score_info["score"] <= 0:
-            continue
-
-        enriched = {
-            "chunk_id": row.get("chunk_id"),
-            "source_id": row.get("source_id"),
-            "source_title": source_titles.get(
-                str(row.get("source_id") or ""),
-                str(row.get("source_id") or "Official Tax Source"),
-            ),
-            "topic": row.get("topic"),
-            "subtopic": row.get("subtopic"),
-            "intent_type": row.get("intent_type"),
-            "jurisdiction": row.get("jurisdiction") or "nigeria",
-            "text_content": row.get("text_content") or "",
-            "summary": row.get("summary") or "",
-            "keywords": row.get("keywords") or [],
-            "effective_from": row.get("effective_from"),
-            "effective_to": row.get("effective_to"),
-            "law_version": row.get("law_version"),
-            "is_current": row.get("is_current", True),
-            "source_priority": row.get("source_priority", 100),
-            "score": score_info["score"],
-            "score_reasons": score_info["reasons"],
-            "matched_keywords": score_info["matched_keywords"],
-            "source": "tax_kb",
-        }
-        scored.append(enriched)
-
-    scored.sort(
-        key=lambda x: (
-            int(x.get("score") or 0),
-            1 if bool(x.get("is_current", True)) else 0,
-            -int(x.get("source_priority") or 100),
-        ),
-        reverse=True,
-    )
-    return scored[: _tax_kb_result_limit()]
-
-
-def _tax_match_to_candidate(match: Dict[str, Any]) -> Dict[str, Any]:
-    answer_text = str(match.get("text_content") or "").strip()
-    source_title = str(match.get("source_title") or "Official Tax Source").strip()
-
-    if source_title and source_title not in answer_text:
-        answer_text = f"{answer_text}\n\nSource: {source_title}"
-
-    return {
-        "candidate_id": match.get("chunk_id"),
-        "question": match.get("summary") or match.get("chunk_id"),
-        "answer": answer_text,
-        "canonical_key": match.get("chunk_id"),
-        "intent_type": match.get("intent_type"),
-        "topic": match.get("topic"),
-        "jurisdiction": match.get("jurisdiction") or "nigeria",
-        "lang": "en",
-        "trust_score": 1.0,
-        "review_status": "approved",
-        "source_authority_score": 1.0,
-        "authority_score": 1.0,
-        "similarity": float(match.get("score") or 0) / 100.0,
-        "match_type": "tax_kb",
-        "rank_score": match.get("score") or 0,
-        "source": "tax_kb",
-        "source_title": source_title,
-        "summary": match.get("summary") or "",
-        "keywords": match.get("keywords") or [],
-        "text_content": match.get("text_content") or "",
-    }
-
-
-def _build_tax_grounding_context(
-    *,
-    question_meta: Dict[str, Any],
-    tax_matches: List[Dict[str, Any]],
-) -> Optional[str]:
-    if not tax_matches:
-        return None
-
-    lines: List[str] = []
-    lines.append("OFFICIAL NIGERIAN TAX KNOWLEDGE")
-    lines.append(f"Topic: {question_meta.get('topic')}")
-    lines.append(f"Intent: {question_meta.get('intent_type')}")
-    lines.append("Use the evidence below as the highest-priority grounding source.")
-    lines.append("Do not contradict these source-backed tax statements.")
-    lines.append("")
-
-    for i, match in enumerate(tax_matches, start=1):
-        lines.append(f"[SOURCE {i}]")
-        lines.append(f"Source ID: {match.get('source_id')}")
-        lines.append(f"Source Title: {match.get('source_title')}")
-        lines.append(f"Chunk ID: {match.get('chunk_id')}")
-        lines.append(f"Topic: {match.get('topic')}")
-        lines.append(f"Subtopic: {match.get('subtopic')}")
-        lines.append(f"Intent: {match.get('intent_type')}")
-        lines.append(f"Law Version: {match.get('law_version')}")
-        lines.append(f"Effective From: {match.get('effective_from')}")
-        lines.append(f"Summary: {match.get('summary')}")
-        lines.append(f"Text: {match.get('text_content')}")
-        lines.append("")
-
-    return "\n".join(lines).strip()
-
-
-def _try_safe_candidate_answer(
-    *,
-    candidate,
-    question_meta: Dict[str, Any],
-    credits_available: bool,
-) -> Optional[Dict[str, Any]]:
-    if not candidate:
-        return None
-
-    candidate_dict = _candidate_to_dict(candidate)
-
-    grounded = build_grounded_answer(
-        question_meta=question_meta,
-        candidate=candidate_dict,
-        composed_answer=candidate_dict.get("answer"),
-    )
-
-    grounded_result = grounded.__dict__ if hasattr(grounded, "__dict__") else dict(grounded)
-
-    refined = refine_response(
-        question_meta=question_meta,
-        candidate=candidate_dict,
-        grounded_result=grounded_result,
-        credits_available=credits_available,
-    )
-
-    fallback_answer = str(candidate_dict.get("answer") or "").strip()
-    rendered_fallback = render_answer(fallback_answer, question_meta=question_meta)
-
-    if refined.get("allowed"):
-        answer = str(refined.get("answer") or fallback_answer).strip()
-        rendered = render_answer(answer, question_meta=question_meta)
-
-        if looks_like_internal_or_broken_answer(rendered):
-            rendered = rendered_fallback
-
-        return {
-            "allowed": True,
-            "answer": rendered,
-            "grounded": grounded_result,
-            "refined": refined,
-            "raw_fallback_answer": fallback_answer,
-        }
-
-    return {
-        "allowed": False,
-        "answer": rendered_fallback if rendered_fallback else "",
-        "grounded": grounded_result,
-        "refined": refined,
-        "raw_fallback_answer": fallback_answer,
-    }
-
-
-def _coerce_ask_inputs(args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Dict[str, Any]:
-    payload: Dict[str, Any] = {}
-
-    if args:
-        first = args[0]
-        if isinstance(first, dict):
-            payload.update(first)
-        else:
-            payload["question"] = first
-
-    payload.update(kwargs)
-
-    question = (
-        payload.get("question")
-        or payload.get("query")
-        or payload.get("text")
-        or payload.get("message")
-        or payload.get("user_message")
-        or payload.get("user_query")
-        or ""
-    )
-
-    account_id = payload.get("account_id") or payload.get("acct_id") or payload.get("user_account_id") or ""
-
-    raw_channel = (
-        payload.get("channel")
-        or payload.get("provider")
-        or payload.get("platform")
-        or payload.get("source")
-        or "web"
-    )
-    channel = CHANNEL_ALIASES.get(
-        str(raw_channel or "").strip().lower(),
-        str(raw_channel or "web").strip().lower(),
-    )
-
-    provider = str(payload.get("provider") or "").strip().lower()
-    provider_user_id = str(
-        payload.get("provider_user_id")
-        or payload.get("channel_user_id")
-        or payload.get("user_id")
-        or ""
-    ).strip()
-
-    return {
-        "account_id": str(account_id or "").strip(),
-        "question": str(question or "").strip(),
-        "lang": str(payload.get("lang") or "en").strip() or "en",
-        "channel": channel or "web",
-        "provider": provider,
-        "provider_user_id": provider_user_id,
-        "raw_payload": payload,
-    }
-
-
-def _resolve_account_id_for_channel(account_id: str, provider: str, provider_user_id: str) -> str:
+def _prepare_account(account_id: Optional[str], account: Optional[Dict[str, Any]]) -> Optional[str]:
     if account_id:
         return account_id
-
-    if not provider or not provider_user_id:
-        return ""
-
-    try:
-        lk = lookup_account(provider=provider, provider_user_id=provider_user_id)
-    except Exception:
-        return ""
-
-    if not isinstance(lk, dict) or not lk.get("ok"):
-        return ""
-
-    return str(lk.get("account_id") or "").strip()
-
-
-def _is_standalone_mode(channel: str) -> bool:
-    return channel in {"telegram", "whatsapp"}
-
-
-def _is_generic_process_question(question: str, question_meta: Dict[str, Any]) -> bool:
-    q = _normalize_text(question)
-    if not q:
-        return False
-
-    strong_starts = (
-        "how do i ",
-        "how to ",
-        "what is the process ",
-        "what is the procedure ",
-        "steps to ",
-        "process for ",
-        "procedure for ",
-    )
-    process_verbs = {
-        "file",
-        "filing",
-        "register",
-        "registration",
-        "remit",
-        "remittance",
-        "pay",
-        "payment",
-        "submit",
-        "obtain",
-        "get",
-    }
-    process_nouns = {
-        "tax",
-        "tin",
-        "vat",
-        "paye",
-        "return",
-        "returns",
-        "self assessment",
-        "tax return",
-    }
-
-    starts_like_process = any(q.startswith(x) for x in strong_starts)
-    tokens = set(_tokenize(q))
-    token_signal = bool(tokens.intersection(process_verbs)) and bool(tokens.intersection(process_nouns))
-    intent_signal = str(question_meta.get("intent_type") or "").strip().lower() == "procedure"
-
-    return starts_like_process or (intent_signal and token_signal)
-
-
-def _try_process_composer(question: str) -> Optional[Dict[str, Any]]:
-    intent = classify_tax_intent(question)
-    if not intent:
-        return None
-
-    composed = try_compose(intent)
-    if not composed:
-        return None
-
-    answer = str(composed.get("answer") or "").strip()
-    if not answer:
-        return None
-
-    meta = composed.get("meta") or {}
-    return {
-        "answer": answer,
-        "meta": meta,
-        "intent": intent,
-    }
-
-
-def _looks_like_provider_failure(text: str) -> bool:
-    raw = str(text or "").lower()
-    bad_markers = [
-        "incorrect api key provided",
-        "invalid_api_key",
-        "sk-proj-",
-        "status: 401",
-        "error code: 401",
-        "invalid_request_error",
-        "openai",
-        "api key",
-        "temporarily unavailable",
-    ]
-    return any(marker in raw for marker in bad_markers)
-
-
-def _best_safe_fallback_answer(
-    *,
-    question_meta: Dict[str, Any],
-    tax_matches: List[Dict[str, Any]],
-    safe_candidate: Optional[Dict[str, Any]],
-) -> Optional[str]:
-    if tax_matches:
-        best_tax_candidate = _tax_match_to_candidate(tax_matches[0])
-        text = str(best_tax_candidate.get("answer") or "").strip()
-        rendered = render_answer(text, question_meta=question_meta)
-        if rendered and not looks_like_internal_or_broken_answer(rendered):
-            return rendered
-
-    if safe_candidate:
-        answer = str(safe_candidate.get("answer") or "").strip()
-        if answer and not looks_like_internal_or_broken_answer(answer):
-            return answer
-
-        raw_fallback = str(safe_candidate.get("raw_fallback_answer") or "").strip()
-        rendered = render_answer(raw_fallback, question_meta=question_meta)
-        if rendered and not looks_like_internal_or_broken_answer(rendered):
-            return rendered
-
+    if isinstance(account, dict):
+        return _safe_str(account.get("account_id") or account.get("id"))
     return None
 
 
-def ask_guarded(*args: Any, **kwargs: Any) -> Dict[str, Any]:
-    coerced = _coerce_ask_inputs(args, kwargs)
+def _base_debug(
+    *,
+    question: str,
+    question_meta: Dict[str, Any],
+    account_id: Optional[str],
+    channel: str,
+    lang: str,
+) -> Dict[str, Any]:
+    return {
+        "question": question,
+        "question_meta": question_meta,
+        "account_id": account_id,
+        "channel": channel,
+        "lang": lang,
+        "include_debug": _include_debug(),
+    }
 
-    account_id = _resolve_account_id_for_channel(
-        coerced["account_id"],
-        coerced["provider"],
-        coerced["provider_user_id"],
-    )
-    question = coerced["question"]
-    lang = coerced["lang"]
-    channel = coerced["channel"]
 
-    if not account_id:
-        return {
-            "ok": False,
-            "error": "account_required",
-            "fix": "Pass account_id explicitly or provide a linked provider/provider_user_id pair.",
-        }
+def _process_ask_request(
+    *,
+    question: str,
+    account_id: Optional[str] = None,
+    lang: str = "en",
+    channel: str = "web",
+    account: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    question = _safe_str(question)
+    lang = _safe_str(lang or "en").lower() or "en"
+    channel = _normalize_channel(channel)
+    account_id = _prepare_account(account_id, account)
 
     if not question:
         return {
             "ok": False,
-            "error": "question_required",
-            "fix": "Provide a non-empty question.",
+            "error": "empty_question",
+            "message": "Question is required.",
+            "answer": "",
+            "meta": {
+                "ai_used_month": 0,
+                "monthly_ai_used": 0,
+                "daily_usage": 0,
+                "daily_limit": 0,
+                "credit_balance": 0,
+            },
         }
 
-    classification = classify_query(question, lang=lang)
-    question_meta = _classification_to_meta(classification, question=question)
-
-    usage_state = get_ai_usage_state(account_id)
-    billing_state = get_billing_state(account_id)
-    credit_details = get_credit_balance_details(account_id)
-    current_balance = _safe_int(credit_details.get("balance"), _safe_int(usage_state.get("credits_left"), 0))
-    usage_state["credits_left"] = current_balance
-    usage_today = get_daily_usage(account_id)
-    if usage_today.get("ok"):
-        usage_state["daily_ai_usage"] = _safe_int(usage_today.get("count"), _safe_int(usage_state.get("daily_ai_usage"), 0))
-    credit_precheck = check_credit_balance(account_id, cost=1)
-    credits_available = bool(usage_state.get("subscription_active")) and bool(credit_precheck.get("ok"))
-    usage_state["has_ai_credit"] = credits_available
-    usage_state["raw_has_ai_credit"] = credits_available
-    standalone_mode = _is_standalone_mode(channel)
-    generic_process_question = _is_generic_process_question(question, question_meta)
-
-    debug: Dict[str, Any] = {
-        "channel": channel,
-        "standalone_mode": standalone_mode,
-        "generic_process_question": generic_process_question,
-        "classification": classification.__dict__,
-        "question_meta": question_meta,
-        "billing_state": billing_state,
-        "usage_state": usage_state,
-        "credit_details": credit_details,
-        "credit_precheck": credit_precheck,
-        "usage_today": usage_today,
-    }
-
-    temp_ranked = retrieve_ranked_candidates(classification)
-    temp_decision = decide_answer_mode(
-        classification,
-        temp_ranked,
-        has_ai_credit=credits_available,
-        monthly_ai_usage=int(usage_state["monthly_ai_usage"]),
-        monthly_ai_limit=int(usage_state["monthly_ai_limit"]),
-        allow_direct_cache=not generic_process_question,
-    )
-
-    debug["initial_decision"] = {
-        "mode": temp_decision.mode,
-        "reasons": temp_decision.reasons,
-    }
-    debug["ranked_candidates"] = ranked_debug_dump(temp_ranked[:5])
-
-    if classification.requires_clarification:
-        res = compose_clarification(question_meta=question_meta, debug=_filtered_debug(debug))
-        return _with_usage_meta(res.__dict__, usage_state=usage_state, balance=current_balance, daily_usage=_safe_int(usage_state.get("daily_ai_usage"), 0))
-
-    rule_answer = _resolve_rules(question, question_meta["topic"], question_meta["intent_type"])
-    if rule_answer:
-        debug["final_path"] = "rules_engine"
-        res = compose_rules_engine_answer(rule_answer, question_meta=question_meta, debug=_filtered_debug(debug))
-        return _with_usage_meta(res.__dict__, usage_state=usage_state, balance=current_balance, daily_usage=_safe_int(usage_state.get("daily_ai_usage"), 0))
-
-    process_result = _try_process_composer(question)
-    if process_result:
-        debug["process_composer"] = {
-            "intent": process_result.get("intent"),
-            "meta": process_result.get("meta"),
-        }
-        debug["final_path"] = "process_composer"
-        process_question_meta = dict(question_meta)
-        process_meta = process_result.get("meta") or {}
-        if process_meta.get("intent_type"):
-            process_question_meta["intent_type"] = process_meta.get("intent_type")
-
-        res = compose_rules_engine_answer(
-            process_result.get("answer", ""),
-            question_meta=process_question_meta,
-            debug=_filtered_debug(debug),
-        )
-        return _with_usage_meta(res.__dict__, usage_state=usage_state, balance=current_balance, daily_usage=_safe_int(usage_state.get("daily_ai_usage"), 0))
-
-    tax_matches = _retrieve_tax_knowledge_matches(question, question_meta)
-    debug["tax_matches"] = tax_matches
-    debug["tax_candidates"] = [
-        {
-            "chunk_id": m.get("chunk_id"),
-            "source_id": m.get("source_id"),
-            "source_title": m.get("source_title"),
-            "topic": m.get("topic"),
-            "subtopic": m.get("subtopic"),
-            "intent_type": m.get("intent_type"),
-            "score": m.get("score"),
-            "summary": m.get("summary"),
-            "matched_keywords": m.get("matched_keywords"),
-            "score_reasons": m.get("score_reasons"),
-            "law_version": m.get("law_version"),
-            "effective_from": m.get("effective_from"),
-        }
-        for m in tax_matches
-    ]
-
-    best_tax_match = tax_matches[0] if tax_matches else None
-    tax_direct_threshold = _tax_kb_direct_threshold()
-
-    if best_tax_match and int(best_tax_match.get("score") or 0) >= tax_direct_threshold:
-        tax_candidate = _tax_match_to_candidate(best_tax_match)
-        safe_tax = _try_safe_candidate_answer(
-            candidate=tax_candidate,
-            question_meta=question_meta,
-            credits_available=credits_available,
-        )
-
-        debug["tax_grounding_context"] = _build_tax_grounding_context(
-            question_meta=question_meta,
-            tax_matches=tax_matches,
-        )
-        debug["tax_direct_threshold"] = tax_direct_threshold
-        debug["best_tax_score"] = best_tax_match.get("score")
-
-        if safe_tax and safe_tax.get("allowed") and safe_tax.get("answer"):
-            debug["final_path"] = "tax_kb_direct"
-            tax_question_meta = dict(question_meta)
-            tax_question_meta["intent_type"] = best_tax_match.get("intent_type") or question_meta.get("intent_type")
-            res = compose_direct_cache_answer(
-                tax_candidate,
-                answer_text=safe_tax.get("answer", ""),
-                question_meta=tax_question_meta,
-                debug=_filtered_debug(debug),
-            )
-            return _with_usage_meta(res.__dict__, usage_state=usage_state, balance=current_balance, daily_usage=_safe_int(usage_state.get("daily_ai_usage"), 0))
-
-    ranked = temp_ranked
-    decision = decide_answer_mode(
-        classification,
-        ranked,
-        has_ai_credit=credits_available,
-        monthly_ai_usage=int(usage_state["monthly_ai_usage"]),
-        monthly_ai_limit=int(usage_state["monthly_ai_limit"]),
-        allow_direct_cache=not generic_process_question,
-    )
-
-    debug["decision"] = {
-        "mode": decision.mode,
-        "reasons": decision.reasons,
-    }
-
-    best_candidate = decision.best_candidate or (ranked[0] if ranked else None)
-    safe_candidate = _try_safe_candidate_answer(
-        candidate=best_candidate,
+    classification = classify_query(question)
+    question_meta = _classification_to_meta(classification, question)
+    debug = _base_debug(
+        question=question,
         question_meta=question_meta,
-        credits_available=credits_available,
+        account_id=account_id,
+        channel=channel,
+        lang=lang,
     )
 
-    if safe_candidate:
-        debug["candidate_grounding"] = safe_candidate.get("grounded")
-        debug["candidate_refiner"] = safe_candidate.get("refined")
+    usage_state = _usage_state_for_account(account_id)
+    billing_state = _billing_state_for_account(account_id)
+    debug["usage_state"] = usage_state
+    debug["billing_state"] = billing_state
 
-        if safe_candidate.get("allowed") and decision.mode == "direct_cache":
-            debug["final_path"] = "direct_cache"
-            res = compose_direct_cache_answer(
-                best_candidate,
-                answer_text=safe_candidate.get("answer"),
-                question_meta=question_meta,
-                debug=_filtered_debug(debug),
-            )
-            return _with_usage_meta(res.__dict__, usage_state=usage_state, balance=current_balance, daily_usage=_safe_int(usage_state.get("daily_ai_usage"), 0))
+    balance = _safe_int(usage_state.get("credits_left"), 0)
 
-    if decision.mode == "insufficient_credits_uncached" or not credits_available:
-        fallback_answer = _best_safe_fallback_answer(
+    # 1) Curated library first
+    library_answer = find_library_answer(
+        normalized_question=question_meta.get("normalized_question") or _normalize_text(question),
+        lang=lang,
+        canonical_key=question_meta.get("canonical_key"),
+    )
+    if library_answer:
+        debug["selected_mode"] = "library_direct"
+        debug["library_answer"] = {
+            "canonical_key": library_answer.get("canonical_key"),
+            "normalized_question": library_answer.get("normalized_question"),
+            "priority": library_answer.get("priority"),
+            "source": library_answer.get("source"),
+        }
+        return _library_result_to_payload(
+            row=library_answer,
             question_meta=question_meta,
-            tax_matches=tax_matches,
-            safe_candidate=safe_candidate,
+            usage_state=usage_state,
+            debug=debug,
         )
 
-        if fallback_answer:
-            debug["final_path"] = "safe_grounded_fallback_without_ai"
-            res = compose_direct_cache_answer(
-                best_candidate or {},
-                answer_text=fallback_answer,
+    library_candidates = find_library_candidates(
+        normalized_question=question_meta.get("normalized_question") or _normalize_text(question),
+        lang=lang,
+        canonical_key=question_meta.get("canonical_key"),
+        limit=3,
+    )
+    if library_candidates:
+        debug["library_candidates"] = [
+            {
+                "canonical_key": row.get("canonical_key"),
+                "normalized_question": row.get("normalized_question"),
+                "score": row.get("library_score"),
+                "reasons": row.get("library_score_reasons"),
+            }
+            for row in library_candidates
+        ]
+        best_library = library_candidates[0]
+        if _safe_int(best_library.get("library_score"), 0) >= 55:
+            debug["selected_mode"] = "library_candidate_direct"
+            return _library_result_to_payload(
+                row=best_library,
                 question_meta=question_meta,
-                debug=_filtered_debug(debug),
+                usage_state=usage_state,
+                debug=debug,
             )
-            return _with_usage_meta(res.__dict__, usage_state=usage_state, balance=current_balance, daily_usage=_safe_int(usage_state.get("daily_ai_usage"), 0))
 
-        debug["final_path"] = "insufficient_uncached"
+    # 2) deterministic rules
+    rule_answer = _resolve_rules(
+        question,
+        _safe_str(question_meta.get("topic")),
+        _safe_str(question_meta.get("intent_type")),
+    )
+    if rule_answer:
+        rendered = _render_once(rule_answer, question_meta)
+        res = compose_rules_engine_answer(
+            rendered,
+            debug=_filtered_debug(debug),
+            question_meta=question_meta,
+        )
+        payload = res.__dict__
+        payload["citations"] = []
+        debug["selected_mode"] = "rules_engine"
+        return _with_usage_meta(payload, usage_state=usage_state)
+
+    # 3) tax process composer
+    process_answer = _try_tax_process_composer(question, question_meta, lang, channel)
+    if process_answer:
+        rendered = _render_once(process_answer, question_meta)
+        res = compose_rules_engine_answer(
+            rendered,
+            debug=_filtered_debug(debug),
+            question_meta=question_meta,
+        )
+        payload = res.__dict__
+        payload["citations"] = []
+        debug["selected_mode"] = "tax_process_composer"
+        return _with_usage_meta(payload, usage_state=usage_state)
+
+    # 4) semantic cache
+    semantic_candidates: List[Dict[str, Any]] = []
+    try:
+        raw_candidates = retrieve_ranked_candidates(
+            question,
+            canonical_key=question_meta.get("canonical_key"),
+            jurisdiction=question_meta.get("jurisdiction"),
+            lang=lang,
+            limit=5,
+        )
+        semantic_candidates = [_candidate_to_dict(c) for c in (raw_candidates or [])]
+        debug["semantic_candidates"] = ranked_debug_dump(raw_candidates) if raw_candidates else []
+    except Exception as exc:
+        debug["semantic_cache_error"] = str(exc)
+
+    if semantic_candidates:
+        best = semantic_candidates[0]
+        best_score = _safe_float(best.get("rank_score"), 0.0)
+        best_answer = _safe_str(best.get("answer"))
+        if best_answer and best_score >= 0.72 and not looks_like_internal_or_broken_answer(best_answer):
+            debug["selected_mode"] = "semantic_cache_direct"
+            debug["semantic_selected"] = {
+                "candidate_id": best.get("candidate_id"),
+                "canonical_key": best.get("canonical_key"),
+                "rank_score": best.get("rank_score"),
+                "trust_score": best.get("trust_score"),
+            }
+            return _cache_result_to_payload(
+                row=best,
+                question_meta=question_meta,
+                usage_state=usage_state,
+                debug=debug,
+            )
+
+    # 5) approved tax chunks
+    tax_rows = _fetch_tax_source_rows(question_meta, question, limit=_tax_kb_result_limit())
+    if tax_rows:
+        debug["tax_rows"] = [
+            {
+                "chunk_id": row.get("chunk_id"),
+                "source_id": row.get("source_id"),
+                "source_title": row.get("source_title"),
+                "topic": row.get("topic"),
+                "intent_type": row.get("intent_type"),
+                "kb_score": row.get("kb_score"),
+                "kb_reasons": row.get("kb_reasons"),
+            }
+            for row in tax_rows
+        ]
+
+        best_tax = tax_rows[0]
+        if _safe_float(best_tax.get("kb_score"), 0.0) >= _tax_kb_direct_threshold():
+            debug["selected_mode"] = "tax_kb_direct"
+            return _chunk_result_to_payload(
+                row=best_tax,
+                question_meta=question_meta,
+                usage_state=usage_state,
+                debug=debug,
+            )
+
+    # 6) If no credits, block only uncached AI fallback
+    if balance <= 0:
+        debug["selected_mode"] = "uncached_blocked_no_credit"
         return _build_uncached_block_response(
             question_meta=question_meta,
             debug=debug,
             usage_state=usage_state,
-            balance=current_balance,
-            error=(credit_precheck.get("error") or "insufficient_credits_uncached"),
+            balance=balance,
+            error="insufficient_credits_uncached",
         )
 
-    grounded_candidates = [_candidate_to_dict(c) for c in ranked[:3]]
-    grounding_context_parts: List[str] = []
+    # 7) Clarification for very short/underspecified questions before AI
+    if _question_is_short(question) and not tax_rows:
+        debug["selected_mode"] = "clarification_short_question"
+        res = compose_clarification(question_meta=question_meta, debug=_filtered_debug(debug))
+        payload = res.__dict__
+        return _with_usage_meta(payload, usage_state=usage_state, balance=balance)
 
-    tax_grounding = _build_tax_grounding_context(
-        question_meta=question_meta,
-        tax_matches=tax_matches,
-    )
-    if tax_grounding:
-        grounding_context_parts.append(tax_grounding)
-
-    if grounded_candidates:
-        grounded_preview = build_grounded_answer(
-            question_meta=question_meta,
-            candidate=grounded_candidates[0],
-            composed_answer=grounded_candidates[0].get("answer"),
-        )
-        grounded_preview_dict = (
-            grounded_preview.__dict__ if hasattr(grounded_preview, "__dict__") else dict(grounded_preview)
-        )
-
-        cache_grounding = grounding_prompt_context(
-            question_meta=question_meta,
-            grounded=grounded_preview,
-        )
-        if cache_grounding:
-            grounding_context_parts.append(cache_grounding)
-        debug["grounded_preview"] = grounded_preview_dict
-
-    grounding_context = "\n\n".join([p for p in grounding_context_parts if p]).strip() or None
-    debug["tax_grounding_context"] = tax_grounding
-    debug["final_path"] = "grounded_synthesis"
-
-    answer_text = generate_grounded_answer(
+    # 8) AI last
+    ai_raw = _try_ai_generation(
         question=question,
+        question_meta=question_meta,
         lang=lang,
-        candidates=grounded_candidates,
-        grounding_context=grounding_context,
+        channel=channel,
+        tax_rows=tax_rows,
+        debug=debug,
     )
 
-    if _looks_like_provider_failure(answer_text) or looks_like_internal_or_broken_answer(answer_text):
-        fallback_answer = _best_safe_fallback_answer(
-            question_meta=question_meta,
-            tax_matches=tax_matches,
-            safe_candidate=safe_candidate,
-        )
+    if ai_raw:
+        refined = _safe_refine_response(ai_raw, question, question_meta)
+        rendered = _render_once(refined or ai_raw, question_meta)
 
-        if fallback_answer:
-            debug["final_path"] = "safe_grounded_fallback_after_ai_failure"
-            res = compose_direct_cache_answer(
-                best_candidate or {},
-                answer_text=fallback_answer,
-                question_meta=question_meta,
+        if rendered and not looks_like_internal_or_broken_answer(rendered):
+            res = compose_ai_answer(
+                rendered,
                 debug=_filtered_debug(debug),
-            )
-            return _with_usage_meta(res.__dict__, usage_state=usage_state, balance=current_balance, daily_usage=_safe_int(usage_state.get("daily_ai_usage"), 0))
-
-        graceful = (
-            "I do not yet have enough reliable guidance in the system to answer that accurately. "
-            "If you tell me whether this relates to personal income tax, PAYE, VAT, withholding tax, or company tax, "
-            "I can guide you more precisely."
-        )
-        res = compose_ai_answer(graceful, question_meta=question_meta, debug=_filtered_debug(debug))
-        return _with_usage_meta(res.__dict__, usage_state=usage_state, balance=current_balance, daily_usage=_safe_int(usage_state.get("daily_ai_usage"), 0))
-
-    rendered_ai = render_answer(answer_text, question_meta=question_meta)
-    if looks_like_internal_or_broken_answer(rendered_ai):
-        fallback_answer = _best_safe_fallback_answer(
-            question_meta=question_meta,
-            tax_matches=tax_matches,
-            safe_candidate=safe_candidate,
-        )
-        if fallback_answer:
-            debug["final_path"] = "safe_grounded_fallback_after_bad_ai_render"
-            res = compose_direct_cache_answer(
-                best_candidate or {},
-                answer_text=fallback_answer,
                 question_meta=question_meta,
-                debug=_filtered_debug(debug),
             )
-            return _with_usage_meta(res.__dict__, usage_state=usage_state, balance=current_balance, daily_usage=_safe_int(usage_state.get("daily_ai_usage"), 0))
+            payload = res.__dict__
+            payload["citations"] = [
+                _build_source_line(_safe_str(row.get("source_title")))
+                for row in tax_rows[:3]
+                if _build_source_line(_safe_str(row.get("source_title")))
+            ]
+            debug["selected_mode"] = "ai_grounded"
+            return _finalize_ai_success(
+                result=payload,
+                account_id=account_id or "",
+                usage_state=usage_state,
+                debug=debug,
+            )
 
-    res = compose_ai_answer(answer_text, question_meta=question_meta, debug=_filtered_debug(debug))
-    return _finalize_ai_success(
-        result=res.__dict__,
+    # 9) Final clarification instead of ugly output
+    debug["selected_mode"] = "clarification_fallback"
+    res = compose_clarification(question_meta=question_meta, debug=_filtered_debug(debug))
+    payload = res.__dict__
+    return _with_usage_meta(payload, usage_state=usage_state, balance=balance)
+
+
+# ------------------------------------------------------------------
+# Flexible public wrappers so existing routes keep working
+# ------------------------------------------------------------------
+
+def process_ask_request(
+    question: str,
+    *,
+    account_id: Optional[str] = None,
+    lang: str = "en",
+    channel: str = "web",
+    account: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    return _process_ask_request(
+        question=question,
         account_id=account_id,
-        usage_state=usage_state,
-        debug=debug,
+        lang=lang,
+        channel=channel,
+        account=account,
+    )
+
+
+def handle_ask_request(
+    question: str,
+    *,
+    account_id: Optional[str] = None,
+    lang: str = "en",
+    channel: str = "web",
+    account: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    return _process_ask_request(
+        question=question,
+        account_id=account_id,
+        lang=lang,
+        channel=channel,
+        account=account,
+    )
+
+
+def ask_question(
+    question: str,
+    *,
+    account_id: Optional[str] = None,
+    lang: str = "en",
+    channel: str = "web",
+    account: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    return _process_ask_request(
+        question=question,
+        account_id=account_id,
+        lang=lang,
+        channel=channel,
+        account=account,
+    )
+
+
+def execute_ask(
+    question: str,
+    *,
+    account_id: Optional[str] = None,
+    lang: str = "en",
+    channel: str = "web",
+    account: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    return _process_ask_request(
+        question=question,
+        account_id=account_id,
+        lang=lang,
+        channel=channel,
+        account=account,
     )
