@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import os
 import re
-import inspect
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from app.core.supabase_client import supabase
-from app.services.accounts_service import lookup_account
 from app.services.query_classifier import classify_query
 from app.services.answer_composer import (
     compose_ai_answer,
@@ -33,7 +31,6 @@ from app.services.tax_grounding_service import build_grounded_answer, grounding_
 from app.services.response_refiner import refine_response
 from app.services.tax_rules.vat_rules import can_handle_vat_rule, resolve_vat_rule
 from app.services.tax_rules.paye_rules import can_handle_paye_rule, resolve_paye_rule
-from app.services.tax_intent_service import classify_tax_intent
 from app.services.tax_process_composer import try_compose
 
 
@@ -380,11 +377,8 @@ def _render_once(answer_text: str, question_meta: Dict[str, Any]) -> str:
     raw = _safe_str(answer_text)
     if not raw:
         return ""
-
-    # Prevent double composition.
     if _looks_already_structured(raw):
         return raw
-
     return render_answer(raw, question_meta=question_meta)
 
 
@@ -403,8 +397,6 @@ def _chunk_to_direct_answer(row: Dict[str, Any], question_meta: Dict[str, Any]) 
         return ""
 
     cleaned = re.sub(r"\s+", " ", base).strip()
-
-    # Keep direct chunk answers short and clean before composition.
     if len(cleaned) > 520:
         cleaned = cleaned[:520].rsplit(" ", 1)[0].strip() + "."
 
@@ -422,10 +414,11 @@ def _fetch_tax_source_rows(question_meta: Dict[str, Any], question: str, limit: 
         res = (
             _sb()
             .table("tax_source_chunks")
-            .select("chunk_id,source_id,topic,subtopic,intent_type,risk_level,jurisdiction,text_content,summary,keywords,law_version,is_current,source_priority")
+            .select("chunk_id,source_id,chunk_order,topic,subtopic,intent_type,risk_level,jurisdiction,text_content,summary,keywords,law_version,is_current,source_priority")
             .eq("approved", True)
             .eq("is_current", True)
             .order("source_priority", desc=True)
+            .order("chunk_order")
             .limit(max(20, limit * 4))
             .execute()
         )
@@ -684,7 +677,6 @@ def _safe_refine_response(answer_text: str, question: str, question_meta: Dict[s
     if not clean:
         return ""
 
-    # Never re-refine content that is already structured.
     if _looks_already_structured(clean):
         return clean
 
@@ -846,7 +838,6 @@ def _process_ask_request(
 
     balance = _safe_int(usage_state.get("credits_left"), 0)
 
-    # 1) Curated library first
     library_answer = find_library_answer(
         normalized_question=question_meta.get("normalized_question") or _normalize_text(question),
         lang=lang,
@@ -893,7 +884,6 @@ def _process_ask_request(
                 debug=debug,
             )
 
-    # 2) deterministic rules
     rule_answer = _resolve_rules(
         question,
         _safe_str(question_meta.get("topic")),
@@ -911,7 +901,6 @@ def _process_ask_request(
         debug["selected_mode"] = "rules_engine"
         return _with_usage_meta(payload, usage_state=usage_state)
 
-    # 3) tax process composer
     process_answer = _try_tax_process_composer(question, question_meta, lang, channel)
     if process_answer:
         rendered = _render_once(process_answer, question_meta)
@@ -925,7 +914,6 @@ def _process_ask_request(
         debug["selected_mode"] = "tax_process_composer"
         return _with_usage_meta(payload, usage_state=usage_state)
 
-    # 4) semantic cache
     semantic_candidates: List[Dict[str, Any]] = []
     try:
         raw_candidates = retrieve_ranked_candidates(
@@ -959,7 +947,6 @@ def _process_ask_request(
                 debug=debug,
             )
 
-    # 5) approved tax chunks
     tax_rows = _fetch_tax_source_rows(question_meta, question, limit=_tax_kb_result_limit())
     if tax_rows:
         debug["tax_rows"] = [
@@ -985,7 +972,6 @@ def _process_ask_request(
                 debug=debug,
             )
 
-    # 6) If no credits, block only uncached AI fallback
     if balance <= 0:
         debug["selected_mode"] = "uncached_blocked_no_credit"
         return _build_uncached_block_response(
@@ -996,14 +982,12 @@ def _process_ask_request(
             error="insufficient_credits_uncached",
         )
 
-    # 7) Clarification for very short/underspecified questions before AI
     if _question_is_short(question) and not tax_rows:
         debug["selected_mode"] = "clarification_short_question"
         res = compose_clarification(question_meta=question_meta, debug=_filtered_debug(debug))
         payload = res.__dict__
         return _with_usage_meta(payload, usage_state=usage_state, balance=balance)
 
-    # 8) AI last
     ai_raw = _try_ai_generation(
         question=question,
         question_meta=question_meta,
@@ -1037,16 +1021,11 @@ def _process_ask_request(
                 debug=debug,
             )
 
-    # 9) Final clarification instead of ugly output
     debug["selected_mode"] = "clarification_fallback"
     res = compose_clarification(question_meta=question_meta, debug=_filtered_debug(debug))
     payload = res.__dict__
     return _with_usage_meta(payload, usage_state=usage_state, balance=balance)
 
-
-# ------------------------------------------------------------------
-# Flexible public wrappers so existing routes keep working
-# ------------------------------------------------------------------
 
 def process_ask_request(
     question: str,
@@ -1100,6 +1079,23 @@ def ask_question(
 
 
 def execute_ask(
+    question: str,
+    *,
+    account_id: Optional[str] = None,
+    lang: str = "en",
+    channel: str = "web",
+    account: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    return _process_ask_request(
+        question=question,
+        account_id=account_id,
+        lang=lang,
+        channel=channel,
+        account=account,
+    )
+
+
+def ask_guarded(
     question: str,
     *,
     account_id: Optional[str] = None,
