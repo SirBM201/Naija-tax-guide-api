@@ -58,19 +58,6 @@ TOPIC_ALIASES = {
     "general": {"general"},
 }
 
-INTENT_ALIASES = {
-    "guidance": {"guidance", "general", "obligation", "compliance"},
-    "obligation": {"guidance", "general", "obligation", "compliance"},
-    "general": {"guidance", "general", "obligation"},
-    "definition": {"definition", "general"},
-    "rate": {"rate", "definition", "general"},
-    "procedure": {"procedure", "how_to", "how to", "filing", "registration"},
-    "how_to": {"procedure", "how_to", "how to", "filing", "registration"},
-    "calculation": {"calculation", "computation"},
-    "computation": {"calculation", "computation"},
-    "exemption": {"exemption", "definition", "guidance"},
-}
-
 
 def _sb():
     return supabase() if callable(supabase) else supabase
@@ -118,7 +105,7 @@ def _tax_kb_enabled() -> bool:
 
 
 def _tax_kb_direct_threshold() -> int:
-    return _env_int("TAX_KB_DIRECT_THRESHOLD", 45)
+    return _env_int("TAX_KB_DIRECT_THRESHOLD", 55)
 
 
 def _tax_kb_result_limit() -> int:
@@ -178,7 +165,7 @@ def _infer_intent_from_question(question: str, fallback: str = "general") -> str
         return "exemption"
     if any(x in q for x in ["calculate", "computation", "compute"]):
         return "calculation"
-    if any(x in q for x in ["do i need", "must i", "am i required", "should i charge"]):
+    if any(x in q for x in ["who must", "must i", "must we", "am i required", "should i charge", "who should", "who needs to"]):
         return "obligation"
 
     return str(fallback or "general").strip().lower()
@@ -350,12 +337,17 @@ def _intent_matches(question_meta: Dict[str, Any], row: Dict[str, Any], question
 
     if not row_intent:
         return False
+
+    # exact
     if row_intent == meta_intent or row_intent == inferred_intent:
         return True
 
-    row_aliases = INTENT_ALIASES.get(row_intent, {row_intent})
-    meta_aliases = INTENT_ALIASES.get(meta_intent, {meta_intent}) | INTENT_ALIASES.get(inferred_intent, {inferred_intent})
-    return bool(row_aliases.intersection(meta_aliases))
+    # do not let generic intent swallow specific intent
+    generic_values = {"general", "guidance", ""}
+    if row_intent in generic_values or meta_intent in generic_values or inferred_intent in generic_values:
+        return False
+
+    return False
 
 
 def _question_is_short(question: str) -> bool:
@@ -406,6 +398,20 @@ def _chunk_to_direct_answer(row: Dict[str, Any], question_meta: Dict[str, Any]) 
     return _render_once(cleaned, question_meta)
 
 
+def _keyword_overlap_count(row: Dict[str, Any], question: str) -> int:
+    q_tokens = set(_tokenize(question))
+    keywords = row.get("keywords") or []
+    keyword_tokens: List[str] = []
+
+    if isinstance(keywords, list):
+        for item in keywords:
+            keyword_tokens.extend(_tokenize(str(item)))
+    else:
+        keyword_tokens.extend(_tokenize(str(keywords)))
+
+    return len(q_tokens.intersection(set(keyword_tokens)))
+
+
 def _fetch_tax_source_rows(question_meta: Dict[str, Any], question: str, limit: int = 5) -> List[Dict[str, Any]]:
     if not _tax_kb_enabled():
         return []
@@ -449,7 +455,6 @@ def _fetch_tax_source_rows(question_meta: Dict[str, Any], question: str, limit: 
         except Exception:
             pass
 
-    q_tokens = set(_tokenize(question))
     results: List[Dict[str, Any]] = []
 
     for row in rows:
@@ -461,18 +466,10 @@ def _fetch_tax_source_rows(question_meta: Dict[str, Any], question: str, limit: 
             reasons.append("topic_match:+40")
 
         if _intent_matches(question_meta, row, question):
-            score += 18
-            reasons.append("intent_match:+18")
+            score += 20
+            reasons.append("intent_match:+20")
 
-        keywords = row.get("keywords") or []
-        keyword_tokens: List[str] = []
-        if isinstance(keywords, list):
-            for item in keywords:
-                keyword_tokens.extend(_tokenize(str(item)))
-        else:
-            keyword_tokens.extend(_tokenize(str(keywords)))
-
-        overlap = len(q_tokens.intersection(set(keyword_tokens)))
+        overlap = _keyword_overlap_count(row, question)
         if overlap > 0:
             bonus = min(20, overlap * 4)
             score += bonus
@@ -495,6 +492,7 @@ def _fetch_tax_source_rows(question_meta: Dict[str, Any], question: str, limit: 
         item["source_title"] = titles_by_source.get(_safe_str(row.get("source_id")), "")
         item["kb_score"] = round(score, 3)
         item["kb_reasons"] = reasons
+        item["keyword_overlap_count"] = overlap
         results.append(item)
 
     results.sort(
@@ -505,6 +503,35 @@ def _fetch_tax_source_rows(question_meta: Dict[str, Any], question: str, limit: 
         reverse=True,
     )
     return results[:limit]
+
+
+def _is_strong_kb_direct_match(row: Dict[str, Any], question_meta: Dict[str, Any], question: str) -> bool:
+    score = _safe_float(row.get("kb_score"), 0.0)
+    overlap = _safe_int(row.get("keyword_overlap_count"), 0)
+    short_q = _question_is_short(question)
+
+    row_topic = _safe_str(row.get("topic")).lower()
+    meta_topic = _safe_str(question_meta.get("topic")).lower()
+
+    row_intent = _safe_str(row.get("intent_type")).lower()
+    meta_intent = _safe_str(question_meta.get("intent_type")).lower()
+
+    exact_topic = row_topic and meta_topic and row_topic == meta_topic
+    exact_intent = row_intent and meta_intent and row_intent == meta_intent and row_intent not in {"general", "guidance"}
+
+    if short_q and exact_topic and score >= _tax_kb_direct_threshold():
+        return True
+
+    if exact_topic and exact_intent and score >= _tax_kb_direct_threshold():
+        return True
+
+    if exact_topic and overlap >= 2 and score >= 60:
+        return True
+
+    if score >= 80:
+        return True
+
+    return False
 
 
 def _resolve_rules(question: str, topic: str, intent_type: str) -> Optional[str]:
@@ -568,12 +595,6 @@ def _finalize_ai_success(
     balance_after = _safe_int(consume_result.get("balance_after"), 0)
     daily_after = _safe_int((daily_result or {}).get("count"), _safe_int(usage_state.get("daily_ai_usage"), 0) + 1)
     monthly_after = _safe_int(usage_state.get("monthly_ai_usage"), 0) + 1
-
-    next_usage_state = dict(usage_state or {})
-    next_usage_state["credits_left"] = balance_after
-    next_usage_state["daily_ai_usage"] = daily_after
-    next_usage_state["monthly_ai_usage"] = monthly_after
-    next_usage_state["has_ai_credit"] = balance_after > 0
 
     payload = dict(result or {})
     meta = dict(payload.get("meta") or {})
@@ -845,12 +866,6 @@ def _process_ask_request(
     )
     if library_answer:
         debug["selected_mode"] = "library_direct"
-        debug["library_answer"] = {
-            "canonical_key": library_answer.get("canonical_key"),
-            "normalized_question": library_answer.get("normalized_question"),
-            "priority": library_answer.get("priority"),
-            "source": library_answer.get("source"),
-        }
         return _library_result_to_payload(
             row=library_answer,
             question_meta=question_meta,
@@ -870,12 +885,11 @@ def _process_ask_request(
                 "canonical_key": row.get("canonical_key"),
                 "normalized_question": row.get("normalized_question"),
                 "score": row.get("library_score"),
-                "reasons": row.get("library_score_reasons"),
             }
             for row in library_candidates
         ]
         best_library = library_candidates[0]
-        if _safe_int(best_library.get("library_score"), 0) >= 55:
+        if _safe_int(best_library.get("library_score"), 0) >= 80:
             debug["selected_mode"] = "library_candidate_direct"
             return _library_result_to_payload(
                 row=best_library,
@@ -932,14 +946,8 @@ def _process_ask_request(
         best = semantic_candidates[0]
         best_score = _safe_float(best.get("rank_score"), 0.0)
         best_answer = _safe_str(best.get("answer"))
-        if best_answer and best_score >= 0.72 and not looks_like_internal_or_broken_answer(best_answer):
+        if best_answer and best_score >= 0.78 and not looks_like_internal_or_broken_answer(best_answer):
             debug["selected_mode"] = "semantic_cache_direct"
-            debug["semantic_selected"] = {
-                "candidate_id": best.get("candidate_id"),
-                "canonical_key": best.get("canonical_key"),
-                "rank_score": best.get("rank_score"),
-                "trust_score": best.get("trust_score"),
-            }
             return _cache_result_to_payload(
                 row=best,
                 question_meta=question_meta,
@@ -957,13 +965,13 @@ def _process_ask_request(
                 "topic": row.get("topic"),
                 "intent_type": row.get("intent_type"),
                 "kb_score": row.get("kb_score"),
-                "kb_reasons": row.get("kb_reasons"),
+                "keyword_overlap_count": row.get("keyword_overlap_count"),
             }
             for row in tax_rows
         ]
 
         best_tax = tax_rows[0]
-        if _safe_float(best_tax.get("kb_score"), 0.0) >= _tax_kb_direct_threshold():
+        if _is_strong_kb_direct_match(best_tax, question_meta, question):
             debug["selected_mode"] = "tax_kb_direct"
             return _chunk_result_to_payload(
                 row=best_tax,
