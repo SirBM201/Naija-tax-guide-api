@@ -27,6 +27,7 @@ ACTION_PATTERNS = {
         r"\bregister\b",
         r"\bregistration\b",
         r"\benrol\b",
+        r"\benroll\b",
         r"\benrollment\b",
     ],
     "file": [
@@ -46,6 +47,7 @@ ACTION_PATTERNS = {
 
 def _normalize(text: Optional[str]) -> str:
     raw = str(text or "").strip().lower()
+    raw = raw.replace("_", " ")
     raw = re.sub(r"[^a-z0-9\s]+", " ", raw)
     raw = re.sub(r"\s+", " ", raw)
     return raw.strip()
@@ -63,6 +65,12 @@ def _detect_action(question: Optional[str]) -> Optional[str]:
     return None
 
 
+def _topic_in(topic: Optional[str], *aliases: str) -> bool:
+    value = _normalize(topic)
+    alias_set = {_normalize(a) for a in aliases if a}
+    return bool(value and value in alias_set)
+
+
 def compose_tax_payment_process() -> Dict:
     answer = """
 To pay tax in Nigeria, use this general flow:
@@ -70,7 +78,7 @@ To pay tax in Nigeria, use this general flow:
 1. Identify the exact tax type involved.
    - Personal Income Tax
    - Company Income Tax
-   - VAT
+   - Value Added Tax
    - Withholding Tax
    - PAYE
 
@@ -80,9 +88,12 @@ To pay tax in Nigeria, use this general flow:
 
 3. Make sure your registration details are in place, especially your TIN.
 
-4. Prepare and file the relevant return if that tax type requires a return before payment.
+4. Confirm the payment basis:
+   - self-assessment
+   - official assessment
+   - deducted tax such as PAYE or withholding
 
-5. Generate the payment reference through the official portal or approved payment channel.
+5. Generate or confirm the payment reference where the authority requires one.
 
 6. Pay through an approved method such as:
    - official tax portal
@@ -91,7 +102,7 @@ To pay tax in Nigeria, use this general flow:
 
 7. Keep the payment receipt and filing evidence for your records.
 
-If you tell me the exact tax type, I can guide you more precisely.
+The exact payment process can differ by tax type and tax authority, so verify the applicable portal or payment channel before making payment.
 """.strip()
 
     return {
@@ -109,27 +120,25 @@ If you tell me the exact tax type, I can guide you more precisely.
 
 def compose_tin_registration() -> Dict:
     answer = """
-To obtain a Tax Identification Number (TIN) in Nigeria:
+To get or register for a TIN in Nigeria:
 
-1. Identify whether you are registering as:
-   - an individual
-   - a business name
-   - a company
+1. Confirm whether you need a personal or business tax registration path.
 
-2. Go through the appropriate tax authority or approved registration channel.
-
-3. Prepare the common details usually required:
-   - full name or business name
-   - address
+2. Gather the core details normally required for registration, such as:
+   - legal name
    - phone number
-   - email where applicable
-   - business registration details for a company or registered business
+   - address
+   - business registration details where applicable
 
-4. Submit the required identification or registration documents.
+3. Use the relevant official tax authority registration channel.
 
-5. After successful registration, the TIN is issued and linked to your tax profile.
+4. Complete the taxpayer registration form carefully and make sure the details match your identity or business records.
 
-TIN is commonly required for filing returns, paying taxes, and dealing with official tax records.
+5. Submit the registration and keep the acknowledgement.
+
+6. Once processed, confirm that the TIN has been issued correctly and keep the number safely for filing, payment, and compliance use.
+
+If you already registered but do not know your TIN, use the authority's recovery or verification process instead of creating a duplicate record.
 """.strip()
 
     return {
@@ -179,34 +188,33 @@ def compose_tax_filing_process() -> Dict:
     answer = """
 To file tax in Nigeria, use this general process:
 
-1. Determine the taxpayer type.
-   - employee
-   - self-employed individual
-   - registered business
-   - company
+1. Confirm the exact tax type and filing period involved.
 
-2. Confirm the correct tax authority.
+2. Confirm whether the filing is for:
+   - an individual
+   - an employer
+   - a company
+
+3. Confirm the correct tax authority.
    - Personal Income Tax is often handled at state level.
    - Some federal taxes are handled through FIRS.
 
-3. Gather the records needed for the filing period, such as:
+4. Gather the records needed for the filing period, such as:
    - income records
-   - expense records where relevant
-   - payroll records where relevant
-   - prior payments or credits
-   - TIN and registration details
+   - invoices
+   - payroll schedules
+   - prior payments
+   - deductions or relief records where relevant
 
-4. Identify the exact return to be filed.
+5. Compute the figures correctly before submitting.
 
-5. Complete the return with the correct figures for the relevant period.
+6. Use the official filing portal or approved filing channel.
 
-6. Submit the return through the approved channel.
+7. Submit the return and keep proof of filing.
 
-7. Pay any amount due if payment is required.
+8. Where tax is payable, complete payment and keep the receipt together with the filed return evidence.
 
-8. Keep evidence of filing and payment.
-
-If you tell me whether you are filing as an employee, freelancer, business owner, or company, I can narrow the steps further.
+If the tax type is specific, such as VAT or PAYE, the filing process should be tailored to that tax rather than treated as a generic filing question.
 """.strip()
 
     return {
@@ -226,23 +234,25 @@ def compose_vat_filing_process() -> Dict:
     answer = """
 To file VAT in Nigeria, use this general flow:
 
-1. Confirm that VAT applies to your business activity.
+1. Confirm the VAT period you are filing for.
 
-2. Gather the records for the filing period:
-   - sales subject to VAT
-   - VAT charged to customers
-   - input VAT where applicable
+2. Gather the relevant records for that period, especially:
+   - taxable sales
+   - output VAT collected
+   - input VAT where relevant
    - invoices and supporting records
 
-3. Prepare the VAT return for the relevant period.
+3. Reconcile your figures before filing so the amounts are consistent with your records.
 
-4. Submit the VAT return through the approved tax filing channel.
+4. Use the approved VAT filing channel of the relevant tax authority.
 
-5. Pay any VAT due through the approved payment channel.
+5. Submit the VAT return within the applicable deadline.
 
-6. Keep the return confirmation, payment receipt, and supporting records.
+6. Where VAT is payable, make payment through the approved payment channel and keep the receipt.
 
-If you want, I can also explain VAT in simpler terms or help you understand what records should be prepared before filing.
+7. Keep both the filed return evidence and the payment evidence for your records.
+
+If your question is about whether VAT applies at all, that should be answered first before filing steps.
 """.strip()
 
     return {
@@ -294,21 +304,21 @@ def compose_paye_remittance_process() -> Dict:
     answer = """
 To handle PAYE remittance in Nigeria, use this general process:
 
-1. Confirm that you are acting as an employer.
+1. Confirm the employees and payroll period involved.
 
-2. Calculate the PAYE to be withheld from employee income for the period.
+2. Compute PAYE correctly for each employee based on the applicable rules.
 
-3. Prepare the employee payroll and deduction schedule.
+3. Prepare the payroll schedule and supporting deduction records.
 
-4. Complete the required PAYE return or remittance schedule for the relevant authority.
+4. Use the correct state tax authority channel for PAYE filing and remittance.
 
-5. Pay or remit the PAYE through the approved state tax authority channel.
+5. Submit the required PAYE schedule or return where required.
 
-6. Keep evidence of deduction, remittance, and filing for your records.
+6. Remit the PAYE amount through the approved payment channel.
 
-7. Make sure staff records and payroll records remain consistent with what was remitted.
+7. Keep proof of filing, proof of remittance, and payroll deduction records.
 
-If you want, I can explain PAYE step by step for a small business employer.
+PAYE issues are usually state-based, so make sure you are using the correct state revenue authority process.
 """.strip()
 
     return {
@@ -399,7 +409,21 @@ If you are using a specific state portal, I can also help you phrase a more port
     }
 
 
+PROCESS_MAP = {
+    "tax_payment_process": compose_tax_payment_process,
+    "tin_registration": compose_tin_registration,
+    "tin_verification": compose_tin_verification,
+    "tax_filing_process": compose_tax_filing_process,
+    "vat_filing_process": compose_vat_filing_process,
+    "vat_registration_process": compose_vat_registration_process,
+    "paye_remittance_process": compose_paye_remittance_process,
+    "tcc_application": compose_tcc_application,
+    "tcc_verification": compose_tcc_verification,
+}
+
+
 def try_compose(
+    intent: Optional[str] = None,
     *,
     question: Optional[str] = None,
     topic: Optional[str] = None,
@@ -409,35 +433,39 @@ def try_compose(
 ):
     del lang, channel
 
+    if intent and not question and not topic and not intent_type:
+        fn = PROCESS_MAP.get(_normalize(intent).replace(" ", "_"))
+        return fn() if fn else None
+
     topic_key = _normalize(topic)
     intent_key = _normalize(intent_type)
     action = _detect_action(question)
 
-    if topic_key == "tax_clearance_certificate":
+    if _topic_in(topic_key, "tax_clearance_certificate", "tax clearance certificate", "tcc"):
         if action == "verify":
             return compose_tcc_verification()
         if action == "apply":
             return compose_tcc_application()
 
-    if topic_key == "tin":
+    if _topic_in(topic_key, "tin", "tax identification number"):
         if action == "verify":
             return compose_tin_verification()
         if action in {"apply", "register"}:
             return compose_tin_registration()
 
-    if topic_key == "vat":
+    if _topic_in(topic_key, "vat", "value added tax"):
         if action == "register":
             return compose_vat_registration_process()
         if action == "file":
             return compose_vat_filing_process()
 
-    if topic_key == "paye" and action == "pay":
+    if _topic_in(topic_key, "paye", "pay as you earn") and action == "pay":
         return compose_paye_remittance_process()
 
-    if intent_key == "tax_payment_process" or action == "pay":
+    if intent_key in {"tax payment process", "tax_payment_process"} or action == "pay":
         return compose_tax_payment_process()
 
-    if intent_key == "tax_filing_process" or action == "file":
+    if intent_key in {"tax filing process", "tax_filing_process"} or action == "file":
         return compose_tax_filing_process()
 
     return None
