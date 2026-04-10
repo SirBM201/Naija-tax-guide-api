@@ -385,34 +385,42 @@ def compose_vat_payment_process() -> Dict:
 
 def compose_paye_remittance_process() -> Dict:
     return _compose_answer(
-        direct_answer="Handle PAYE remittance through the official State Internal Revenue Service channel for the employees and payroll period involved.",
+        direct_answer="File and remit PAYE through the official State Internal Revenue Service channel for the employees and payroll period involved.",
         sections=[
             _section(
-                "Before remittance:",
+                "Before filing or remittance:",
                 [
-                    "Confirm the employees and payroll period involved.",
+                    "Confirm the employees, payroll period, and state tax authority involved.",
                     "Compute PAYE correctly for each employee under the applicable rules.",
-                    "Prepare the payroll schedule and supporting deduction records.",
+                    "Prepare the payroll schedule and supporting deduction records before submission.",
                 ],
             ),
             _section(
-                "Remittance steps:",
+                "Filing and remittance steps:",
                 [
-                    "Submit the required PAYE schedule or return where required.",
-                    "Remit the PAYE amount through the approved payment channel.",
-                    "Keep proof of filing, proof of remittance, and payroll deduction records.",
+                    "Submit the PAYE schedule or return through the approved state channel where required.",
+                    "Generate or confirm the payment reference required by the portal or approved payment channel.",
+                    "Remit the PAYE amount and keep proof of filing and payment.",
                 ],
                 numbered=True,
+            ),
+            _section(
+                "Records to keep:",
+                [
+                    "payroll register or schedule for the period",
+                    "deduction support and employee pay records",
+                    "return evidence, remittance receipt, or acknowledgement",
+                ],
             ),
         ],
         next_steps=[
             "Ask who must deduct PAYE in your situation.",
-            "Ask when PAYE should be filed or paid.",
-            "Ask what payroll records should be kept for PAYE compliance.",
+            "Ask which state authority should receive the PAYE return.",
+            "Ask what to do if PAYE was not deducted or remitted correctly.",
         ],
         source_line=PAYE_SOURCE_LINE,
         intent_type="paye_remittance_process",
-        source_label="PAYE Remittance Process",
+        source_label="PAYE Filing and Remittance Process",
     )
 
 
@@ -564,7 +572,7 @@ def try_compose(
         if action == "pay":
             return compose_vat_payment_process()
 
-    if _topic_in(topic_key, "paye", "pay as you earn") and action == "pay":
+    if _topic_in(topic_key, "paye", "pay as you earn") and action in {"pay", "file"}:
         return compose_paye_remittance_process()
 
     if intent_key in {"vat payment process", "vat_payment_process"}:
