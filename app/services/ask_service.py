@@ -58,6 +58,8 @@ TOPIC_ALIASES = {
     "general": {"general"},
 }
 
+GENERIC_INTENTS = {"", "general", "guidance", "definition"}
+
 
 def _sb():
     return supabase() if callable(supabase) else supabase
@@ -165,7 +167,7 @@ def _infer_intent_from_question(question: str, fallback: str = "general") -> str
         return "exemption"
     if any(x in q for x in ["calculate", "computation", "compute"]):
         return "calculation"
-    if any(x in q for x in ["who must", "must i", "must we", "am i required", "should i charge", "who should", "who needs to"]):
+    if any(x in q for x in ["who must", "must i", "must we", "am i required", "should i charge", "who should", "who needs to", "comply with"]):
         return "obligation"
 
     return str(fallback or "general").strip().lower()
@@ -338,13 +340,10 @@ def _intent_matches(question_meta: Dict[str, Any], row: Dict[str, Any], question
     if not row_intent:
         return False
 
-    # exact
     if row_intent == meta_intent or row_intent == inferred_intent:
         return True
 
-    # do not let generic intent swallow specific intent
-    generic_values = {"general", "guidance", ""}
-    if row_intent in generic_values or meta_intent in generic_values or inferred_intent in generic_values:
+    if row_intent in GENERIC_INTENTS or meta_intent in GENERIC_INTENTS or inferred_intent in GENERIC_INTENTS:
         return False
 
     return False
@@ -396,6 +395,88 @@ def _chunk_to_direct_answer(row: Dict[str, Any], question_meta: Dict[str, Any]) 
         cleaned = f"{cleaned}\n\nSource: {source_title}"
 
     return _render_once(cleaned, question_meta)
+
+
+def _library_row_question_text(row: Dict[str, Any]) -> str:
+    return _safe_str(
+        row.get("normalized_question")
+        or row.get("question")
+        or row.get("canonical_key")
+    )
+
+
+def _library_overlap_count(row: Dict[str, Any], question: str) -> int:
+    row_tokens = set(_tokenize(_library_row_question_text(row)))
+    q_tokens = set(_tokenize(question))
+    return len(row_tokens.intersection(q_tokens))
+
+
+def _is_strong_library_direct_match(row: Dict[str, Any], question_meta: Dict[str, Any], question: str) -> bool:
+    norm_q = _normalize_text(question)
+    row_norm = _normalize_text(_library_row_question_text(row))
+
+    meta_topic = _safe_str(question_meta.get("topic")).lower()
+    row_topic = _safe_str(row.get("topic")).lower()
+
+    meta_intent = _safe_str(question_meta.get("intent_type")).lower()
+    row_intent = _safe_str(row.get("intent_type")).lower()
+
+    meta_ck = _normalize_text(_safe_str(question_meta.get("canonical_key")))
+    row_ck = _normalize_text(_safe_str(row.get("canonical_key")))
+
+    short_q = _question_is_short(question)
+    overlap = _library_overlap_count(row, question)
+
+    exact_norm = bool(norm_q and row_norm and norm_q == row_norm)
+    exact_topic = bool(meta_topic and row_topic and meta_topic == row_topic)
+    exact_intent = bool(meta_intent and row_intent and meta_intent == row_intent)
+
+    if exact_norm:
+        return True
+
+    if meta_ck and row_ck and meta_ck == row_ck and exact_topic and (exact_intent or row_intent in GENERIC_INTENTS):
+        return True
+
+    if short_q and exact_topic:
+        return True
+
+    if not short_q and exact_topic and exact_intent and row_intent not in GENERIC_INTENTS and overlap >= 2:
+        return True
+
+    return False
+
+
+def _is_strong_library_candidate_match(row: Dict[str, Any], question_meta: Dict[str, Any], question: str) -> bool:
+    score = _safe_int(row.get("library_score"), 0)
+    norm_q = _normalize_text(question)
+    row_norm = _normalize_text(_library_row_question_text(row))
+
+    meta_topic = _safe_str(question_meta.get("topic")).lower()
+    row_topic = _safe_str(row.get("topic")).lower()
+
+    meta_intent = _safe_str(question_meta.get("intent_type")).lower()
+    row_intent = _safe_str(row.get("intent_type")).lower()
+
+    short_q = _question_is_short(question)
+    overlap = _library_overlap_count(row, question)
+
+    exact_norm = bool(norm_q and row_norm and norm_q == row_norm)
+    exact_topic = bool(meta_topic and row_topic and meta_topic == row_topic)
+    exact_intent = bool(meta_intent and row_intent and meta_intent == row_intent)
+
+    if exact_norm and score >= 60:
+        return True
+
+    if short_q and exact_topic and score >= 60:
+        return True
+
+    if not short_q and exact_topic and exact_intent and row_intent not in GENERIC_INTENTS and overlap >= 2 and score >= 70:
+        return True
+
+    if exact_topic and overlap >= 3 and score >= 85:
+        return True
+
+    return False
 
 
 def _keyword_overlap_count(row: Dict[str, Any], question: str) -> int:
@@ -517,7 +598,7 @@ def _is_strong_kb_direct_match(row: Dict[str, Any], question_meta: Dict[str, Any
     meta_intent = _safe_str(question_meta.get("intent_type")).lower()
 
     exact_topic = row_topic and meta_topic and row_topic == meta_topic
-    exact_intent = row_intent and meta_intent and row_intent == meta_intent and row_intent not in {"general", "guidance"}
+    exact_intent = row_intent and meta_intent and row_intent == meta_intent and row_intent not in GENERIC_INTENTS
 
     if short_q and exact_topic and score >= _tax_kb_direct_threshold():
         return True
@@ -858,41 +939,18 @@ def _process_ask_request(
     debug["billing_state"] = billing_state
 
     balance = _safe_int(usage_state.get("credits_left"), 0)
+    short_q = _question_is_short(question)
 
-    library_answer = find_library_answer(
-        normalized_question=question_meta.get("normalized_question") or _normalize_text(question),
-        lang=lang,
-        canonical_key=question_meta.get("canonical_key"),
-    )
-    if library_answer:
-        debug["selected_mode"] = "library_direct"
-        return _library_result_to_payload(
-            row=library_answer,
-            question_meta=question_meta,
-            usage_state=usage_state,
-            debug=debug,
+    if short_q:
+        library_answer = find_library_answer(
+            normalized_question=question_meta.get("normalized_question") or _normalize_text(question),
+            lang=lang,
+            canonical_key=question_meta.get("canonical_key"),
         )
-
-    library_candidates = find_library_candidates(
-        normalized_question=question_meta.get("normalized_question") or _normalize_text(question),
-        lang=lang,
-        canonical_key=question_meta.get("canonical_key"),
-        limit=3,
-    )
-    if library_candidates:
-        debug["library_candidates"] = [
-            {
-                "canonical_key": row.get("canonical_key"),
-                "normalized_question": row.get("normalized_question"),
-                "score": row.get("library_score"),
-            }
-            for row in library_candidates
-        ]
-        best_library = library_candidates[0]
-        if _safe_int(best_library.get("library_score"), 0) >= 80:
-            debug["selected_mode"] = "library_candidate_direct"
+        if library_answer and _is_strong_library_direct_match(library_answer, question_meta, question):
+            debug["selected_mode"] = "library_direct_short"
             return _library_result_to_payload(
-                row=best_library,
+                row=library_answer,
                 question_meta=question_meta,
                 usage_state=usage_state,
                 debug=debug,
@@ -927,6 +985,47 @@ def _process_ask_request(
         payload["citations"] = []
         debug["selected_mode"] = "tax_process_composer"
         return _with_usage_meta(payload, usage_state=usage_state)
+
+    library_answer = find_library_answer(
+        normalized_question=question_meta.get("normalized_question") or _normalize_text(question),
+        lang=lang,
+        canonical_key=question_meta.get("canonical_key"),
+    )
+    if library_answer and _is_strong_library_direct_match(library_answer, question_meta, question):
+        debug["selected_mode"] = "library_direct"
+        return _library_result_to_payload(
+            row=library_answer,
+            question_meta=question_meta,
+            usage_state=usage_state,
+            debug=debug,
+        )
+
+    library_candidates = find_library_candidates(
+        normalized_question=question_meta.get("normalized_question") or _normalize_text(question),
+        lang=lang,
+        canonical_key=question_meta.get("canonical_key"),
+        limit=3,
+    )
+    if library_candidates:
+        debug["library_candidates"] = [
+            {
+                "canonical_key": row.get("canonical_key"),
+                "normalized_question": row.get("normalized_question"),
+                "score": row.get("library_score"),
+                "topic": row.get("topic"),
+                "intent_type": row.get("intent_type"),
+            }
+            for row in library_candidates
+        ]
+        best_library = library_candidates[0]
+        if _is_strong_library_candidate_match(best_library, question_meta, question):
+            debug["selected_mode"] = "library_candidate_direct"
+            return _library_result_to_payload(
+                row=best_library,
+                question_meta=question_meta,
+                usage_state=usage_state,
+                debug=debug,
+            )
 
     semantic_candidates: List[Dict[str, Any]] = []
     try:
@@ -990,7 +1089,7 @@ def _process_ask_request(
             error="insufficient_credits_uncached",
         )
 
-    if _question_is_short(question) and not tax_rows:
+    if short_q and not tax_rows:
         debug["selected_mode"] = "clarification_short_question"
         res = compose_clarification(question_meta=question_meta, debug=_filtered_debug(debug))
         payload = res.__dict__
