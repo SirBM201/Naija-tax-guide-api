@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 @dataclass
@@ -26,6 +26,9 @@ _INTERNAL_HEADER_PATTERNS = [
     r"(?im)^debug:\s*$",
     r"(?im)^system prompt:\s*$",
     r"(?im)^prompt:\s*$",
+    r"(?im)^reasoning:\s*$",
+    r"(?im)^analysis:\s*$",
+    r"(?im)^final answer draft:\s*$",
 ]
 
 _INTERNAL_FIELD_LINE_PATTERNS = [
@@ -44,6 +47,8 @@ _INTERNAL_FIELD_LINE_PATTERNS = [
     r"(?im)^-?\s*grounded:\s*.*$",
     r"(?im)^-?\s*grounding_mode:\s*.*$",
     r"(?im)^-?\s*confidence:\s*.*$",
+    r"(?im)^-?\s*normalized_question:\s*.*$",
+    r"(?im)^-?\s*canonical_key:\s*.*$",
     r"(?im)^source id:\s*.*$",
     r"(?im)^source title:\s*.*$",
     r"(?im)^chunk id:\s*.*$",
@@ -56,7 +61,6 @@ _PROVIDER_ERROR_PATTERNS = [
     r"status:\s*401",
     r"error code:\s*401",
     r"invalid_request_error",
-    r"\bopenai\b",
     r"\bapi key\b",
 ]
 
@@ -73,9 +77,19 @@ _CLEAR_INTERNAL_MARKERS = [
     "best supported answer",
     "based on the strongest available",
     "no evidence provided",
+    "prompt:",
+    "system prompt",
+    "reasoning:",
+    "analysis:",
+    "trust_score",
+    "similarity",
+    "match_type",
 ]
 
 _SOURCE_PREFIX_RE = re.compile(r"(?im)^source:\s*")
+_BULLET_RE = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+")
+_MULTI_SPACE_RE = re.compile(r"\s+")
+_SHORT_QUESTION_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9\s/\-?]{0,20}\??$")
 
 
 def _safe_str(value: Any) -> str:
@@ -116,6 +130,10 @@ def _candidate_meta(candidate: Any) -> Dict[str, Any]:
     }
 
 
+def _normalize_inline(text: str) -> str:
+    return _MULTI_SPACE_RE.sub(" ", _safe_str(text)).strip()
+
+
 def _clean_lines(text: str) -> List[str]:
     raw = _safe_str(text)
     if not raw:
@@ -145,7 +163,7 @@ def _clean_lines(text: str) -> List[str]:
 
 
 def _ensure_sentence(text: str) -> str:
-    text = _safe_str(text)
+    text = _normalize_inline(text)
     if not text:
         return ""
     if text.endswith((".", "!", "?", ":")):
@@ -153,7 +171,7 @@ def _ensure_sentence(text: str) -> str:
     return text + "."
 
 
-def _extract_source_tail(lines: List[str]) -> tuple[List[str], Optional[str]]:
+def _extract_source_tail(lines: List[str]) -> Tuple[List[str], Optional[str]]:
     if not lines:
         return lines, None
 
@@ -205,6 +223,9 @@ def _sanitize_answer_text(text: str) -> str:
             "debug:",
             "system prompt:",
             "prompt:",
+            "reasoning:",
+            "analysis:",
+            "final answer draft:",
         }:
             continue
 
@@ -258,7 +279,7 @@ def looks_like_internal_or_broken_answer(text: str) -> bool:
     return False
 
 
-def _split_intro_and_steps(lines: List[str]) -> tuple[List[str], List[str]]:
+def _split_intro_and_steps(lines: List[str]) -> Tuple[List[str], List[str]]:
     intro: List[str] = []
     steps: List[str] = []
 
@@ -275,128 +296,226 @@ def _split_intro_and_steps(lines: List[str]) -> tuple[List[str], List[str]]:
 
 
 def _fallback_unknown() -> str:
-    return "I do not yet have enough reliable guidance in the system to answer that accurately."
+    return (
+        "I do not yet have enough reliable guidance in the system to answer that accurately.\n\n"
+        "What to do next:\n"
+        "1. Ask the question in a more specific way.\n"
+        "2. Mention the tax type, person or business type, and the period involved.\n"
+        "3. If helpful, ask for the meaning, process, rate, exemption, or penalty directly."
+    )
 
 
-def _format_definition(text: str) -> str:
-    lines = _clean_lines(_sanitize_answer_text(text))
-    lines, source_tail = _extract_source_tail(lines)
+def _extract_source_line(lines: List[str]) -> Tuple[List[str], Optional[str]]:
+    stripped_lines = [ln for ln in lines if ln.strip()]
+    if not stripped_lines:
+        return [], None
+
+    kept: List[str] = []
+    source_line: Optional[str] = None
+
+    for line in stripped_lines:
+        if _SOURCE_PREFIX_RE.match(line.strip()):
+            source_line = line.strip()
+        else:
+            kept.append(line.strip())
+
+    return kept, source_line
+
+
+def _dedupe_lines(lines: List[str]) -> List[str]:
+    seen = set()
+    result: List[str] = []
+    for line in lines:
+        key = _normalize_inline(line).lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(line.strip())
+    return result
+
+
+def _looks_like_short_question(question_meta: Optional[Dict[str, Any]]) -> bool:
+    normalized_question = _safe_str((question_meta or {}).get("normalized_question"))
+    if not normalized_question:
+        return False
+    return bool(_SHORT_QUESTION_RE.match(normalized_question))
+
+
+def _topic_label(question_meta: Optional[Dict[str, Any]]) -> str:
+    topic = _safe_str((question_meta or {}).get("topic")).replace("_", " ")
+    if not topic or topic == "general":
+        return "this tax issue"
+    return topic.upper() if topic.lower() in {"vat", "paye", "tin"} else topic
+
+
+def _user_type_hint(question_meta: Optional[Dict[str, Any]]) -> str:
+    topic = _safe_str((question_meta or {}).get("topic")).lower()
+    if topic in {"vat", "value_added_tax"}:
+        return "registered businesses or suppliers of taxable goods and services"
+    if topic in {"paye", "personal_income_tax"}:
+        return "employees and employers"
+    if topic in {"withholding_tax"}:
+        return "businesses making qualifying payments"
+    if topic in {"freelancer", "self_employed"}:
+        return "freelancers, consultants, and self-employed persons"
+    return "the person or business involved"
+
+
+def _build_plain_definition(lines: List[str], question_meta: Optional[Dict[str, Any]]) -> str:
+    lines, source_line = _extract_source_line(lines)
+    lines = _dedupe_lines(lines)
 
     if not lines:
         return _fallback_unknown()
 
-    first = _ensure_sentence(lines[0])
-    rest = [ln for ln in lines[1:] if ln]
+    lead = _ensure_sentence(lines[0])
+    detail_lines = lines[1:3]
 
-    parts = [first]
-    if rest:
-        parts.append("\n".join(rest))
-    if source_tail:
-        parts.append(source_tail)
+    parts: List[str] = []
+    parts.append(f"Answer:\n{lead}")
+
+    meaning_block = []
+    if detail_lines:
+        meaning_block.extend(_ensure_sentence(x) for x in detail_lines[:2] if x.strip())
+
+    if _looks_like_short_question(question_meta):
+        topic = _topic_label(question_meta)
+        meaning_block.append(
+            _ensure_sentence(
+                f"If you want a more exact answer, ask what {topic} means, who it applies to, or how to comply with it in Nigeria"
+            )
+        )
+
+    if meaning_block:
+        parts.append("What this means:\n" + "\n".join(meaning_block))
+
+    if source_line:
+        parts.append(source_line)
 
     return "\n\n".join(parts).strip()
 
 
-def _format_procedure(text: str) -> str:
-    lines = _clean_lines(_sanitize_answer_text(text))
-    lines, source_tail = _extract_source_tail(lines)
+def _build_plain_procedure(lines: List[str], question_meta: Optional[Dict[str, Any]]) -> str:
+    lines, source_line = _extract_source_line(lines)
+    lines = _dedupe_lines(lines)
 
     if not lines:
         return _fallback_unknown()
 
     intro, steps = _split_intro_and_steps(lines)
-    parts: List[str] = []
 
-    if intro:
-        parts.append("\n".join(intro[:2]))
+    lead = _ensure_sentence(intro[0] if intro else lines[0])
+    parts: List[str] = [f"Answer:\n{lead}"]
+
+    if len(intro) > 1:
+        parts.append("What this means:\n" + "\n".join(_ensure_sentence(x) for x in intro[1:3]))
 
     if steps:
-        parts.append("Steps:\n" + "\n".join(steps))
+        rendered_steps = []
+        for idx, step in enumerate(steps, start=1):
+            clean = re.sub(r"^\d+[.)]\s+", "", step).strip()
+            rendered_steps.append(f"{idx}. {_ensure_sentence(clean)}")
+        parts.append("What to do next:\n" + "\n".join(rendered_steps[:6]))
     elif len(lines) > 1:
-        numbered = [f"{i + 1}. {line}" for i, line in enumerate(lines[1:])]
-        parts = [_ensure_sentence(lines[0]), "Steps:\n" + "\n".join(numbered)]
+        rendered_steps = []
+        for idx, line in enumerate(lines[1:5], start=1):
+            rendered_steps.append(f"{idx}. {_ensure_sentence(line)}")
+        parts.append("What to do next:\n" + "\n".join(rendered_steps))
+
+    if source_line:
+        parts.append(source_line)
+
+    return "\n\n".join(parts).strip()
+
+
+def _build_plain_obligation(lines: List[str], question_meta: Optional[Dict[str, Any]]) -> str:
+    lines, source_line = _extract_source_line(lines)
+    lines = _dedupe_lines(lines)
+
+    if not lines:
+        return _fallback_unknown()
+
+    lead = _ensure_sentence(lines[0])
+    meaning = [_ensure_sentence(x) for x in lines[1:3] if x.strip()]
+    topic_hint = _topic_label(question_meta)
+    user_hint = _user_type_hint(question_meta)
+
+    parts: List[str] = [f"Answer:\n{lead}"]
+
+    if meaning:
+        parts.append("What this means:\n" + "\n".join(meaning))
     else:
-        parts = [_ensure_sentence(lines[0])]
+        parts.append(
+            "What this means:\n"
+            + _ensure_sentence(f"This depends on whether {user_hint} is covered by the relevant rules for {topic_hint}")
+        )
 
-    if source_tail:
-        parts.append(source_tail)
+    next_steps = [
+        f"1. Confirm whether you are asking as {user_hint}.",
+        f"2. Confirm the exact tax type involved under {topic_hint}.",
+        "3. Ask a narrower follow-up if you want the process, rate, or penalty.",
+    ]
+    parts.append("What to do next:\n" + "\n".join(next_steps))
 
-    return "\n\n".join(parts).strip()
-
-
-def _format_obligation(text: str) -> str:
-    lines = _clean_lines(_sanitize_answer_text(text))
-    lines, source_tail = _extract_source_tail(lines)
-
-    if not lines:
-        return _fallback_unknown()
-
-    decision = _ensure_sentence(lines[0])
-    rest = [ln for ln in lines[1:] if ln]
-
-    parts = [decision]
-    if rest:
-        parts.append("\n".join(rest))
-    if source_tail:
-        parts.append(source_tail)
+    if source_line:
+        parts.append(source_line)
 
     return "\n\n".join(parts).strip()
 
 
-def _format_calculation(text: str) -> str:
-    lines = _clean_lines(_sanitize_answer_text(text))
-    lines, source_tail = _extract_source_tail(lines)
+def _build_plain_calculation(lines: List[str], question_meta: Optional[Dict[str, Any]]) -> str:
+    lines, source_line = _extract_source_line(lines)
+    lines = _dedupe_lines(lines)
 
     if not lines:
         return _fallback_unknown()
 
     lead = _ensure_sentence(lines[0])
-    rest = [ln for ln in lines[1:] if ln]
+    parts: List[str] = [f"Answer:\n{lead}"]
 
-    parts = [lead]
-    if rest:
-        parts.append("\n".join(rest))
-    if source_tail:
-        parts.append(source_tail)
+    detail_lines = [_ensure_sentence(x) for x in lines[1:4] if x.strip()]
+    if detail_lines:
+        parts.append("What this means:\n" + "\n".join(detail_lines))
+
+    next_steps = [
+        "1. Confirm the amount, period, and tax type involved.",
+        "2. Confirm whether any exemption, deduction, or special rate applies.",
+        "3. Ask for a worked example if you want the calculation broken down.",
+    ]
+    parts.append("What to do next:\n" + "\n".join(next_steps))
+
+    if source_line:
+        parts.append(source_line)
 
     return "\n\n".join(parts).strip()
 
 
-def _format_deduction(text: str) -> str:
-    lines = _clean_lines(_sanitize_answer_text(text))
-    lines, source_tail = _extract_source_tail(lines)
+def _build_plain_general(lines: List[str], question_meta: Optional[Dict[str, Any]]) -> str:
+    lines, source_line = _extract_source_line(lines)
+    lines = _dedupe_lines(lines)
 
     if not lines:
         return _fallback_unknown()
 
     lead = _ensure_sentence(lines[0])
-    rest = [ln for ln in lines[1:] if ln]
+    detail_lines = [_ensure_sentence(x) for x in lines[1:4] if x.strip()]
 
-    parts = [lead]
-    if rest:
-        parts.append("\n".join(rest))
-    if source_tail:
-        parts.append(source_tail)
+    parts: List[str] = [f"Answer:\n{lead}"]
 
-    return "\n\n".join(parts).strip()
+    if detail_lines:
+        parts.append("What this means:\n" + "\n".join(detail_lines))
 
+    if _looks_like_short_question(question_meta):
+        topic = _topic_label(question_meta)
+        next_steps = [
+            f"1. Ask what {topic} means in Nigeria.",
+            f"2. Ask who must comply with {topic}.",
+            f"3. Ask for the registration, filing, or payment process for {topic}.",
+        ]
+        parts.append("What to do next:\n" + "\n".join(next_steps))
 
-def _format_general(text: str) -> str:
-    cleaned = _sanitize_answer_text(text)
-    lines = _clean_lines(cleaned)
-
-    if not lines:
-        return _fallback_unknown()
-
-    lines, source_tail = _extract_source_tail(lines)
-    first = _ensure_sentence(lines[0])
-    rest = [ln for ln in lines[1:] if ln]
-
-    parts = [first]
-    if rest:
-        parts.append("\n".join(rest))
-    if source_tail:
-        parts.append(source_tail)
+    if source_line:
+        parts.append(source_line)
 
     return "\n\n".join(parts).strip()
 
@@ -414,28 +533,29 @@ def render_answer(answer_text: str, *, question_meta: Optional[Dict[str, Any]] =
     if looks_like_internal_or_broken_answer(raw) and not sanitized:
         return _fallback_unknown()
 
-    if looks_like_internal_or_broken_answer(raw) and len(_clean_lines(sanitized)) <= 1:
+    lines = _clean_lines(sanitized)
+    if not lines:
+        return _fallback_unknown()
+
+    if looks_like_internal_or_broken_answer(raw) and len(lines) <= 1:
         return _fallback_unknown()
 
     if intent_type == "definition":
-        return _format_definition(sanitized)
+        return _build_plain_definition(lines, question_meta)
 
     if intent_type in {"procedure", "how_to"}:
-        return _format_procedure(sanitized)
+        return _build_plain_procedure(lines, question_meta)
 
     if intent_type in {"obligation", "eligibility"}:
-        return _format_obligation(sanitized)
+        return _build_plain_obligation(lines, question_meta)
 
-    if intent_type in {"calculation", "computation"}:
-        return _format_calculation(sanitized)
-
-    if intent_type == "deduction":
-        return _format_deduction(sanitized)
+    if intent_type in {"calculation", "computation", "deduction"}:
+        return _build_plain_calculation(lines, question_meta)
 
     if topic in {"penalty", "rate", "deadline"}:
-        return _format_calculation(sanitized)
+        return _build_plain_calculation(lines, question_meta)
 
-    return _format_general(sanitized)
+    return _build_plain_general(lines, question_meta)
 
 
 def compose_direct_cache_answer(
@@ -494,11 +614,12 @@ def compose_clarification(
     return AskExecutionResult(
         ok=True,
         answer=(
+            "Answer:\n"
             "I need a little more detail before I answer this safely.\n\n"
-            f"Please clarify these points about your {topic}:\n"
-            "1. Are you asking as an employee, freelancer, sole proprietor, or company?\n"
-            "2. Do you want the meaning, the process, whether it applies to you, or the penalty/rate?\n"
-            "3. If this is about filing or payment, which tax type is involved and for what period?"
+            "What to clarify:\n"
+            f"1. Are you asking about {topic} as an employee, freelancer, sole proprietor, or company?\n"
+            "2. Do you want the meaning, process, whether it applies, or the rate or penalty?\n"
+            "3. If this is about filing or payment, which tax type and period are involved?"
         ),
         source="clarification",
         needs_credit=False,
