@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List
 
 from app.core.supabase_client import supabase
 
@@ -24,13 +24,6 @@ def _tokenize(value: str) -> List[str]:
     return [part for part in text.split(" ") if part]
 
 
-def _safe_float(value: Any, default: float = 0.0) -> float:
-    try:
-        return float(value)
-    except Exception:
-        return default
-
-
 def _safe_int(value: Any, default: int = 0) -> int:
     try:
         return int(value)
@@ -38,106 +31,80 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
-def _language_candidates(lang: str) -> List[str]:
-    raw = (lang or "en").strip().lower() or "en"
-    ordered = [raw]
-    if raw != "en":
-        ordered.append("en")
-    return ordered
+def _language_answer_field(lang: str) -> str:
+    code = (lang or "en").strip().lower()
+
+    mapping = {
+        "en": "answer_en",
+        "pcm": "answer_pcm",
+        "pidgin": "answer_pidgin",
+        "yo": "answer_yo",
+        "yoruba": "answer_yoruba",
+        "ig": "answer_ig",
+        "igbo": "answer_igbo",
+        "ha": "answer_ha",
+        "hausa": "answer_hausa",
+    }
+    return mapping.get(code, "answer_en")
 
 
-def _fetch_enabled_rows(lang: str, limit: int = 400) -> List[Dict[str, Any]]:
-    languages = _language_candidates(lang)
-    rows: List[Dict[str, Any]] = []
+def _row_best_answer(row: Dict[str, Any], lang: str) -> str:
+    preferred_field = _language_answer_field(lang)
+    preferred = str(row.get(preferred_field) or "").strip()
+    if preferred:
+        return preferred
 
-    try:
-        for code in languages:
-            res = (
-                _sb()
-                .table("qa_library")
-                .select("*")
-                .eq("enabled", True)
-                .eq("lang", code)
-                .order("priority", desc=True)
-                .limit(limit)
-                .execute()
-            )
-            data = getattr(res, "data", None) or []
-            if isinstance(data, list):
-                rows.extend(data)
-    except Exception:
-        return []
-
-    deduped: List[Dict[str, Any]] = []
-    seen = set()
-    for row in rows:
-        row_id = row.get("id") or row.get("canonical_key") or row.get("normalized_question")
-        if row_id in seen:
-            continue
-        seen.add(row_id)
-        deduped.append(row)
-    return deduped
+    fallback_order = [
+        "answer_en",
+        "answer_pcm",
+        "answer_yo",
+        "answer_ig",
+        "answer_ha",
+        "answer_pidgin",
+        "answer_yoruba",
+        "answer_igbo",
+        "answer_hausa",
+        "answer",
+    ]
+    for key in fallback_order:
+        value = str(row.get(key) or "").strip()
+        if value:
+            return value
+    return ""
 
 
-def _row_text_blob(row: Dict[str, Any]) -> str:
-    return " ".join(
-        [
-            str(row.get("question") or ""),
-            str(row.get("normalized_question") or ""),
-            str(row.get("canonical_key") or ""),
-            str(row.get("topic") or ""),
-            str(row.get("intent_type") or ""),
-            str(row.get("answer") or ""),
-            str(row.get("keywords") or ""),
-            str(row.get("aliases") or ""),
-        ]
-    ).strip()
+def _row_terms(row: Dict[str, Any]) -> List[str]:
+    terms: List[str] = []
 
+    for key in ["question", "normalized_question", "canonical_key", "category", "source"]:
+        value = str(row.get(key) or "").strip()
+        if value:
+            terms.append(value)
 
-def _extract_terms(row: Dict[str, Any]) -> List[str]:
-    values: List[str] = []
+    tags = row.get("tags") or []
+    if isinstance(tags, list):
+        terms.extend(str(tag).strip() for tag in tags if str(tag).strip())
 
-    for key in ["normalized_question", "canonical_key", "topic", "intent_type"]:
-        raw = str(row.get(key) or "").strip()
-        if raw:
-            values.append(raw)
-
-    aliases = row.get("aliases")
-    if isinstance(aliases, list):
-        values.extend(str(x).strip() for x in aliases if str(x).strip())
-    elif isinstance(aliases, str):
-        values.extend(part.strip() for part in aliases.split(",") if part.strip())
-
-    keywords = row.get("keywords")
-    if isinstance(keywords, list):
-        values.extend(str(x).strip() for x in keywords if str(x).strip())
-    elif isinstance(keywords, str):
-        values.extend(part.strip() for part in keywords.split(",") if part.strip())
-
-    question = str(row.get("question") or "").strip()
-    if question:
-        values.append(question)
-
-    return [_normalize_text(v) for v in values if _normalize_text(v)]
+    return [_normalize_text(term) for term in terms if _normalize_text(term)]
 
 
 def _score_row(
     normalized_question: str,
     canonical_key: Optional[str],
     row: Dict[str, Any],
-) -> Tuple[float, List[str]]:
-    score = 0.0
+) -> Dict[str, Any]:
+    score = 0
     reasons: List[str] = []
 
     nq = _normalize_text(normalized_question)
     ck = _normalize_text(canonical_key or "")
     row_nq = _normalize_text(str(row.get("normalized_question") or ""))
     row_ck = _normalize_text(str(row.get("canonical_key") or ""))
+    row_question = _normalize_text(str(row.get("question") or ""))
+    row_terms = set(_row_terms(row))
 
     q_tokens = set(_tokenize(nq))
-    row_blob = _normalize_text(_row_text_blob(row))
-    row_tokens = set(_tokenize(row_blob))
-    row_terms = set(_extract_terms(row))
+    row_tokens = set(_tokenize(" ".join(row_terms)))
 
     if ck and row_ck and ck == row_ck:
         score += 200
@@ -147,47 +114,34 @@ def _score_row(
         score += 180
         reasons.append("normalized_question_exact:+180")
 
-    if nq and row_nq:
-        if nq in row_nq or row_nq in nq:
-            score += 70
-            reasons.append("normalized_phrase_match:+70")
+    if nq and row_question and nq == row_question:
+        score += 120
+        reasons.append("question_exact:+120")
+
+    if nq and row_nq and (nq in row_nq or row_nq in nq):
+        score += 50
+        reasons.append("normalized_phrase_overlap:+50")
 
     if ck and ck in row_terms:
-        score += 50
-        reasons.append("canonical_term_match:+50")
+        score += 40
+        reasons.append("canonical_key_term_hit:+40")
 
-    token_overlap = len(q_tokens.intersection(row_tokens))
-    if token_overlap > 0:
-        overlap_bonus = min(45, token_overlap * 8)
-        score += overlap_bonus
-        reasons.append(f"token_overlap:+{overlap_bonus}")
-
-    exact_term_hits = 0
-    for term in row_terms:
-        if term and term in nq:
-            exact_term_hits += 1
-    if exact_term_hits > 0:
-        term_bonus = min(36, exact_term_hits * 6)
-        score += term_bonus
-        reasons.append(f"term_hits:+{term_bonus}")
+    overlap = len(q_tokens.intersection(row_tokens))
+    if overlap > 0:
+        bonus = min(30, overlap * 6)
+        score += bonus
+        reasons.append(f"token_overlap:+{bonus}")
 
     priority = _safe_int(row.get("priority"), 0)
     if priority > 0:
-        priority_bonus = min(20, priority)
-        score += priority_bonus
-        reasons.append(f"priority:+{priority_bonus}")
+        bonus = min(20, priority)
+        score += bonus
+        reasons.append(f"priority:+{bonus}")
 
-    quality_flags = [
-        bool(str(row.get("answer") or "").strip()),
-        bool(str(row.get("question") or "").strip()),
-        bool(row.get("enabled")),
-    ]
-    quality_bonus = sum(2 for flag in quality_flags if flag)
-    if quality_bonus:
-        score += quality_bonus
-        reasons.append(f"quality:+{quality_bonus}")
-
-    return score, reasons
+    return {
+        "score": score,
+        "reasons": reasons,
+    }
 
 
 def find_library_candidates(
@@ -202,24 +156,38 @@ def find_library_candidates(
     if not nq and not ck:
         return []
 
-    rows = _fetch_enabled_rows(lang=lang, limit=400)
-    if not rows:
+    try:
+        res = (
+            _sb()
+            .table("qa_library")
+            .select("*")
+            .eq("enabled", True)
+            .order("priority", desc=True)
+            .limit(400)
+            .execute()
+        )
+        rows = getattr(res, "data", None) or []
+    except Exception:
+        return []
+
+    if not isinstance(rows, list):
         return []
 
     scored: List[Dict[str, Any]] = []
     for row in rows:
-        score, reasons = _score_row(nq, ck, row)
-        if score <= 0:
+        score_info = _score_row(nq, ck, row)
+        if score_info["score"] <= 0:
             continue
 
         enriched = dict(row)
-        enriched["library_score"] = round(score, 3)
-        enriched["library_score_reasons"] = reasons
+        enriched["library_score"] = score_info["score"]
+        enriched["library_score_reasons"] = score_info["reasons"]
+        enriched["resolved_answer"] = _row_best_answer(row, lang)
         scored.append(enriched)
 
     scored.sort(
         key=lambda item: (
-            _safe_float(item.get("library_score"), 0.0),
+            _safe_int(item.get("library_score"), 0),
             _safe_int(item.get("priority"), 0),
         ),
         reverse=True,
@@ -247,13 +215,14 @@ def find_library_answer(
                 .select("*")
                 .eq("enabled", True)
                 .eq("canonical_key", ck)
-                .in_("lang", _language_candidates(lang))
                 .order("priority", desc=True)
                 .limit(1)
                 .execute()
             )
             if getattr(res, "data", None):
-                return res.data[0]
+                row = dict(res.data[0])
+                row["resolved_answer"] = _row_best_answer(row, lang)
+                return row
 
         if nq:
             res = (
@@ -262,13 +231,14 @@ def find_library_answer(
                 .select("*")
                 .eq("enabled", True)
                 .eq("normalized_question", nq)
-                .in_("lang", _language_candidates(lang))
                 .order("priority", desc=True)
                 .limit(1)
                 .execute()
             )
             if getattr(res, "data", None):
-                return res.data[0]
+                row = dict(res.data[0])
+                row["resolved_answer"] = _row_best_answer(row, lang)
+                return row
     except Exception:
         pass
 
@@ -282,9 +252,7 @@ def find_library_answer(
         return None
 
     best = candidates[0]
-    best_score = _safe_float(best.get("library_score"), 0.0)
-
-    if best_score < 40:
+    if _safe_int(best.get("library_score"), 0) < 40:
         return None
 
     return best
