@@ -33,20 +33,21 @@ def _normalize_spaces(text: str) -> str:
     return text.strip()
 
 
-def _strip_duplicate_leading_labels(text: str) -> str:
+def _strip_leading_answer_labels(text: str) -> str:
     lines = text.split("\n")
     cleaned: List[str] = []
+    skipping = True
 
-    seen_answer_label = False
     for line in lines:
-        stripped = line.strip()
+        stripped = line.strip().lower()
 
-        if stripped.lower() == "answer:":
-            if seen_answer_label:
-                continue
-            seen_answer_label = True
+        if skipping and stripped in {"answer", "answer:"}:
             continue
 
+        if skipping and stripped == "":
+            continue
+
+        skipping = False
         cleaned.append(line)
 
     return "\n".join(cleaned).strip()
@@ -55,21 +56,12 @@ def _strip_duplicate_leading_labels(text: str) -> str:
 def _dedupe_repeated_sections(text: str) -> str:
     text = _normalize_spaces(text)
 
-    # remove duplicated "What to do next:" sections, keep the first full block
-    marker = "What to do next:"
-    first = text.find(marker)
-    if first != -1:
-        second = text.find(marker, first + len(marker))
-        if second != -1:
-            text = text[:second].rstrip()
-
-    # remove duplicated "What this means:" sections
-    marker2 = "What this means:"
-    first2 = text.find(marker2)
-    if first2 != -1:
-        second2 = text.find(marker2, first2 + len(marker2))
-        if second2 != -1:
-            text = text[:second2].rstrip()
+    for marker in ["What to do next:", "What this means:"]:
+        first = text.find(marker)
+        if first != -1:
+            second = text.find(marker, first + len(marker))
+            if second != -1:
+                text = text[:second].rstrip()
 
     return text.strip()
 
@@ -79,13 +71,13 @@ def _looks_structured(text: str) -> bool:
     return (
         "what this means:" in raw
         or "what to do next:" in raw
-        or raw.startswith("answer:")
+        or raw.startswith("answer")
     )
 
 
 def _clean_existing_structured_answer(text: str) -> str:
     cleaned = _normalize_spaces(text)
-    cleaned = _strip_duplicate_leading_labels(cleaned)
+    cleaned = _strip_leading_answer_labels(cleaned)
     cleaned = _dedupe_repeated_sections(cleaned)
     return cleaned.strip()
 
@@ -96,6 +88,12 @@ def _infer_followups(question_meta: Optional[Dict[str, Any]] = None) -> List[str
     intent_type = _safe_str(meta.get("intent_type")).lower()
 
     if topic == "vat":
+        if intent_type in {"obligation", "compliance"}:
+            return [
+                "Ask whether your business or transaction must charge VAT.",
+                "Ask what supplies may be exempt or zero-rated.",
+                "Ask for VAT registration, filing, or payment steps.",
+            ]
         return [
             "Ask what VAT means in Nigeria.",
             "Ask who must comply with VAT.",
@@ -106,7 +104,7 @@ def _infer_followups(question_meta: Optional[Dict[str, Any]] = None) -> List[str
         return [
             "Ask how to get a TIN as an individual or business.",
             "Ask how to verify a TIN.",
-            "Ask what documents may be needed for registration.",
+            "Ask what registration details may be required.",
         ]
 
     if topic == "tax_clearance_certificate":
@@ -144,14 +142,12 @@ def _build_structured_answer(
     source_line: Optional[str] = None,
 ) -> str:
     body = _normalize_spaces(body)
-    body = _strip_duplicate_leading_labels(body)
+    body = _strip_leading_answer_labels(body)
     body = _dedupe_repeated_sections(body)
 
     followups = _infer_followups(question_meta)
 
     parts: List[str] = []
-    parts.append("Answer")
-    parts.append("")
     parts.append(body)
     parts.append("")
     parts.append("What to do next:")
