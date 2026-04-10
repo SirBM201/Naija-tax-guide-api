@@ -29,6 +29,7 @@ ACTION_PATTERNS = {
         r"\benrol\b",
         r"\benroll\b",
         r"\benrollment\b",
+        r"\bsign up\b",
     ],
     "file": [
         r"\bfile\b",
@@ -41,6 +42,7 @@ ACTION_PATTERNS = {
         r"\bpayment\b",
         r"\bremit\b",
         r"\bremittance\b",
+        r"\bsettle\b",
     ],
 }
 
@@ -48,7 +50,7 @@ ACTION_PATTERNS = {
 GENERIC_SOURCE_LINE = "Source: official tax authority portal, eServices platform, or approved compliance channel for the relevant issuing authority."
 TCC_SOURCE_LINE = "Source: official State Internal Revenue Service or FIRS portal/eServices channel that handles TCC issuance or verification."
 TIN_SOURCE_LINE = "Source: official tax authority taxpayer registration, TIN lookup, or taxpayer verification channel."
-VAT_SOURCE_LINE = "Source: official VAT registration, filing, or payment channel of the relevant tax authority."
+VAT_SOURCE_LINE = "Source: official VAT registration, filing, payment, and compliance channel of the relevant tax authority."
 PAYE_SOURCE_LINE = "Source: official State Internal Revenue Service PAYE filing and remittance channel."
 
 
@@ -134,7 +136,7 @@ def compose_tax_payment_process() -> Dict:
                 "Before payment:",
                 [
                     "Confirm the exact tax involved, such as Personal Income Tax, Company Income Tax, VAT, Withholding Tax, or PAYE.",
-                    "Confirm whether the payment belongs to FIRS or the relevant State Internal Revenue Service.",
+                    "Confirm whether the payment belongs to FIRS/NRS or the relevant State Internal Revenue Service.",
                     "Make sure the taxpayer details and TIN are correct before generating or using a payment reference.",
                 ],
             ),
@@ -341,6 +343,46 @@ def compose_vat_registration_process() -> Dict:
     )
 
 
+def compose_vat_payment_process() -> Dict:
+    return _compose_answer(
+        direct_answer="Pay VAT through the approved VAT payment channel of the tax authority that receives the return.",
+        sections=[
+            _section(
+                "Before payment:",
+                [
+                    "Confirm the VAT period and the amount due from the return or assessment.",
+                    "Make sure the taxpayer profile, TIN, and VAT return details match the correct business.",
+                    "Generate or confirm the payment reference required by the official portal or payment channel.",
+                ],
+            ),
+            _section(
+                "Payment steps:",
+                [
+                    "Use the approved VAT payment channel accepted by the relevant authority.",
+                    "Pay the exact VAT amount due for the relevant period.",
+                    "Keep the receipt, acknowledgement, or payment confirmation.",
+                ],
+                numbered=True,
+            ),
+            _section(
+                "After payment:",
+                [
+                    "Keep the payment evidence together with the VAT return evidence for that period.",
+                    "If the portal still shows unpaid status, confirm whether the payment has posted correctly before assuming there is a failure.",
+                ],
+            ),
+        ],
+        next_steps=[
+            "Ask how to file VAT if the return has not been submitted yet.",
+            "Ask what records should support the VAT amount paid.",
+            "Ask what to do if the portal still shows unpaid after payment.",
+        ],
+        source_line=VAT_SOURCE_LINE,
+        intent_type="vat_payment_process",
+        source_label="VAT Payment Process",
+    )
+
+
 def compose_paye_remittance_process() -> Dict:
     return _compose_answer(
         direct_answer="Handle PAYE remittance through the official State Internal Revenue Service channel for the employees and payroll period involved.",
@@ -382,7 +424,7 @@ def compose_tcc_application() -> Dict:
                 "Where to apply:",
                 [
                     "For many personal income tax cases, the application is usually handled by the relevant State Internal Revenue Service.",
-                    "For relevant federal cases, use the appropriate FIRS channel.",
+                    "For relevant federal cases, use the appropriate FIRS/NRS channel.",
                 ],
             ),
             _section(
@@ -476,6 +518,7 @@ PROCESS_MAP = {
     "tax_filing_process": compose_tax_filing_process,
     "vat_filing_process": compose_vat_filing_process,
     "vat_registration_process": compose_vat_registration_process,
+    "vat_payment_process": compose_vat_payment_process,
     "paye_remittance_process": compose_paye_remittance_process,
     "tcc_application": compose_tcc_application,
     "tcc_verification": compose_tcc_verification,
@@ -518,9 +561,14 @@ def try_compose(
             return compose_vat_registration_process()
         if action == "file":
             return compose_vat_filing_process()
+        if action == "pay":
+            return compose_vat_payment_process()
 
     if _topic_in(topic_key, "paye", "pay as you earn") and action == "pay":
         return compose_paye_remittance_process()
+
+    if intent_key in {"vat payment process", "vat_payment_process"}:
+        return compose_vat_payment_process()
 
     if intent_key in {"tax payment process", "tax_payment_process"} or action == "pay":
         return compose_tax_payment_process()
