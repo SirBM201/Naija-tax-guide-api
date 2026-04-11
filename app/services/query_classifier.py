@@ -89,6 +89,35 @@ def _detect_intent(q: str) -> str:
     if _contains_any(
         ql,
         [
+            "what records should i keep",
+            "records should i keep",
+            "what records",
+            "keep records",
+            "what documents are needed",
+            "what documents do i need",
+            "required documents",
+        ],
+    ):
+        return "records"
+
+    if _contains_any(
+        ql,
+        [
+            "which tax authority",
+            "what authority",
+            "which authority",
+            "who issues",
+            "who handles",
+            "which portal",
+            "which channel",
+            "who receives",
+        ],
+    ):
+        return "authority"
+
+    if _contains_any(
+        ql,
+        [
             "calculate",
             "rate",
             "how much",
