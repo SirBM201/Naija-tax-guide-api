@@ -153,7 +153,7 @@ def _answer(answer: str, intent_type: str, source_label: str) -> Dict:
 
 
 # -------------------------------------------------
-# Authority routing answers
+# Authority routing
 # -------------------------------------------------
 
 
@@ -174,8 +174,6 @@ What to do next:
 1. Ask which state authority should receive the personal income tax in your case.
 2. Ask whether the issue is about PAYE or another personal-income-tax matter.
 3. Ask which portal or filing channel that state authority uses.
-
-Source: current official Nigerian tax-administration structure for personal income tax at state level and the relevant State Internal Revenue Service channel for the taxpayer's case.
 """,
         "personal_income_tax_authority",
         "Personal Income Tax Authority Routing",
@@ -199,8 +197,6 @@ What to do next:
 1. Ask which state authority should receive the PAYE return in your case.
 2. Ask who must deduct PAYE on the payroll involved.
 3. Ask which state portal or remittance channel should be used.
-
-Source: current official state-level PAYE administration structure and the relevant State Internal Revenue Service filing and remittance channel.
 """,
         "paye_authority",
         "PAYE Authority Routing",
@@ -224,8 +220,6 @@ What to do next:
 1. Ask which federal portal should be used for VAT in your case.
 2. Ask how to register, file, or pay VAT after confirming the channel.
 3. Ask whether the exact supply is taxable, exempt, or zero-rated before charging VAT.
-
-Source: current official Nigeria Revenue Service VAT administration structure and approved federal VAT portal channels.
 """,
         "vat_authority",
         "VAT Authority Routing",
@@ -249,8 +243,6 @@ What to do next:
 1. Ask which authority should issue the TCC in your case.
 2. Ask how to apply for the TCC on that authority's approved portal.
 3. Ask how to verify the issued TCC before using it.
-
-Source: current official TCC administration structure, including the approved NRS TCC eServices channel and the relevant State Internal Revenue Service route for state-side cases.
 """,
         "tcc_authority",
         "TCC Authority Routing",
@@ -275,8 +267,6 @@ What to do next:
 1. Ask how to register for a TIN in your case.
 2. Ask how to verify an issued TIN before using it.
 3. Ask what documents should support the TIN registration request.
-
-Source: current official Nigeria Revenue Service / Joint Revenue Board TIN registration and TIN verification structure.
 """,
         "tin_authority",
         "TIN Authority Routing",
@@ -300,8 +290,6 @@ What to do next:
 1. Ask whether the exact payment in your case should attract WHT at all.
 2. Ask what rate applies to that payment category.
 3. Ask how to remit the WHT once the receiving authority is confirmed.
-
-Source: current official withholding-tax administration guidance and the approved remittance channel of the authority that receives the deduction for the payment category involved.
 """,
         "withholding_tax_authority",
         "Withholding Tax Authority Routing",
@@ -325,8 +313,6 @@ What to do next:
 1. Ask what Company Income Tax rate rule applies to the company category in your case.
 2. Ask how to file Company Income Tax for the relevant period.
 3. Ask how to pay Company Income Tax through the approved federal channel.
-
-Source: current official Nigeria Revenue Service company-income-tax administration structure and approved federal CIT filing and payment channels.
 """,
         "company_income_tax_authority",
         "Company Income Tax Authority Routing",
@@ -334,7 +320,7 @@ Source: current official Nigeria Revenue Service company-income-tax administrati
 
 
 # -------------------------------------------------
-# TIN answers
+# TIN
 # -------------------------------------------------
 
 
@@ -356,8 +342,6 @@ What to do next:
 1. Ask who should issue or manage the TIN in your case.
 2. Ask how to register for a TIN if one has not yet been issued.
 3. Ask how to verify the TIN before using it for filing or payment.
-
-Source: current official Nigeria Revenue Service / Joint Revenue Board TIN registration and TIN verification channels.
 """,
         "tin_basic",
         "TIN Definition",
@@ -383,8 +367,6 @@ What to do next:
 1. Ask how to register for a TIN after preparing the required details.
 2. Ask which authority channel should handle the TIN registration in your case.
 3. Ask how to verify the issued TIN after registration.
-
-Source: current official Nigeria Revenue Service / Joint Revenue Board TIN registration channels and taxpayer-profile requirements.
 """,
         "tin_documents",
         "TIN Registration Documents",
@@ -434,7 +416,7 @@ What to do next:
 
 
 # -------------------------------------------------
-# VAT answers
+# VAT
 # -------------------------------------------------
 
 
@@ -465,20 +447,24 @@ What to do next:
 def compose_vat_obligation() -> Dict:
     return _answer(
         """
-A person or business generally has to comply with VAT when it makes taxable supplies of goods or services under the applicable VAT rules.
+A person or business generally has to comply with VAT when it makes taxable supplies that fall within the current Nigerian VAT rules.
 
 Who this usually affects:
-- businesses making taxable supplies that fall within the VAT system
-- taxpayers that must register, charge VAT where applicable, file VAT returns, and pay the VAT due through the approved federal channel
+- businesses making taxable supplies of goods or services
+- businesses that should register, charge VAT where applicable, file returns, and remit VAT through the official channel
+
+Important limits:
+- Not every supply should be charged at the standard VAT rate.
+- Some supplies may be exempt or zero-rated under the current law.
+- The correct answer depends on the exact supply, the nature of the taxpayer, and the current legal treatment of that transaction.
 
 Practical rule:
-- Do not decide VAT compliance based only on the fact that a business is operating.
-- First confirm whether the exact goods, services, or transactions are taxable under the current VAT rule, then follow the registration, invoicing, filing, and payment obligations that apply.
+- First confirm whether the exact good or service is taxable. If it is taxable, move to registration, invoicing, filing, and remittance compliance.
 
 What to do next:
-1. Ask whether the exact supply is taxable, exempt, or zero-rated.
-2. Ask how to register for VAT if the taxpayer falls within the registration rule.
-3. Ask what VAT records and invoices should be kept for compliance.
+1. Ask whether your exact business activity or transaction is taxable for VAT.
+2. Ask how to register for VAT if the registration rule applies.
+3. Ask what records should support your VAT filing and payment.
 """,
         "vat_obligation",
         "VAT Obligation",
@@ -555,6 +541,11 @@ Payment steps:
 After payment:
 - Keep the payment evidence together with the VAT return evidence for that period.
 - If the portal still shows unpaid status, confirm whether the payment has posted correctly before assuming there is a failure.
+
+What to do next:
+1. Ask what VAT means in Nigeria.
+2. Ask how to file VAT for the same period.
+3. Ask what records you should keep for VAT compliance.
 """,
         "vat_payment_process",
         "VAT Payment Process",
@@ -590,21 +581,21 @@ What to do next:
 def compose_vat_zero_rated() -> Dict:
     return _answer(
         """
-A zero-rated VAT treatment means the supply is treated under a VAT rule that applies a zero rate rather than the standard charge.
+A zero-rated VAT treatment means the supply falls within a VAT category that is charged at a zero rate under the applicable rule.
 
-What this usually means:
-- The supply is not treated the same way as a standard-rated taxable supply.
+What this means:
+- A zero-rated supply is not treated the same way as a standard-rated taxable supply.
 - It is also not automatically the same thing as an exempt supply.
-- The taxpayer should confirm that the exact transaction falls within a valid zero-rated category before using that treatment.
+- You should confirm that the exact good or service falls into a zero-rated category before using that treatment.
 
 Practical rule:
-- Do not label a supply zero-rated just because no VAT is being charged in practice.
+- Do not label a supply zero-rated just because no VAT is visibly charged in practice.
 - First confirm that the law and current guidance place that exact supply in a zero-rated category, then keep the records supporting that treatment.
 
 What to do next:
 1. Ask whether your exact supply is zero-rated or exempt.
 2. Ask what records should support a zero-rated VAT treatment.
-3. Ask how that supply should be shown in the VAT records or return.
+3. Ask how the supply should be shown in the VAT return.
 """,
         "vat_zero_rated",
         "Zero-Rated VAT",
@@ -614,21 +605,20 @@ What to do next:
 def compose_vat_exemption() -> Dict:
     return _answer(
         """
-A VAT-exempt treatment means the supply falls into a category that is not charged to VAT under the applicable VAT rule.
+An exempt supply is different from a zero-rated supply for VAT, so you should confirm the exact category before charging VAT or filing the return.
 
-What this usually means:
-- An exempt supply is not handled the same way as a standard-rated taxable supply.
-- It is also not automatically the same thing as a zero-rated supply.
-- The correct treatment depends on the exact nature of the goods, services, or transaction involved.
+What this means:
+- If a supply is exempt, the VAT treatment is different from a supply that is zero-rated.
+- You should not assume that a supply is exempt or zero-rated just because VAT is not visibly charged in practice.
 
 Practical rule:
-- Do not treat a supply as VAT-exempt without first confirming that the rule clearly puts that supply into an exempt category.
-- Keep the records that support why the exempt treatment was used.
+- Check the current official schedule or legal list for the exact good or service involved.
+- If the supply is not clearly listed under the current exemption or zero-rating treatment, do not guess. Confirm with the current official authority guidance before invoicing or filing.
 
 What to do next:
-1. Ask whether your exact supply is taxable, exempt, or zero-rated.
-2. Ask what records should support the exempt treatment.
-3. Ask how the supply should be reflected in the VAT return or compliance records.
+1. Ask about the exact good or service you want to classify for VAT.
+2. Ask whether the standard VAT rate should be charged on that supply.
+3. Ask how the supply should be treated in VAT filing after classification.
 """,
         "vat_exemption",
         "VAT Exemption",
@@ -636,7 +626,162 @@ What to do next:
 
 
 # -------------------------------------------------
-# PAYE answers
+# PIT
+# -------------------------------------------------
+
+
+def compose_personal_income_tax_basic() -> Dict:
+    return _answer(
+        """
+Personal Income Tax in Nigeria is the tax charged on the income of an individual under the applicable personal-income-tax rules.
+
+What it is:
+- Personal Income Tax is an individual's income tax, not a company profit tax.
+- It may be handled through PAYE where the income is employment income, or through the individual's direct filing path where that is the applicable route.
+- The correct treatment depends on the income type, the taxpayer's status, and the current rule that applies.
+
+Practical rule:
+- First confirm that the issue is about an individual's income and not VAT, Company Income Tax, or Withholding Tax.
+- Then confirm whether the case should be handled under PAYE or another personal-income-tax path.
+
+What to do next:
+1. Ask who pays Personal Income Tax in your case.
+2. Ask what authority handles Personal Income Tax for the taxpayer involved.
+3. Ask how to file or pay Personal Income Tax where applicable.
+""",
+        "personal_income_tax_basic",
+        "Personal Income Tax Definition",
+    )
+
+
+def compose_personal_income_tax_obligation() -> Dict:
+    return _answer(
+        """
+Individuals with income that falls within the applicable Personal Income Tax rules are the ones expected to comply with Personal Income Tax in Nigeria.
+
+Who this usually affects:
+- individuals earning taxable income under the applicable personal-income-tax rules
+- employers where the income is handled through PAYE deduction for employees
+- individuals who may need to file directly where their tax position is not handled only through payroll deduction
+
+Practical rule:
+- Do not assume every income question should be treated as PAYE.
+- First identify the income type and the taxpayer context, then confirm whether the compliance route is PAYE, direct personal-income-tax filing, or another lawful path.
+
+What to do next:
+1. Ask whether the issue is about PAYE or direct personal-income-tax filing.
+2. Ask which state tax authority should handle the case.
+3. Ask what records should support the Personal Income Tax position.
+""",
+        "personal_income_tax_obligation",
+        "Personal Income Tax Obligation",
+    )
+
+
+def compose_personal_income_tax_rate() -> Dict:
+    return _answer(
+        """
+There is no one-line shortcut that should be used blindly for every Personal Income Tax question. The correct rate treatment depends on the taxable-income computation and the current personal-income-tax rules that apply to the individual.
+
+Important note:
+- Do not guess the rate treatment from salary alone without first confirming the taxpayer's taxable-income position.
+- The correct computation should follow the current personal-income-tax framework applicable to the individual and the income involved.
+
+Practical rule:
+- Confirm the individual's income type, deduction position, and the current rule that applies before computing or quoting a Personal Income Tax liability.
+
+What to do next:
+1. Ask how to compute Personal Income Tax for the income involved.
+2. Ask whether the case should be handled through PAYE.
+3. Ask what records should support the Personal Income Tax computation.
+""",
+        "personal_income_tax_rate",
+        "Personal Income Tax Rate",
+    )
+
+
+def compose_personal_income_tax_filing() -> Dict:
+    return _answer(
+        """
+File Personal Income Tax through the approved channel of the State Internal Revenue Service that has the taxing right in the case.
+
+Before filing:
+- Confirm that the issue is a Personal Income Tax matter and not Company Income Tax or VAT.
+- Confirm the correct state authority and the filing period involved.
+- Gather the income details, computation support, and any records required for the filing.
+
+Filing steps:
+1. Use the approved state filing portal or filing channel for the taxpayer's case.
+2. Complete the return or filing process with the correct taxpayer details and figures.
+3. Submit the filing within the applicable deadline.
+4. Keep the acknowledgement, confirmation page, or filing receipt.
+
+What to do next:
+1. Ask how to pay Personal Income Tax after filing.
+2. Ask what records should be kept for Personal Income Tax.
+3. Ask whether the case should instead be handled through PAYE.
+""",
+        "personal_income_tax_filing",
+        "Personal Income Tax Filing Process",
+    )
+
+
+def compose_personal_income_tax_payment() -> Dict:
+    return _answer(
+        """
+Pay Personal Income Tax through the approved payment channel of the State Internal Revenue Service that receives the tax in the case.
+
+Before payment:
+- Confirm the correct state authority, taxpayer details, and period involved.
+- Make sure the amount being paid matches the return, assessment, or lawful computation.
+- Generate or confirm any payment reference required by the official channel.
+
+Payment steps:
+1. Use the approved state portal, bank channel, or payment platform accepted by that authority.
+2. Pay the correct amount due for the relevant period or assessment.
+3. Keep the receipt, acknowledgement, or payment confirmation.
+
+After payment:
+- Match the payment evidence to the related filing, assessment, or tax record for the same period.
+
+What to do next:
+1. Ask how to file Personal Income Tax if the filing has not yet been completed.
+2. Ask what records should support the Personal Income Tax payment.
+3. Ask whether the case should be handled through PAYE.
+""",
+        "personal_income_tax_payment",
+        "Personal Income Tax Payment Process",
+    )
+
+
+def compose_personal_income_tax_records() -> Dict:
+    return _answer(
+        """
+Keep the income, computation, filing, and payment records that support the Personal Income Tax position for the period involved.
+
+Records you should normally keep:
+- income records, pay statements, or other source records supporting the income reported
+- computation schedules or working papers supporting the tax position
+- filed return, acknowledgement, or portal confirmation where a filing was made
+- payment receipt, assessment notice, or other official evidence supporting the payment where applicable
+- any state-authority correspondence or supporting record tied to that same tax period
+
+Practical rule:
+- Keep records in a form that lets you trace the income, the tax computation, the filing made, and any payment or assessment tied to the same period.
+- If part of the issue is handled through PAYE, keep the payroll-side records together with the broader tax record where relevant.
+
+What to do next:
+1. Ask how to file Personal Income Tax for the period involved.
+2. Ask how to pay Personal Income Tax once the amount due is confirmed.
+3. Ask which authority should handle the Personal Income Tax in your case.
+""",
+        "personal_income_tax_records",
+        "Personal Income Tax Records",
+    )
+
+
+# -------------------------------------------------
+# PAYE
 # -------------------------------------------------
 
 
@@ -738,7 +883,7 @@ What to do next:
 
 
 # -------------------------------------------------
-# TCC answers
+# TCC
 # -------------------------------------------------
 
 
@@ -807,7 +952,7 @@ What to do next:
 
 
 # -------------------------------------------------
-# Withholding tax answers
+# WHT
 # -------------------------------------------------
 
 
@@ -934,7 +1079,7 @@ What to do next:
 
 
 # -------------------------------------------------
-# Company income tax answers
+# CIT
 # -------------------------------------------------
 
 
@@ -1084,7 +1229,7 @@ What to do next:
 
 
 # -------------------------------------------------
-# General process answers
+# General process
 # -------------------------------------------------
 
 
@@ -1122,7 +1267,7 @@ To file tax in Nigeria, use this general process:
 7. Submit the return and keep proof of filing.
 8. Where tax is payable, complete payment and keep the receipt together with the filed return evidence.
 
-If the tax type is specific, such as VAT, PAYE, WHT, or Company Income Tax, the filing process should be tailored to that tax rather than treated as a generic filing question.
+If the tax type is specific, such as VAT, PAYE, WHT, Personal Income Tax, or Company Income Tax, the filing process should be tailored to that tax rather than treated as a generic filing question.
 """,
         "tax_filing_process",
         "General Tax Filing Process",
@@ -1144,6 +1289,8 @@ PROCESS_MAP = {
     "withholding_tax_remittance": compose_withholding_tax_remittance,
     "company_income_tax_filing": compose_company_income_tax_filing,
     "company_income_tax_payment": compose_company_income_tax_payment,
+    "personal_income_tax_filing": compose_personal_income_tax_filing,
+    "personal_income_tax_payment": compose_personal_income_tax_payment,
 }
 
 
@@ -1168,7 +1315,7 @@ def try_compose(
     action = _detect_action(question)
 
     # -----------------------------
-    # Authority routing questions
+    # Authority routing
     # -----------------------------
     if q and _is_authority_question(q):
         if _mentions_any(q, "personal income tax", "pit"):
@@ -1187,7 +1334,7 @@ def try_compose(
             return compose_company_income_tax_authority()
 
     # -----------------------------
-    # Direct TIN questions
+    # Direct TIN
     # -----------------------------
     if q in {"what is a tin", "what is tin"} or _mentions_any(
         q,
@@ -1221,7 +1368,7 @@ def try_compose(
         return compose_tin_documents()
 
     # -----------------------------
-    # Direct VAT questions
+    # Direct VAT
     # -----------------------------
     if _mentions_any(
         q,
@@ -1273,7 +1420,63 @@ def try_compose(
         return compose_vat_exemption()
 
     # -----------------------------
-    # Direct PAYE questions
+    # Direct PIT
+    # -----------------------------
+    if _mentions_any(
+        q,
+        "what is personal income tax",
+        "meaning of personal income tax",
+        "define personal income tax",
+        "what is pit",
+        "what does pit mean",
+    ):
+        return compose_personal_income_tax_basic()
+
+    if _mentions_any(
+        q,
+        "who pays personal income tax",
+        "who should pay personal income tax",
+        "who must pay personal income tax",
+        "who pays pit",
+    ):
+        return compose_personal_income_tax_obligation()
+
+    if _mentions_any(
+        q,
+        "what is the personal income tax rate",
+        "personal income tax rate",
+        "pit rate",
+    ):
+        return compose_personal_income_tax_rate()
+
+    if _mentions_any(
+        q,
+        "how do i file personal income tax",
+        "how to file personal income tax",
+        "file personal income tax",
+        "file pit",
+    ):
+        return compose_personal_income_tax_filing()
+
+    if _mentions_any(
+        q,
+        "how do i pay personal income tax",
+        "how to pay personal income tax",
+        "pay personal income tax",
+        "pay pit",
+    ):
+        return compose_personal_income_tax_payment()
+
+    if _mentions_any(
+        q,
+        "what records should i keep for personal income tax",
+        "personal income tax records",
+        "pit records",
+    ):
+        return compose_personal_income_tax_records()
+
+    # -----------------------------
+    # Direct PAYE
     # -----------------------------
     if _mentions_any(q, "what is paye", "meaning of paye", "define paye", "what does paye mean"):
         return compose_paye_basic()
@@ -1292,7 +1495,7 @@ def try_compose(
         return compose_paye_records()
 
     # -----------------------------
-    # Direct WHT questions
+    # Direct WHT
     # -----------------------------
     if _mentions_any(
         q,
@@ -1351,7 +1554,7 @@ def try_compose(
         return compose_withholding_tax_records()
 
     # -----------------------------
-    # Direct CIT questions
+    # Direct CIT
     # -----------------------------
     if _mentions_any(
         q,
@@ -1405,7 +1608,7 @@ def try_compose(
         return compose_company_income_tax_records()
 
     # -----------------------------
-    # Direct TCC questions
+    # Direct TCC
     # -----------------------------
     if _mentions_any(q, "who issues a tcc", "who issues tcc"):
         return compose_tcc_authority()
@@ -1436,6 +1639,16 @@ def try_compose(
             return compose_vat_payment_process()
         if action == "records":
             return compose_vat_records()
+
+    if _topic_in(topic_key, *TOPIC_ALIASES["pit"]) or _mentions_any(q, *TOPIC_ALIASES["pit"]):
+        if action == "file":
+            return compose_personal_income_tax_filing()
+        if action == "pay":
+            return compose_personal_income_tax_payment()
+        if action == "records":
+            return compose_personal_income_tax_records()
+        if action == "rate":
+            return compose_personal_income_tax_rate()
 
     if _topic_in(topic_key, *TOPIC_ALIASES["paye"]) or _mentions_any(q, *TOPIC_ALIASES["paye"]):
         if action == "pay":
@@ -1498,6 +1711,12 @@ __all__ = [
     "compose_vat_records",
     "compose_vat_zero_rated",
     "compose_vat_exemption",
+    "compose_personal_income_tax_basic",
+    "compose_personal_income_tax_obligation",
+    "compose_personal_income_tax_rate",
+    "compose_personal_income_tax_filing",
+    "compose_personal_income_tax_payment",
+    "compose_personal_income_tax_records",
     "compose_paye_basic",
     "compose_paye_obligation",
     "compose_paye_records",
