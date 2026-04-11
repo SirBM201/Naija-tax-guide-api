@@ -334,7 +334,7 @@ Source: current official Nigeria Revenue Service company-income-tax administrati
 
 
 # -------------------------------------------------
-# TIN basic answers
+# TIN answers
 # -------------------------------------------------
 
 
@@ -391,57 +391,6 @@ Source: current official Nigeria Revenue Service / Joint Revenue Board TIN regis
     )
 
 
-# -------------------------------------------------
-# General process answers
-# -------------------------------------------------
-
-
-def compose_tax_payment_process() -> Dict:
-    return _answer(
-        """
-To pay tax in Nigeria, use this general flow:
-
-1. Identify the exact tax type involved.
-2. Confirm the correct tax authority.
-3. Make sure your registration details are in place, especially your TIN where required.
-4. Confirm the payment basis and the amount due.
-5. Generate or confirm the payment reference where the authority requires one.
-6. Pay through the approved portal, bank channel, or payment platform accepted by the authority.
-7. Keep the payment receipt and filing evidence for your records.
-
-The exact payment process differs by tax type and authority, so confirm the applicable portal or payment channel before making payment.
-""",
-        "tax_payment_process",
-        "General Nigerian Tax Payment Process",
-    )
-
-
-def compose_tax_filing_process() -> Dict:
-    return _answer(
-        """
-To file tax in Nigeria, use this general process:
-
-1. Confirm the exact tax type and filing period involved.
-2. Confirm whether the filing is for an individual, an employer, or a company.
-3. Confirm the correct tax authority.
-4. Gather the records needed for the filing period.
-5. Compute the figures correctly before submitting.
-6. Use the official filing portal or approved filing channel.
-7. Submit the return and keep proof of filing.
-8. Where tax is payable, complete payment and keep the receipt together with the filed return evidence.
-
-If the tax type is specific, such as VAT, PAYE, WHT, or Company Income Tax, the filing process should be tailored to that tax rather than treated as a generic filing question.
-""",
-        "tax_filing_process",
-        "General Tax Filing Process",
-    )
-
-
-# -------------------------------------------------
-# TIN process answers
-# -------------------------------------------------
-
-
 def compose_tin_registration() -> Dict:
     return _answer(
         """
@@ -485,8 +434,55 @@ What to do next:
 
 
 # -------------------------------------------------
-# VAT process answers
+# VAT answers
 # -------------------------------------------------
+
+
+def compose_vat_basic() -> Dict:
+    return _answer(
+        """
+VAT in Nigeria means Value Added Tax.
+
+What it is:
+- VAT is a consumption tax that generally applies to taxable supplies of goods and services under the applicable VAT rules.
+- It is not the same thing as Company Income Tax, PAYE, or Withholding Tax.
+- The correct VAT treatment depends on the exact supply, the taxpayer profile, and the rule that applies to that transaction.
+
+Practical rule:
+- Do not assume every business receipt automatically carries VAT.
+- First confirm whether the exact supply is taxable, exempt, or zero-rated before charging or filing VAT on it.
+
+What to do next:
+1. Ask whether your business or transaction should comply with VAT.
+2. Ask how to register for VAT if the registration rule applies.
+3. Ask how to file or pay VAT for the relevant period.
+""",
+        "vat_basic",
+        "VAT Definition",
+    )
+
+
+def compose_vat_obligation() -> Dict:
+    return _answer(
+        """
+A person or business generally has to comply with VAT when it makes taxable supplies of goods or services under the applicable VAT rules.
+
+Who this usually affects:
+- businesses making taxable supplies that fall within the VAT system
+- taxpayers that must register, charge VAT where applicable, file VAT returns, and pay the VAT due through the approved federal channel
+
+Practical rule:
+- Do not decide VAT compliance based only on the fact that a business is operating.
+- First confirm whether the exact goods, services, or transactions are taxable under the current VAT rule, then follow the registration, invoicing, filing, and payment obligations that apply.
+
+What to do next:
+1. Ask whether the exact supply is taxable, exempt, or zero-rated.
+2. Ask how to register for VAT if the taxpayer falls within the registration rule.
+3. Ask what VAT records and invoices should be kept for compliance.
+""",
+        "vat_obligation",
+        "VAT Obligation",
+    )
 
 
 def compose_vat_registration_process() -> Dict:
@@ -562,6 +558,80 @@ After payment:
 """,
         "vat_payment_process",
         "VAT Payment Process",
+    )
+
+
+def compose_vat_records() -> Dict:
+    return _answer(
+        """
+Keep the sales, invoice, tax-computation, filing, and payment records that support your VAT position for each relevant period.
+
+Records you should normally keep:
+- sales records and transaction schedules for taxable, exempt, or zero-rated supplies
+- tax invoices and any supporting commercial documents tied to the supply
+- VAT computation schedules showing output VAT, input VAT where relevant, and the amount reported
+- filed VAT return, acknowledgement, or portal confirmation
+- payment receipt or other official evidence supporting the VAT settlement for the same period
+
+Practical rule:
+- Keep records in a form that lets you trace the underlying transaction, the VAT treatment applied, the return filed, and any payment made for that same period.
+- Where the taxpayer treats a supply as exempt or zero-rated, keep the records that support that treatment.
+
+What to do next:
+1. Ask how to file VAT for the relevant period.
+2. Ask how to pay VAT once the amount due is confirmed.
+3. Ask whether the exact supply is taxable, exempt, or zero-rated.
+""",
+        "vat_records",
+        "VAT Records",
+    )
+
+
+def compose_vat_zero_rated() -> Dict:
+    return _answer(
+        """
+A zero-rated VAT treatment means the supply is treated under a VAT rule that applies a zero rate rather than the standard charge.
+
+What this usually means:
+- The supply is not treated the same way as a standard-rated taxable supply.
+- It is also not automatically the same thing as an exempt supply.
+- The taxpayer should confirm that the exact transaction falls within a valid zero-rated category before using that treatment.
+
+Practical rule:
+- Do not label a supply zero-rated just because no VAT is being charged in practice.
+- First confirm that the law and current guidance place that exact supply in a zero-rated category, then keep the records supporting that treatment.
+
+What to do next:
+1. Ask whether your exact supply is zero-rated or exempt.
+2. Ask what records should support a zero-rated VAT treatment.
+3. Ask how that supply should be shown in the VAT records or return.
+""",
+        "vat_zero_rated",
+        "Zero-Rated VAT",
+    )
+
+
+def compose_vat_exemption() -> Dict:
+    return _answer(
+        """
+A VAT-exempt treatment means the supply falls into a category that is not charged to VAT under the applicable VAT rule.
+
+What this usually means:
+- An exempt supply is not handled the same way as a standard-rated taxable supply.
+- It is also not automatically the same thing as a zero-rated supply.
+- The correct treatment depends on the exact nature of the goods, services, or transaction involved.
+
+Practical rule:
+- Do not treat a supply as VAT-exempt without first confirming that the rule clearly puts that supply into an exempt category.
+- Keep the records that support why the exempt treatment was used.
+
+What to do next:
+1. Ask whether your exact supply is taxable, exempt, or zero-rated.
+2. Ask what records should support the exempt treatment.
+3. Ask how the supply should be reflected in the VAT return or compliance records.
+""",
+        "vat_exemption",
+        "VAT Exemption",
     )
 
 
@@ -1013,6 +1083,52 @@ What to do next:
     )
 
 
+# -------------------------------------------------
+# General process answers
+# -------------------------------------------------
+
+
+def compose_tax_payment_process() -> Dict:
+    return _answer(
+        """
+To pay tax in Nigeria, use this general flow:
+
+1. Identify the exact tax type involved.
+2. Confirm the correct tax authority.
+3. Make sure your registration details are in place, especially your TIN where required.
+4. Confirm the payment basis and the amount due.
+5. Generate or confirm the payment reference where the authority requires one.
+6. Pay through the approved portal, bank channel, or payment platform accepted by the authority.
+7. Keep the payment receipt and filing evidence for your records.
+
+The exact payment process differs by tax type and authority, so confirm the applicable portal or payment channel before making payment.
+""",
+        "tax_payment_process",
+        "General Nigerian Tax Payment Process",
+    )
+
+
+def compose_tax_filing_process() -> Dict:
+    return _answer(
+        """
+To file tax in Nigeria, use this general process:
+
+1. Confirm the exact tax type and filing period involved.
+2. Confirm whether the filing is for an individual, an employer, or a company.
+3. Confirm the correct tax authority.
+4. Gather the records needed for the filing period.
+5. Compute the figures correctly before submitting.
+6. Use the official filing portal or approved filing channel.
+7. Submit the return and keep proof of filing.
+8. Where tax is payable, complete payment and keep the receipt together with the filed return evidence.
+
+If the tax type is specific, such as VAT, PAYE, WHT, or Company Income Tax, the filing process should be tailored to that tax rather than treated as a generic filing question.
+""",
+        "tax_filing_process",
+        "General Tax Filing Process",
+    )
+
+
 PROCESS_MAP = {
     "tax_payment_process": compose_tax_payment_process,
     "tax_filing_process": compose_tax_filing_process,
@@ -1103,6 +1219,58 @@ def try_compose(
         "what registration details may be required",
     ):
         return compose_tin_documents()
+
+    # -----------------------------
+    # Direct VAT questions
+    # -----------------------------
+    if _mentions_any(
+        q,
+        "what is vat",
+        "meaning of vat",
+        "define vat",
+        "what does vat mean",
+        "what is value added tax",
+    ):
+        return compose_vat_basic()
+
+    if _mentions_any(
+        q,
+        "who must comply with vat",
+        "who should comply with vat",
+        "who should register for vat",
+        "who needs to register for vat",
+        "does my business need vat",
+        "who pays vat",
+    ):
+        return compose_vat_obligation()
+
+    if _mentions_any(
+        q,
+        "what records should i keep for vat",
+        "vat records",
+        "records for vat",
+        "keep records for vat",
+    ):
+        return compose_vat_records()
+
+    if _mentions_any(
+        q,
+        "what is zero rated vat",
+        "what is zero rated value added tax",
+        "zero rated vat",
+        "zero rated supply",
+    ):
+        return compose_vat_zero_rated()
+
+    if _mentions_any(
+        q,
+        "what is vat exemption",
+        "what is exempt vat",
+        "vat exempt",
+        "vat exemption",
+        "exempt supply",
+    ):
+        return compose_vat_exemption()
 
     # -----------------------------
     # Direct PAYE questions
@@ -1266,6 +1434,8 @@ def try_compose(
             return compose_vat_filing_process()
         if action == "pay":
             return compose_vat_payment_process()
+        if action == "records":
+            return compose_vat_records()
 
     if _topic_in(topic_key, *TOPIC_ALIASES["paye"]) or _mentions_any(q, *TOPIC_ALIASES["paye"]):
         if action == "pay":
@@ -1318,13 +1488,16 @@ __all__ = [
     "compose_company_income_tax_authority",
     "compose_tin_basic",
     "compose_tin_documents",
-    "compose_tax_payment_process",
-    "compose_tax_filing_process",
     "compose_tin_registration",
     "compose_tin_verification",
+    "compose_vat_basic",
+    "compose_vat_obligation",
     "compose_vat_registration_process",
     "compose_vat_filing_process",
     "compose_vat_payment_process",
+    "compose_vat_records",
+    "compose_vat_zero_rated",
+    "compose_vat_exemption",
     "compose_paye_basic",
     "compose_paye_obligation",
     "compose_paye_records",
@@ -1342,6 +1515,8 @@ __all__ = [
     "compose_company_income_tax_filing",
     "compose_company_income_tax_payment",
     "compose_company_income_tax_records",
+    "compose_tax_payment_process",
+    "compose_tax_filing_process",
     "PROCESS_MAP",
     "try_compose",
 ]
