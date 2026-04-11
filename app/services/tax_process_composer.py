@@ -10,8 +10,6 @@ ACTION_PATTERNS = {
         r"\bverification\b",
         r"\bvalidate\b",
         r"\bvalidation\b",
-        r"\bconfirm\b",
-        r"\bcheck\b",
         r"\bauthentic(?:ity)?\b",
         r"\bgenuine\b",
         r"\bstatus\b",
@@ -46,6 +44,17 @@ ACTION_PATTERNS = {
         r"\bdeduct\b",
         r"\bdeduction\b",
         r"\bwithhold\b",
+        r"\bwithholding\b",
+    ],
+    "rate": [
+        r"\brate\b",
+        r"\bpercentage\b",
+    ],
+    "records": [
+        r"\brecords\b",
+        r"\brecord\b",
+        r"\bpayroll records\b",
+        r"\bkeep\b.*\brecord",
     ],
 }
 
@@ -58,12 +67,29 @@ def _normalize(text: Optional[str]) -> str:
     return raw.strip()
 
 
+def _mentions_any(text: str, *terms: str) -> bool:
+    value = _normalize(text)
+    return any(_normalize(term) in value for term in terms if term)
+
+
 def _detect_action(question: Optional[str]) -> Optional[str]:
     q = _normalize(question)
     if not q:
         return None
-    for action, patterns in ACTION_PATTERNS.items():
-        for pattern in patterns:
+
+    priority_order = [
+        "verify",
+        "apply",
+        "register",
+        "file",
+        "pay",
+        "records",
+        "rate",
+        "deduct",
+    ]
+
+    for action in priority_order:
+        for pattern in ACTION_PATTERNS[action]:
             if re.search(pattern, q):
                 return action
     return None
@@ -75,204 +101,309 @@ def _topic_in(topic: Optional[str], *aliases: str) -> bool:
     return bool(value and value in alias_set)
 
 
-def _mentions_any(text: Optional[str], *patterns: str) -> bool:
-    q = _normalize(text)
-    return any(re.search(pattern, q) for pattern in patterns)
+def _answer(answer: str, intent_type: str, source_label: str) -> Dict:
+    return {
+        "ok": True,
+        "answer": answer.strip(),
+        "meta": {
+            "intent_type": intent_type,
+            "answer_mode": "process",
+            "source_type": "process_composer",
+            "source_label": source_label,
+            "grounded": True,
+        },
+    }
 
 
-def _is_records_question(question: Optional[str]) -> bool:
-    return _mentions_any(
-        question,
-        r"\brecords?\b",
-        r"\bdocumentation\b",
-        r"\bwhat should i keep\b",
-        r"\bkeep .*record\b",
-        r"\bevidence\b",
-        r"\bschedule\b",
+# ------------------------
+# Authority routing answers
+# ------------------------
+
+
+def compose_personal_income_tax_authority() -> Dict:
+    return _answer(
+        """
+The relevant State Internal Revenue Service usually handles Personal Income Tax for individuals in the state that has the taxing right in the case.
+
+What this usually means:
+- Personal Income Tax is generally handled on the state side.
+- The correct state authority should be confirmed before filing, paying, or asking for a personal-income-tax compliance document.
+
+Practical rule:
+- Do not route a personal-income-tax question to the federal company-income-tax channel just because the taxpayer works for a company.
+- First confirm that the issue is about an individual's income tax, then use the relevant state tax authority channel.
+
+What to do next:
+1. Ask which state authority should receive the personal income tax in your case.
+2. Ask whether the issue is about PAYE or another personal-income-tax matter.
+3. Ask which portal or filing channel that state authority uses.
+
+Source: current official Nigerian tax-administration structure for personal income tax at state level and the relevant State Internal Revenue Service channel for the taxpayer's case.
+""",
+        "personal_income_tax_authority",
+        "Personal Income Tax Authority Routing",
     )
 
 
-def _is_payroll_records_context(question: Optional[str]) -> bool:
-    return _mentions_any(
-        question,
-        r"\bpayroll\b",
-        r"\bpaye\b",
-    ) and _is_records_question(question)
+def compose_paye_authority() -> Dict:
+    return _answer(
+        """
+PAYE is usually handled by the relevant State Internal Revenue Service, not by the federal company-income-tax channel.
 
+What this usually means:
+- PAYE is part of personal income tax administered through payroll deduction.
+- The employer should use the state tax authority that has the right to receive the employee-related PAYE filing and remittance.
 
+Practical rule:
+- If the question is whether FIRS/NRS or a State Internal Revenue Service handles PAYE, start from the state personal-income-tax side.
+- Then confirm the exact state authority that should receive the PAYE return and remittance in the case.
 
+What to do next:
+1. Ask which state authority should receive the PAYE return in your case.
+2. Ask who must deduct PAYE on the payroll involved.
+3. Ask which state portal or remittance channel should be used.
 
-def _is_withholding_definition_question(question: Optional[str]) -> bool:
-    return _mentions_any(
-        question,
-        r"\bwhat is withholding tax\b",
-        r"\bwhat is wht\b",
-        r"\bmeaning of withholding tax\b",
-        r"\bdefine withholding tax\b",
-        r"\bwhat does withholding tax mean\b",
-        r"\bwhat does wht mean\b",
+Source: current official state-level PAYE administration structure and the relevant State Internal Revenue Service filing and remittance channel.
+""",
+        "paye_authority",
+        "PAYE Authority Routing",
     )
 
 
-def _is_withholding_deductor_question(question: Optional[str]) -> bool:
-    return _mentions_any(
-        question,
-        r"\bwho must deduct withholding tax\b",
-        r"\bwho deducts withholding tax\b",
-        r"\bwho should deduct withholding tax\b",
-        r"\bwho deducts wht\b",
-        r"\bwho must deduct wht\b",
-        r"\bwho is responsible for withholding tax\b",
+def compose_vat_authority() -> Dict:
+    return _answer(
+        """
+VAT is handled through the federal tax authority channel, currently the Nigeria Revenue Service / former FIRS VAT administration channel and its approved service portals.
+
+What this usually means:
+- VAT registration, filing, payment, and federal VAT administration should be routed through the approved federal VAT channel.
+- The taxpayer should use the official federal portal or self-service channel that supports the VAT profile and transaction involved.
+
+Practical rule:
+- Do not route a VAT question to a state personal-income-tax portal just because the same business also deals with state taxes.
+- First confirm that the question is about VAT, then use the federal VAT administration channel.
+
+What to do next:
+1. Ask which federal portal should be used for VAT in your case.
+2. Ask how to register, file, or pay VAT after confirming the channel.
+3. Ask whether the exact supply is taxable, exempt, or zero-rated before charging VAT.
+
+Source: current official Nigeria Revenue Service / former FIRS VAT administration structure and approved federal VAT portal channels.
+""",
+        "vat_authority",
+        "VAT Authority Routing",
     )
 
 
-def _is_withholding_rate_question(question: Optional[str]) -> bool:
-    return _mentions_any(
-        question,
-        r"\bwithholding tax rate\b",
-        r"\bwht rate\b",
-        r"\brate of withholding tax\b",
-        r"\bpercentage of withholding tax\b",
-        r"\bhow much is withholding tax\b",
+def compose_tcc_authority() -> Dict:
+    return _answer(
+        """
+The Tax Clearance Certificate should be issued by the tax authority that administers the taxpayer's relevant tax record for the case.
+
+What this usually means:
+- For many personal income tax cases, the relevant State Internal Revenue Service is the issuing authority.
+- For relevant federal cases, the approved Nigeria Revenue Service / former FIRS TCC eServices channel is used.
+
+Practical rule:
+- Do not assume every TCC must come from only one authority.
+- First confirm whether the taxpayer's case is being handled on the state personal-income-tax side or on the relevant federal side, then use the issuing authority's TCC portal or eServices channel.
+
+What to do next:
+1. Ask which authority should issue the TCC in your case.
+2. Ask how to apply for the TCC on that authority's approved portal.
+3. Ask how to verify the issued TCC before using it.
+
+Source: current official TCC administration structure, including the approved NRS/FIRS TCC eServices channel and the relevant State Internal Revenue Service route for state-side cases.
+""",
+        "tcc_authority",
+        "TCC Authority Routing",
     )
 
 
-def _is_withholding_deduction_process_question(question: Optional[str], action: Optional[str]) -> bool:
-    return _mentions_any(
-        question,
-        r"\bhow do i deduct withholding tax\b",
-        r"\bhow to deduct withholding tax\b",
-        r"\bhow do i deduct wht\b",
-        r"\bhow to deduct wht\b",
-        r"\bwithholding tax deduction\b",
-        r"\bdeduction steps?\b",
-    ) or (
-        action == "deduct"
-        and not _is_withholding_definition_question(question)
-        and not _is_withholding_deductor_question(question)
-        and not _is_withholding_rate_question(question)
+def compose_withholding_tax_authority() -> Dict:
+    return _answer(
+        """
+The tax authority that should receive Withholding Tax depends on the payment category and the authority that administers that withholding obligation in the case.
+
+What this usually means:
+- You should not assume that every WHT remittance goes to one universal channel.
+- First identify the exact payment type, the payer/recipient context, and the current rule that applies to that withholding category.
+
+Practical rule:
+- Confirm the exact withholding category first.
+- Then use the approved channel of the tax authority that receives that specific WHT deduction for the payment involved.
+
+What to do next:
+1. Ask whether the exact payment in your case should attract WHT at all.
+2. Ask what rate applies to that payment category.
+3. Ask how to remit the WHT once the receiving authority is confirmed.
+
+Source: current official withholding-tax administration guidance and the approved remittance channel of the authority that receives the deduction for the payment category involved.
+""",
+        "withholding_tax_authority",
+        "Withholding Tax Authority Routing",
     )
 
 
-def _is_withholding_remittance_process_question(question: Optional[str], action: Optional[str]) -> bool:
-    return _mentions_any(
-        question,
-        r"\bhow do i remit withholding tax\b",
-        r"\bhow to remit withholding tax\b",
-        r"\bhow do i remit wht\b",
-        r"\bhow to remit wht\b",
-        r"\bwithholding tax remittance\b",
-        r"\bremit wht\b",
-    ) or action in {"pay", "file"}
+def compose_company_income_tax_authority() -> Dict:
+    return _answer(
+        """
+Company Income Tax is handled through the federal tax authority channel, currently the Nigeria Revenue Service / former FIRS company-income-tax administration channel.
 
+What this usually means:
+- CIT filing, payment, and core company-income-tax administration are handled on the federal side.
+- The company should use the approved federal filing and payment channel for the relevant accounting period.
 
+Practical rule:
+- Do not route a Company Income Tax question to a state personal-income-tax or PAYE channel.
+- First confirm that the taxpayer is a company and the issue is about company profits, then use the approved federal CIT channel.
 
-def _is_company_income_tax_topic(question: Optional[str]) -> bool:
-    return _mentions_any(
-        question,
-        r"\bcompany income tax\b",
-        r"\bcompanies income tax\b",
-        r"\bcit\b",
-        r"\bcita\b",
+What to do next:
+1. Ask what Company Income Tax rate rule applies to the company category in your case.
+2. Ask how to file Company Income Tax for the relevant period.
+3. Ask how to pay Company Income Tax through the approved federal channel.
+
+Source: current official Nigeria Revenue Service / former FIRS company-income-tax administration structure and approved federal CIT filing and payment channels.
+""",
+        "company_income_tax_authority",
+        "Company Income Tax Authority Routing",
     )
 
 
-def _is_company_income_tax_definition_question(question: Optional[str]) -> bool:
-    return _mentions_any(
-        question,
-        r"\bwhat is company income tax\b",
-        r"\bwhat is companies income tax\b",
-        r"\bwhat is cit\b",
-        r"\bmeaning of company income tax\b",
-        r"\bdefine company income tax\b",
-        r"\bwhat does cit mean\b",
-    )
+# ------------------------
+# Existing process answers
+# ------------------------
 
-
-def _is_company_income_tax_payer_question(question: Optional[str]) -> bool:
-    return _mentions_any(
-        question,
-        r"\bwho pays company income tax\b",
-        r"\bwho must pay company income tax\b",
-        r"\bwho should pay company income tax\b",
-        r"\bwho pays cit\b",
-        r"\bwho must pay cit\b",
-        r"\bwhich companies pay company income tax\b",
-        r"\bdoes my company pay company income tax\b",
-        r"\bdoes my company pay cit\b",
-        r"\bwho is liable for company income tax\b",
-    )
-
-
-def _is_company_income_tax_rate_question(question: Optional[str]) -> bool:
-    return _mentions_any(
-        question,
-        r"\bcompany income tax rate\b",
-        r"\bcit rate\b",
-        r"\brate of company income tax\b",
-        r"\bpercentage of company income tax\b",
-        r"\bhow much is company income tax\b",
-    )
 
 def compose_tax_payment_process() -> Dict:
-    answer = """
+    return _answer(
+        """
 To pay tax in Nigeria, use this general flow:
 
 1. Identify the exact tax type involved.
+   - Personal Income Tax
+   - Company Income Tax
+   - Value Added Tax
+   - Withholding Tax
+   - PAYE
+
 2. Confirm the correct tax authority.
-3. Make sure your registration details are in place, especially your TIN.
-4. Confirm the payment basis and the amount due.
+   - Federal taxes such as VAT and Company Income Tax are handled through the approved federal tax channel.
+   - State Internal Revenue Services usually handle Personal Income Tax and PAYE matters for the relevant state case.
+
+3. Make sure your registration details are in place, especially your TIN or tax profile details where applicable.
+
+4. Confirm the payment basis:
+   - self-assessment
+   - official assessment
+   - deducted tax such as PAYE or withholding
+
 5. Generate or confirm the payment reference where the authority requires one.
-6. Pay through the approved portal, bank channel, or payment platform accepted by the authority.
+
+6. Pay through an approved method such as:
+   - official tax portal
+   - approved bank channel
+   - approved payment platform where applicable
+
 7. Keep the payment receipt and filing evidence for your records.
-""".strip()
-    return {"ok": True, "answer": answer, "meta": {"intent_type": "tax_payment_process", "answer_mode": "process", "source_type": "process_composer", "source_label": "General Nigerian Tax Payment Process", "grounded": True}}
+
+The exact payment process can differ by tax type and tax authority, so verify the applicable portal or payment channel before making payment.
+""",
+        "tax_payment_process",
+        "General Nigerian Tax Payment Process",
+    )
 
 
 def compose_tin_registration() -> Dict:
-    answer = """
+    return _answer(
+        """
 To get or register for a TIN in Nigeria:
 
-1. Confirm whether you need a personal or business registration path.
-2. Gather the core identity and business details required.
+1. Confirm whether you need an individual or business registration path.
+2. Gather the core details normally required for registration.
 3. Use the relevant official tax authority registration channel.
-4. Complete the registration form carefully.
+4. Complete the registration form carefully so the details match your identity or business records.
 5. Submit the registration and keep the acknowledgement.
-6. Confirm that the TIN has been issued correctly and keep it safely.
-""".strip()
-    return {"ok": True, "answer": answer, "meta": {"intent_type": "tin_registration", "answer_mode": "process", "source_type": "process_composer", "source_label": "TIN Registration Process", "grounded": True}}
+6. Once processed, confirm that the TIN has been issued correctly and keep it safely for filing, payment, and compliance use.
+
+If you already registered but do not know your TIN, use the authority's recovery or verification process instead of creating a duplicate record.
+""",
+        "tin_registration",
+        "TIN Registration Process",
+    )
 
 
 def compose_tin_verification() -> Dict:
-    answer = """
+    return _answer(
+        """
 To verify a TIN in Nigeria:
 
 1. Use the official tax authority channel that issued or manages the TIN.
 2. Open the TIN verification or taxpayer search option where available.
-3. Enter the TIN exactly as issued.
+3. Enter the TIN exactly as issued. If the portal allows it, you can also confirm using the taxpayer or business name.
 4. Check that the returned taxpayer details match the correct person or business.
-5. Keep a screenshot or confirmation page where available.
-""".strip()
-    return {"ok": True, "answer": answer, "meta": {"intent_type": "tin_verification", "answer_mode": "process", "source_type": "process_composer", "source_label": "TIN Verification Process", "grounded": True}}
+5. If the TIN does not validate or the details do not match, contact the issuing tax authority before using it for filing, payment, or compliance work.
+
+Keep a screenshot or confirmation page where available for your records.
+""",
+        "tin_verification",
+        "TIN Verification Process",
+    )
 
 
 def compose_tax_filing_process() -> Dict:
-    answer = """
+    return _answer(
+        """
 To file tax in Nigeria, use this general process:
 
 1. Confirm the exact tax type and filing period involved.
-2. Confirm the correct tax authority.
-3. Gather the records needed for the filing period.
-4. Compute the figures correctly before submitting.
-5. Use the official filing portal or approved filing channel.
-6. Submit the return and keep proof of filing.
-7. Where tax is payable, complete payment and keep the receipt.
-""".strip()
-    return {"ok": True, "answer": answer, "meta": {"intent_type": "tax_filing_process", "answer_mode": "process", "source_type": "process_composer", "source_label": "General Tax Filing Process", "grounded": True}}
+2. Confirm whether the filing is for an individual, an employer, or a company.
+3. Confirm the correct tax authority.
+4. Gather the records needed for the filing period.
+5. Compute the figures correctly before submitting.
+6. Use the official filing portal or approved filing channel.
+7. Submit the return and keep proof of filing.
+8. Where tax is payable, complete payment and keep the receipt together with the filed return evidence.
+
+If the tax type is specific, such as VAT, PAYE, WHT, or Company Income Tax, the filing process should be tailored to that tax rather than treated as a generic filing question.
+""",
+        "tax_filing_process",
+        "General Tax Filing Process",
+    )
+
+
+def compose_vat_registration_process() -> Dict:
+    return _answer(
+        """
+Register for VAT through the approved registration channel of the relevant federal tax authority once your business falls within the scope of VAT registration.
+
+Before registration:
+- Confirm that the business activity falls within the applicable VAT registration rules.
+- Prepare the business details and TIN required for registration.
+
+Registration steps:
+1. Provide the required taxpayer and business information accurately.
+2. Complete any activation or confirmation step required by the authority.
+3. Keep the acknowledgement and any confirmation notice or certificate issued.
+
+After registration:
+- Make sure your invoicing, record-keeping, filing, and payment process are aligned with VAT compliance.
+
+What to do next:
+1. Ask whether your business must charge VAT.
+2. Ask how to file VAT after registration.
+3. Ask what invoices and records should support VAT compliance.
+
+Source: official federal VAT registration and compliance channel of the relevant tax authority.
+""",
+        "vat_registration_process",
+        "VAT Registration Process",
+    )
 
 
 def compose_vat_filing_process() -> Dict:
-    answer = """
+    return _answer(
+        """
 File VAT through the approved VAT filing channel for the relevant tax authority and filing period.
 
 Before filing:
@@ -291,91 +422,51 @@ What to do next:
 3. Ask what records you should keep for VAT compliance.
 
 Source: official VAT registration, filing, payment, and compliance channel of the relevant tax authority.
-""".strip()
-    return {"ok": True, "answer": answer, "meta": {"intent_type": "vat_filing_process", "answer_mode": "process", "source_type": "process_composer", "source_label": "VAT Filing Process", "grounded": True}}
-
-
-def compose_vat_registration_process() -> Dict:
-    answer = """
-Register for VAT through the approved registration channel of the relevant tax authority once your business falls within the scope of VAT registration.
-
-Before registration:
-- Confirm that your business activity falls within the applicable VAT registration rules.
-- Prepare the business details and TIN required for registration.
-
-Registration steps:
-1. Provide the required taxpayer and business information accurately.
-2. Complete any activation or confirmation step required by the authority.
-3. Keep the acknowledgement and any confirmation notice or certificate issued.
-
-After registration:
-- Make sure your invoicing, record-keeping, filing, and payment process are aligned with VAT compliance.
-
-What to do next:
-1. Ask whether your business must charge VAT.
-2. Ask how to file VAT after registration.
-3. Ask what invoices and records should support VAT compliance.
-
-Source: official VAT registration and compliance channel of the relevant tax authority.
-""".strip()
-    return {"ok": True, "answer": answer, "meta": {"intent_type": "vat_registration_process", "answer_mode": "process", "source_type": "process_composer", "source_label": "VAT Registration Process", "grounded": True}}
+""",
+        "vat_filing_process",
+        "VAT Filing Process",
+    )
 
 
 def compose_paye_remittance_process() -> Dict:
-    answer = """
-File and remit PAYE through the approved channel of the relevant State Internal Revenue Service for the payroll period involved.
+    return _answer(
+        """
+Handle PAYE remittance through the relevant State Internal Revenue Service channel for the payroll period involved.
 
-Before filing or remittance:
+Before remittance:
 - Confirm the employees and payroll period involved.
-- Compute PAYE correctly for each employee.
-- Prepare the payroll schedule and deduction records.
+- Compute PAYE correctly for each employee based on the applicable rules.
+- Prepare the payroll schedule and supporting deduction records.
 
-Process steps:
-1. Submit the required PAYE return or schedule where required.
-2. Remit the PAYE amount through the approved payment channel.
-3. Keep proof of filing, proof of remittance, and payroll records.
+Remittance steps:
+1. Use the correct state tax authority channel for PAYE filing and remittance.
+2. Submit the required PAYE schedule or return where required.
+3. Remit the PAYE amount through the approved payment channel.
+4. Keep proof of filing, proof of remittance, and payroll deduction records.
 
 What to do next:
 1. Ask who should deduct PAYE in your case.
-2. Ask what payroll records should be kept for PAYE.
-3. Ask what state tax authority should receive the PAYE return.
+2. Ask what records should be kept for PAYE.
+3. Ask which state authority should receive the PAYE return.
 
-Source: current official State Internal Revenue Service PAYE filing and remittance channel.
-""".strip()
-    return {"ok": True, "answer": answer, "meta": {"intent_type": "paye_remittance_process", "answer_mode": "process", "source_type": "process_composer", "source_label": "PAYE Filing and Remittance Process", "grounded": True}}
-
-
-def compose_paye_records() -> Dict:
-    answer = """
-Keep the payroll and deduction records that support PAYE computation, filing, and remittance for each payroll period.
-
-Records you should normally keep:
-- payroll register or payroll schedule for the period
-- employee pay details showing gross pay, deductions, and net pay
-- PAYE computation support for each employee where applicable
-- PAYE return or schedule submitted to the relevant State Internal Revenue Service
-- payment receipt, remittance acknowledgement, or portal confirmation
-
-Practical rule:
-- Keep records in a way that lets you trace the PAYE deducted, the return filed, and the amount remitted for the same payroll period.
-- Where employee details or payroll treatment change, keep the updated records that explain the change.
-
-What to do next:
-1. Ask how to file or remit PAYE after deduction.
-2. Ask who should deduct PAYE in your case.
-3. Ask what to do if payroll records do not match the PAYE return.
-
-Source: current official State Internal Revenue Service PAYE guidance, employer payroll compliance rules, and the official PAYE filing and remittance channel of the relevant state tax authority.
-""".strip()
-    return {"ok": True, "answer": answer, "meta": {"intent_type": "paye_records", "answer_mode": "process", "source_type": "process_composer", "source_label": "PAYE Records", "grounded": True}}
+Source: official PAYE filing and remittance channel of the relevant State Internal Revenue Service.
+""",
+        "paye_remittance_process",
+        "PAYE Remittance Process",
+    )
 
 
 def compose_tcc_application() -> Dict:
-    answer = """
+    return _answer(
+        """
 Apply for a Tax Clearance Certificate through the official portal or eServices channel of the tax authority that manages your tax record.
 
+Where to apply:
+- For many personal income tax cases, the application is usually handled by the relevant State Internal Revenue Service.
+- For relevant federal cases, use the appropriate federal TCC channel.
+
 Before you apply:
-- Make sure the TIN is active.
+- Make sure the TIN or profile is active.
 - File any outstanding returns that should already have been submitted.
 - Settle or regularize unpaid liabilities where due.
 - Make sure the taxpayer profile details match the correct person or business.
@@ -389,16 +480,19 @@ Application steps:
 
 What to do next:
 1. Verify the issued TCC on the same authority's portal before using it.
-2. Confirm which tax authority should issue your TCC in your case.
+2. Confirm which authority should issue your TCC in your case.
 3. Check what a TCC is commonly used for in practice.
 
-Source: official State Internal Revenue Service or FIRS portal/eServices channel that handles TCC issuance or verification.
-""".strip()
-    return {"ok": True, "answer": answer, "meta": {"intent_type": "tcc_application", "answer_mode": "process", "source_type": "process_composer", "source_label": "TCC Application Process", "grounded": True}}
+Source: official State Internal Revenue Service or federal TCC portal/eServices channel that handles TCC issuance or verification.
+""",
+        "tcc_application",
+        "TCC Application Process",
+    )
 
 
 def compose_tcc_verification() -> Dict:
-    answer = """
+    return _answer(
+        """
 Verify the TCC on the official portal or eServices channel of the tax authority that issued it.
 
 Where to verify:
@@ -423,80 +517,16 @@ What to do next:
 2. Check what a TCC is commonly used for in practice.
 3. Ask what to do when a portal shows no match or invalid status.
 
-Source: official State Internal Revenue Service or FIRS portal/eServices channel that handles TCC issuance or verification.
-""".strip()
-    return {"ok": True, "answer": answer, "meta": {"intent_type": "tcc_verification", "answer_mode": "process", "source_type": "process_composer", "source_label": "TCC Verification Process", "grounded": True}}
+Source: official State Internal Revenue Service or federal TCC portal/eServices channel that handles TCC issuance or verification.
+""",
+        "tcc_verification",
+        "TCC Verification Process",
+    )
 
 
-
-
-def compose_withholding_tax_definition() -> Dict:
-    answer = """
-Withholding Tax (WHT) in Nigeria is a tax deduction taken at source from certain qualifying payments and then remitted to the relevant tax authority on behalf of the recipient.
-
-What it is:
-- WHT usually works as a deduction-and-remittance mechanism linked to the underlying income tax system.
-- It is not one single flat rule for every payment type.
-- The exact treatment depends on the nature of the payment, the recipient, and the rule that applies to that payment category.
-
-Practical rule:
-- First identify the exact payment type before deciding whether WHT applies, who should deduct it, and what rate should be used.
-
-What to do next:
-1. Ask whether the exact payment in your case should attract WHT.
-2. Ask who should deduct WHT for that payment.
-3. Ask what rate applies to that payment category.
-
-Source: current official withholding-tax deduction, remittance, and credit-treatment guidance of the relevant tax authority.
-""".strip()
-    return {"ok": True, "answer": answer, "meta": {"intent_type": "withholding_tax_definition", "answer_mode": "process", "source_type": "process_composer", "source_label": "Withholding Tax Basics", "grounded": True}}
-
-
-def compose_withholding_tax_deductor_rule() -> Dict:
-    answer = """
-The payer is usually the party that must deduct Withholding Tax when making a payment that falls within a withholding category under the applicable rule.
-
-Who this usually affects:
-- businesses, organizations, or other payers making qualifying payments
-- payers who must deduct the WHT before paying the net amount to the recipient
-
-Practical rule:
-- Do not deduct WHT only because a payment is business-related.
-- First confirm that the exact payment category is one that attracts WHT.
-- Then confirm the correct rate and the correct authority that should receive the remittance.
-
-What to do next:
-1. Ask whether the exact payment in your case attracts WHT.
-2. Ask what rate applies to that payment category.
-3. Ask how to remit WHT after deduction.
-
-Source: current official withholding-tax deduction and remittance guidance for qualifying payments.
-""".strip()
-    return {"ok": True, "answer": answer, "meta": {"intent_type": "withholding_tax_deductor_rule", "answer_mode": "process", "source_type": "process_composer", "source_label": "Who Deducts Withholding Tax", "grounded": True}}
-
-
-def compose_withholding_tax_rate_rule() -> Dict:
-    answer = """
-There is no single universal Withholding Tax rate for every payment in Nigeria. The applicable rate depends on the exact payment category, the recipient, and the current rule in force.
-
-Important note:
-- Do not apply one general WHT rate across all contracts, services, rents, interest, dividends, commissions, or similar payments.
-- The correct rate must be confirmed against the exact payment type and the current applicable guidance.
-
-Practical rule:
-- Identify the exact nature of the payment first, then confirm the current WHT rate for that specific category before deduction.
-
-What to do next:
-1. Ask what rate applies to your exact payment type.
-2. Ask whether that payment should attract WHT at all.
-3. Ask how to remit WHT once the deduction is made.
-
-Source: current official withholding-tax schedules and payment-category guidance of the relevant tax authority.
-""".strip()
-    return {"ok": True, "answer": answer, "meta": {"intent_type": "withholding_tax_rate_rule", "answer_mode": "process", "source_type": "process_composer", "source_label": "Withholding Tax Rate Basics", "grounded": True}}
-
-def compose_withholding_tax_deduction_process() -> Dict:
-    answer = """
+def compose_withholding_tax_deduction() -> Dict:
+    return _answer(
+        """
 Deduct Withholding Tax only after confirming that the exact payment you are making falls within a withholding category under the applicable rule.
 
 Before deduction:
@@ -515,13 +545,16 @@ What to do next:
 2. Ask what rate applies to the exact payment type.
 3. Ask what records and credit-support evidence should be kept.
 
-Source: current official withholding-tax deduction and payment-category guidance.
-""".strip()
-    return {"ok": True, "answer": answer, "meta": {"intent_type": "withholding_tax_deduction_process", "answer_mode": "process", "source_type": "process_composer", "source_label": "Withholding Tax Deduction Process", "grounded": True}}
+Source: current official withholding-tax deduction and remittance guidance for qualifying payments.
+""",
+        "withholding_tax_deduction",
+        "Withholding Tax Deduction Process",
+    )
 
 
-def compose_withholding_tax_remittance_process() -> Dict:
-    answer = """
+def compose_withholding_tax_remittance() -> Dict:
+    return _answer(
+        """
 Remit Withholding Tax through the approved channel of the tax authority that receives the deduction for the payment category involved.
 
 Before remittance:
@@ -540,103 +573,17 @@ What to do next:
 2. Ask what evidence the recipient should receive for tax-credit purposes.
 3. Ask whether the exact payment in your case should attract WHT at all.
 
-Source: current official withholding-tax remittance and credit-support guidance.
-""".strip()
-    return {"ok": True, "answer": answer, "meta": {"intent_type": "withholding_tax_remittance_process", "answer_mode": "process", "source_type": "process_composer", "source_label": "Withholding Tax Remittance Process", "grounded": True}}
+Source: official withholding-tax remittance and credit-support channel of the relevant tax authority.
+""",
+        "withholding_tax_remittance",
+        "Withholding Tax Remittance Process",
+    )
 
 
-def compose_withholding_tax_records() -> Dict:
-    answer = """
-Keep the payment and deduction records that support Withholding Tax computation, remittance, and credit support for the transaction involved.
-
-Records you should normally keep:
-- contract, invoice, payment instruction, or source document for the transaction
-- gross amount, WHT amount deducted, and net amount paid
-- WHT computation support showing how the deduction was calculated
-- remittance receipt, acknowledgement, or portal confirmation
-- credit note, receipt, or other support given to the recipient where applicable
-
-Practical rule:
-- Keep records in a way that lets you trace the original payment, the WHT deducted, the remittance made, and the evidence that supports the recipient's tax-credit position.
-
-What to do next:
-1. Ask how to remit WHT after deduction.
-2. Ask who should deduct WHT for the payment in your case.
-3. Ask what rate applies to that payment category.
-
-Source: current official withholding-tax deduction, remittance, and tax-credit support guidance.
-""".strip()
-    return {"ok": True, "answer": answer, "meta": {"intent_type": "withholding_tax_records", "answer_mode": "process", "source_type": "process_composer", "source_label": "Withholding Tax Records", "grounded": True}}
-
-
-def compose_company_income_tax_definition() -> Dict:
-    answer = """
-Company Income Tax (CIT) in Nigeria is the tax charged on the taxable profits of companies under the current company-income-tax rules.
-
-What it is:
-- CIT is a company profit tax, not a payroll tax and not the same thing as VAT or withholding tax.
-- The charge is tied to the taxable profit position of the company for the relevant accounting period.
-- The exact treatment depends on the company category, the profit position, and the current rule in force.
-
-Practical rule:
-- First confirm that the taxpayer is a company and that the question is about company profits before applying any CIT rule.
-
-What to do next:
-1. Ask who is expected to pay Company Income Tax in your case.
-2. Ask what Company Income Tax rate applies under the current rule.
-3. Ask how to file or pay Company Income Tax for the relevant period.
-
-Source: current official Federal Inland Revenue Service company-income-tax guidance and the current CIT framework in force.
-""".strip()
-    return {"ok": True, "answer": answer, "meta": {"intent_type": "company_income_tax_definition", "answer_mode": "process", "source_type": "process_composer", "source_label": "Company Income Tax Basics", "grounded": True}}
-
-
-def compose_company_income_tax_payer_rule() -> Dict:
-    answer = """
-Companies that fall within the applicable Company Income Tax charge are the ones expected to pay CIT on their taxable profits for the relevant period.
-
-Who this usually affects:
-- companies carrying on business and earning profits that fall within the current company-income-tax rules
-- companies that must file the required CIT return and settle any CIT due through the approved FIRS channel
-
-Practical rule:
-- First confirm that the taxpayer is being treated as a company under the applicable tax rules.
-- Then confirm whether the company falls within the current CIT charge, what rate rule applies, and what filing obligations follow.
-
-What to do next:
-1. Ask what Company Income Tax rate applies in your case.
-2. Ask how to file Company Income Tax for the relevant accounting period.
-3. Ask what records should support Company Income Tax computation and filing.
-
-Source: current official Federal Inland Revenue Service company-income-tax guidance and filing rules.
-""".strip()
-    return {"ok": True, "answer": answer, "meta": {"intent_type": "company_income_tax_payer_rule", "answer_mode": "process", "source_type": "process_composer", "source_label": "Who Pays Company Income Tax", "grounded": True}}
-
-
-def compose_company_income_tax_rate_rule() -> Dict:
-    answer = """
-The Company Income Tax rate in Nigeria depends on the category the company falls into under the current rule in force. It should be confirmed against the current CIT framework before filing or payment.
-
-Important note:
-- Do not assume there is one flat result for every company without first checking the company category under the current CIT rules.
-- The correct rate treatment should be tied to the company's applicable classification for the relevant period.
-
-Practical rule:
-- Confirm the current category rule that applies to the company first, then use the applicable CIT rate for that category when computing the liability.
-
-What to do next:
-1. Ask which Company Income Tax category applies to the company in your case.
-2. Ask how to file Company Income Tax after confirming the rate rule.
-3. Ask what records should support the Company Income Tax computation.
-
-Source: current official Federal Inland Revenue Service company-income-tax rate guidance and the current CIT framework in force.
-""".strip()
-    return {"ok": True, "answer": answer, "meta": {"intent_type": "company_income_tax_rate_rule", "answer_mode": "process", "source_type": "process_composer", "source_label": "Company Income Tax Rate Basics", "grounded": True}}
-
-
-def compose_company_income_tax_filing_process() -> Dict:
-    answer = """
-File Company Income Tax through the approved Federal Inland Revenue Service channel for the relevant accounting period.
+def compose_company_income_tax_filing() -> Dict:
+    return _answer(
+        """
+File Company Income Tax through the approved Federal Inland Revenue Service / Nigeria Revenue Service channel for the relevant accounting period.
 
 Before filing:
 - Confirm the accounting period involved and the return being prepared.
@@ -654,14 +601,17 @@ What to do next:
 2. Ask what records should support the Company Income Tax computation.
 3. Ask what rate rule applies to the company category in your case.
 
-Source: current official Federal Inland Revenue Service company-income-tax filing channel and return-support guidance.
-""".strip()
-    return {"ok": True, "answer": answer, "meta": {"intent_type": "company_income_tax_filing_process", "answer_mode": "process", "source_type": "process_composer", "source_label": "Company Income Tax Filing Process", "grounded": True}}
+Source: official federal Company Income Tax filing channel of the relevant tax authority.
+""",
+        "company_income_tax_filing",
+        "Company Income Tax Filing Process",
+    )
 
 
-def compose_company_income_tax_payment_process() -> Dict:
-    answer = """
-Pay Company Income Tax through the approved Federal Inland Revenue Service payment channel for the relevant assessment or self-computed liability.
+def compose_company_income_tax_payment() -> Dict:
+    return _answer(
+        """
+Pay Company Income Tax through the approved Federal Inland Revenue Service / Nigeria Revenue Service payment channel for the relevant assessment or self-computed liability.
 
 Before payment:
 - Confirm the accounting period, tax amount due, and the correct taxpayer details.
@@ -679,33 +629,11 @@ What to do next:
 2. Ask what records should support the Company Income Tax computation and payment.
 3. Ask what Company Income Tax rate rule applies to the company category in your case.
 
-Source: current official Federal Inland Revenue Service company-income-tax payment channel and settlement guidance.
-""".strip()
-    return {"ok": True, "answer": answer, "meta": {"intent_type": "company_income_tax_payment_process", "answer_mode": "process", "source_type": "process_composer", "source_label": "Company Income Tax Payment Process", "grounded": True}}
-
-
-def compose_company_income_tax_records() -> Dict:
-    answer = """
-Keep the accounting, profit-computation, tax-adjustment, filing, and payment records that support the Company Income Tax position for each relevant accounting period.
-
-Records you should normally keep:
-- financial statements, trial balance, ledgers, and supporting accounting schedules for the period
-- income, expense, and adjustment records used to compute taxable profit
-- tax computation working papers and schedules supporting the CIT liability
-- filed Company Income Tax return, acknowledgement, or portal confirmation
-- payment receipt, assessment notice, or other official evidence supporting the CIT settlement where applicable
-
-Practical rule:
-- Keep records in a form that lets you trace the accounting profit, the tax adjustments made, the CIT return filed, and any payment or assessment tied to the same period.
-
-What to do next:
-1. Ask how to file Company Income Tax for the period involved.
-2. Ask how to pay Company Income Tax once the liability is confirmed.
-3. Ask what Company Income Tax rate rule applies to the company category in your case.
-
-Source: current official Federal Inland Revenue Service company-income-tax filing, computation, and payment-support guidance.
-""".strip()
-    return {"ok": True, "answer": answer, "meta": {"intent_type": "company_income_tax_records", "answer_mode": "process", "source_type": "process_composer", "source_label": "Company Income Tax Records", "grounded": True}}
+Source: official federal Company Income Tax payment channel of the relevant tax authority.
+""",
+        "company_income_tax_payment",
+        "Company Income Tax Payment Process",
+    )
 
 
 PROCESS_MAP = {
@@ -716,91 +644,119 @@ PROCESS_MAP = {
     "vat_filing_process": compose_vat_filing_process,
     "vat_registration_process": compose_vat_registration_process,
     "paye_remittance_process": compose_paye_remittance_process,
-    "paye_records": compose_paye_records,
     "tcc_application": compose_tcc_application,
     "tcc_verification": compose_tcc_verification,
-    "withholding_tax_definition": compose_withholding_tax_definition,
-    "withholding_tax_deductor_rule": compose_withholding_tax_deductor_rule,
-    "withholding_tax_rate_rule": compose_withholding_tax_rate_rule,
-    "withholding_tax_deduction_process": compose_withholding_tax_deduction_process,
-    "withholding_tax_remittance_process": compose_withholding_tax_remittance_process,
-    "withholding_tax_records": compose_withholding_tax_records,
-    "company_income_tax_definition": compose_company_income_tax_definition,
-    "company_income_tax_payer_rule": compose_company_income_tax_payer_rule,
-    "company_income_tax_rate_rule": compose_company_income_tax_rate_rule,
-    "company_income_tax_filing_process": compose_company_income_tax_filing_process,
-    "company_income_tax_payment_process": compose_company_income_tax_payment_process,
-    "company_income_tax_records": compose_company_income_tax_records,
+    "withholding_tax_deduction": compose_withholding_tax_deduction,
+    "withholding_tax_remittance": compose_withholding_tax_remittance,
+    "company_income_tax_filing": compose_company_income_tax_filing,
+    "company_income_tax_payment": compose_company_income_tax_payment,
+    "personal_income_tax_authority": compose_personal_income_tax_authority,
+    "paye_authority": compose_paye_authority,
+    "vat_authority": compose_vat_authority,
+    "tcc_authority": compose_tcc_authority,
+    "withholding_tax_authority": compose_withholding_tax_authority,
+    "company_income_tax_authority": compose_company_income_tax_authority,
 }
 
 
-def try_compose(intent: Optional[str] = None, *, question: Optional[str] = None, topic: Optional[str] = None, intent_type: Optional[str] = None, lang: str = "en", channel: str = "web"):
+def _is_authority_question(q: str) -> bool:
+    return any(
+        phrase in q
+        for phrase in [
+            "which tax authority",
+            "what tax authority",
+            "who handles",
+            "which authority",
+            "does firs or state",
+            "does nrs or state",
+            "who issues",
+            "who receives",
+            "which portal should i use",
+            "which portal do i use",
+        ]
+    )
+
+
+def try_compose(
+    intent: Optional[str] = None,
+    *,
+    question: Optional[str] = None,
+    topic: Optional[str] = None,
+    intent_type: Optional[str] = None,
+    lang: str = "en",
+    channel: str = "web",
+):
     del lang, channel
 
     if intent and not question and not topic and not intent_type:
         fn = PROCESS_MAP.get(_normalize(intent).replace(" ", "_"))
         return fn() if fn else None
 
+    q = _normalize(question)
     topic_key = _normalize(topic)
     intent_key = _normalize(intent_type)
     action = _detect_action(question)
 
-    if _topic_in(topic_key, "tax clearance certificate", "tax_clearance_certificate", "tcc"):
+    # Authority routing questions first
+    if q and (_is_authority_question(q) or "which tax authority handles personal income tax" in q):
+        if _mentions_any(q, "personal income tax", "pit"):
+            return compose_personal_income_tax_authority()
+        if _mentions_any(q, "paye", "pay as you earn"):
+            return compose_paye_authority()
+        if _mentions_any(q, "vat", "value added tax"):
+            return compose_vat_authority()
+        if _mentions_any(q, "tcc", "tax clearance certificate"):
+            return compose_tcc_authority()
+        if _mentions_any(q, "withholding tax", "wht"):
+            return compose_withholding_tax_authority()
+        if _mentions_any(q, "company income tax", "cit"):
+            return compose_company_income_tax_authority()
+
+    if "who issues a tcc" in q or "who issues tcc" in q:
+        return compose_tcc_authority()
+    if "which tax authority handles vat" in q:
+        return compose_vat_authority()
+    if "which tax authority receives withholding tax" in q or "which tax authority receives wht" in q:
+        return compose_withholding_tax_authority()
+    if "which tax authority handles company income tax" in q or "which tax authority handles cit" in q:
+        return compose_company_income_tax_authority()
+    if "does firs or state internal revenue handle paye" in q or "does nrs or state internal revenue handle paye" in q:
+        return compose_paye_authority()
+
+    # Specific topical process routing
+    if _topic_in(topic_key, "tax_clearance_certificate", "tax clearance certificate", "tcc") or _mentions_any(q, "tcc", "tax clearance certificate"):
         if action == "verify":
             return compose_tcc_verification()
         if action == "apply":
             return compose_tcc_application()
 
-    if _topic_in(topic_key, "tin", "tax identification number"):
+    if _topic_in(topic_key, "tin", "tax identification number") or _mentions_any(q, "tin", "tax identification number"):
         if action == "verify":
             return compose_tin_verification()
         if action in {"apply", "register"}:
             return compose_tin_registration()
 
-    if _topic_in(topic_key, "vat", "value added tax"):
+    if _topic_in(topic_key, "vat", "value added tax") or _mentions_any(q, "vat", "value added tax"):
         if action == "register":
             return compose_vat_registration_process()
         if action == "file":
             return compose_vat_filing_process()
-        if action == "pay":
-            return compose_tax_payment_process()
 
-    if _topic_in(topic_key, "paye", "pay as you earn"):
-        if _is_records_question(question):
-            return compose_paye_records()
-        if action in {"pay", "file"}:
+    if _topic_in(topic_key, "paye", "pay as you earn") or _mentions_any(q, "paye", "pay as you earn"):
+        if action in {"file", "pay"}:
             return compose_paye_remittance_process()
 
-    if _is_payroll_records_context(question):
-        return compose_paye_records()
-
-    if _topic_in(topic_key, "withholding tax", "withholding_tax", "wht", "withholding"):
-        if _is_records_question(question):
-            return compose_withholding_tax_records()
-        if _is_withholding_rate_question(question):
-            return compose_withholding_tax_rate_rule()
-        if _is_withholding_deductor_question(question):
-            return compose_withholding_tax_deductor_rule()
-        if _is_withholding_remittance_process_question(question, action):
-            return compose_withholding_tax_remittance_process()
-        if _is_withholding_deduction_process_question(question, action):
-            return compose_withholding_tax_deduction_process()
-        if _is_withholding_definition_question(question):
-            return compose_withholding_tax_definition()
-
-    if _topic_in(topic_key, "company income tax", "companies income tax", "cit", "cita") or _is_company_income_tax_topic(question):
-        if _is_records_question(question):
-            return compose_company_income_tax_records()
-        if _is_company_income_tax_rate_question(question):
-            return compose_company_income_tax_rate_rule()
-        if _is_company_income_tax_payer_question(question):
-            return compose_company_income_tax_payer_rule()
-        if action == "file":
-            return compose_company_income_tax_filing_process()
+    if _topic_in(topic_key, "withholding tax", "wht") or _mentions_any(q, "withholding tax", "wht"):
+        if action == "deduct":
+            return compose_withholding_tax_deduction()
         if action == "pay":
-            return compose_company_income_tax_payment_process()
-        if _is_company_income_tax_definition_question(question):
-            return compose_company_income_tax_definition()
+            return compose_withholding_tax_remittance()
+
+    if _topic_in(topic_key, "company income tax", "cit") or _mentions_any(q, "company income tax", "cit"):
+        if action == "file":
+            return compose_company_income_tax_filing()
+        if action == "pay":
+            return compose_company_income_tax_payment()
 
     if intent_key in {"tax payment process", "tax_payment_process"} or action == "pay":
         return compose_tax_payment_process()
