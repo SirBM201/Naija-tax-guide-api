@@ -44,6 +44,16 @@ ACTION_PATTERNS = {
         r"\bremittance\b",
         r"\bsettle\b",
     ],
+    "records": [
+        r"\brecord\b",
+        r"\brecords\b",
+        r"\bdocumentation\b",
+        r"\bdocuments\b",
+        r"\bevidence\b",
+        r"\bpayroll records\b",
+        r"\bwhat records should i keep\b",
+        r"\bkeep records\b",
+    ],
 }
 
 
@@ -424,6 +434,40 @@ def compose_paye_remittance_process() -> Dict:
     )
 
 
+
+def compose_paye_records_process() -> Dict:
+    return _compose_answer(
+        direct_answer="Keep the payroll and deduction records that support PAYE computation, filing, and remittance for each payroll period.",
+        sections=[
+            _section(
+                "Records you should normally keep:",
+                [
+                    "payroll register or payroll schedule for the period",
+                    "employee pay details showing gross pay, deductions, and net pay",
+                    "PAYE computation support for each employee where applicable",
+                    "PAYE return or schedule submitted to the relevant State Internal Revenue Service",
+                    "payment receipt, remittance acknowledgement, or portal confirmation",
+                ],
+            ),
+            _section(
+                "Practical rule:",
+                [
+                    "Keep records in a way that lets you trace the PAYE deducted, the return filed, and the amount remitted for the same payroll period.",
+                    "Where employee details or payroll treatment change, keep the updated records that explain the change.",
+                ],
+            ),
+        ],
+        next_steps=[
+            "Ask how to file or remit PAYE after deduction.",
+            "Ask who should deduct PAYE in your case.",
+            "Ask what to do if payroll records do not match the PAYE return.",
+        ],
+        source_line=PAYE_SOURCE_LINE,
+        intent_type="paye_records_process",
+        source_label="PAYE Records Process",
+    )
+
+
 def compose_tcc_application() -> Dict:
     return _compose_answer(
         direct_answer="Apply for a Tax Clearance Certificate through the official portal or eServices channel of the tax authority that manages your tax record.",
@@ -528,6 +572,7 @@ PROCESS_MAP = {
     "vat_registration_process": compose_vat_registration_process,
     "vat_payment_process": compose_vat_payment_process,
     "paye_remittance_process": compose_paye_remittance_process,
+    "paye_records_process": compose_paye_records_process,
     "tcc_application": compose_tcc_application,
     "tcc_verification": compose_tcc_verification,
 }
@@ -572,8 +617,14 @@ def try_compose(
         if action == "pay":
             return compose_vat_payment_process()
 
-    if _topic_in(topic_key, "paye", "pay as you earn") and action in {"pay", "file"}:
-        return compose_paye_remittance_process()
+    if _topic_in(topic_key, "paye", "pay as you earn"):
+        if action in {"pay", "file"}:
+            return compose_paye_remittance_process()
+        if action == "records":
+            return compose_paye_records_process()
+
+    if intent_key in {"paye records process", "paye_records_process"}:
+        return compose_paye_records_process()
 
     if intent_key in {"vat payment process", "vat_payment_process"}:
         return compose_vat_payment_process()
