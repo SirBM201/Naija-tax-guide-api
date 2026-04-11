@@ -31,6 +31,14 @@ from app.services.tax_grounding_service import build_grounded_answer, grounding_
 from app.services.response_refiner import refine_response
 from app.services.tax_rules.vat_rules import can_handle_vat_rule, resolve_vat_rule
 from app.services.tax_rules.paye_rules import can_handle_paye_rule, resolve_paye_rule
+from app.services.tax_rules.tin_rules import can_handle_tin_rule, resolve_tin_rule
+from app.services.tax_rules.personal_income_tax_rules import (
+    can_handle_personal_income_tax_rule,
+    resolve_personal_income_tax_rule,
+)
+from app.services.tax_rules.tax_authority_rules import try_answer as try_answer_tax_authority_rule
+from app.services.tax_rules.company_income_tax_rules import try_answer as try_answer_company_income_tax_rule
+from app.services.tax_rules.withholding_tax_rules import try_answer as try_answer_withholding_tax_rule
 from app.services.tax_process_composer import try_compose
 
 
@@ -47,16 +55,12 @@ CHANNEL_ALIASES = {
 TOPIC_ALIASES = {
     "vat": {"vat", "value_added_tax", "value added tax"},
     "value_added_tax": {"vat", "value_added_tax", "value added tax"},
-    "paye": {"paye", "pay as you earn", "payroll", "payroll tax"},
+    "paye": {"paye", "pay as you earn", "payroll"},
     "personal_income_tax": {"personal_income_tax", "personal income tax", "pit"},
-    "pit": {"personal_income_tax", "personal income tax", "pit"},
     "withholding_tax": {"withholding_tax", "withholding tax", "wht"},
-    "wht": {"withholding_tax", "withholding tax", "wht"},
     "company_income_tax": {"company_income_tax", "company income tax", "cit"},
-    "cit": {"company_income_tax", "company income tax", "cit"},
-    "freelancer": {"freelancer", "self_employed", "self employed", "sole proprietor", "freelancer_tax"},
-    "self_employed": {"freelancer", "self_employed", "self employed", "sole proprietor", "freelancer_tax"},
-    "freelancer_tax": {"freelancer", "self_employed", "self employed", "sole proprietor", "freelancer_tax"},
+    "freelancer": {"freelancer", "self_employed", "self employed", "sole proprietor"},
+    "self_employed": {"freelancer", "self_employed", "self employed", "sole proprietor"},
     "tin": {"tin", "tax identification number"},
     "tax_clearance_certificate": {"tcc", "tax clearance certificate", "tax_clearance_certificate"},
     "general": {"general"},
@@ -101,15 +105,14 @@ STOPWORDS = {
 }
 
 ACTION_KEYWORDS = {
-    "verify": {"verify", "verification", "validate", "validation", "confirm", "check", "authenticity", "genuine", "status"},
-    "apply": {"apply", "application", "obtain", "get", "request"},
-    "register": {"register", "registration", "enrol", "enroll", "enrollment"},
-    "file": {"file", "filing", "submit", "return"},
-    "pay": {"pay", "payment", "remit", "remittance"},
+    "verification": {"verify", "verification", "validate", "validation", "confirm", "check", "status"},
+    "registration": {"register", "registration", "enrol", "enroll", "enrollment", "apply", "application", "obtain", "get"},
+    "filing": {"file", "filing", "return", "submit", "submission"},
+    "payment": {"pay", "payment", "remit", "remittance"},
+    "records": {"record", "records", "documentation", "documents", "evidence", "keep", "supporting"},
+    "authority": {"authority", "authorities", "firs", "nrs", "state", "issues", "issue", "receives", "receive", "handles", "handle", "portal"},
     "calculate": {"calculate", "computation", "compute", "rate", "percentage"},
-    "records": {"record", "records", "documentation", "evidence", "documents"},
-    "authority": {"authority", "authorities", "firs", "irs", "service", "receives", "handles", "issues", "portal", "channel"},
-    "exempt": {"exempt", "exemption", "zero", "rated", "zero-rated", "zero-rated"},
+    "exempt": {"exempt", "exemption", "zero", "rated", "zero-rated"},
     "use": {"use", "used", "purpose", "needed"},
 }
 
@@ -212,7 +215,9 @@ def _infer_topic_from_question(question: str, fallback: str = "general") -> str:
 
     if any(x in q for x in ["vat", "value added tax", "value_added_tax"]):
         return "vat"
-    if any(x in q for x in ["paye", "pay as you earn", "personal income tax"]):
+    if any(x in q for x in ["personal income tax", "pit"]):
+        return "personal_income_tax"
+    if any(x in q for x in ["paye", "pay as you earn", "payroll"]):
         return "paye"
     if any(x in q for x in ["withholding tax", "wht"]):
         return "withholding_tax"
@@ -231,18 +236,30 @@ def _infer_topic_from_question(question: str, fallback: str = "general") -> str:
 def _infer_intent_from_question(question: str, fallback: str = "general") -> str:
     q = _normalize_text(question)
 
-    if q.startswith("what is ") or q.startswith("define "):
-        return "definition"
-    if q.startswith("how do i ") or q.startswith("how to ") or "process" in q or "procedure" in q:
-        return "procedure"
-    if any(x in q for x in ["rate", "percentage"]):
+    if any(x in q for x in ["which tax authority", "what tax authority", "which authority", "who handles", "who issues", "who receives", "does firs or state", "does nrs or state"]):
+        return "authority"
+    if any(x in q for x in ["what records should i keep", "what records should be kept", "what documents are needed", "what documents are required", "documentation", "evidence"]):
+        return "records"
+    if any(x in q for x in ["how do i verify", "how to verify", "verify", "verification", "validate", "validation"]):
+        return "verification"
+    if any(x in q for x in ["how do i register", "how to register", "register for", "registration", "apply for"]):
+        return "registration"
+    if any(x in q for x in ["how do i file", "how to file", " filing", "file ", "return", "submit"]):
+        return "filing"
+    if any(x in q for x in ["how do i pay", "how to pay", "how do i remit", "how to remit", "payment", "remit", "remittance"]):
+        return "payment"
+    if any(x in q for x in ["rate", "percentage", "how much"]):
         return "rate"
     if any(x in q for x in ["exempt", "exemption", "zero rated", "zero-rated"]):
         return "exemption"
+    if q.startswith("what is ") or q.startswith("define ") or q.startswith("meaning of ") or q.startswith("what does "):
+        return "definition"
     if any(x in q for x in ["calculate", "computation", "compute"]):
         return "calculation"
-    if any(x in q for x in ["who must", "must i", "must we", "am i required", "should i charge", "who should", "who needs to", "comply with"]):
+    if any(x in q for x in ["who must", "must i", "must we", "am i required", "should i charge", "who should", "who needs to", "comply with", "who pays", "who must pay"]):
         return "obligation"
+    if q.startswith("how do i ") or q.startswith("how to ") or "process" in q or "procedure" in q:
+        return "procedure"
 
     return str(fallback or "general").strip().lower()
 
@@ -426,6 +443,40 @@ def _intent_matches(question_meta: Dict[str, Any], row: Dict[str, Any], question
 def _question_is_short(question: str) -> bool:
     nq = _normalize_text(question)
     return bool(nq) and len(_tokenize(nq)) <= 3
+
+
+def _is_tax_specific_short_question(question_meta: Dict[str, Any], question: str) -> bool:
+    topic = _safe_str(question_meta.get("topic")).lower()
+    if topic in {
+        "vat",
+        "paye",
+        "personal_income_tax",
+        "withholding_tax",
+        "company_income_tax",
+        "tin",
+        "tax_clearance_certificate",
+    }:
+        return True
+
+    q = _normalize_text(question)
+    return any(
+        phrase in q
+        for phrase in [
+            "vat",
+            "value added tax",
+            "paye",
+            "pay as you earn",
+            "personal income tax",
+            "withholding tax",
+            "wht",
+            "company income tax",
+            "cit",
+            "tin",
+            "tax identification number",
+            "tcc",
+            "tax clearance certificate",
+        ]
+    )
 
 
 def _looks_already_structured(text: str) -> bool:
@@ -701,16 +752,68 @@ def _is_strong_kb_direct_match(row: Dict[str, Any], question_meta: Dict[str, Any
     return False
 
 
+def _rule_result_to_answer(result: Any) -> Optional[str]:
+    if isinstance(result, dict):
+        if result.get("ok"):
+            answer = _safe_str(result.get("answer"))
+            return answer or None
+        return None
+
+    answer = _safe_str(result)
+    return answer or None
+
+
 def _resolve_rules(question: str, topic: str, intent_type: str) -> Optional[str]:
     try:
+        answer = _rule_result_to_answer(try_answer_tax_authority_rule(question=question))
+        if answer:
+            return answer
+    except Exception:
+        pass
+
+    try:
+        if can_handle_tin_rule(question, topic, intent_type):
+            answer = _rule_result_to_answer(resolve_tin_rule(question, intent_type))
+            if answer:
+                return answer
+    except Exception:
+        pass
+
+    try:
         if can_handle_vat_rule(question, topic, intent_type):
-            return resolve_vat_rule(question, intent_type)
+            answer = _rule_result_to_answer(resolve_vat_rule(question, intent_type))
+            if answer:
+                return answer
     except Exception:
         pass
 
     try:
         if can_handle_paye_rule(question, topic, intent_type):
-            return resolve_paye_rule(question, intent_type)
+            answer = _rule_result_to_answer(resolve_paye_rule(question, intent_type))
+            if answer:
+                return answer
+    except Exception:
+        pass
+
+    try:
+        if can_handle_personal_income_tax_rule(question, topic, intent_type):
+            answer = _rule_result_to_answer(resolve_personal_income_tax_rule(question, intent_type))
+            if answer:
+                return answer
+    except Exception:
+        pass
+
+    try:
+        answer = _rule_result_to_answer(try_answer_company_income_tax_rule(question=question))
+        if answer:
+            return answer
+    except Exception:
+        pass
+
+    try:
+        answer = _rule_result_to_answer(try_answer_withholding_tax_rule(question=question))
+        if answer:
+            return answer
     except Exception:
         pass
 
@@ -1026,8 +1129,9 @@ def _process_ask_request(
 
     balance = _safe_int(usage_state.get("credits_left"), 0)
     short_q = _question_is_short(question)
+    tax_specific_short = _is_tax_specific_short_question(question_meta, question)
 
-    if short_q:
+    if short_q and not tax_specific_short:
         library_answer = find_library_answer(
             normalized_question=question_meta.get("normalized_question") or _normalize_text(question),
             lang=lang,
