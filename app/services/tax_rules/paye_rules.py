@@ -166,14 +166,17 @@ def can_handle_paye_rule(question: str, topic: str, intent_type: str) -> bool:
     topic_key = _normalize(topic)
     intent_key = _normalize(intent_type)
 
-    if topic_key != "paye":
+    payroll_context = topic_key in {"paye", "pay as you earn", "payroll"} or "paye" in q or "payroll" in q
+
+    if any(hint in q for hint in _RECORDS_HINTS):
+        return payroll_context
+
+    if not payroll_context:
         return False
 
     if intent_key in {"definition", "obligation", "deduction", "records"}:
         return True
 
-    if any(hint in q for hint in _RECORDS_HINTS):
-        return True
     if any(hint in q for hint in _OBLIGATION_HINTS):
         return True
     if any(hint in q for hint in _DEDUCTION_HINTS):
