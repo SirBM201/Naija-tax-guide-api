@@ -595,7 +595,11 @@ def try_compose(
 
     topic_key = _normalize(topic)
     intent_key = _normalize(intent_type)
+    q = _normalize(question)
     action = _detect_action(question)
+
+    if action == "records" and ("paye" in q or "payroll" in q):
+        return compose_paye_records_process()
 
     if _topic_in(topic_key, "tax_clearance_certificate", "tax clearance certificate", "tcc"):
         if action == "verify":
@@ -617,7 +621,7 @@ def try_compose(
         if action == "pay":
             return compose_vat_payment_process()
 
-    if _topic_in(topic_key, "paye", "pay as you earn"):
+    if _topic_in(topic_key, "paye", "pay as you earn", "payroll"):
         if action in {"pay", "file"}:
             return compose_paye_remittance_process()
         if action == "records":
