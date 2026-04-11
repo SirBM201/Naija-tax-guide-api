@@ -46,7 +46,6 @@ ACTION_PATTERNS = {
         r"\bdeduct\b",
         r"\bdeduction\b",
         r"\bwithhold\b",
-        r"\bwithholding\b",
     ],
 }
 
@@ -100,6 +99,71 @@ def _is_payroll_records_context(question: Optional[str]) -> bool:
         r"\bpaye\b",
     ) and _is_records_question(question)
 
+
+
+
+def _is_withholding_definition_question(question: Optional[str]) -> bool:
+    return _mentions_any(
+        question,
+        r"\bwhat is withholding tax\b",
+        r"\bwhat is wht\b",
+        r"\bmeaning of withholding tax\b",
+        r"\bdefine withholding tax\b",
+        r"\bwhat does withholding tax mean\b",
+        r"\bwhat does wht mean\b",
+    )
+
+
+def _is_withholding_deductor_question(question: Optional[str]) -> bool:
+    return _mentions_any(
+        question,
+        r"\bwho must deduct withholding tax\b",
+        r"\bwho deducts withholding tax\b",
+        r"\bwho should deduct withholding tax\b",
+        r"\bwho deducts wht\b",
+        r"\bwho must deduct wht\b",
+        r"\bwho is responsible for withholding tax\b",
+    )
+
+
+def _is_withholding_rate_question(question: Optional[str]) -> bool:
+    return _mentions_any(
+        question,
+        r"\bwithholding tax rate\b",
+        r"\bwht rate\b",
+        r"\brate of withholding tax\b",
+        r"\bpercentage of withholding tax\b",
+        r"\bhow much is withholding tax\b",
+    )
+
+
+def _is_withholding_deduction_process_question(question: Optional[str], action: Optional[str]) -> bool:
+    return _mentions_any(
+        question,
+        r"\bhow do i deduct withholding tax\b",
+        r"\bhow to deduct withholding tax\b",
+        r"\bhow do i deduct wht\b",
+        r"\bhow to deduct wht\b",
+        r"\bwithholding tax deduction\b",
+        r"\bdeduction steps?\b",
+    ) or (
+        action == "deduct"
+        and not _is_withholding_definition_question(question)
+        and not _is_withholding_deductor_question(question)
+        and not _is_withholding_rate_question(question)
+    )
+
+
+def _is_withholding_remittance_process_question(question: Optional[str], action: Optional[str]) -> bool:
+    return _mentions_any(
+        question,
+        r"\bhow do i remit withholding tax\b",
+        r"\bhow to remit withholding tax\b",
+        r"\bhow do i remit wht\b",
+        r"\bhow to remit wht\b",
+        r"\bwithholding tax remittance\b",
+        r"\bremit wht\b",
+    ) or action in {"pay", "file"}
 
 def compose_tax_payment_process() -> Dict:
     answer = """
@@ -315,6 +379,73 @@ Source: official State Internal Revenue Service or FIRS portal/eServices channel
     return {"ok": True, "answer": answer, "meta": {"intent_type": "tcc_verification", "answer_mode": "process", "source_type": "process_composer", "source_label": "TCC Verification Process", "grounded": True}}
 
 
+
+
+def compose_withholding_tax_definition() -> Dict:
+    answer = """
+Withholding Tax (WHT) in Nigeria is a tax deduction taken at source from certain qualifying payments and then remitted to the relevant tax authority on behalf of the recipient.
+
+What it is:
+- WHT usually works as a deduction-and-remittance mechanism linked to the underlying income tax system.
+- It is not one single flat rule for every payment type.
+- The exact treatment depends on the nature of the payment, the recipient, and the rule that applies to that payment category.
+
+Practical rule:
+- First identify the exact payment type before deciding whether WHT applies, who should deduct it, and what rate should be used.
+
+What to do next:
+1. Ask whether the exact payment in your case should attract WHT.
+2. Ask who should deduct WHT for that payment.
+3. Ask what rate applies to that payment category.
+
+Source: current official withholding-tax deduction, remittance, and credit-treatment guidance of the relevant tax authority.
+""".strip()
+    return {"ok": True, "answer": answer, "meta": {"intent_type": "withholding_tax_definition", "answer_mode": "process", "source_type": "process_composer", "source_label": "Withholding Tax Basics", "grounded": True}}
+
+
+def compose_withholding_tax_deductor_rule() -> Dict:
+    answer = """
+The payer is usually the party that must deduct Withholding Tax when making a payment that falls within a withholding category under the applicable rule.
+
+Who this usually affects:
+- businesses, organizations, or other payers making qualifying payments
+- payers who must deduct the WHT before paying the net amount to the recipient
+
+Practical rule:
+- Do not deduct WHT only because a payment is business-related.
+- First confirm that the exact payment category is one that attracts WHT.
+- Then confirm the correct rate and the correct authority that should receive the remittance.
+
+What to do next:
+1. Ask whether the exact payment in your case attracts WHT.
+2. Ask what rate applies to that payment category.
+3. Ask how to remit WHT after deduction.
+
+Source: current official withholding-tax deduction and remittance guidance for qualifying payments.
+""".strip()
+    return {"ok": True, "answer": answer, "meta": {"intent_type": "withholding_tax_deductor_rule", "answer_mode": "process", "source_type": "process_composer", "source_label": "Who Deducts Withholding Tax", "grounded": True}}
+
+
+def compose_withholding_tax_rate_rule() -> Dict:
+    answer = """
+There is no single universal Withholding Tax rate for every payment in Nigeria. The applicable rate depends on the exact payment category, the recipient, and the current rule in force.
+
+Important note:
+- Do not apply one general WHT rate across all contracts, services, rents, interest, dividends, commissions, or similar payments.
+- The correct rate must be confirmed against the exact payment type and the current applicable guidance.
+
+Practical rule:
+- Identify the exact nature of the payment first, then confirm the current WHT rate for that specific category before deduction.
+
+What to do next:
+1. Ask what rate applies to your exact payment type.
+2. Ask whether that payment should attract WHT at all.
+3. Ask how to remit WHT once the deduction is made.
+
+Source: current official withholding-tax schedules and payment-category guidance of the relevant tax authority.
+""".strip()
+    return {"ok": True, "answer": answer, "meta": {"intent_type": "withholding_tax_rate_rule", "answer_mode": "process", "source_type": "process_composer", "source_label": "Withholding Tax Rate Basics", "grounded": True}}
+
 def compose_withholding_tax_deduction_process() -> Dict:
     answer = """
 Deduct Withholding Tax only after confirming that the exact payment you are making falls within a withholding category under the applicable rule.
@@ -400,6 +531,9 @@ PROCESS_MAP = {
     "paye_records": compose_paye_records,
     "tcc_application": compose_tcc_application,
     "tcc_verification": compose_tcc_verification,
+    "withholding_tax_definition": compose_withholding_tax_definition,
+    "withholding_tax_deductor_rule": compose_withholding_tax_deductor_rule,
+    "withholding_tax_rate_rule": compose_withholding_tax_rate_rule,
     "withholding_tax_deduction_process": compose_withholding_tax_deduction_process,
     "withholding_tax_remittance_process": compose_withholding_tax_remittance_process,
     "withholding_tax_records": compose_withholding_tax_records,
@@ -449,10 +583,16 @@ def try_compose(intent: Optional[str] = None, *, question: Optional[str] = None,
     if _topic_in(topic_key, "withholding tax", "withholding_tax", "wht", "withholding"):
         if _is_records_question(question):
             return compose_withholding_tax_records()
-        if action == "deduct":
-            return compose_withholding_tax_deduction_process()
-        if action in {"pay", "file"}:
+        if _is_withholding_rate_question(question):
+            return compose_withholding_tax_rate_rule()
+        if _is_withholding_deductor_question(question):
+            return compose_withholding_tax_deductor_rule()
+        if _is_withholding_remittance_process_question(question, action):
             return compose_withholding_tax_remittance_process()
+        if _is_withholding_deduction_process_question(question, action):
+            return compose_withholding_tax_deduction_process()
+        if _is_withholding_definition_question(question):
+            return compose_withholding_tax_definition()
 
     if intent_key in {"tax payment process", "tax_payment_process"} or action == "pay":
         return compose_tax_payment_process()
