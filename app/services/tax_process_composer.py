@@ -270,84 +270,84 @@ Source: current official Nigeria Revenue Service / former FIRS company-income-ta
     )
 
 
-# ------------------------
-# Existing process answers
-# ------------------------
 
 
-def compose_tax_payment_process() -> Dict:
+def compose_tin_basic() -> Dict:
     return _answer(
         """
-To pay tax in Nigeria, use this general flow:
+A TIN in Nigeria is a Tax Identification Number used to identify a taxpayer for registration, filing, payment, verification, and general tax-compliance purposes.
 
-1. Identify the exact tax type involved.
-   - Personal Income Tax
-   - Company Income Tax
-   - Value Added Tax
-   - Withholding Tax
-   - PAYE
+What it is:
+- A TIN is the taxpayer identifier used across the relevant tax authority's records.
+- It may be used for an individual, a business, or another qualifying taxpayer record under the applicable system.
+- It should be kept accurately because the same TIN is often needed for registration, tax filing, payment, verification, and compliance requests.
 
-2. Confirm the correct tax authority.
-   - Federal taxes such as VAT and Company Income Tax are handled through the approved federal tax channel.
-   - State Internal Revenue Services usually handle Personal Income Tax and PAYE matters for the relevant state case.
+Practical rule:
+- Do not create duplicate taxpayer records just because the TIN is not immediately available.
+- First check whether the taxpayer already has a TIN or needs a fresh registration under the correct authority channel.
 
-3. Make sure your registration details are in place, especially your TIN or tax profile details where applicable.
+What to do next:
+1. Ask who should issue or manage the TIN in your case.
+2. Ask how to register for a TIN if one has not yet been issued.
+3. Ask how to verify the TIN before using it for filing or payment.
 
-4. Confirm the payment basis:
-   - self-assessment
-   - official assessment
-   - deducted tax such as PAYE or withholding
-
-5. Generate or confirm the payment reference where the authority requires one.
-
-6. Pay through an approved method such as:
-   - official tax portal
-   - approved bank channel
-   - approved payment platform where applicable
-
-7. Keep the payment receipt and filing evidence for your records.
-
-The exact payment process can differ by tax type and tax authority, so verify the applicable portal or payment channel before making payment.
+Source: current official Nigeria Revenue Service / Joint Tax Board TIN registration and TIN verification channels.
 """,
-        "tax_payment_process",
-        "General Nigerian Tax Payment Process",
+        "tin_basic",
+        "TIN Definition",
     )
 
 
-def compose_tin_registration() -> Dict:
+def compose_tin_authority() -> Dict:
     return _answer(
         """
-To get or register for a TIN in Nigeria:
+The tax authority that issues or manages a TIN depends on the taxpayer's registration path and the authority channel being used for that taxpayer record.
 
-1. Confirm whether you need an individual or business registration path.
-2. Gather the core details normally required for registration.
-3. Use the relevant official tax authority registration channel.
-4. Complete the registration form carefully so the details match your identity or business records.
-5. Submit the registration and keep the acknowledgement.
-6. Once processed, confirm that the TIN has been issued correctly and keep it safely for filing, payment, and compliance use.
+What this usually means:
+- You should use the approved TIN registration or TIN verification channel that matches the taxpayer's case.
+- The Joint Tax Board / Joint Revenue Board TIN infrastructure and the Nigeria Revenue Service channels are commonly part of the TIN administration path.
+- The correct route should be confirmed before starting a fresh registration or relying on an existing TIN.
 
-If you already registered but do not know your TIN, use the authority's recovery or verification process instead of creating a duplicate record.
+Practical rule:
+- Do not assume every TIN question belongs only to one portal without checking the taxpayer type and the registration context.
+- First confirm whether you are asking about TIN registration, TIN verification, or recovery of an already-issued TIN, then use the matching official channel.
+
+What to do next:
+1. Ask how to register for a TIN in your case.
+2. Ask how to verify an issued TIN before using it.
+3. Ask what documents should support the TIN registration request.
+
+Source: current official Nigeria Revenue Service / Joint Tax Board TIN registration and TIN verification structure.
 """,
-        "tin_registration",
-        "TIN Registration Process",
+        "tin_authority",
+        "TIN Authority Routing",
     )
 
 
-def compose_tin_verification() -> Dict:
+def compose_tin_documents() -> Dict:
     return _answer(
         """
-To verify a TIN in Nigeria:
+Prepare the identity, business, and supporting registration details required by the approved TIN registration channel for the taxpayer involved.
 
-1. Use the official tax authority channel that issued or manages the TIN.
-2. Open the TIN verification or taxpayer search option where available.
-3. Enter the TIN exactly as issued. If the portal allows it, you can also confirm using the taxpayer or business name.
-4. Check that the returned taxpayer details match the correct person or business.
-5. If the TIN does not validate or the details do not match, contact the issuing tax authority before using it for filing, payment, or compliance work.
+Documents or details you should normally be ready with:
+- taxpayer name and other identifying details exactly as they should appear on the tax record
+- business registration or incorporation details where the registration is for a business
+- address, contact details, and any other profile information required by the authority
+- any identity or supporting document the approved registration channel asks for in that case
 
-Keep a screenshot or confirmation page where available for your records.
+Practical rule:
+- The exact document set can differ depending on whether the registration is for an individual or a business and on the authority channel being used.
+- First confirm the taxpayer type, then prepare the details and documents requested by the official TIN registration process for that case.
+
+What to do next:
+1. Ask how to register for a TIN after preparing the required details.
+2. Ask which authority channel should handle the TIN registration in your case.
+3. Ask how to verify the issued TIN after registration.
+
+Source: current official Nigeria Revenue Service / Joint Tax Board TIN registration channels and taxpayer-profile requirements.
 """,
-        "tin_verification",
-        "TIN Verification Process",
+        "tin_documents",
+        "TIN Registration Documents",
     )
 
 
@@ -638,6 +638,9 @@ Source: official federal Company Income Tax payment channel of the relevant tax 
 
 PROCESS_MAP = {
     "tax_payment_process": compose_tax_payment_process,
+    "tin_basic": compose_tin_basic,
+    "tin_authority": compose_tin_authority,
+    "tin_documents": compose_tin_documents,
     "tin_registration": compose_tin_registration,
     "tin_verification": compose_tin_verification,
     "tax_filing_process": compose_tax_filing_process,
@@ -671,6 +674,9 @@ def _is_authority_question(q: str) -> bool:
             "does nrs or state",
             "who issues",
             "who receives",
+            "who issues a tin",
+            "which tax authority handles tin registration",
+            "which authority handles tin registration",
             "which portal should i use",
             "which portal do i use",
         ]
@@ -707,6 +713,8 @@ def try_compose(
             return compose_vat_authority()
         if _mentions_any(q, "tcc", "tax clearance certificate"):
             return compose_tcc_authority()
+        if _mentions_any(q, "tin", "tax identification number", "tax id"):
+            return compose_tin_authority()
         if _mentions_any(q, "withholding tax", "wht"):
             return compose_withholding_tax_authority()
         if _mentions_any(q, "company income tax", "cit"):
@@ -714,6 +722,8 @@ def try_compose(
 
     if "who issues a tcc" in q or "who issues tcc" in q:
         return compose_tcc_authority()
+    if "who issues a tin" in q or "who issues tin" in q or "which tax authority handles tin registration" in q or "which authority handles tin registration" in q:
+        return compose_tin_authority()
     if "which tax authority handles vat" in q:
         return compose_vat_authority()
     if "which tax authority receives withholding tax" in q or "which tax authority receives wht" in q:
@@ -722,6 +732,10 @@ def try_compose(
         return compose_company_income_tax_authority()
     if "does firs or state internal revenue handle paye" in q or "does nrs or state internal revenue handle paye" in q:
         return compose_paye_authority()
+    if "what is a tin" in q or "what is tin" in q or "meaning of tin" in q or "define tin" in q or "what does tin mean" in q:
+        return compose_tin_basic()
+    if "what documents are needed for tin registration" in q or "what documents are required for tin registration" in q or "documents needed for tin registration" in q or "documents for tin registration" in q:
+        return compose_tin_documents()
 
     # Specific topical process routing
     if _topic_in(topic_key, "tax_clearance_certificate", "tax clearance certificate", "tcc") or _mentions_any(q, "tcc", "tax clearance certificate"):
@@ -730,7 +744,13 @@ def try_compose(
         if action == "apply":
             return compose_tcc_application()
 
-    if _topic_in(topic_key, "tin", "tax identification number") or _mentions_any(q, "tin", "tax identification number"):
+    if _topic_in(topic_key, "tin", "tax identification number", "tax id") or _mentions_any(q, "tin", "tax identification number", "tax id"):
+        if "what is a tin" in q or "what is tin" in q or "meaning of tin" in q or "define tin" in q or "what does tin mean" in q:
+            return compose_tin_basic()
+        if "who issues a tin" in q or "who issues tin" in q or "which tax authority handles tin registration" in q or "which authority handles tin registration" in q:
+            return compose_tin_authority()
+        if "what documents are needed for tin registration" in q or "what documents are required for tin registration" in q or "documents needed for tin registration" in q or "documents for tin registration" in q:
+            return compose_tin_documents()
         if action == "verify":
             return compose_tin_verification()
         if action in {"apply", "register"}:
