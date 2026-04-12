@@ -5,8 +5,8 @@ from typing import Optional
 
 
 CURRENT_VAT_SOURCE = (
-    "Source: current official Nigeria Revenue Service guidance, the Nigeria Tax Act 2025 framework, "
-    "and the official VAT registration, filing, and payment channels of the relevant tax authority."
+    "Source: current official Nigeria Revenue Service guidance, "
+    "the Nigeria Tax Act 2025 framework, and the official VAT registration, filing, and payment channels of the relevant tax authority."
 )
 
 
@@ -50,24 +50,6 @@ def explain_vat_basic() -> str:
     )
 
 
-def explain_vat_rate() -> str:
-    return _render_structured(
-        body_lines=[
-            "The standard VAT rate in Nigeria is 7.5% under the current federal VAT framework.",
-            "",
-            "Important note:",
-            "- Do not apply the standard rate automatically if the supply may be exempt, zero-rated, outside scope, or otherwise treated differently under the current law.",
-            "- For production use, always confirm the current treatment of the exact supply on the official authority channel or the latest law in force.",
-        ],
-        next_steps=[
-            "Ask whether the exact supply is taxable, exempt, or zero-rated.",
-            "Ask who is expected to charge VAT in your situation.",
-            "Ask how to file or pay VAT after charging it.",
-        ],
-        source_line=CURRENT_VAT_SOURCE,
-    )
-
-
 def explain_vat_obligation() -> str:
     return _render_structured(
         body_lines=[
@@ -87,30 +69,8 @@ def explain_vat_obligation() -> str:
         ],
         next_steps=[
             "Ask whether your exact business activity or transaction is taxable for VAT.",
-            "Ask whether the supply may be exempt or zero-rated.",
-            "Ask how to register, file, or pay VAT once VAT applies.",
-        ],
-        source_line=CURRENT_VAT_SOURCE,
-    )
-
-
-def explain_vat_exemption_zero_rated() -> str:
-    return _render_structured(
-        body_lines=[
-            "Exempt supplies and zero-rated supplies are not treated the same for VAT, so you should confirm the exact category before charging VAT or filing the return.",
-            "",
-            "What this means:",
-            "- If a supply is exempt, the VAT treatment is different from a supply that is zero-rated.",
-            "- You should not assume that a supply is exempt or zero-rated just because VAT is not visibly charged in practice.",
-            "",
-            "Practical rule:",
-            "- Check the current official schedule or legal list for the exact good or service involved.",
-            "- If the supply is not clearly listed under the current exemption or zero-rating treatment, do not guess. Confirm with the current official authority guidance before invoicing or filing.",
-        ],
-        next_steps=[
-            "Ask about the exact good or service you want to classify for VAT.",
-            "Ask whether the standard VAT rate should be charged on that supply.",
-            "Ask how the supply should be treated in VAT filing after classification.",
+            "Ask how to register for VAT if the activity falls within the VAT rules.",
+            "Ask how to file or pay VAT after confirming that VAT applies.",
         ],
         source_line=CURRENT_VAT_SOURCE,
     )
@@ -187,8 +147,8 @@ def explain_vat_payment() -> str:
         ],
         next_steps=[
             "Ask how to file VAT if the return has not yet been submitted.",
-            "Ask what records should support the VAT payment.",
-            "Ask whether the exact supply is taxable, exempt, or zero-rated.",
+            "Ask what records should support the VAT payment and return.",
+            "Ask whether the exact supply is taxable, exempt, or zero-rated before charging VAT next time.",
         ],
         source_line=CURRENT_VAT_SOURCE,
     )
@@ -219,73 +179,111 @@ def explain_vat_records() -> str:
     )
 
 
-_OBLIGATION_HINTS = (
-    "who must",
-    "must charge",
-    "must comply",
-    "am i required",
-    "who should charge",
-    "who needs to register",
-    "who is required",
-    "does my business need",
-)
+def explain_zero_rated_vat() -> str:
+    return _render_structured(
+        body_lines=[
+            "Zero-rated VAT means the supply falls within the current zero-rating treatment under the applicable VAT rule, so it is not treated in the same way as a standard-rated supply.",
+            "",
+            "What this means:",
+            "- A zero-rated supply is not the same thing as a supply that is exempt from VAT.",
+            "- The taxpayer should first confirm that the exact supply is listed under the current zero-rating treatment before applying that classification.",
+            "",
+            "Practical rule:",
+            "- Do not treat a supply as zero-rated just because no VAT was charged in practice.",
+            "- Check the current official legal list or authority guidance for the exact good or service before invoicing or filing.",
+        ],
+        next_steps=[
+            "Ask whether your exact good or service is zero-rated under the current rule.",
+            "Ask how the supply should be shown in VAT filing after classification.",
+            "Ask how zero-rated treatment differs from VAT exemption in your case.",
+        ],
+        source_line=CURRENT_VAT_SOURCE,
+    )
 
-_EXEMPTION_HINTS = (
-    "exempt",
-    "exemption",
-    "zero rated",
-    "zero-rated",
-    "zero rated supplies",
-    "zero-rated supplies",
-    "outside scope",
-)
 
-_RATE_HINTS = (
-    "rate",
-    "percentage",
-    "7 5",
-    "7.5",
-)
+def explain_vat_exemption() -> str:
+    return _render_structured(
+        body_lines=[
+            "Exempt supplies and zero-rated supplies are not treated the same for VAT, so you should confirm the exact category before charging VAT or filing the return.",
+            "",
+            "What this means:",
+            "- If a supply is exempt, the VAT treatment is different from a supply that is zero-rated.",
+            "- You should not assume that a supply is exempt or zero-rated just because VAT is not visibly charged in practice.",
+            "",
+            "Practical rule:",
+            "- Check the current official schedule or legal list for the exact good or service involved.",
+            "- If the supply is not clearly listed under the current exemption or zero-rating treatment, do not guess. Confirm with the current official authority guidance before invoicing or filing.",
+        ],
+        next_steps=[
+            "Ask about the exact good or service you want to classify for VAT.",
+            "Ask whether the standard VAT rate should be charged on that supply.",
+            "Ask how the supply should be treated in VAT filing after classification.",
+        ],
+        source_line=CURRENT_VAT_SOURCE,
+    )
 
-_DEFINITION_HINTS = (
+
+_BASIC_HINTS = (
     "what is vat",
-    "meaning of vat",
     "define vat",
+    "meaning of vat",
     "what does vat mean",
+    "what is value added tax",
+)
+
+_OBLIGATION_HINTS = (
+    "who must comply with vat",
+    "who pays vat",
+    "who should charge vat",
+    "who should comply with vat",
+    "does vat apply",
+    "must i charge vat",
 )
 
 _REGISTRATION_HINTS = (
-    "register for vat",
-    "vat registration",
     "how do i register for vat",
     "how to register for vat",
+    "register for vat",
+    "vat registration",
 )
 
 _FILING_HINTS = (
-    "file vat",
-    "filing vat",
-    "vat return",
-    "submit vat",
     "how do i file vat",
     "how to file vat",
+    "file vat",
+    "vat filing",
 )
 
 _PAYMENT_HINTS = (
-    "pay vat",
-    "payment of vat",
-    "remit vat",
-    "vat payment",
     "how do i pay vat",
     "how to pay vat",
+    "pay vat",
+    "vat payment",
 )
 
 _RECORDS_HINTS = (
     "what records should i keep for vat",
     "vat records",
     "records for vat",
-    "vat documentation",
-    "vat evidence",
-    "what should i keep for vat",
+)
+
+_ZERO_RATED_HINTS = (
+    "what is zero rated vat",
+    "what is zero rated",
+    "what is zero rated supply",
+    "zero rated vat",
+    "zero rated supplies",
+    "zero rated supply",
+    "zero rated",
+    "zero rated vat",
+)
+
+_EXEMPTION_HINTS = (
+    "what is vat exemption",
+    "vat exemption",
+    "vat exempt",
+    "what is vat exempt",
+    "exempt from vat",
 )
 
 
@@ -294,60 +292,55 @@ def can_handle_vat_rule(question: str, topic: str, intent_type: str) -> bool:
     topic_key = _normalize(topic)
     intent_key = _normalize(intent_type)
 
-    vat_context = topic_key == "vat" or " vat " in f" {q} " or "value added tax" in q
+    vat_context = topic_key in {"vat", "value added tax", "value_added_tax"} or "vat" in q or "value added tax" in q
     if not vat_context:
-        return False
-
-    if intent_key in {"definition", "obligation", "exemption", "rate", "registration", "filing", "payment", "records", "procedure"}:
-        return True
-
-    return any(
-        hint in q
-        for hint in (
-            _OBLIGATION_HINTS
-            + _EXEMPTION_HINTS
-            + _RATE_HINTS
-            + _DEFINITION_HINTS
+        vat_context = any(
+            h in q
+            for h in _BASIC_HINTS
+            + _OBLIGATION_HINTS
             + _REGISTRATION_HINTS
             + _FILING_HINTS
             + _PAYMENT_HINTS
             + _RECORDS_HINTS
+            + _ZERO_RATED_HINTS
+            + _EXEMPTION_HINTS
         )
-    )
+
+    if not vat_context:
+        return False
+
+    if intent_key in {"definition", "obligation", "registration", "filing", "payment", "records", "exemption"}:
+        return True
+
+    return True
 
 
 def resolve_vat_rule(question: str, intent_type: str) -> Optional[str]:
     q = _normalize(question)
     intent_key = _normalize(intent_type)
 
-    if intent_key == "records" or any(hint in q for hint in _RECORDS_HINTS):
+    if intent_key == "records" or any(h in q for h in _RECORDS_HINTS):
         return explain_vat_records()
 
-    if intent_key in {"payment", "procedure"} and any(hint in q for hint in _PAYMENT_HINTS):
-        return explain_vat_payment()
-    if intent_key == "payment" or any(hint in q for hint in _PAYMENT_HINTS):
+    if intent_key == "payment" or any(h in q for h in _PAYMENT_HINTS):
         return explain_vat_payment()
 
-    if intent_key in {"filing", "procedure"} and any(hint in q for hint in _FILING_HINTS):
-        return explain_vat_filing()
-    if intent_key == "filing" or any(hint in q for hint in _FILING_HINTS):
+    if intent_key == "filing" or any(h in q for h in _FILING_HINTS):
         return explain_vat_filing()
 
-    if intent_key in {"registration", "procedure"} and any(hint in q for hint in _REGISTRATION_HINTS):
-        return explain_vat_registration()
-    if intent_key == "registration" or any(hint in q for hint in _REGISTRATION_HINTS):
+    if intent_key in {"registration", "procedure"} or any(h in q for h in _REGISTRATION_HINTS):
         return explain_vat_registration()
 
-    if intent_key == "obligation" or any(hint in q for hint in _OBLIGATION_HINTS):
+    if any(h in q for h in _ZERO_RATED_HINTS):
+        return explain_zero_rated_vat()
+
+    if intent_key == "exemption" or any(h in q for h in _EXEMPTION_HINTS):
+        return explain_vat_exemption()
+
+    if intent_key == "obligation" or any(h in q for h in _OBLIGATION_HINTS):
         return explain_vat_obligation()
 
-    if intent_key == "exemption" or any(hint in q for hint in _EXEMPTION_HINTS):
-        return explain_vat_exemption_zero_rated()
-
-    if intent_key == "rate" or any(hint in q for hint in _RATE_HINTS):
-        return explain_vat_rate()
-
-    if intent_key == "definition" or any(hint in q for hint in _DEFINITION_HINTS):
+    if intent_key == "definition" or any(h in q for h in _BASIC_HINTS):
         return explain_vat_basic()
 
-    return None
+    return explain_vat_basic()
