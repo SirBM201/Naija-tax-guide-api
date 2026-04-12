@@ -17,11 +17,6 @@ def _normalize(text: str) -> str:
     return value.strip()
 
 
-def _looks_structured(text: str) -> bool:
-    raw = _normalize(text)
-    return "what to do next:" in raw or "what this means:" in raw or raw.startswith("answer")
-
-
 def _render_structured(*, body_lines: list[str], next_steps: list[str], source_line: str) -> str:
     lines: list[str] = []
     lines.extend(body_lines)
@@ -121,6 +116,109 @@ def explain_vat_exemption_zero_rated() -> str:
     )
 
 
+def explain_vat_registration() -> str:
+    return _render_structured(
+        body_lines=[
+            "Register for VAT through the approved registration channel of the relevant federal tax authority once your business falls within the scope of VAT registration.",
+            "",
+            "Before registration:",
+            "- Confirm that the business activity falls within the applicable VAT registration rules.",
+            "- Prepare the business details and TIN required for registration.",
+            "",
+            "Registration steps:",
+            "1. Provide the required taxpayer and business information accurately.",
+            "2. Complete any activation or confirmation step required by the authority.",
+            "3. Keep the acknowledgement and any confirmation notice or certificate issued.",
+            "",
+            "After registration:",
+            "- Make sure your invoicing, record-keeping, filing, and payment process are aligned with VAT compliance.",
+        ],
+        next_steps=[
+            "Ask whether your business must charge VAT.",
+            "Ask how to file VAT after registration.",
+            "Ask what invoices and records should support VAT compliance.",
+        ],
+        source_line=CURRENT_VAT_SOURCE,
+    )
+
+
+def explain_vat_filing() -> str:
+    return _render_structured(
+        body_lines=[
+            "File VAT through the approved VAT filing channel for the relevant tax authority and filing period.",
+            "",
+            "Before filing:",
+            "- Confirm the VAT period involved.",
+            "- Gather the records for taxable sales, output VAT, input VAT where relevant, invoices, and supporting schedules.",
+            "- Reconcile the figures so the return matches your records.",
+            "",
+            "Filing steps:",
+            "1. Submit the VAT return through the approved channel within the applicable deadline.",
+            "2. Where VAT is payable, complete payment through the approved payment channel.",
+            "3. Keep both the return evidence and payment evidence for your records.",
+        ],
+        next_steps=[
+            "Ask whether VAT applies to your business or transaction first.",
+            "Ask how to register for VAT if you are not yet registered.",
+            "Ask what records you should keep for VAT compliance.",
+        ],
+        source_line=CURRENT_VAT_SOURCE,
+    )
+
+
+def explain_vat_payment() -> str:
+    return _render_structured(
+        body_lines=[
+            "Pay VAT through the approved VAT payment channel of the federal tax authority that receives the return.",
+            "",
+            "Before payment:",
+            "- Confirm the VAT period and amount due from the return or assessment.",
+            "- Make sure the taxpayer profile, TIN, and VAT return details match the correct business.",
+            "- Generate or confirm the payment reference required by the official portal or payment channel.",
+            "",
+            "Payment steps:",
+            "1. Use the approved VAT payment channel accepted by the relevant authority.",
+            "2. Pay the exact VAT amount due for the relevant period.",
+            "3. Keep the receipt, acknowledgement, or payment confirmation.",
+            "",
+            "After payment:",
+            "- Keep the payment evidence together with the VAT return evidence for that period.",
+            "- If the portal still shows unpaid status, confirm whether the payment has posted correctly before assuming there is a failure.",
+        ],
+        next_steps=[
+            "Ask how to file VAT if the return has not yet been submitted.",
+            "Ask what records should support the VAT payment.",
+            "Ask whether the exact supply is taxable, exempt, or zero-rated.",
+        ],
+        source_line=CURRENT_VAT_SOURCE,
+    )
+
+
+def explain_vat_records() -> str:
+    return _render_structured(
+        body_lines=[
+            "Keep the sales, invoice, tax-computation, filing, and payment records that support your VAT position for each relevant period.",
+            "",
+            "Records you should normally keep:",
+            "- sales records and transaction schedules for taxable, exempt, or zero-rated supplies",
+            "- tax invoices and any supporting commercial documents tied to the supply",
+            "- VAT computation schedules showing output VAT, input VAT where relevant, and the amount reported",
+            "- filed VAT return, acknowledgement, or portal confirmation",
+            "- payment receipt or other official evidence supporting the VAT settlement for the same period",
+            "",
+            "Practical rule:",
+            "- Keep records in a form that lets you trace the underlying transaction, the VAT treatment applied, the return filed, and any payment made for that same period.",
+            "- Where the taxpayer treats a supply as exempt or zero-rated, keep the records that support that treatment.",
+        ],
+        next_steps=[
+            "Ask how to file VAT for the relevant period.",
+            "Ask how to pay VAT once the amount due is confirmed.",
+            "Ask whether the exact supply is taxable, exempt, or zero-rated.",
+        ],
+        source_line=CURRENT_VAT_SOURCE,
+    )
+
+
 _OBLIGATION_HINTS = (
     "who must",
     "must charge",
@@ -156,33 +254,89 @@ _DEFINITION_HINTS = (
     "what does vat mean",
 )
 
+_REGISTRATION_HINTS = (
+    "register for vat",
+    "vat registration",
+    "how do i register for vat",
+    "how to register for vat",
+)
+
+_FILING_HINTS = (
+    "file vat",
+    "filing vat",
+    "vat return",
+    "submit vat",
+    "how do i file vat",
+    "how to file vat",
+)
+
+_PAYMENT_HINTS = (
+    "pay vat",
+    "payment of vat",
+    "remit vat",
+    "vat payment",
+    "how do i pay vat",
+    "how to pay vat",
+)
+
+_RECORDS_HINTS = (
+    "what records should i keep for vat",
+    "vat records",
+    "records for vat",
+    "vat documentation",
+    "vat evidence",
+    "what should i keep for vat",
+)
+
 
 def can_handle_vat_rule(question: str, topic: str, intent_type: str) -> bool:
     q = _normalize(question)
     topic_key = _normalize(topic)
     intent_key = _normalize(intent_type)
 
-    if topic_key != "vat":
+    vat_context = topic_key == "vat" or " vat " in f" {q} " or "value added tax" in q
+    if not vat_context:
         return False
 
-    if intent_key in {"definition", "obligation", "exemption", "rate"}:
+    if intent_key in {"definition", "obligation", "exemption", "rate", "registration", "filing", "payment", "records", "procedure"}:
         return True
 
-    if any(hint in q for hint in _OBLIGATION_HINTS):
-        return True
-    if any(hint in q for hint in _EXEMPTION_HINTS):
-        return True
-    if any(hint in q for hint in _RATE_HINTS):
-        return True
-    if any(hint in q for hint in _DEFINITION_HINTS):
-        return True
-
-    return False
+    return any(
+        hint in q
+        for hint in (
+            _OBLIGATION_HINTS
+            + _EXEMPTION_HINTS
+            + _RATE_HINTS
+            + _DEFINITION_HINTS
+            + _REGISTRATION_HINTS
+            + _FILING_HINTS
+            + _PAYMENT_HINTS
+            + _RECORDS_HINTS
+        )
+    )
 
 
 def resolve_vat_rule(question: str, intent_type: str) -> Optional[str]:
     q = _normalize(question)
     intent_key = _normalize(intent_type)
+
+    if intent_key == "records" or any(hint in q for hint in _RECORDS_HINTS):
+        return explain_vat_records()
+
+    if intent_key in {"payment", "procedure"} and any(hint in q for hint in _PAYMENT_HINTS):
+        return explain_vat_payment()
+    if intent_key == "payment" or any(hint in q for hint in _PAYMENT_HINTS):
+        return explain_vat_payment()
+
+    if intent_key in {"filing", "procedure"} and any(hint in q for hint in _FILING_HINTS):
+        return explain_vat_filing()
+    if intent_key == "filing" or any(hint in q for hint in _FILING_HINTS):
+        return explain_vat_filing()
+
+    if intent_key in {"registration", "procedure"} and any(hint in q for hint in _REGISTRATION_HINTS):
+        return explain_vat_registration()
+    if intent_key == "registration" or any(hint in q for hint in _REGISTRATION_HINTS):
+        return explain_vat_registration()
 
     if intent_key == "obligation" or any(hint in q for hint in _OBLIGATION_HINTS):
         return explain_vat_obligation()
