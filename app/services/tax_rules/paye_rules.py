@@ -5,8 +5,8 @@ from typing import Optional
 
 
 CURRENT_PAYE_SOURCE = (
-    "Source: current official State Internal Revenue Service PAYE guidance, employer payroll compliance rules, "
-    "and the official PAYE filing and remittance channel of the relevant state tax authority."
+    "Source: current official State Internal Revenue Service PAYE guidance, "
+    "employer payroll compliance rules, and the official PAYE filing and remittance channel of the relevant state tax authority."
 )
 
 
@@ -72,28 +72,6 @@ def explain_paye_obligation() -> str:
     )
 
 
-def explain_paye_deduction() -> str:
-    return _render_structured(
-        body_lines=[
-            "PAYE is generally deducted by the employer from taxable employment income before the net pay is released.",
-            "",
-            "What this means:",
-            "- the employer should compute the payroll tax correctly under the applicable rules",
-            "- the employer should deduct the tax through payroll records",
-            "- the employer should file and remit the deducted amount through the correct State Internal Revenue Service channel",
-            "",
-            "Important note:",
-            "- Do not assume every payment to a worker is treated the same way for PAYE. Confirm the employment and payroll treatment first.",
-        ],
-        next_steps=[
-            "Ask how to file or remit PAYE after deduction.",
-            "Ask what payroll records should support the deduction.",
-            "Ask what to do if PAYE was not deducted correctly.",
-        ],
-        source_line=CURRENT_PAYE_SOURCE,
-    )
-
-
 def explain_paye_remittance() -> str:
     return _render_structured(
         body_lines=[
@@ -144,58 +122,34 @@ def explain_paye_records() -> str:
     )
 
 
-_OBLIGATION_HINTS = (
-    "who must deduct",
-    "who deducts",
-    "must deduct",
-    "who should deduct",
-    "does my employer",
-    "is my employer required",
-    "who must comply",
-    "who is required",
-    "does paye apply",
+_BASIC_HINTS = (
+    "what is paye",
+    "meaning of paye",
+    "define paye",
+    "what does paye mean",
 )
 
-_DEDUCTION_HINTS = (
-    "deduct paye",
-    "paye deduction",
-    "deducted from salary",
-    "deducted from wages",
-    "deducted from payroll",
+_OBLIGATION_HINTS = (
+    "who must deduct paye",
+    "who should deduct paye",
+    "who deducts paye",
+    "who must comply with paye",
+    "who pays paye",
 )
 
 _REMITTANCE_HINTS = (
     "how do i remit paye",
     "how to remit paye",
     "remit paye",
+    "how do i pay paye",
+    "how to pay paye",
     "paye remittance",
-    "how do i file paye",
-    "how to file paye",
-    "file paye",
-    "paye filing",
-    "pay paye",
-    "paye payment",
 )
 
 _RECORDS_HINTS = (
     "what records should i keep for paye",
-    "what payroll records should i keep",
-    "what records should be kept for paye",
+    "keep records for paye",
     "paye records",
-    "payroll records",
-    "records for paye",
-    "records should i keep",
-    "keep for paye",
-    "keep for payroll tax",
-    "paye documentation",
-    "paye evidence",
-)
-
-_DEFINITION_HINTS = (
-    "what is paye",
-    "define paye",
-    "meaning of paye",
-    "what does paye mean",
 )
 
 
@@ -204,48 +158,33 @@ def can_handle_paye_rule(question: str, topic: str, intent_type: str) -> bool:
     topic_key = _normalize(topic)
     intent_key = _normalize(intent_type)
 
-    payroll_context = topic_key in {"paye", "pay as you earn", "payroll"} or "paye" in q or "payroll" in q
+    paye_context = topic_key in {"paye", "pay as you earn", "pay_as_you_earn"} or "paye" in q or "pay as you earn" in q
+    if not paye_context:
+        paye_context = any(h in q for h in _BASIC_HINTS + _OBLIGATION_HINTS + _REMITTANCE_HINTS + _RECORDS_HINTS)
 
-    if any(hint in q for hint in _RECORDS_HINTS):
-        return payroll_context
-
-    if not payroll_context:
+    if not paye_context:
         return False
 
-    if intent_key in {"definition", "obligation", "deduction", "records", "procedure", "filing", "payment"}:
+    if intent_key in {"definition", "obligation", "payment", "records", "filing"}:
         return True
 
-    if any(hint in q for hint in _OBLIGATION_HINTS):
-        return True
-    if any(hint in q for hint in _DEDUCTION_HINTS):
-        return True
-    if any(hint in q for hint in _REMITTANCE_HINTS):
-        return True
-    if any(hint in q for hint in _DEFINITION_HINTS):
-        return True
-
-    return False
+    return True
 
 
 def resolve_paye_rule(question: str, intent_type: str) -> Optional[str]:
     q = _normalize(question)
     intent_key = _normalize(intent_type)
 
-    if intent_key == "records" or any(hint in q for hint in _RECORDS_HINTS):
+    if intent_key == "records" or any(h in q for h in _RECORDS_HINTS):
         return explain_paye_records()
 
-    if intent_key in {"procedure", "filing", "payment"} and any(hint in q for hint in _REMITTANCE_HINTS):
-        return explain_paye_remittance()
-    if any(hint in q for hint in _REMITTANCE_HINTS):
+    if intent_key in {"payment", "filing"} or any(h in q for h in _REMITTANCE_HINTS):
         return explain_paye_remittance()
 
-    if intent_key == "obligation" or any(hint in q for hint in _OBLIGATION_HINTS):
+    if intent_key == "obligation" or any(h in q for h in _OBLIGATION_HINTS):
         return explain_paye_obligation()
 
-    if intent_key == "deduction" or any(hint in q for hint in _DEDUCTION_HINTS):
-        return explain_paye_deduction()
-
-    if intent_key == "definition" or any(hint in q for hint in _DEFINITION_HINTS):
+    if intent_key == "definition" or any(h in q for h in _BASIC_HINTS):
         return explain_paye_basic()
 
-    return None
+    return explain_paye_basic()
