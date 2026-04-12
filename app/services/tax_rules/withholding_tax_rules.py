@@ -41,6 +41,23 @@ def _is_records_question(question: str) -> bool:
     return _has_any(q, r"\brecords?\b", r"\bdocumentation\b", r"\bwhat should i keep\b", r"\bkeep .*record\b", r"\bevidence\b")
 
 
+def _is_remittance_question(question: str) -> bool:
+    q = _normalize(question)
+    return _has_any(
+        q,
+        r"\bhow do i remit\b",
+        r"\bhow to remit\b",
+        r"\bremit\b",
+        r"\bremittance\b",
+        r"\bhow do i pay\b",
+        r"\bhow to pay\b",
+        r"\bpay wht\b",
+        r"\bfile wht\b",
+        r"\bhow do i file\b",
+        r"\bhow to file\b",
+    )
+
+
 def compose_withholding_tax_definition() -> Dict:
     answer = """
 Withholding Tax (WHT) in Nigeria is a deduction taken at source from certain payments and then remitted to the relevant tax authority on behalf of the recipient.
@@ -107,6 +124,31 @@ Source: current official withholding-tax schedules and tax-authority guidance fo
     return {"ok": True, "answer": answer, "meta": {"intent_type": "withholding_tax_rate_rule", "answer_mode": "rule", "source_type": "rule_composer", "source_label": "Withholding Tax Rate Basics", "grounded": True}}
 
 
+def compose_withholding_tax_remittance_rule() -> Dict:
+    answer = """
+Remit Withholding Tax through the approved channel of the tax authority that receives the deduction for the payment category involved.
+
+Before remittance:
+- Confirm the exact payment type, gross amount, WHT rate used, and amount deducted.
+- Make sure the payer and recipient details match the transaction records.
+- Prepare the deduction schedule and any supporting payment documents.
+
+Remittance steps:
+1. Use the approved tax-authority channel for the relevant WHT category.
+2. Submit any required schedule or transaction details together with the remittance.
+3. Keep the receipt, acknowledgement, or portal confirmation after payment.
+4. Issue or retain the evidence needed to support the recipient's tax-credit claim where applicable.
+
+What to do next:
+1. Ask who should deduct WHT in your case.
+2. Ask what records should support the WHT deduction and remittance.
+3. Ask what rate applies to the exact payment type involved.
+
+Source: current official withholding-tax remittance, deduction, and tax-credit support guidance.
+""".strip()
+    return {"ok": True, "answer": answer, "meta": {"intent_type": "withholding_tax_remittance_rule", "answer_mode": "rule", "source_type": "rule_composer", "source_label": "How to Remit Withholding Tax", "grounded": True}}
+
+
 def compose_withholding_tax_records_rule() -> Dict:
     answer = """
 Keep the core payment, deduction, remittance, and credit-support records that show how the Withholding Tax was computed, deducted, and remitted.
@@ -137,6 +179,8 @@ def try_answer(question: Optional[str] = None, *_, **__) -> Optional[Dict]:
         return None
     if _is_records_question(q):
         return compose_withholding_tax_records_rule()
+    if _is_remittance_question(q):
+        return compose_withholding_tax_remittance_rule()
     if _is_deductor_question(q):
         return compose_withholding_tax_deductor_rule()
     if _is_rate_question(q):
