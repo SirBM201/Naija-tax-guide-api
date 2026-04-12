@@ -30,13 +30,12 @@ def _detect_intent(q: str) -> str:
         [
             "which tax authority",
             "what tax authority",
-            "which authority",
             "who handles",
-            "who issues",
-            "who receives",
-            "who should receive",
+            "which authority",
             "does firs or state",
             "does nrs or state",
+            "who issues",
+            "who receives",
             "which portal should i use",
             "which portal do i use",
         ],
@@ -46,30 +45,13 @@ def _detect_intent(q: str) -> str:
     if _contains_any(
         ql,
         [
-            "what records should i keep",
-            "what records should be kept",
-            "what documents should i keep",
-            "what documents are needed",
-            "what documents are required",
-            "records should i keep",
-            "records should be kept",
-            "documentation",
-            "supporting documents",
-            "evidence",
-        ],
-    ):
-        return "records"
-
-    if _contains_any(
-        ql,
-        [
-            "how do i verify",
-            "how to verify",
             "verify",
             "verification",
             "validate",
             "validation",
             "check tin",
+            "confirm tcc",
+            "tcc verification",
         ],
     ):
         return "verification"
@@ -77,13 +59,56 @@ def _detect_intent(q: str) -> str:
     if _contains_any(
         ql,
         [
-            "how do i register",
-            "how to register",
+            "what documents",
+            "documents needed",
+            "documents required",
+            "requirements for",
+        ],
+    ):
+        return "documents"
+
+    if _contains_any(
+        ql,
+        [
+            "what records",
+            "what record",
+            "what should i keep",
+            "records should i keep",
+            "keep for",
+        ],
+    ):
+        return "records"
+
+    if _contains_any(
+        ql,
+        [
+            "what is",
+            "meaning of",
+            "stands for",
+            "define",
+            "explain",
+            "what does",
+            "difference between",
+        ],
+    ):
+        return "definition"
+
+    if _contains_any(
+        ql,
+        [
+            "rate",
+            "percentage",
+        ],
+    ):
+        return "rate"
+
+    if _contains_any(
+        ql,
+        [
             "register for",
             "registration",
-            "apply for",
-            "how can i register",
-            "how can i apply",
+            "register ",
+            "apply for a tin",
             "get a tin",
             "obtain a tin",
         ],
@@ -93,14 +118,23 @@ def _detect_intent(q: str) -> str:
     if _contains_any(
         ql,
         [
-            "how do i file",
-            "how to file",
-            "how can i file",
-            " file ",
-            " filing",
-            "return",
+            "how do i",
+            "how to",
+            "steps to",
+            "process for",
+            "procedure for",
+            "how can i",
+        ],
+    ):
+        return "procedure"
+
+    if _contains_any(
+        ql,
+        [
+            "file",
+            "filing",
             "submit",
-            "submission",
+            "return",
         ],
     ):
         return "filing"
@@ -108,61 +142,14 @@ def _detect_intent(q: str) -> str:
     if _contains_any(
         ql,
         [
-            "how do i pay",
-            "how to pay",
-            "how do i remit",
-            "how to remit",
-            "how can i pay",
-            "how can i remit",
+            "pay",
             "payment",
-            " remit",
+            "remit",
             "remittance",
+            "settle",
         ],
     ):
         return "payment"
-
-    if _contains_any(
-        ql,
-        [
-            "exempt",
-            "exemption",
-            "zero rated",
-            "zero-rated",
-            "outside scope",
-        ],
-    ):
-        return "exemption"
-
-    if _contains_any(
-        ql,
-        [
-            "calculate",
-            "rate",
-            "how much",
-            "penalty",
-            "due date",
-            "deadline",
-            "fine",
-            "late fee",
-            "percentage",
-            "when is",
-        ],
-    ):
-        return "rate"
-
-    if _contains_any(
-        ql,
-        [
-            "what is",
-            "meaning of",
-            "stands for",
-            "define",
-            "difference between",
-            "explain",
-            "what does",
-        ],
-    ):
-        return "definition"
 
     if _contains_any(
         ql,
@@ -171,17 +158,14 @@ def _detect_intent(q: str) -> str:
             "am i required to",
             "must i",
             "must we",
+            "who must",
             "who should",
+            "who needs to",
             "does it apply",
-            "am i supposed to",
-            "is it compulsory",
             "should i charge",
-            "do i have to",
-            "who pays",
-            "who must pay",
-            "who should pay",
-            "who must comply",
             "comply with",
+            "is it compulsory",
+            "do i have to",
         ],
     ):
         return "obligation"
@@ -203,14 +187,19 @@ def _detect_intent(q: str) -> str:
     if _contains_any(
         ql,
         [
-            "how do i",
-            "how to",
-            "steps to",
-            "process for",
-            "procedure for",
+            "calculate",
+            "computation",
+            "compute",
+            "how much",
+            "penalty",
+            "due date",
+            "deadline",
+            "fine",
+            "late fee",
+            "when is",
         ],
     ):
-        return "procedure"
+        return "calculation"
 
     if _contains_any(
         ql,
@@ -233,32 +222,25 @@ def _detect_intent(q: str) -> str:
 
 
 def _detect_topic(q: str) -> str:
-    ql = q.lower()
+    ql = f" {q.lower()} "
 
-    if "tax clearance certificate" in ql or re.search(r"\btcc\b", ql):
+    if " tax clearance certificate " in ql or " tcc " in ql:
         return "tax_clearance_certificate"
-    if "tax identification number" in ql or re.search(r"\btin\b", ql):
+    if " tax identification number " in ql or " tin " in ql or " tax id " in ql:
         return "tin"
-    if "value added tax" in ql or re.search(r"\bvat\b", ql):
+    if " value added tax " in ql or " vat " in ql:
         return "vat"
-    if "company income tax" in ql or re.search(r"\bcit\b", ql):
-        return "company_income_tax"
-    if "personal income tax" in ql or re.search(r"\bpit\b", ql):
-        return "personal_income_tax"
-    if "paye" in ql or "pay as you earn" in ql:
+    if " pay as you earn " in ql or " paye " in ql or " payroll " in ql:
         return "paye"
-    if "withholding" in ql or re.search(r"\bwht\b", ql):
+    if " withholding tax " in ql or " wht " in ql or " withholding " in ql:
         return "withholding_tax"
-    if "freelancer" in ql or "sole proprietor" in ql or "self employed" in ql:
+    if " company income tax " in ql or re.search(r"\bcit\b", ql):
+        return "company_income_tax"
+    if " personal income tax " in ql or re.search(r"\bpit\b", ql):
+        return "personal_income_tax"
+    if " freelancer " in ql or " sole proprietor " in ql or " self employed " in ql:
         return "freelancer_tax"
-    if "registration" in ql or "register" in ql:
-        return "registration"
-    if "file" in ql or "filing" in ql or "return" in ql or "submit" in ql:
-        return "filing"
-    if "penalty" in ql or "fine" in ql or "deadline" in ql or "due date" in ql:
-        return "penalty"
-    if "deduct" in ql or "allowable" in ql or "expense" in ql:
-        return "deduction"
+
     return "general"
 
 
@@ -284,14 +266,14 @@ def _detect_complexity(q: str) -> str:
     if len(tokens) >= 18:
         return "intermediate"
 
-    if any(x in ql for x in ["and", "or"]) and len(tokens) >= 12:
+    if any(x in ql for x in [" and ", " or "]) and len(tokens) >= 12:
         return "intermediate"
 
     return "basic"
 
 
 def _risk_level(intent_type: str, complexity: str) -> str:
-    if complexity == "advanced" or intent_type in {"advanced_advisory", "rate"}:
+    if complexity == "advanced" or intent_type in {"advanced_advisory", "calculation"}:
         return "high"
     if complexity == "intermediate" or intent_type in {"obligation", "deduction", "authority"}:
         return "medium"
@@ -303,9 +285,6 @@ def _requires_clarification(intent_type: str, topic: str, complexity: str, q: st
 
     if intent_type == "advanced_advisory" or complexity == "advanced":
         return True
-
-    if intent_type in {"definition", "authority", "records", "verification", "registration", "filing", "payment", "rate", "exemption"}:
-        return False
 
     mixed_signals = 0
     for group in [
@@ -319,7 +298,7 @@ def _requires_clarification(intent_type: str, topic: str, complexity: str, q: st
     if mixed_signals >= 3:
         return True
 
-    if intent_type in {"obligation", "deduction"} and topic == "general":
+    if intent_type in {"obligation", "deduction", "authority"} and topic == "general":
         return True
 
     if any(x in ql for x in ["this business", "my business", "my company", "as a business"]) and not any(
