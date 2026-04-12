@@ -56,6 +56,16 @@ def _is_records_question(question: str) -> bool:
     return _has_any(q, r"\brecords?\b", r"\bdocumentation\b", r"\bwhat should i keep\b", r"\bkeep .*record\b", r"\bevidence\b")
 
 
+def _is_filing_question(question: str) -> bool:
+    q = _normalize(question)
+    return _has_any(q, r"\bhow do i file\b", r"\bhow to file\b", r"\bfile\b", r"\bfiling\b", r"\breturn\b", r"\bsubmit\b")
+
+
+def _is_payment_question(question: str) -> bool:
+    q = _normalize(question)
+    return _has_any(q, r"\bhow do i pay\b", r"\bhow to pay\b", r"\bpay\b", r"\bpayment\b", r"\bremit\b")
+
+
 def compose_company_income_tax_definition() -> Dict:
     answer = """
 Company Income Tax (CIT) in Nigeria is the tax charged on the taxable profits of companies under the applicable company-income-tax rules.
@@ -151,6 +161,76 @@ Source: current official Federal Inland Revenue Service company-income-tax rate 
     }
 
 
+def compose_company_income_tax_filing_rule() -> Dict:
+    answer = """
+File Company Income Tax through the approved federal company-tax channel for the relevant accounting period.
+
+Before filing:
+- Confirm that the issue is a Company Income Tax matter and that the correct accounting period is being used.
+- Prepare the taxable-profit computation, supporting schedules, and company details required for the return.
+- Confirm what rate rule applies to the company category before finalizing the figures.
+
+Filing steps:
+1. Use the approved federal CIT filing portal or channel for the company.
+2. Complete the return with the correct company details, computation figures, and supporting schedules.
+3. Submit the filing within the applicable deadline.
+4. Keep the acknowledgement, filing receipt, or portal confirmation.
+
+What to do next:
+1. Ask how to pay Company Income Tax after filing.
+2. Ask what records should support the Company Income Tax return.
+3. Ask what rate rule applies to the company category in your case.
+
+Source: current official Federal Inland Revenue Service company-income-tax filing guidance and the approved CIT return channel.
+""".strip()
+    return {
+        "ok": True,
+        "answer": answer,
+        "meta": {
+            "intent_type": "company_income_tax_filing_rule",
+            "answer_mode": "rule",
+            "source_type": "rule_composer",
+            "source_label": "How to File Company Income Tax",
+            "grounded": True,
+        },
+    }
+
+
+def compose_company_income_tax_payment_rule() -> Dict:
+    answer = """
+Pay Company Income Tax through the approved federal payment channel for the company's return or assessment.
+
+Before payment:
+- Confirm the accounting period, company details, and amount due from the return or assessment.
+- Make sure the payment reference and taxpayer details match the company profile.
+- Keep the computation and filing details ready in case the payment must be tied back to the submitted return.
+
+Payment steps:
+1. Use the approved federal CIT payment channel or portal accepted by the authority.
+2. Pay the exact amount due for the relevant period.
+3. Keep the receipt, acknowledgement, or payment confirmation.
+4. Match the payment evidence with the related filing or assessment for that same period.
+
+What to do next:
+1. Ask how to file Company Income Tax if the return has not yet been submitted.
+2. Ask what records should support the Company Income Tax payment.
+3. Ask what rate rule applies to the company category in your case.
+
+Source: current official Federal Inland Revenue Service company-income-tax payment guidance and the approved federal settlement channel.
+""".strip()
+    return {
+        "ok": True,
+        "answer": answer,
+        "meta": {
+            "intent_type": "company_income_tax_payment_rule",
+            "answer_mode": "rule",
+            "source_type": "rule_composer",
+            "source_label": "How to Pay Company Income Tax",
+            "grounded": True,
+        },
+    }
+
+
 def compose_company_income_tax_records_rule() -> Dict:
     answer = """
 Keep the accounting, profit-computation, tax-adjustment, filing, and payment records that support the Company's Income Tax position for each relevant accounting period.
@@ -191,6 +271,10 @@ def try_answer(question: Optional[str] = None, *_, **__) -> Optional[Dict]:
         return None
     if _is_records_question(q):
         return compose_company_income_tax_records_rule()
+    if _is_payment_question(q):
+        return compose_company_income_tax_payment_rule()
+    if _is_filing_question(q):
+        return compose_company_income_tax_filing_rule()
     if _is_payer_question(q):
         return compose_company_income_tax_payer_rule()
     if _is_rate_question(q):
