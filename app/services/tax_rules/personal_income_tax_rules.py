@@ -79,14 +79,15 @@ def explain_personal_income_tax_obligation() -> str:
 def explain_personal_income_tax_rate() -> str:
     return _render_structured(
         body_lines=[
-            "There is no one-line shortcut that should be used blindly for every Personal Income Tax question. The correct rate treatment depends on the taxable-income computation and the current personal-income-tax rules that apply to the individual.",
+            "Personal Income Tax in Nigeria is not one flat rate that should be quoted blindly for every individual.",
             "",
-            "Important note:",
-            "- Do not guess the rate treatment from salary alone without first confirming the taxpayer's taxable-income position.",
-            "- The correct computation should follow the current personal-income-tax framework applicable to the individual and the income involved.",
+            "What this means:",
+            "- The correct Personal Income Tax result comes from applying the current personal-income-tax bands or rate rules to the individual's chargeable income under the applicable framework.",
+            "- Reliefs, deductions, exemptions, payroll treatment, and the taxpayer's income profile can affect the final amount payable.",
             "",
             "Practical rule:",
-            "- Confirm the individual's income type, deduction position, and the current rule that applies before computing or quoting a Personal Income Tax liability.",
+            "- Do not guess the tax from salary alone and do not assume that one quick percentage will fit every case.",
+            "- First confirm the income type, the chargeable-income position, and the current rule that applies before quoting or computing the liability.",
         ],
         next_steps=[
             "Ask how to compute Personal Income Tax for the income involved.",
