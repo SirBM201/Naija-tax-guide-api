@@ -32,13 +32,10 @@ from app.services.response_refiner import refine_response
 from app.services.tax_rules.vat_rules import can_handle_vat_rule, resolve_vat_rule
 from app.services.tax_rules.paye_rules import can_handle_paye_rule, resolve_paye_rule
 from app.services.tax_rules.tin_rules import can_handle_tin_rule, resolve_tin_rule
-from app.services.tax_rules.personal_income_tax_rules import (
-    can_handle_personal_income_tax_rule,
-    resolve_personal_income_tax_rule,
-)
-from app.services.tax_rules.tax_authority_rules import try_answer as try_answer_tax_authority_rule
-from app.services.tax_rules.company_income_tax_rules import try_answer as try_answer_company_income_tax_rule
-from app.services.tax_rules.withholding_tax_rules import try_answer as try_answer_withholding_tax_rule
+from app.services.tax_rules.tax_authority_rules import try_answer as try_tax_authority_rule
+from app.services.tax_rules.company_income_tax_rules import try_answer as try_company_income_tax_rule
+from app.services.tax_rules.withholding_tax_rules import try_answer as try_withholding_tax_rule
+from app.services.tax_rules.personal_income_tax_rules import can_handle_pit_rule, resolve_pit_rule
 from app.services.tax_process_composer import try_compose
 
 
@@ -57,8 +54,10 @@ TOPIC_ALIASES = {
     "value_added_tax": {"vat", "value_added_tax", "value added tax"},
     "paye": {"paye", "pay as you earn", "payroll"},
     "personal_income_tax": {"personal_income_tax", "personal income tax", "pit"},
+    "pit": {"personal_income_tax", "personal income tax", "pit"},
     "withholding_tax": {"withholding_tax", "withholding tax", "wht"},
     "company_income_tax": {"company_income_tax", "company income tax", "cit"},
+    "cit": {"company_income_tax", "company income tax", "cit"},
     "freelancer": {"freelancer", "self_employed", "self employed", "sole proprietor"},
     "self_employed": {"freelancer", "self_employed", "self employed", "sole proprietor"},
     "tin": {"tin", "tax identification number"},
@@ -105,14 +104,13 @@ STOPWORDS = {
 }
 
 ACTION_KEYWORDS = {
-    "verification": {"verify", "verification", "validate", "validation", "confirm", "check", "status"},
-    "registration": {"register", "registration", "enrol", "enroll", "enrollment", "apply", "application", "obtain", "get"},
-    "filing": {"file", "filing", "return", "submit", "submission"},
-    "payment": {"pay", "payment", "remit", "remittance"},
-    "records": {"record", "records", "documentation", "documents", "evidence", "keep", "supporting"},
-    "authority": {"authority", "authorities", "firs", "nrs", "state", "issues", "issue", "receives", "receive", "handles", "handle", "portal"},
+    "verify": {"verify", "verification", "validate", "validation", "confirm", "check", "authenticity", "genuine", "status"},
+    "apply": {"apply", "application", "obtain", "get", "request"},
+    "register": {"register", "registration", "enrol", "enroll", "enrollment"},
+    "file": {"file", "filing", "submit", "return"},
+    "pay": {"pay", "payment", "remit", "remittance"},
     "calculate": {"calculate", "computation", "compute", "rate", "percentage"},
-    "exempt": {"exempt", "exemption", "zero", "rated", "zero-rated"},
+    "exempt": {"exempt", "exemption", "zero", "rated", "zero-rated", "zero-rated"},
     "use": {"use", "used", "purpose", "needed"},
 }
 
@@ -211,24 +209,24 @@ def _action_conflicts(question: str, row_text: str) -> bool:
 
 
 def _infer_topic_from_question(question: str, fallback: str = "general") -> str:
-    q = _normalize_text(question)
+    q = f" {_normalize_text(question)} "
 
-    if any(x in q for x in ["vat", "value added tax", "value_added_tax"]):
-        return "vat"
-    if any(x in q for x in ["personal income tax", "pit"]):
-        return "personal_income_tax"
-    if any(x in q for x in ["paye", "pay as you earn", "payroll"]):
-        return "paye"
-    if any(x in q for x in ["withholding tax", "wht"]):
+    if any(x in q for x in [" withholding tax ", " wht "]):
         return "withholding_tax"
-    if any(x in q for x in ["company income tax", "cit"]):
+    if any(x in q for x in [" company income tax ", " cit "]):
         return "company_income_tax"
-    if any(x in q for x in ["freelancer", "self employed", "sole proprietor"]):
-        return "freelancer"
-    if any(x in q for x in ["tin", "tax identification number"]):
+    if any(x in q for x in [" personal income tax ", " pit "]):
+        return "personal_income_tax"
+    if any(x in q for x in [" paye ", " pay as you earn ", " payroll "]):
+        return "paye"
+    if any(x in q for x in [" vat ", " value added tax ", " value_added_tax "]):
+        return "vat"
+    if any(x in q for x in [" tin ", " tax identification number ", " tax id "]):
         return "tin"
-    if any(x in q for x in ["tcc", "tax clearance certificate"]):
+    if any(x in q for x in [" tcc ", " tax clearance certificate "]):
         return "tax_clearance_certificate"
+    if any(x in q for x in [" freelancer ", " self employed ", " sole proprietor "]):
+        return "freelancer"
 
     return str(fallback or "general").strip().lower()
 
@@ -236,30 +234,55 @@ def _infer_topic_from_question(question: str, fallback: str = "general") -> str:
 def _infer_intent_from_question(question: str, fallback: str = "general") -> str:
     q = _normalize_text(question)
 
-    if any(x in q for x in ["which tax authority", "what tax authority", "which authority", "who handles", "who issues", "who receives", "does firs or state", "does nrs or state"]):
+    if any(x in q for x in [
+        "which tax authority",
+        "what tax authority",
+        "who handles",
+        "which authority",
+        "does firs or state",
+        "does nrs or state",
+        "who issues",
+        "who receives",
+        "which portal should i use",
+        "which portal do i use",
+    ]):
         return "authority"
-    if any(x in q for x in ["what records should i keep", "what records should be kept", "what documents are needed", "what documents are required", "documentation", "evidence"]):
-        return "records"
-    if any(x in q for x in ["how do i verify", "how to verify", "verify", "verification", "validate", "validation"]):
+
+    if any(x in q for x in ["verify", "verification", "validate", "validation", "check tin", "confirm tcc"]):
         return "verification"
-    if any(x in q for x in ["how do i register", "how to register", "register for", "registration", "apply for"]):
-        return "registration"
-    if any(x in q for x in ["how do i file", "how to file", " filing", "file ", "return", "submit"]):
-        return "filing"
-    if any(x in q for x in ["how do i pay", "how to pay", "how do i remit", "how to remit", "payment", "remit", "remittance"]):
-        return "payment"
-    if any(x in q for x in ["rate", "percentage", "how much"]):
-        return "rate"
-    if any(x in q for x in ["exempt", "exemption", "zero rated", "zero-rated"]):
-        return "exemption"
+
+    if any(x in q for x in ["what documents", "documents needed", "documents required", "requirements for"]):
+        return "documents"
+
+    if any(x in q for x in ["what records", "what record", "what should i keep", "keep for", "records should i keep"]):
+        return "records"
+
     if q.startswith("what is ") or q.startswith("define ") or q.startswith("meaning of ") or q.startswith("what does "):
         return "definition"
-    if any(x in q for x in ["calculate", "computation", "compute"]):
-        return "calculation"
-    if any(x in q for x in ["who must", "must i", "must we", "am i required", "should i charge", "who should", "who needs to", "comply with", "who pays", "who must pay"]):
-        return "obligation"
+
+    if any(x in q for x in ["rate", "percentage"]):
+        return "rate"
+
+    if any(x in q for x in ["exempt", "exemption", "zero rated", "zero-rated"]):
+        return "exemption"
+
+    if any(x in q for x in ["register for", "registration", "register ", "obtain a tin", "get a tin", "apply for a tin"]):
+        return "registration"
+
     if q.startswith("how do i ") or q.startswith("how to ") or "process" in q or "procedure" in q:
         return "procedure"
+
+    if any(x in q for x in ["file", "filing", "submit", "return"]):
+        return "filing"
+
+    if any(x in q for x in ["pay", "payment", "remit", "remittance"]):
+        return "payment"
+
+    if any(x in q for x in ["calculate", "computation", "compute", "how much", "penalty", "due date", "deadline", "fine", "late fee", "when is"]):
+        return "calculation"
+
+    if any(x in q for x in ["who must", "must i", "must we", "am i required", "should i charge", "who should", "who needs to", "comply with"]):
+        return "obligation"
 
     return str(fallback or "general").strip().lower()
 
@@ -443,40 +466,6 @@ def _intent_matches(question_meta: Dict[str, Any], row: Dict[str, Any], question
 def _question_is_short(question: str) -> bool:
     nq = _normalize_text(question)
     return bool(nq) and len(_tokenize(nq)) <= 3
-
-
-def _is_tax_specific_short_question(question_meta: Dict[str, Any], question: str) -> bool:
-    topic = _safe_str(question_meta.get("topic")).lower()
-    if topic in {
-        "vat",
-        "paye",
-        "personal_income_tax",
-        "withholding_tax",
-        "company_income_tax",
-        "tin",
-        "tax_clearance_certificate",
-    }:
-        return True
-
-    q = _normalize_text(question)
-    return any(
-        phrase in q
-        for phrase in [
-            "vat",
-            "value added tax",
-            "paye",
-            "pay as you earn",
-            "personal income tax",
-            "withholding tax",
-            "wht",
-            "company income tax",
-            "cit",
-            "tin",
-            "tax identification number",
-            "tcc",
-            "tax clearance certificate",
-        ]
-    )
 
 
 def _looks_already_structured(text: str) -> bool:
@@ -752,68 +741,66 @@ def _is_strong_kb_direct_match(row: Dict[str, Any], question_meta: Dict[str, Any
     return False
 
 
-def _rule_result_to_answer(result: Any) -> Optional[str]:
+def _rule_result_to_text(result: Any) -> Optional[str]:
+    if isinstance(result, str):
+        return result.strip() or None
     if isinstance(result, dict):
-        if result.get("ok"):
-            answer = _safe_str(result.get("answer"))
-            return answer or None
-        return None
-
-    answer = _safe_str(result)
-    return answer or None
+        answer = _safe_str(result.get("answer"))
+        return answer or None
+    return None
 
 
 def _resolve_rules(question: str, topic: str, intent_type: str) -> Optional[str]:
     try:
-        answer = _rule_result_to_answer(try_answer_tax_authority_rule(question=question))
-        if answer:
-            return answer
+        authority_answer = _rule_result_to_text(try_tax_authority_rule(question=question, topic=topic, intent_type=intent_type))
+        if authority_answer:
+            return authority_answer
     except Exception:
         pass
 
     try:
         if can_handle_tin_rule(question, topic, intent_type):
-            answer = _rule_result_to_answer(resolve_tin_rule(question, intent_type))
-            if answer:
-                return answer
+            tin_answer = _rule_result_to_text(resolve_tin_rule(question, intent_type))
+            if tin_answer:
+                return tin_answer
+    except Exception:
+        pass
+
+    try:
+        if can_handle_pit_rule(question, topic, intent_type):
+            pit_answer = _rule_result_to_text(resolve_pit_rule(question, intent_type))
+            if pit_answer:
+                return pit_answer
     except Exception:
         pass
 
     try:
         if can_handle_vat_rule(question, topic, intent_type):
-            answer = _rule_result_to_answer(resolve_vat_rule(question, intent_type))
-            if answer:
-                return answer
+            vat_answer = _rule_result_to_text(resolve_vat_rule(question, intent_type))
+            if vat_answer:
+                return vat_answer
     except Exception:
         pass
 
     try:
         if can_handle_paye_rule(question, topic, intent_type):
-            answer = _rule_result_to_answer(resolve_paye_rule(question, intent_type))
-            if answer:
-                return answer
+            paye_answer = _rule_result_to_text(resolve_paye_rule(question, intent_type))
+            if paye_answer:
+                return paye_answer
     except Exception:
         pass
 
     try:
-        if can_handle_personal_income_tax_rule(question, topic, intent_type):
-            answer = _rule_result_to_answer(resolve_personal_income_tax_rule(question, intent_type))
-            if answer:
-                return answer
+        wht_answer = _rule_result_to_text(try_withholding_tax_rule(question=question, topic=topic, intent_type=intent_type))
+        if wht_answer:
+            return wht_answer
     except Exception:
         pass
 
     try:
-        answer = _rule_result_to_answer(try_answer_company_income_tax_rule(question=question))
-        if answer:
-            return answer
-    except Exception:
-        pass
-
-    try:
-        answer = _rule_result_to_answer(try_answer_withholding_tax_rule(question=question))
-        if answer:
-            return answer
+        cit_answer = _rule_result_to_text(try_company_income_tax_rule(question=question, topic=topic, intent_type=intent_type))
+        if cit_answer:
+            return cit_answer
     except Exception:
         pass
 
@@ -1129,9 +1116,8 @@ def _process_ask_request(
 
     balance = _safe_int(usage_state.get("credits_left"), 0)
     short_q = _question_is_short(question)
-    tax_specific_short = _is_tax_specific_short_question(question_meta, question)
 
-    if short_q and not tax_specific_short:
+    if short_q:
         library_answer = find_library_answer(
             normalized_question=question_meta.get("normalized_question") or _normalize_text(question),
             lang=lang,
