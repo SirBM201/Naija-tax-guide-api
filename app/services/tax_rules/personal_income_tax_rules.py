@@ -6,8 +6,7 @@ from typing import Optional
 
 CURRENT_PIT_SOURCE = (
     "Source: current official State Internal Revenue Service personal-income-tax guidance, "
-    "the current Personal Income Tax framework, and the approved state filing and payment "
-    "channels for the taxpayer's case."
+    "the current Personal Income Tax framework in force, and the approved state filing and payment channels."
 )
 
 
@@ -144,7 +143,7 @@ def explain_personal_income_tax_payment() -> str:
         next_steps=[
             "Ask how to file Personal Income Tax if the filing has not yet been completed.",
             "Ask what records should support the Personal Income Tax payment.",
-            "Ask whether the case should be handled through PAYE.",
+            "Ask which state tax authority should receive the tax in your case.",
         ],
         source_line=CURRENT_PIT_SOURCE,
     )
@@ -169,30 +168,28 @@ def explain_personal_income_tax_records() -> str:
         next_steps=[
             "Ask how to file Personal Income Tax for the period involved.",
             "Ask how to pay Personal Income Tax once the amount due is confirmed.",
-            "Ask which authority should handle the Personal Income Tax in your case.",
+            "Ask whether part of the case should be handled through PAYE.",
         ],
         source_line=CURRENT_PIT_SOURCE,
     )
 
 
-_DEFINITION_HINTS = (
+_BASIC_HINTS = (
     "what is personal income tax",
     "meaning of personal income tax",
     "define personal income tax",
-    "personal income tax meaning",
+    "what does personal income tax mean",
 )
 
 _OBLIGATION_HINTS = (
     "who pays personal income tax",
-    "who must pay personal income tax",
-    "who should pay personal income tax",
-    "who pays pit",
     "who must comply with personal income tax",
+    "who should pay personal income tax",
+    "who is liable for personal income tax",
 )
 
 _RATE_HINTS = (
     "personal income tax rate",
-    "what is the personal income tax rate",
     "pit rate",
     "rate of personal income tax",
 )
@@ -201,63 +198,60 @@ _FILING_HINTS = (
     "how do i file personal income tax",
     "how to file personal income tax",
     "file personal income tax",
-    "personal income tax filing",
 )
 
 _PAYMENT_HINTS = (
     "how do i pay personal income tax",
     "how to pay personal income tax",
     "pay personal income tax",
-    "personal income tax payment",
 )
 
 _RECORDS_HINTS = (
     "what records should i keep for personal income tax",
-    "what records should be kept for personal income tax",
+    "what records should i keep for pit",
     "personal income tax records",
-    "records for personal income tax",
-    "what should i keep for personal income tax",
+    "pit records",
 )
 
 
-def can_handle_personal_income_tax_rule(question: str, topic: str, intent_type: str) -> bool:
+def can_handle_pit_rule(question: str, topic: str, intent_type: str) -> bool:
     q = _normalize(question)
     topic_key = _normalize(topic)
     intent_key = _normalize(intent_type)
 
-    pit_context = topic_key in {"personal income tax", "personal_income_tax", "pit"} or "personal income tax" in q or " pit " in f" {q} "
+    pit_context = topic_key in {"personal income tax", "personal_income_tax", "pit"} or "personal income tax" in q or re.search(r"\bpit\b", q)
+    if not pit_context:
+        pit_context = any(h in q for h in _BASIC_HINTS + _OBLIGATION_HINTS + _RATE_HINTS + _FILING_HINTS + _PAYMENT_HINTS + _RECORDS_HINTS)
+
     if not pit_context:
         return False
 
     if intent_key in {"definition", "obligation", "rate", "filing", "payment", "records"}:
         return True
 
-    if any(hint in q for hint in _DEFINITION_HINTS + _OBLIGATION_HINTS + _RATE_HINTS + _FILING_HINTS + _PAYMENT_HINTS + _RECORDS_HINTS):
-        return True
-
-    return False
+    return any(h in q for h in _BASIC_HINTS + _OBLIGATION_HINTS + _RATE_HINTS + _FILING_HINTS + _PAYMENT_HINTS + _RECORDS_HINTS)
 
 
-def resolve_personal_income_tax_rule(question: str, intent_type: str) -> Optional[str]:
+def resolve_pit_rule(question: str, intent_type: str) -> Optional[str]:
     q = _normalize(question)
     intent_key = _normalize(intent_type)
 
-    if intent_key == "records" or any(hint in q for hint in _RECORDS_HINTS):
+    if intent_key == "records" or any(h in q for h in _RECORDS_HINTS):
         return explain_personal_income_tax_records()
 
-    if intent_key == "payment" or any(hint in q for hint in _PAYMENT_HINTS):
+    if intent_key == "payment" or any(h in q for h in _PAYMENT_HINTS):
         return explain_personal_income_tax_payment()
 
-    if intent_key == "filing" or any(hint in q for hint in _FILING_HINTS):
+    if intent_key == "filing" or any(h in q for h in _FILING_HINTS):
         return explain_personal_income_tax_filing()
 
-    if intent_key == "rate" or any(hint in q for hint in _RATE_HINTS):
-        return explain_personal_income_tax_rate()
-
-    if intent_key == "obligation" or any(hint in q for hint in _OBLIGATION_HINTS):
+    if intent_key == "obligation" or any(h in q for h in _OBLIGATION_HINTS):
         return explain_personal_income_tax_obligation()
 
-    if intent_key == "definition" or any(hint in q for hint in _DEFINITION_HINTS):
+    if intent_key == "rate" or any(h in q for h in _RATE_HINTS):
+        return explain_personal_income_tax_rate()
+
+    if intent_key == "definition" or any(h in q for h in _BASIC_HINTS):
         return explain_personal_income_tax_basic()
 
     return None
