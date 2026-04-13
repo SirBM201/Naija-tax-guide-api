@@ -1,258 +1,517 @@
 from __future__ import annotations
 
-import re
-from typing import Optional, Dict, Any, List
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
 from app.core.supabase_client import supabase
+
+HISTORY_TABLE = "qa_history"
+
+
+SAFE_HISTORY_COLUMNS = [
+    "id",
+    "account_id",
+    "question",
+    "answer",
+    "lang",
+    "source",
+    "from_cache",
+    "canonical_key",
+    "normalized_question",
+    "plan_code",
+    "credits_consumed",
+    "usage_charged",
+    "channel",
+    "created_at",
+    "updated_at",
+]
+
+
+DEFAULT_ITEM = {
+    "id": None,
+    "account_id": "",
+    "question": "",
+    "answer": "",
+    "lang": "en",
+    "source": "web",
+    "from_cache": False,
+    "canonical_key": None,
+    "normalized_question": None,
+    "plan_code": None,
+    "credits_consumed": 0,
+    "usage_charged": False,
+    "channel": "web",
+    "created_at": None,
+    "updated_at": None,
+}
 
 
 def _sb():
     return supabase() if callable(supabase) else supabase
 
 
-def _normalize_text(value: str) -> str:
-    text = (value or "").strip().lower()
-    text = re.sub(r"[^a-z0-9\s]+", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _tokenize(value: str) -> List[str]:
-    text = _normalize_text(value)
-    if not text:
-        return []
-    return [part for part in text.split(" ") if part]
+def _clip(value: Any, limit: int = 280) -> str:
+    text = str(value or "")
+    return text if len(text) <= limit else f"{text[:limit]}...<truncated>"
 
 
-def _safe_int(value: Any, default: int = 0) -> int:
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _as_int(value: Any, default: int = 0) -> int:
     try:
         return int(value)
     except Exception:
         return default
 
 
-def _language_answer_field(lang: str) -> str:
-    code = (lang or "en").strip().lower()
-
-    mapping = {
-        "en": "answer_en",
-        "pcm": "answer_pcm",
-        "pidgin": "answer_pidgin",
-        "yo": "answer_yo",
-        "yoruba": "answer_yoruba",
-        "ig": "answer_ig",
-        "igbo": "answer_igbo",
-        "ha": "answer_ha",
-        "hausa": "answer_hausa",
-    }
-    return mapping.get(code, "answer_en")
+def _normalize_text(value: Any) -> Optional[str]:
+    text = str(value or "").strip()
+    return text or None
 
 
-def _row_best_answer(row: Dict[str, Any], lang: str) -> str:
-    preferred_field = _language_answer_field(lang)
-    preferred = str(row.get(preferred_field) or "").strip()
-    if preferred:
-        return preferred
-
-    fallback_order = [
-        "answer_en",
-        "answer_pcm",
-        "answer_yo",
-        "answer_ig",
-        "answer_ha",
-        "answer_pidgin",
-        "answer_yoruba",
-        "answer_igbo",
-        "answer_hausa",
-        "answer",
-    ]
-    for key in fallback_order:
-        value = str(row.get(key) or "").strip()
-        if value:
-            return value
-    return ""
+def _normalize_lang(value: Any) -> str:
+    text = str(value or "en").strip().lower()
+    return text or "en"
 
 
-def _row_terms(row: Dict[str, Any]) -> List[str]:
-    terms: List[str] = []
-
-    for key in ["question", "normalized_question", "canonical_key", "category", "source"]:
-        value = str(row.get(key) or "").strip()
-        if value:
-            terms.append(value)
-
-    tags = row.get("tags") or []
-    if isinstance(tags, list):
-        terms.extend(str(tag).strip() for tag in tags if str(tag).strip())
-
-    return [_normalize_text(term) for term in terms if _normalize_text(term)]
+def _normalize_channel(value: Any) -> str:
+    text = str(value or "web").strip().lower()
+    return text or "web"
 
 
-def _score_row(
-    normalized_question: str,
-    canonical_key: Optional[str],
-    row: Dict[str, Any],
-) -> Dict[str, Any]:
-    score = 0
-    reasons: List[str] = []
-
-    nq = _normalize_text(normalized_question)
-    ck = _normalize_text(canonical_key or "")
-    row_nq = _normalize_text(str(row.get("normalized_question") or ""))
-    row_ck = _normalize_text(str(row.get("canonical_key") or ""))
-    row_question = _normalize_text(str(row.get("question") or ""))
-    row_terms = set(_row_terms(row))
-
-    q_tokens = set(_tokenize(nq))
-    row_tokens = set(_tokenize(" ".join(row_terms)))
-
-    if ck and row_ck and ck == row_ck:
-        score += 200
-        reasons.append("canonical_key_exact:+200")
-
-    if nq and row_nq and nq == row_nq:
-        score += 180
-        reasons.append("normalized_question_exact:+180")
-
-    if nq and row_question and nq == row_question:
-        score += 120
-        reasons.append("question_exact:+120")
-
-    if nq and row_nq and (nq in row_nq or row_nq in nq):
-        score += 50
-        reasons.append("normalized_phrase_overlap:+50")
-
-    if ck and ck in row_terms:
-        score += 40
-        reasons.append("canonical_key_term_hit:+40")
-
-    overlap = len(q_tokens.intersection(row_tokens))
-    if overlap > 0:
-        bonus = min(30, overlap * 6)
-        score += bonus
-        reasons.append(f"token_overlap:+{bonus}")
-
-    priority = _safe_int(row.get("priority"), 0)
-    if priority > 0:
-        bonus = min(20, priority)
-        score += bonus
-        reasons.append(f"priority:+{bonus}")
-
-    return {
-        "score": score,
-        "reasons": reasons,
-    }
+def _normalize_source(value: Any, channel: str) -> str:
+    text = str(value or "").strip().lower()
+    if text in {"", "ai", "direct_cache", "cache", "rules_engine", "tax_process_composer", "ai_grounded"}:
+        return channel or "web"
+    return text
 
 
-def find_library_candidates(
-    normalized_question: str,
-    lang: str = "en",
-    canonical_key: Optional[str] = None,
-    limit: int = 5,
+def _has_table(table: str) -> bool:
+    try:
+        _sb().table(table).select("*").limit(1).execute()
+        return True
+    except Exception:
+        return False
+
+
+def _has_column(table: str, column: str) -> bool:
+    try:
+        _sb().table(table).select(column).limit(1).execute()
+        return True
+    except Exception:
+        return False
+
+
+def _available_columns() -> List[str]:
+    return [column for column in SAFE_HISTORY_COLUMNS if _has_column(HISTORY_TABLE, column)]
+
+
+def _safe_select_cols() -> str:
+    cols = _available_columns()
+    return ",".join(cols) if cols else "*"
+
+
+def _row_to_item(row: Dict[str, Any]) -> Dict[str, Any]:
+    item = dict(DEFAULT_ITEM)
+    raw = row or {}
+    item.update(
+        {
+            "id": raw.get("id"),
+            "account_id": str(raw.get("account_id") or "").strip(),
+            "question": str(raw.get("question") or "").strip(),
+            "answer": str(raw.get("answer") or "").strip(),
+            "lang": _normalize_lang(raw.get("lang")),
+            "source": _normalize_source(raw.get("source"), _normalize_channel(raw.get("channel"))),
+            "from_cache": _as_bool(raw.get("from_cache")),
+            "canonical_key": _normalize_text(raw.get("canonical_key")),
+            "normalized_question": _normalize_text(raw.get("normalized_question")),
+            "plan_code": _normalize_text(raw.get("plan_code")),
+            "credits_consumed": _as_int(raw.get("credits_consumed"), 0),
+            "usage_charged": _as_bool(raw.get("usage_charged")),
+            "channel": _normalize_channel(raw.get("channel")),
+            "created_at": raw.get("created_at"),
+            "updated_at": raw.get("updated_at"),
+        }
+    )
+    return item
+
+
+def _filter_rows(
+    rows: List[Dict[str, Any]],
+    *,
+    source: Optional[str] = None,
+    channel: Optional[str] = None,
+    query: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    nq = _normalize_text(normalized_question)
-    ck = _normalize_text(canonical_key or "")
+    source_norm = (source or "").strip().lower() or None
+    channel_norm = (channel or "").strip().lower() or None
+    query_norm = (query or "").strip().lower() or None
 
-    if not nq and not ck:
-        return []
+    filtered = rows
+
+    if source_norm:
+        filtered = [
+            row
+            for row in filtered
+            if str(row.get("source") or "").strip().lower() == source_norm
+        ]
+
+    if channel_norm:
+        filtered = [
+            row
+            for row in filtered
+            if str(row.get("channel") or "").strip().lower() == channel_norm
+        ]
+
+    if query_norm:
+        matched: List[Dict[str, Any]] = []
+        for row in filtered:
+            haystack = " ".join(
+                [
+                    str(row.get("question") or ""),
+                    str(row.get("answer") or ""),
+                    str(row.get("lang") or ""),
+                    str(row.get("source") or ""),
+                    str(row.get("channel") or ""),
+                    str(row.get("canonical_key") or ""),
+                    str(row.get("normalized_question") or ""),
+                ]
+            ).lower()
+            if query_norm in haystack:
+                matched.append(row)
+        filtered = matched
+
+    return filtered
+
+
+def history_table_ready() -> Dict[str, Any]:
+    exists = _has_table(HISTORY_TABLE)
+    return {
+        "ok": True,
+        "table": HISTORY_TABLE,
+        "exists": exists,
+        "available_columns": _available_columns() if exists else [],
+    }
+
+
+def log_history_item_best_effort(
+    *,
+    account_id: str,
+    question: str,
+    answer: str,
+    lang: str = "en",
+    source: str = "web",
+    from_cache: bool = False,
+    canonical_key: Optional[str] = None,
+    normalized_question: Optional[str] = None,
+    plan_code: Optional[str] = None,
+    credits_consumed: int = 0,
+    usage_charged: bool = False,
+    channel: str = "web",
+) -> None:
+    account_id = str(account_id or "").strip()
+    question = str(question or "").strip()
+    answer = str(answer or "").strip()
+    lang = _normalize_lang(lang)
+    channel = _normalize_channel(channel)
+    source = _normalize_source(source, channel)
+    canonical_key = _normalize_text(canonical_key)
+    normalized_question = _normalize_text(normalized_question)
+    plan_code = _normalize_text(plan_code)
+
+    if not account_id or not question or not answer:
+        return
+
+    if not _has_table(HISTORY_TABLE):
+        return
+
+    payload: Dict[str, Any] = {
+        "account_id": account_id,
+        "question": question,
+        "answer": answer,
+        "lang": lang,
+        "source": source,
+        "from_cache": bool(from_cache),
+        "canonical_key": canonical_key,
+        "normalized_question": normalized_question,
+        "plan_code": plan_code,
+        "credits_consumed": int(credits_consumed or 0),
+        "usage_charged": bool(usage_charged),
+        "channel": channel,
+        "created_at": _now_iso(),
+        "updated_at": _now_iso(),
+    }
+
+    safe_payload = {key: value for key, value in payload.items() if _has_column(HISTORY_TABLE, key)}
+    if not safe_payload:
+        return
+
+    try:
+        _sb().table(HISTORY_TABLE).insert(safe_payload).execute()
+    except Exception:
+        return
+
+
+def list_history_items(
+    *,
+    account_id: str,
+    limit: int = 50,
+    source: Optional[str] = None,
+    channel: Optional[str] = None,
+    query: Optional[str] = None,
+) -> Dict[str, Any]:
+    account_id = str(account_id or "").strip()
+    if not account_id:
+        return {
+            "ok": False,
+            "error": "account_id_required",
+            "root_cause": "missing_account_id",
+            "fix": "Authenticate first so a canonical account_id can be resolved.",
+        }
+
+    if not _has_table(HISTORY_TABLE):
+        return {
+            "ok": False,
+            "error": "history_table_missing",
+            "root_cause": f"{HISTORY_TABLE} table is not available.",
+            "fix": f"Create table {HISTORY_TABLE} before using persistent history.",
+            "details": {"table": HISTORY_TABLE},
+        }
+
+    try:
+        safe_limit = max(1, min(int(limit or 50), 500))
+    except Exception:
+        safe_limit = 50
 
     try:
         res = (
             _sb()
-            .table("qa_library")
-            .select("*")
-            .eq("enabled", True)
-            .order("priority", desc=True)
-            .limit(400)
+            .table(HISTORY_TABLE)
+            .select(_safe_select_cols())
+            .eq("account_id", account_id)
+            .order("created_at", desc=True)
+            .limit(safe_limit)
+            .execute()
+        )
+        raw_rows = getattr(res, "data", None) or []
+        items = [_row_to_item(row) for row in raw_rows]
+        items = _filter_rows(items, source=source, channel=channel, query=query)
+        return {
+            "ok": True,
+            "items": items,
+            "count": len(items),
+            "account_id": account_id,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": "history_lookup_failed",
+            "root_cause": f"{type(exc).__name__}: {_clip(exc)}",
+            "fix": f"Check {HISTORY_TABLE} table access, columns, and Supabase connectivity.",
+            "details": {"table": HISTORY_TABLE, "account_id": account_id},
+        }
+
+
+def get_history_item(*, account_id: str, item_id: str) -> Dict[str, Any]:
+    account_id = str(account_id or "").strip()
+    item_id = str(item_id or "").strip()
+
+    if not account_id:
+        return {
+            "ok": False,
+            "error": "account_id_required",
+            "root_cause": "missing_account_id",
+            "fix": "Authenticate first so a canonical account_id can be resolved.",
+        }
+
+    if not item_id:
+        return {
+            "ok": False,
+            "error": "item_id_required",
+            "root_cause": "missing_item_id",
+            "fix": "Provide the history item id.",
+        }
+
+    if not _has_table(HISTORY_TABLE):
+        return {
+            "ok": False,
+            "error": "history_table_missing",
+            "root_cause": f"{HISTORY_TABLE} table is not available.",
+            "fix": f"Create table {HISTORY_TABLE} before using persistent history.",
+            "details": {"table": HISTORY_TABLE},
+        }
+
+    try:
+        res = (
+            _sb()
+            .table(HISTORY_TABLE)
+            .select(_safe_select_cols())
+            .eq("account_id", account_id)
+            .eq("id", item_id)
+            .limit(1)
             .execute()
         )
         rows = getattr(res, "data", None) or []
-    except Exception:
-        return []
-
-    if not isinstance(rows, list):
-        return []
-
-    scored: List[Dict[str, Any]] = []
-    for row in rows:
-        score_info = _score_row(nq, ck, row)
-        if score_info["score"] <= 0:
-            continue
-
-        enriched = dict(row)
-        enriched["library_score"] = score_info["score"]
-        enriched["library_score_reasons"] = score_info["reasons"]
-        enriched["resolved_answer"] = _row_best_answer(row, lang)
-        scored.append(enriched)
-
-    scored.sort(
-        key=lambda item: (
-            _safe_int(item.get("library_score"), 0),
-            _safe_int(item.get("priority"), 0),
-        ),
-        reverse=True,
-    )
-
-    return scored[: max(1, int(limit))]
+        row = rows[0] if rows else None
+        if not row:
+            return {
+                "ok": False,
+                "error": "history_item_not_found",
+                "root_cause": "No matching history item was found for this account.",
+                "fix": "Use an existing history item id for the authenticated account.",
+                "details": {"item_id": item_id},
+            }
+        return {"ok": True, "item": _row_to_item(row), "account_id": account_id}
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": "history_item_lookup_failed",
+            "root_cause": f"{type(exc).__name__}: {_clip(exc)}",
+            "fix": f"Check {HISTORY_TABLE} table access, columns, and Supabase connectivity.",
+            "details": {"table": HISTORY_TABLE, "item_id": item_id, "account_id": account_id},
+        }
 
 
-def find_library_answer(
-    normalized_question: str,
-    lang: str = "en",
-    canonical_key: Optional[str] = None,
-) -> Optional[Dict[str, Any]]:
-    nq = _normalize_text(normalized_question)
-    ck = _normalize_text(canonical_key or "")
+def delete_history_item(*, account_id: str, item_id: str) -> Dict[str, Any]:
+    account_id = str(account_id or "").strip()
+    item_id = str(item_id or "").strip()
 
-    if not nq and not ck:
-        return None
+    lookup = get_history_item(account_id=account_id, item_id=item_id)
+    if not lookup.get("ok"):
+        return lookup
 
     try:
-        if ck:
-            res = (
-                _sb()
-                .table("qa_library")
-                .select("*")
-                .eq("enabled", True)
-                .eq("canonical_key", ck)
-                .order("priority", desc=True)
-                .limit(1)
-                .execute()
-            )
-            if getattr(res, "data", None):
-                row = dict(res.data[0])
-                row["resolved_answer"] = _row_best_answer(row, lang)
-                return row
+        _sb().table(HISTORY_TABLE).delete().eq("account_id", account_id).eq("id", item_id).execute()
+        return {
+            "ok": True,
+            "deleted": True,
+            "item_id": item_id,
+            "account_id": account_id,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": "history_item_delete_failed",
+            "root_cause": f"{type(exc).__name__}: {_clip(exc)}",
+            "fix": f"Check delete access to {HISTORY_TABLE} and verify the item still exists.",
+            "details": {"table": HISTORY_TABLE, "item_id": item_id, "account_id": account_id},
+        }
 
-        if nq:
-            res = (
-                _sb()
-                .table("qa_library")
-                .select("*")
-                .eq("enabled", True)
-                .eq("normalized_question", nq)
-                .order("priority", desc=True)
-                .limit(1)
-                .execute()
-            )
-            if getattr(res, "data", None):
-                row = dict(res.data[0])
-                row["resolved_answer"] = _row_best_answer(row, lang)
-                return row
-    except Exception:
-        pass
 
-    candidates = find_library_candidates(
-        normalized_question=nq,
-        lang=lang,
-        canonical_key=ck,
-        limit=3,
+def clear_history_items(
+    *,
+    account_id: str,
+    source: Optional[str] = None,
+    channel: Optional[str] = None,
+) -> Dict[str, Any]:
+    account_id = str(account_id or "").strip()
+    if not account_id:
+        return {
+            "ok": False,
+            "error": "account_id_required",
+            "root_cause": "missing_account_id",
+            "fix": "Authenticate first so a canonical account_id can be resolved.",
+        }
+
+    listed = list_history_items(
+        account_id=account_id,
+        limit=5000,
+        source=source,
+        channel=channel,
+        query=None,
     )
-    if not candidates:
-        return None
+    if not listed.get("ok"):
+        return listed
 
-    best = candidates[0]
-    if _safe_int(best.get("library_score"), 0) < 40:
-        return None
+    items = listed.get("items", [])
+    if not items:
+        return {
+            "ok": True,
+            "deleted": 0,
+            "account_id": account_id,
+            "source": (source or "").strip().lower() or None,
+            "channel": (channel or "").strip().lower() or None,
+        }
 
-    return best
+    item_ids = [str(item.get("id") or "").strip() for item in items if str(item.get("id") or "").strip()]
+    deleted = 0
+    errors: List[Dict[str, Any]] = []
+
+    for item_id in item_ids:
+        try:
+            _sb().table(HISTORY_TABLE).delete().eq("account_id", account_id).eq("id", item_id).execute()
+            deleted += 1
+        except Exception as exc:
+            errors.append({"item_id": item_id, "root_cause": f"{type(exc).__name__}: {_clip(exc)}"})
+
+    if errors:
+        return {
+            "ok": False,
+            "error": "history_clear_partial_failure",
+            "root_cause": "Some history items could not be deleted.",
+            "fix": "Retry the clear action or inspect delete permissions for qa_history.",
+            "deleted": deleted,
+            "errors": errors,
+            "account_id": account_id,
+        }
+
+    return {
+        "ok": True,
+        "deleted": deleted,
+        "account_id": account_id,
+        "source": (source or "").strip().lower() or None,
+        "channel": (channel or "").strip().lower() or None,
+    }
+
+
+def history_summary(
+    *,
+    account_id: str,
+    source: Optional[str] = None,
+    channel: Optional[str] = None,
+    query: Optional[str] = None,
+) -> Dict[str, Any]:
+    listed = list_history_items(
+        account_id=account_id,
+        limit=5000,
+        source=source,
+        channel=channel,
+        query=query,
+    )
+    if not listed.get("ok"):
+        return listed
+
+    items = listed.get("items", [])
+    by_source: Dict[str, int] = {}
+    by_channel: Dict[str, int] = {}
+    by_lang: Dict[str, int] = {}
+    dates = [str(item.get("created_at") or "").strip() for item in items if str(item.get("created_at") or "").strip()]
+
+    for item in items:
+        item_source = str(item.get("source") or "unknown").strip().lower() or "unknown"
+        item_channel = str(item.get("channel") or item_source or "unknown").strip().lower() or "unknown"
+        item_lang = str(item.get("lang") or "en").strip().lower() or "en"
+        by_source[item_source] = by_source.get(item_source, 0) + 1
+        by_channel[item_channel] = by_channel.get(item_channel, 0) + 1
+        by_lang[item_lang] = by_lang.get(item_lang, 0) + 1
+
+    sorted_dates = sorted(dates)
+    return {
+        "ok": True,
+        "account_id": account_id,
+        "count": len(items),
+        "by_source": by_source,
+        "by_channel": by_channel,
+        "by_lang": by_lang,
+        "oldest_created_at": sorted_dates[0] if sorted_dates else None,
+        "newest_created_at": sorted_dates[-1] if sorted_dates else None,
+        "storage_mode": "server",
+    }
