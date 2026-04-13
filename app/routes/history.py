@@ -15,11 +15,7 @@ from app.services.history_service import (
     save_item,
 )
 
-history_bp = Blueprint("history", __name__, url_prefix="/api/history")
-
-
-def register_history_blueprint(app) -> None:
-    app.register_blueprint(history_bp)
+bp = Blueprint("history", __name__)
 
 
 def _request_body() -> dict[str, Any]:
@@ -74,10 +70,10 @@ def _error(message: str, status: int = 400, **extra: Any):
     return jsonify(payload), status
 
 
-@history_bp.get("")
-@history_bp.get("/")
-@history_bp.get("/items")
-@history_bp.get("/list")
+@bp.get("/history")
+@bp.get("/history/")
+@bp.get("/history/items")
+@bp.get("/history/list")
 def history_list():
     account_id = _resolve_account_id()
     if not account_id:
@@ -112,6 +108,7 @@ def history_list():
                 "results": items_payload["items"],
                 "history": items_payload["items"],
                 "total": items_payload["total"],
+                "count": items_payload["total"],
                 "limit": items_payload["limit"],
                 "offset": items_payload["offset"],
                 "summary": summary_payload,
@@ -125,8 +122,8 @@ def history_list():
         return _error(str(exc), 500, backend_history_available=False, storage_mode="local")
 
 
-@history_bp.get("/summary")
-@history_bp.get("/status")
+@bp.get("/history/summary")
+@bp.get("/history/status")
 def history_summary():
     account_id = _resolve_account_id()
     if not account_id:
@@ -143,7 +140,7 @@ def history_summary():
         return _error(str(exc), 500, backend_history_available=False, storage_mode="local")
 
 
-@history_bp.get("/health")
+@bp.get("/history/health")
 def history_health():
     try:
         result = healthcheck()
@@ -152,8 +149,8 @@ def history_health():
         return _error(str(exc), 503, backend_history_available=False, storage_mode="local")
 
 
-@history_bp.get("/item/<item_id>")
-@history_bp.get("/items/<item_id>")
+@bp.get("/history/item/<item_id>")
+@bp.get("/history/items/<item_id>")
 def history_get_item(item_id: str):
     account_id = _resolve_account_id()
     if not account_id:
@@ -177,8 +174,8 @@ def history_get_item(item_id: str):
         return _error(str(exc), 500, backend_history_available=False, storage_mode="local")
 
 
-@history_bp.post("/save")
-@history_bp.post("/items")
+@bp.post("/history/save")
+@bp.post("/history/items")
 def history_save():
     body = _request_body()
     account_id = _resolve_account_id(body)
@@ -221,7 +218,7 @@ def history_save():
         return _error(str(exc), 400, backend_history_available=False, storage_mode="local")
 
 
-@history_bp.post("/delete")
+@bp.post("/history/delete")
 def history_delete():
     body = _request_body()
     account_id = _resolve_account_id(body)
@@ -249,8 +246,8 @@ def history_delete():
         return _error(str(exc), 400, backend_history_available=False, storage_mode="local")
 
 
-@history_bp.delete("/item/<item_id>")
-@history_bp.delete("/items/<item_id>")
+@bp.delete("/history/item/<item_id>")
+@bp.delete("/history/items/<item_id>")
 def history_delete_by_path(item_id: str):
     account_id = _resolve_account_id()
     if not account_id:
@@ -273,8 +270,8 @@ def history_delete_by_path(item_id: str):
         return _error(str(exc), 400, backend_history_available=False, storage_mode="local")
 
 
-@history_bp.post("/clear")
-@history_bp.delete("/clear")
+@bp.post("/history/clear")
+@bp.delete("/history/clear")
 def history_clear():
     body = _request_body()
     account_id = _resolve_account_id(body)
