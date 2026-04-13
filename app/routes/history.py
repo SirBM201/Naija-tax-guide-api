@@ -173,3 +173,4 @@ def clear_history():
 
     result["debug"] = {"auth": auth_debug}
     return jsonify(result), 200
+
