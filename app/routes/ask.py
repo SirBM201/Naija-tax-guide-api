@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional, Tuple
 from flask import Blueprint, jsonify, request
 
 from app.services.ask_service import ask_guarded
+from app.services.qa_history_service import log_history_item_best_effort
 from app.services.web_auth_service import get_account_id_from_request
 
 bp = Blueprint("ask", __name__)
@@ -23,17 +24,21 @@ def _safe_json() -> Dict[str, Any]:
     return request.get_json(silent=True) or {}
 
 
-def _extract_account_id(auth_result: Any) -> Tuple[Optional[str], Dict[str, Any]]:
-    """
-    Normalize whatever get_account_id_from_request returns into:
-      (account_id, auth_debug)
+def _safe_text(value: Any) -> str:
+    return str(value or "").strip()
 
-    Supported shapes:
-    - "uuid-string"
-    - ("uuid-string", {...debug...})
-    - {"ok": True, "account_id": "...", ...}
-    - {"account_id": "..."}
-    """
+
+def _normalize_lang(value: Any) -> str:
+    text = _safe_text(value).lower()
+    return text or "en"
+
+
+def _normalize_channel(value: Any) -> str:
+    text = _safe_text(value).lower()
+    return text or "web"
+
+
+def _extract_account_id(auth_result: Any) -> Tuple[Optional[str], Dict[str, Any]]:
     if isinstance(auth_result, str):
         account_id = auth_result.strip()
         return (account_id or None, {})
@@ -66,11 +71,38 @@ def _build_unauthorized(auth_debug: Dict[str, Any]):
     return jsonify(body), 401
 
 
+def _history_source_from_result(result: Dict[str, Any], channel: str) -> str:
+    source = _safe_text(result.get("source")).lower()
+    if source in {"", "ai", "direct_cache", "cache", "rules_engine", "tax_process_composer", "ai_grounded"}:
+        return channel
+    return source
+
+
+def _history_flags_from_result(result: Dict[str, Any]) -> Tuple[bool, int, bool, Optional[str]]:
+    mode = _safe_text(result.get("mode")).lower()
+    meta = dict(result.get("meta") or {})
+
+    from_cache = mode == "direct_cache"
+    credits_before = meta.get("credits_left_before")
+    credits_after = meta.get("credits_left") or meta.get("credit_balance")
+
+    credits_consumed = 0
+    try:
+        if credits_before is not None and credits_after is not None:
+            credits_consumed = max(0, int(credits_before) - int(credits_after))
+    except Exception:
+        credits_consumed = 0
+
+    usage_charged = bool(credits_consumed > 0 or mode == "ai_grounded")
+    plan_code = _safe_text(meta.get("plan_code")) or None
+    return from_cache, credits_consumed, usage_charged, plan_code
+
+
 def _handle_ask():
     payload = _safe_json()
-    question = str(payload.get("question") or "").strip()
-    lang = str(payload.get("lang") or "en").strip() or "en"
-    channel = str(payload.get("channel") or "web").strip() or "web"
+    question = _safe_text(payload.get("question"))
+    lang = _normalize_lang(payload.get("lang") or "en")
+    channel = _normalize_channel(payload.get("channel") or "web")
 
     if not question:
         return jsonify(
@@ -109,6 +141,25 @@ def _handle_ask():
             return jsonify(body), 500
 
         result.setdefault("ok", True)
+
+        answer_text = _safe_text(result.get("answer"))
+        if result.get("ok") and question and answer_text:
+            from_cache, credits_consumed, usage_charged, plan_code = _history_flags_from_result(result)
+            log_history_item_best_effort(
+                account_id=account_id,
+                question=question,
+                answer=answer_text,
+                lang=lang,
+                source=_history_source_from_result(result, channel),
+                from_cache=from_cache,
+                canonical_key=None,
+                normalized_question=question.lower(),
+                plan_code=plan_code,
+                credits_consumed=credits_consumed,
+                usage_charged=usage_charged,
+                channel=channel,
+            )
+
         return jsonify(result), 200
 
     except Exception as exc:
