@@ -255,9 +255,6 @@ def _infer_intent_from_question(question: str, fallback: str = "general") -> str
             return "documents"
         return "records"
 
-    if q.startswith("what is ") or q.startswith("define ") or "meaning of" in q or "what does" in q:
-        return "definition"
-
     if any(x in q for x in ["register", "registration", "apply for", "apply to get", "obtain a tin", "get a tin"]):
         return "registration"
 
@@ -291,6 +288,9 @@ def _infer_intent_from_question(question: str, fallback: str = "general") -> str
         "deduct",
     ]):
         return "obligation"
+
+    if q.startswith("what is ") or q.startswith("define ") or "meaning of" in q or "what does" in q:
+        return "definition"
 
     return str(fallback or "general").strip().lower()
 
@@ -563,7 +563,7 @@ def _is_strong_library_direct_match(row: Dict[str, Any], question_meta: Dict[str
     if meta_ck and row_ck and meta_ck == row_ck and exact_topic and (exact_intent or row_intent in GENERIC_INTENTS):
         return True
 
-    if short_q and exact_topic:
+    if short_q and exact_topic and (exact_intent or row_intent in GENERIC_INTENTS):
         return True
 
     if not short_q and exact_topic and exact_intent and row_intent not in GENERIC_INTENTS and overlap >= 2:
@@ -597,7 +597,7 @@ def _is_strong_library_candidate_match(row: Dict[str, Any], question_meta: Dict[
     if exact_norm and score >= 60:
         return True
 
-    if short_q and exact_topic and score >= 60:
+    if short_q and exact_topic and (exact_intent or row_intent in GENERIC_INTENTS) and score >= 60:
         return True
 
     if not short_q and exact_topic and exact_intent and row_intent not in GENERIC_INTENTS and overlap >= 2 and score >= 70:
@@ -734,7 +734,7 @@ def _is_strong_kb_direct_match(row: Dict[str, Any], question_meta: Dict[str, Any
     exact_topic = row_topic and meta_topic and row_topic == meta_topic
     exact_intent = row_intent and meta_intent and row_intent == meta_intent and row_intent not in GENERIC_INTENTS
 
-    if short_q and exact_topic and score >= _tax_kb_direct_threshold():
+    if short_q and exact_topic and (exact_intent or row_intent in GENERIC_INTENTS) and score >= _tax_kb_direct_threshold():
         return True
 
     if exact_topic and exact_intent and score >= _tax_kb_direct_threshold():
@@ -1123,21 +1123,6 @@ def _process_ask_request(
 
     balance = _safe_int(usage_state.get("credits_left"), 0)
     short_q = _question_is_short(question)
-
-    if short_q:
-        library_answer = find_library_answer(
-            normalized_question=question_meta.get("normalized_question") or _normalize_text(question),
-            lang=lang,
-            canonical_key=question_meta.get("canonical_key"),
-        )
-        if library_answer and _is_strong_library_direct_match(library_answer, question_meta, question):
-            debug["selected_mode"] = "library_direct_short"
-            return _library_result_to_payload(
-                row=library_answer,
-                question_meta=question_meta,
-                usage_state=usage_state,
-                debug=debug,
-            )
 
     rule_answer = _resolve_rules(
         question,
