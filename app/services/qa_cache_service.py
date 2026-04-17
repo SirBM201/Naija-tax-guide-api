@@ -1,7 +1,7 @@
 # app/services/qa_cache_service.py
 from __future__ import annotations
 
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 from datetime import datetime, timezone
 
 from ..core.supabase_client import supabase
@@ -203,8 +203,3 @@ def upsert_ai_answer_to_cache_best_effort(
             supabase().table("qa_cache").upsert(payload, on_conflict="normalized_question,lang").execute()
     except Exception:
         return
-
-
-# Legacy alias for compatibility
-def upsert_ai_answer_to_cache(...):
-    return upsert_ai_answer_to_cache_best_effort(...)
