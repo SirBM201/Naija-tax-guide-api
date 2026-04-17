@@ -11,6 +11,13 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _normalize_question(q: str) -> str:
+    """Basic normalization: lowercase, strip, remove extra spaces."""
+    if not q:
+        return ""
+    return " ".join(q.strip().lower().split())
+
+
 def find_cached_answer(
     normalized_question: str,
     lang: str = "en",
@@ -72,7 +79,7 @@ def find_best_cached_answer(
     
     Within each source, highest priority wins.
     """
-    nq = (normalized_question or "").strip()
+    nq = _normalize_question(normalized_question) if normalized_question else ""
     if not nq and not canonical_key:
         return None
 
@@ -97,7 +104,6 @@ def find_best_cached_answer(
         
         # Priority 2: search by normalized_question with source priority
         if nq:
-            # Define source priority order
             source_priority = ['seeded', 'library', 'ai']
             for source in source_priority:
                 res = (
@@ -113,9 +119,7 @@ def find_best_cached_answer(
                 )
                 if getattr(res, "data", None) and len(res.data) > 0:
                     return res.data[0]
-        
         return None
-        
     except Exception:
         return None
 
@@ -156,7 +160,7 @@ def upsert_ai_answer_to_cache_best_effort(
     Upsert an AI-generated answer into cache.
     Does NOT overwrite existing seeded or library answers for the same normalized_question+lang.
     """
-    nq = (normalized_question or "").strip()
+    nq = _normalize_question(normalized_question) if normalized_question else ""
     ans = (answer or "").strip()
     if not nq or not ans:
         return
@@ -179,7 +183,6 @@ def upsert_ai_answer_to_cache_best_effort(
             # Do not overwrite curated content
             return
     except Exception:
-        # If check fails, proceed anyway (fail open)
         pass
 
     payload: Dict[str, Any] = {
@@ -196,7 +199,6 @@ def upsert_ai_answer_to_cache_best_effort(
         payload["canonical_key"] = canonical_key.strip()
 
     try:
-        # canonical_key+lang preferred when present; else normalized_question+lang
         if payload.get("canonical_key"):
             supabase().table("qa_cache").upsert(payload, on_conflict="canonical_key,lang").execute()
         else:
