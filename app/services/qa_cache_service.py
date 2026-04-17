@@ -1,17 +1,67 @@
-from app.core.supabase_client import supabase as _sb
-from typing import Optional, Dict, Any
-import hashlib
+# app/services/qa_cache_service.py
+from __future__ import annotations
 
-def _normalize_question(q: str) -> str:
-    """Basic normalization: lowercase, strip, remove extra spaces."""
-    if not q:
-        return ""
-    return " ".join(q.strip().lower().split())
+from typing import Optional, Dict, Any, List
+from datetime import datetime, timezone
+
+from ..core.supabase_client import supabase
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def find_cached_answer(
+    normalized_question: str,
+    lang: str = "en",
+    canonical_key: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Legacy function: returns any enabled answer (highest priority) without source ordering.
+    Kept for backward compatibility.
+    """
+    nq = (normalized_question or "").strip()
+    if not nq:
+        return None
+    lang = (lang or "en").strip() or "en"
+
+    try:
+        if canonical_key and canonical_key.strip():
+            ck = canonical_key.strip()
+            res = (
+                supabase().table("qa_cache")
+                .select("*")
+                .eq("enabled", True)
+                .eq("canonical_key", ck)
+                .eq("lang", lang)
+                .order("priority", desc=True)
+                .limit(1)
+                .execute()
+            )
+            if getattr(res, "data", None):
+                return res.data[0]
+
+        res = (
+            supabase().table("qa_cache")
+            .select("*")
+            .eq("enabled", True)
+            .eq("normalized_question", nq)
+            .eq("lang", lang)
+            .order("priority", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if getattr(res, "data", None):
+            return res.data[0]
+        return None
+    except Exception:
+        return None
+
 
 def find_best_cached_answer(
     normalized_question: str,
     lang: str = "en",
-    canonical_key: Optional[str] = None
+    canonical_key: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Returns the best answer from cache searching in this order:
@@ -22,7 +72,7 @@ def find_best_cached_answer(
     
     Within each source, highest priority wins.
     """
-    nq = _normalize_question(normalized_question) if normalized_question else ""
+    nq = (normalized_question or "").strip()
     if not nq and not canonical_key:
         return None
 
@@ -32,14 +82,16 @@ def find_best_cached_answer(
         # Priority 1: exact canonical_key match (most specific)
         if canonical_key and canonical_key.strip():
             ck = canonical_key.strip()
-            res = (_sb().table("qa_cache")
-                   .select("*")
-                   .eq("enabled", True)
-                   .eq("canonical_key", ck)
-                   .eq("lang", lang)
-                   .order("priority", desc=True)
-                   .limit(1)
-                   .execute())
+            res = (
+                supabase().table("qa_cache")
+                .select("*")
+                .eq("enabled", True)
+                .eq("canonical_key", ck)
+                .eq("lang", lang)
+                .order("priority", desc=True)
+                .limit(1)
+                .execute()
+            )
             if getattr(res, "data", None) and len(res.data) > 0:
                 return res.data[0]
         
@@ -48,82 +100,111 @@ def find_best_cached_answer(
             # Define source priority order
             source_priority = ['seeded', 'library', 'ai']
             for source in source_priority:
-                res = (_sb().table("qa_cache")
-                       .select("*")
-                       .eq("enabled", True)
-                       .eq("normalized_question", nq)
-                       .eq("lang", lang)
-                       .eq("source", source)  # Use existing 'source' column
-                       .order("priority", desc=True)
-                       .limit(1)
-                       .execute())
+                res = (
+                    supabase().table("qa_cache")
+                    .select("*")
+                    .eq("enabled", True)
+                    .eq("normalized_question", nq)
+                    .eq("lang", lang)
+                    .eq("source", source)
+                    .order("priority", desc=True)
+                    .limit(1)
+                    .execute()
+                )
                 if getattr(res, "data", None) and len(res.data) > 0:
                     return res.data[0]
         
         return None
         
-    except Exception as e:
-        print(f"Cache lookup error: {e}")
+    except Exception:
         return None
 
-def increment_cache_use(cache_id: str):
-    """Increment use_count and update last_used_at."""
+
+def touch_cache_best_effort(cache_id: str) -> None:
+    cid = (cache_id or "").strip()
+    if not cid:
+        return
     try:
-        (_sb().table("qa_cache")
-         .update({"use_count": _sb().raw("use_count + 1"), "last_used_at": "now()"})
-         .eq("id", cache_id)
-         .execute())
-    except Exception as e:
-        print(f"Failed to increment cache use: {e}")
+        res = supabase().table("qa_cache").select("use_count").eq("id", cid).limit(1).execute()
+        current = 0
+        if getattr(res, "data", None):
+            current = int(res.data[0].get("use_count") or 0)
+
+        supabase().table("qa_cache").update(
+            {"use_count": current + 1, "last_used_at": _now_iso()}
+        ).eq("id", cid).execute()
+    except Exception:
+        return
+
+
+def increment_cache_use(cache_id: str) -> None:
+    """Alias for touch_cache_best_effort for consistency."""
+    touch_cache_best_effort(cache_id)
+
 
 def upsert_ai_answer_to_cache_best_effort(
     normalized_question: str,
     answer: str,
+    tags: Optional[str] = None,
     source: str = "ai",
     lang: str = "en",
+    canonical_key: Optional[str] = None,
     enabled: bool = True,
     priority: int = 0,
-    canonical_key: Optional[str] = None,
-    tags: Optional[list] = None
-):
-    """Upsert an AI-generated answer into cache. Does not overwrite higher-priority seeded/library answers."""
-    nq = _normalize_question(normalized_question)
-    if not nq or not answer:
+) -> None:
+    """
+    Upsert an AI-generated answer into cache.
+    Does NOT overwrite existing seeded or library answers for the same normalized_question+lang.
+    """
+    nq = (normalized_question or "").strip()
+    ans = (answer or "").strip()
+    if not nq or not ans:
         return
-    
+
     lang = (lang or "en").strip() or "en"
     
+    # Check if a seeded or library answer already exists for this question
     try:
-        # Check if a seeded/library answer already exists for this question
-        existing = (_sb().table("qa_cache")
-                    .select("source, priority")
-                    .eq("normalized_question", nq)
-                    .eq("lang", lang)
-                    .in_("source", ["seeded", "library"])
-                    .execute())
-        
-        if existing.data and len(existing.data) > 0:
-            # Don't overwrite curated content with AI
-            print(f"Skip AI cache upsert: seeded/library answer exists for '{nq}'")
+        existing = (
+            supabase().table("qa_cache")
+            .select("source, priority")
+            .eq("enabled", True)
+            .eq("normalized_question", nq)
+            .eq("lang", lang)
+            .in_("source", ["seeded", "library"])
+            .limit(1)
+            .execute()
+        )
+        if getattr(existing, "data", None) and len(existing.data) > 0:
+            # Do not overwrite curated content
             return
-        
-        # Otherwise, upsert the AI answer
-        data = {
-            "normalized_question": nq,
-            "answer": answer,
-            "source": source,
-            "lang": lang,
-            "enabled": enabled,
-            "priority": priority,
-            "use_count": 0,
-        }
-        if canonical_key:
-            data["canonical_key"] = canonical_key
-        if tags:
-            data["tags"] = tags
-            
-        (_sb().table("qa_cache")
-         .upsert(data, on_conflict="normalized_question,lang")
-         .execute())
-    except Exception as e:
-        print(f"AI cache upsert error: {e}")
+    except Exception:
+        # If check fails, proceed anyway (fail open)
+        pass
+
+    payload: Dict[str, Any] = {
+        "normalized_question": nq,
+        "answer": ans,
+        "tags": tags,
+        "source": source,
+        "enabled": bool(enabled),
+        "priority": int(priority or 0),
+        "lang": lang,
+        "last_used_at": _now_iso(),
+    }
+    if canonical_key and canonical_key.strip():
+        payload["canonical_key"] = canonical_key.strip()
+
+    try:
+        # canonical_key+lang preferred when present; else normalized_question+lang
+        if payload.get("canonical_key"):
+            supabase().table("qa_cache").upsert(payload, on_conflict="canonical_key,lang").execute()
+        else:
+            supabase().table("qa_cache").upsert(payload, on_conflict="normalized_question,lang").execute()
+    except Exception:
+        return
+
+
+# Legacy alias for compatibility
+def upsert_ai_answer_to_cache(...):
+    return upsert_ai_answer_to_cache_best_effort(...)
