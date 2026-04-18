@@ -7,12 +7,16 @@ from datetime import datetime, timezone
 from ..core.supabase_client import supabase
 
 
+def _sb():
+    """Return the Supabase client, handling both callable and instance."""
+    return supabase() if callable(supabase) else supabase
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _normalize_question(q: str) -> str:
-    """Basic normalization: lowercase, strip, remove extra spaces."""
     if not q:
         return ""
     return " ".join(q.strip().lower().split())
@@ -23,7 +27,6 @@ def find_cached_answer(
     lang: str = "en",
     canonical_key: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Legacy function – kept for compatibility."""
     nq = (normalized_question or "").strip()
     if not nq:
         return None
@@ -33,7 +36,7 @@ def find_cached_answer(
         if canonical_key and canonical_key.strip():
             ck = canonical_key.strip()
             res = (
-                supabase().table("qa_cache")
+                _sb().table("qa_cache")
                 .select("*")
                 .eq("enabled", True)
                 .eq("canonical_key", ck)
@@ -46,7 +49,7 @@ def find_cached_answer(
                 return res.data[0]
 
         res = (
-            supabase().table("qa_cache")
+            _sb().table("qa_cache")
             .select("*")
             .eq("enabled", True)
             .eq("normalized_question", nq)
@@ -67,13 +70,6 @@ def find_best_cached_answer(
     lang: str = "en",
     canonical_key: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    """
-    Returns the best answer from cache searching in order:
-    1. Exact canonical_key match
-    2. source='seeded'
-    3. source='library'
-    4. source='ai'
-    """
     nq = _normalize_question(normalized_question) if normalized_question else ""
     if not nq and not canonical_key:
         return None
@@ -85,7 +81,7 @@ def find_best_cached_answer(
         if canonical_key and canonical_key.strip():
             ck = canonical_key.strip()
             res = (
-                supabase().table("qa_cache")
+                _sb().table("qa_cache")
                 .select("*")
                 .eq("enabled", True)
                 .eq("canonical_key", ck)
@@ -101,7 +97,7 @@ def find_best_cached_answer(
         if nq:
             for source in ["seeded", "library", "ai"]:
                 res = (
-                    supabase().table("qa_cache")
+                    _sb().table("qa_cache")
                     .select("*")
                     .eq("enabled", True)
                     .eq("normalized_question", nq)
@@ -124,12 +120,12 @@ def touch_cache_best_effort(cache_id: str) -> None:
     if not cid:
         return
     try:
-        res = supabase().table("qa_cache").select("use_count").eq("id", cid).limit(1).execute()
+        res = _sb().table("qa_cache").select("use_count").eq("id", cid).limit(1).execute()
         current = 0
         if getattr(res, "data", None):
             current = int(res.data[0].get("use_count") or 0)
 
-        supabase().table("qa_cache").update(
+        _sb().table("qa_cache").update(
             {"use_count": current + 1, "last_used_at": _now_iso()}
         ).eq("id", cid).execute()
     except Exception:
@@ -160,7 +156,7 @@ def upsert_ai_answer_to_cache_best_effort(
     # Do not overwrite seeded/library answers
     try:
         existing = (
-            supabase().table("qa_cache")
+            _sb().table("qa_cache")
             .select("source")
             .eq("enabled", True)
             .eq("normalized_question", nq)
@@ -189,8 +185,8 @@ def upsert_ai_answer_to_cache_best_effort(
 
     try:
         if payload.get("canonical_key"):
-            supabase().table("qa_cache").upsert(payload, on_conflict="canonical_key,lang").execute()
+            _sb().table("qa_cache").upsert(payload, on_conflict="canonical_key,lang").execute()
         else:
-            supabase().table("qa_cache").upsert(payload, on_conflict="normalized_question,lang").execute()
+            _sb().table("qa_cache").upsert(payload, on_conflict="normalized_question,lang").execute()
     except Exception:
         return
