@@ -38,7 +38,6 @@ from app.services.tax_rules.withholding_tax_rules import try_answer as try_withh
 from app.services.tax_rules.company_income_tax_rules import try_answer as try_company_income_tax_rule_answer
 from app.services.tax_process_composer import try_compose
 
-# 🔁 CHANGE 1: Import the new priority cache functions
 from app.services.qa_cache_service import (
     find_best_cached_answer,
     increment_cache_use,
@@ -1132,21 +1131,21 @@ def _process_ask_request(
     balance = _safe_int(usage_state.get("credits_left"), 0)
     short_q = _question_is_short(question)
 
-    # 🔁 CHANGE 2: PRIORITY CACHE CHECK (seeded → library → ai)
-    # This runs BEFORE rules, library, semantic cache, etc.
-    # It uses the `source` column to return the best available answer.
+    # 🔍 DEBUG: priority cache check
     priority_cached = find_best_cached_answer(
         normalized_question=question,
         lang=lang,
         canonical_key=question_meta.get("canonical_key"),
     )
+    # Log what we found (this will appear in server logs)
+    print(f"DEBUG priority_cache: question='{question}', lang='{lang}', found_source={priority_cached.get('source') if priority_cached else None}")
+
     if priority_cached:
         try:
             increment_cache_use(priority_cached.get("id"))
         except Exception:
             pass
         debug["selected_mode"] = f"priority_cache_{priority_cached.get('source', 'unknown')}"
-        # Return the cached answer with source_type
         rendered = _render_once(priority_cached.get("answer", ""), question_meta)
         res = compose_direct_cache_answer(
             priority_cached,
@@ -1312,7 +1311,6 @@ def _process_ask_request(
         rendered = _render_once(refined or ai_raw, question_meta)
 
         if rendered and not looks_like_internal_or_broken_answer(rendered):
-            # 🔁 CHANGE 3: Save AI answer to cache for future use (source='ai')
             try:
                 upsert_ai_answer_to_cache_best_effort(
                     normalized_question=question,
