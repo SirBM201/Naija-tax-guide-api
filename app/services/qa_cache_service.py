@@ -1,6 +1,7 @@
 # app/services/qa_cache_service.py
 from __future__ import annotations
 
+import re
 from typing import Optional, Dict, Any
 from datetime import datetime, timezone
 
@@ -17,9 +18,19 @@ def _now_iso() -> str:
 
 
 def _normalize_question(q: str) -> str:
+    """
+    Normalize a question: lowercase, strip, remove extra spaces,
+    and remove trailing punctuation (?, !, .).
+    """
     if not q:
         return ""
-    return " ".join(q.strip().lower().split())
+    # Lowercase and strip
+    text = q.strip().lower()
+    # Remove trailing punctuation (?, !, ., maybe ;)
+    text = re.sub(r'[?!.;]+$', '', text)
+    # Collapse multiple spaces
+    text = " ".join(text.split())
+    return text
 
 
 def find_cached_answer(
