@@ -23,10 +23,7 @@ def find_cached_answer(
     lang: str = "en",
     canonical_key: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    """
-    Legacy function: returns any enabled answer (highest priority) without source ordering.
-    Kept for backward compatibility.
-    """
+    """Legacy function – kept for compatibility."""
     nq = (normalized_question or "").strip()
     if not nq:
         return None
@@ -71,22 +68,20 @@ def find_best_cached_answer(
     canonical_key: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
-    Returns the best answer from cache searching in this order:
-    1. Exact canonical_key match (if provided)
-    2. Seeded answers (source='seeded')
-    3. Library answers (source='library')
-    4. AI cached answers (source='ai')
-    
-    Within each source, highest priority wins.
+    Returns the best answer from cache searching in order:
+    1. Exact canonical_key match
+    2. source='seeded'
+    3. source='library'
+    4. source='ai'
     """
     nq = _normalize_question(normalized_question) if normalized_question else ""
     if not nq and not canonical_key:
         return None
 
     lang = (lang or "en").strip() or "en"
-    
+
     try:
-        # Priority 1: exact canonical_key match (most specific)
+        # 1. canonical_key match
         if canonical_key and canonical_key.strip():
             ck = canonical_key.strip()
             res = (
@@ -101,11 +96,10 @@ def find_best_cached_answer(
             )
             if getattr(res, "data", None) and len(res.data) > 0:
                 return res.data[0]
-        
-        # Priority 2: search by normalized_question with source priority
+
+        # 2. source priority order
         if nq:
-            source_priority = ['seeded', 'library', 'ai']
-            for source in source_priority:
+            for source in ["seeded", "library", "ai"]:
                 res = (
                     supabase().table("qa_cache")
                     .select("*")
@@ -120,7 +114,8 @@ def find_best_cached_answer(
                 if getattr(res, "data", None) and len(res.data) > 0:
                     return res.data[0]
         return None
-    except Exception:
+    except Exception as e:
+        print(f"find_best_cached_answer error: {e}")
         return None
 
 
@@ -142,7 +137,6 @@ def touch_cache_best_effort(cache_id: str) -> None:
 
 
 def increment_cache_use(cache_id: str) -> None:
-    """Alias for touch_cache_best_effort for consistency."""
     touch_cache_best_effort(cache_id)
 
 
@@ -156,22 +150,18 @@ def upsert_ai_answer_to_cache_best_effort(
     enabled: bool = True,
     priority: int = 0,
 ) -> None:
-    """
-    Upsert an AI-generated answer into cache.
-    Does NOT overwrite existing seeded or library answers for the same normalized_question+lang.
-    """
     nq = _normalize_question(normalized_question) if normalized_question else ""
     ans = (answer or "").strip()
     if not nq or not ans:
         return
 
     lang = (lang or "en").strip() or "en"
-    
-    # Check if a seeded or library answer already exists for this question
+
+    # Do not overwrite seeded/library answers
     try:
         existing = (
             supabase().table("qa_cache")
-            .select("source, priority")
+            .select("source")
             .eq("enabled", True)
             .eq("normalized_question", nq)
             .eq("lang", lang)
@@ -180,7 +170,6 @@ def upsert_ai_answer_to_cache_best_effort(
             .execute()
         )
         if getattr(existing, "data", None) and len(existing.data) > 0:
-            # Do not overwrite curated content
             return
     except Exception:
         pass
