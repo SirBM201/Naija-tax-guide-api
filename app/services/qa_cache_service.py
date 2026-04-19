@@ -193,12 +193,17 @@ def find_best_cached_answer(
                     .limit(1)
                     .execute()
                 )
-                if getattr(res, "data", None) and len(res.data) > 0:
-                    logger.info(f"Found in qa_cache with source={source}")
-                    return res.data[0]
-    except Exception as e:
-        logger.error(f"find_best_cached_answer cache error: {e}", exc_info=True)
-
+              # Inside find_best_cached_answer, after the qa_cache queries
+if getattr(res, "data", None) and len(res.data) > 0:
+    cached_row = res.data[0]
+    answer_text = cached_row.get('answer', '')
+    logger.info(f"Found in qa_cache with source={cached_row.get('source')}, answer length={len(answer_text)}")
+    if not answer_text:
+        logger.warning("Cache answer is empty! Deleting this cache entry.")
+        _sb().table("qa_cache").delete().eq("id", cached_row['id']).execute()
+        # Fall through to library search
+    else:
+        return cached_row
     # ----- Stage 2: qa_library -----
     logger.info("Not found in cache, searching qa_library")
     library_answer = find_answer_in_library(nq, lang)
