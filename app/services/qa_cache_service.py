@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import re
+import logging
 from typing import Optional, Dict, Any
 from datetime import datetime, timezone
 
 from ..core.supabase_client import supabase
 
+# Set up logging
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
 
 def _sb():
-    """Return the Supabase client, handling both callable and instance."""
     return supabase() if callable(supabase) else supabase
 
 
@@ -17,10 +21,6 @@ def _now_iso() -> str:
 
 
 def _normalize_question(q: str) -> str:
-    """
-    Normalize a question: lowercase, strip, remove extra spaces,
-    and remove trailing punctuation (?, !, .).
-    """
     if not q:
         return ""
     text = q.strip().lower()
@@ -34,7 +34,6 @@ def find_cached_answer(
     lang: str = "en",
     canonical_key: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Exact match in qa_cache (original behaviour)."""
     nq = (normalized_question or "").strip()
     if not nq:
         return None
@@ -54,6 +53,7 @@ def find_cached_answer(
                 .execute()
             )
             if getattr(res, "data", None):
+                logger.info(f"find_cached_answer: exact canonical_key match found for {ck}")
                 return res.data[0]
 
         res = (
@@ -67,9 +67,12 @@ def find_cached_answer(
             .execute()
         )
         if getattr(res, "data", None):
+            logger.info(f"find_cached_answer: exact normalized_question match found for {nq}")
             return res.data[0]
+        logger.info(f"find_cached_answer: no exact match for {nq}")
         return None
-    except Exception:
+    except Exception as e:
+        logger.error(f"find_cached_answer error: {e}")
         return None
 
 
@@ -77,24 +80,17 @@ def find_answer_in_library(
     normalized_question: str,
     lang: str = "en",
 ) -> Optional[Dict[str, Any]]:
-    """
-    Search qa_library with exact match, then trigram similarity (via RPC).
-    Returns a dict compatible with qa_cache rows.
-    """
     nq = (normalized_question or "").strip()
     if not nq:
         return None
 
     lang = (lang or "en").strip() or "en"
-    # Determine which answer column to use
     lang_column = f"answer_{lang}" if lang != "en" else "answer"
-    try:
-        _sb().table("qa_library").select(lang_column).limit(1).execute()
-    except Exception:
-        lang_column = "answer"
+    logger.info(f"find_answer_in_library: searching for '{nq}', lang={lang}, using column {lang_column}")
 
     try:
         # ----- Stage 1: Exact match -----
+        logger.info("Stage 1: Exact match on normalized_question")
         res = (
             _sb().table("qa_library")
             .select("id", "answer", lang_column, "priority", "canonical_key", "tags")
@@ -106,9 +102,12 @@ def find_answer_in_library(
         )
         if getattr(res, "data", None) and res.data:
             row = res.data[0]
+            logger.info(f"Exact match found: id={row.get('id')}, priority={row.get('priority')}")
+            answer_text = row.get(lang_column) or row.get("answer")
+            logger.info(f"Answer text length: {len(answer_text) if answer_text else 0}")
             return {
                 "id": row.get("id"),
-                "answer": row.get(lang_column) or row.get("answer"),
+                "answer": answer_text,
                 "source": "library_exact",
                 "priority": row.get("priority", 50),
                 "canonical_key": row.get("canonical_key"),
@@ -119,6 +118,7 @@ def find_answer_in_library(
             }
 
         # ----- Stage 2: Trigram similarity via RPC -----
+        logger.info("Stage 2: Trigram similarity via RPC")
         res = _sb().rpc("search_library_trigram", {
             "query_text": nq,
             "min_similarity": 0.35
@@ -126,8 +126,9 @@ def find_answer_in_library(
 
         if getattr(res, "data", None) and len(res.data) > 0:
             best_row = res.data[0]
-            # Determine answer column again (in case language column differs)
+            logger.info(f"Trigram match found: id={best_row.get('id')}, similarity={best_row.get('similarity')}")
             answer_text = best_row.get(lang_column) or best_row.get("answer")
+            logger.info(f"Answer text length: {len(answer_text) if answer_text else 0}")
             return {
                 "id": best_row.get("id"),
                 "answer": answer_text,
@@ -140,8 +141,10 @@ def find_answer_in_library(
                 "enabled": True,
                 "similarity": best_row.get("similarity"),
             }
+        else:
+            logger.info("No trigram match found")
     except Exception as e:
-        print(f"Error searching qa_library: {e}")
+        logger.error(f"Error searching qa_library: {e}", exc_info=True)
     return None
 
 
@@ -150,22 +153,18 @@ def find_best_cached_answer(
     lang: str = "en",
     canonical_key: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    """
-    Multi-stage search:
-    1. qa_cache (exact, canonical, source priority)
-    2. qa_library (exact then trigram)
-    3. Return None if not found.
-    """
     nq = _normalize_question(normalized_question) if normalized_question else ""
     if not nq and not canonical_key:
         return None
 
     lang = (lang or "en").strip() or "en"
+    logger.info(f"find_best_cached_answer: normalized='{nq}', lang='{lang}', canonical_key='{canonical_key}'")
 
     # ----- Stage 1: qa_cache -----
     try:
         if canonical_key and canonical_key.strip():
             ck = canonical_key.strip()
+            logger.info(f"Checking qa_cache with canonical_key={ck}")
             res = (
                 _sb().table("qa_cache")
                 .select("*")
@@ -177,9 +176,11 @@ def find_best_cached_answer(
                 .execute()
             )
             if getattr(res, "data", None) and len(res.data) > 0:
+                logger.info(f"Found in qa_cache via canonical_key: {res.data[0].get('source')}")
                 return res.data[0]
 
         if nq:
+            logger.info(f"Checking qa_cache with normalized_question={nq}")
             for source in ["seeded", "library", "ai"]:
                 res = (
                     _sb().table("qa_cache")
@@ -193,14 +194,17 @@ def find_best_cached_answer(
                     .execute()
                 )
                 if getattr(res, "data", None) and len(res.data) > 0:
+                    logger.info(f"Found in qa_cache with source={source}")
                     return res.data[0]
     except Exception as e:
-        print(f"find_best_cached_answer cache error: {e}")
+        logger.error(f"find_best_cached_answer cache error: {e}", exc_info=True)
 
     # ----- Stage 2: qa_library -----
+    logger.info("Not found in cache, searching qa_library")
     library_answer = find_answer_in_library(nq, lang)
     if library_answer:
-        # Copy to qa_cache for future speed
+        logger.info(f"Found in library: source={library_answer.get('source')}")
+        # Copy to cache
         try:
             upsert_ai_answer_to_cache_best_effort(
                 normalized_question=nq,
@@ -212,9 +216,10 @@ def find_best_cached_answer(
                 enabled=True,
                 priority=library_answer.get("priority", 50),
             )
+            logger.info("Copied library answer to cache")
         except Exception as e:
-            print(f"Failed to cache library answer: {e}")
-        # Return in the same format as qa_cache rows
+            logger.error(f"Failed to cache library answer: {e}")
+        # Return in expected format
         return {
             "id": library_answer.get("id"),
             "normalized_question": nq,
@@ -227,6 +232,7 @@ def find_best_cached_answer(
             "tags": library_answer.get("tags"),
         }
 
+    logger.info("No answer found in library either")
     return None
 
 
@@ -239,7 +245,6 @@ def touch_cache_best_effort(cache_id: str) -> None:
         current = 0
         if getattr(res, "data", None):
             current = int(res.data[0].get("use_count") or 0)
-
         _sb().table("qa_cache").update(
             {"use_count": current + 1, "last_used_at": _now_iso()}
         ).eq("id", cid).execute()
@@ -281,6 +286,7 @@ def upsert_ai_answer_to_cache_best_effort(
             .execute()
         )
         if getattr(existing, "data", None) and len(existing.data) > 0:
+            logger.info(f"Not overwriting existing {existing.data[0]['source']} answer in cache")
             return
     except Exception:
         pass
@@ -301,7 +307,9 @@ def upsert_ai_answer_to_cache_best_effort(
     try:
         if payload.get("canonical_key"):
             _sb().table("qa_cache").upsert(payload, on_conflict="canonical_key,lang").execute()
+            logger.info(f"Upserted to cache with canonical_key={payload['canonical_key']}")
         else:
             _sb().table("qa_cache").upsert(payload, on_conflict="normalized_question,lang").execute()
-    except Exception:
-        return
+            logger.info(f"Upserted to cache with normalized_question={nq}")
+    except Exception as e:
+        logger.error(f"Failed to upsert to cache: {e}")
