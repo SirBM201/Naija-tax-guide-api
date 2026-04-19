@@ -1,4 +1,3 @@
-# app/services/qa_cache_service.py
 from __future__ import annotations
 
 import re
@@ -24,11 +23,8 @@ def _normalize_question(q: str) -> str:
     """
     if not q:
         return ""
-    # Lowercase and strip
     text = q.strip().lower()
-    # Remove trailing punctuation (?, !, ., maybe ;)
     text = re.sub(r'[?!.;]+$', '', text)
-    # Collapse multiple spaces
     text = " ".join(text.split())
     return text
 
@@ -38,6 +34,7 @@ def find_cached_answer(
     lang: str = "en",
     canonical_key: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
+    """Exact match in qa_cache (original behaviour)."""
     nq = (normalized_question or "").strip()
     if not nq:
         return None
@@ -76,19 +73,115 @@ def find_cached_answer(
         return None
 
 
+def find_answer_in_library(
+    normalized_question: str,
+    lang: str = "en",
+) -> Optional[Dict[str, Any]]:
+    """
+    Search qa_library with exact match, then trigram similarity.
+    Returns a dict compatible with qa_cache rows (including 'answer', 'source', etc.)
+    """
+    nq = (normalized_question or "").strip()
+    if not nq:
+        return None
+
+    lang = (lang or "en").strip() or "en"
+    # Determine which answer column to use
+    lang_column = f"answer_{lang}" if lang != "en" else "answer"
+    # Verify the column exists; fallback to 'answer'
+    try:
+        _sb().table("qa_library").select(lang_column).limit(1).execute()
+    except Exception:
+        lang_column = "answer"
+
+    try:
+        # ----- Stage 1: Exact match -----
+        res = (
+            _sb().table("qa_library")
+            .select("id", "answer", lang_column, "priority", "canonical_key", "tags")
+            .eq("normalized_question", nq)
+            .eq("enabled", True)
+            .order("priority", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if getattr(res, "data", None) and res.data:
+            row = res.data[0]
+            return {
+                "id": row.get("id"),
+                "answer": row.get(lang_column) or row.get("answer"),
+                "source": "library_exact",
+                "priority": row.get("priority", 50),
+                "canonical_key": row.get("canonical_key"),
+                "tags": row.get("tags"),
+                "normalized_question": nq,
+                "lang": lang,
+                "enabled": True,
+            }
+
+        # ----- Stage 2: Trigram similarity (requires pg_trgm extension) -----
+        # Escape single quotes for safety
+        safe_nq = nq.replace("'", "''")
+        res = (
+            _sb().table("qa_library")
+            .select("id", "answer", lang_column, "priority", "canonical_key", "tags",
+                    f"similarity(normalized_question, '{safe_nq}') as sim")
+            .eq("enabled", True)
+            .filter("normalized_question", "op", "%", value=nq)
+            .limit(5)
+            .execute()
+        )
+        if getattr(res, "data", None):
+            best_row = None
+            best_score = -1
+            for row in res.data:
+                sim = row.get("sim", 0.0)
+                if sim < 0.35:  # similarity threshold
+                    continue
+                # Score combines priority (0-100) and similarity (0-1)
+                score = (row.get("priority", 0) * 100) + sim
+                if score > best_score:
+                    best_score = score
+                    best_row = row
+            if best_row:
+                return {
+                    "id": best_row.get("id"),
+                    "answer": best_row.get(lang_column) or best_row.get("answer"),
+                    "source": "library_trigram",
+                    "priority": best_row.get("priority", 50),
+                    "canonical_key": best_row.get("canonical_key"),
+                    "tags": best_row.get("tags"),
+                    "normalized_question": nq,
+                    "lang": lang,
+                    "enabled": True,
+                    "similarity": best_row.get("sim"),
+                }
+    except Exception as e:
+        # Log error but don't crash
+        print(f"Error searching qa_library: {e}")
+    return None
+
+
 def find_best_cached_answer(
     normalized_question: str,
     lang: str = "en",
     canonical_key: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
+    """
+    Multi-stage search:
+    1. qa_cache (exact, canonical, source priority)
+    2. qa_library (exact then trigram)
+    3. Return None if not found.
+    """
     nq = _normalize_question(normalized_question) if normalized_question else ""
     if not nq and not canonical_key:
         return None
 
     lang = (lang or "en").strip() or "en"
 
+    # ----- Stage 1: qa_cache (same as original) -----
     try:
-        # 1. canonical_key match
+        # 1a. canonical_key match
         if canonical_key and canonical_key.strip():
             ck = canonical_key.strip()
             res = (
@@ -104,7 +197,7 @@ def find_best_cached_answer(
             if getattr(res, "data", None) and len(res.data) > 0:
                 return res.data[0]
 
-        # 2. source priority order
+        # 1b. source priority order
         if nq:
             for source in ["seeded", "library", "ai"]:
                 res = (
@@ -120,10 +213,40 @@ def find_best_cached_answer(
                 )
                 if getattr(res, "data", None) and len(res.data) > 0:
                     return res.data[0]
-        return None
     except Exception as e:
-        print(f"find_best_cached_answer error: {e}")
-        return None
+        print(f"find_best_cached_answer cache error: {e}")
+
+    # ----- Stage 2: qa_library -----
+    library_answer = find_answer_in_library(nq, lang)
+    if library_answer:
+        # Optionally copy to qa_cache for future speed
+        try:
+            upsert_ai_answer_to_cache_best_effort(
+                normalized_question=nq,
+                answer=library_answer["answer"],
+                tags=library_answer.get("tags"),
+                source="library",
+                lang=lang,
+                canonical_key=library_answer.get("canonical_key"),
+                enabled=True,
+                priority=library_answer.get("priority", 50),
+            )
+        except Exception as e:
+            print(f"Failed to cache library answer: {e}")
+        # Return in the same format as qa_cache rows
+        return {
+            "id": library_answer.get("id"),
+            "normalized_question": nq,
+            "answer": library_answer["answer"],
+            "source": library_answer["source"],
+            "priority": library_answer.get("priority", 50),
+            "canonical_key": library_answer.get("canonical_key"),
+            "lang": lang,
+            "enabled": True,
+            "tags": library_answer.get("tags"),
+        }
+
+    return None
 
 
 def touch_cache_best_effort(cache_id: str) -> None:
