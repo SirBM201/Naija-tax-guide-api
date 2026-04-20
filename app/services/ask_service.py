@@ -1129,15 +1129,13 @@ def _process_ask_request(
     debug["billing_state"] = billing_state
 
     balance = _safe_int(usage_state.get("credits_left"), 0)
-    short_q = _question_is_short(question)
 
-    # 🔍 DEBUG: priority cache check
+    # Priority cache check
     priority_cached = find_best_cached_answer(
         normalized_question=question,
         lang=lang,
         canonical_key=question_meta.get("canonical_key"),
     )
-    print(f"DEBUG priority_cache: question='{question}', lang='{lang}', found_source={priority_cached.get('source') if priority_cached else None}")
 
     if priority_cached:
         try:
@@ -1157,6 +1155,7 @@ def _process_ask_request(
         payload["citations"] = [_build_source_line(priority_cached.get("source", "Cached answer"))]
         return _with_usage_meta(payload, usage_state=usage_state)
 
+    # Rules engine
     rule_answer = _resolve_rules(
         question,
         _safe_str(question_meta.get("topic")),
@@ -1174,6 +1173,7 @@ def _process_ask_request(
         debug["selected_mode"] = "rules_engine"
         return _with_usage_meta(payload, usage_state=usage_state)
 
+    # Tax process composer
     process_answer = _try_tax_process_composer(question, question_meta, lang, channel)
     if process_answer:
         rendered = _render_once(process_answer, question_meta)
@@ -1187,6 +1187,7 @@ def _process_ask_request(
         debug["selected_mode"] = "tax_process_composer"
         return _with_usage_meta(payload, usage_state=usage_state)
 
+    # Library direct match
     library_answer = find_library_answer(
         normalized_question=question_meta.get("normalized_question") or _normalize_text(question),
         lang=lang,
@@ -1201,6 +1202,7 @@ def _process_ask_request(
             debug=debug,
         )
 
+    # Library candidates
     library_candidates = find_library_candidates(
         normalized_question=question_meta.get("normalized_question") or _normalize_text(question),
         lang=lang,
@@ -1228,6 +1230,7 @@ def _process_ask_request(
                 debug=debug,
             )
 
+    # Semantic cache
     semantic_candidates: List[Dict[str, Any]] = []
     try:
         raw_candidates = retrieve_ranked_candidates(
@@ -1255,6 +1258,7 @@ def _process_ask_request(
                 debug=debug,
             )
 
+    # Tax knowledge base
     tax_rows = _fetch_tax_source_rows(question_meta, question, limit=_tax_kb_result_limit())
     if tax_rows:
         debug["tax_rows"] = [
@@ -1280,6 +1284,7 @@ def _process_ask_request(
                 debug=debug,
             )
 
+    # No answer found in any table – try AI
     if balance <= 0:
         debug["selected_mode"] = "uncached_blocked_no_credit"
         return _build_uncached_block_response(
@@ -1290,7 +1295,6 @@ def _process_ask_request(
             error="insufficient_credits_uncached",
         )
 
-    # Last resort: try AI generation for any question (including short or non-tax)
     ai_raw = _try_ai_generation(
         question=question,
         question_meta=question_meta,
@@ -1338,17 +1342,23 @@ def _process_ask_request(
                 debug=debug,
             )
 
-    # If AI fails or returns empty, fall back to clarification
-    if short_q and not tax_rows:
-        debug["selected_mode"] = "clarification_short_question"
-        res = compose_clarification(question_meta=question_meta, debug=_filtered_debug(debug))
-        payload = res.__dict__
-        return _with_usage_meta(payload, usage_state=usage_state, balance=balance)
-    else:
-        debug["selected_mode"] = "clarification_fallback"
-        res = compose_clarification(question_meta=question_meta, debug=_filtered_debug(debug))
-        payload = res.__dict__
-        return _with_usage_meta(payload, usage_state=usage_state, balance=balance)
+    # If AI fails, return a polite message
+    debug["selected_mode"] = "ai_failed_fallback"
+    return {
+        "ok": True,
+        "answer": "I am Naija Tax Guide, designed only for Nigerian tax questions. Please ask a specific tax-related question about VAT, TIN, PAYE, filing, or other Nigerian tax topics.",
+        "answer_text": "I am Naija Tax Guide, designed only for Nigerian tax questions. Please ask a specific tax-related question about VAT, TIN, PAYE, filing, or other Nigerian tax topics.",
+        "mode": "ai_failed_fallback",
+        "source": "system",
+        "citations": [],
+        "meta": {
+            "ai_used_month": usage_state.get("monthly_ai_usage", 0),
+            "monthly_ai_used": usage_state.get("monthly_ai_usage", 0),
+            "daily_usage": usage_state.get("daily_ai_usage", 0),
+            "daily_limit": usage_state.get("daily_ai_limit", 0),
+            "credit_balance": balance,
+        }
+    }
 
 
 def process_ask_request(
