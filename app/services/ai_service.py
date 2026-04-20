@@ -13,13 +13,8 @@ def _safe_str(value: Any) -> str:
     return str(value or "").strip()
 
 
-def _clip(text: str, n: int = 400) -> str:
-    text = _safe_str(text)
-    return text if len(text) <= n else text[:n] + "…"
-
-
-def _truthy(value: str | None) -> bool:
-    return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+def _truthy(v: str | None) -> bool:
+    return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def _env(*names: str, default: str = "") -> str:
@@ -50,31 +45,13 @@ def _get_api_key() -> str:
 def _build_client() -> OpenAI:
     if OpenAI is None:
         raise RuntimeError("openai_sdk_missing")
-
     api_key = _get_api_key()
     if not api_key:
         raise RuntimeError("openai_api_key_not_set")
-
     return OpenAI(api_key=api_key)
 
 
-def _default_system_prompt(channel: str = "web") -> str:
-    return (
-        "You are Naija Tax Guide, a Nigerian tax assistant. "
-        "You can ONLY answer questions about Nigerian tax. "
-        "If the user asks anything not related to Nigerian tax (e.g., general knowledge, cooking, sports, entertainment, weather, non‑tax laws, etc.), "
-        "politely explain that you are designed exclusively for Nigerian tax questions and ask them to ask a tax‑related question. "
-        "Do not attempt to answer non‑tax questions. "
-        "For tax questions, be practical, direct, and accurate. "
-        "Do not invent legal citations, deadlines, rates, penalties, or regulatory procedures. "
-        "If you are not sure, say so clearly. "
-        "If the user asks for a definition, answer with the definition first. "
-        "If the user asks for a procedure, provide steps where appropriate."
-    )
-
-
 def _call_openai_chat(
-    *,
     system_prompt: str,
     user_prompt: str,
     temperature: float = 0.2,
@@ -90,46 +67,18 @@ def _call_openai_chat(
             {"role": "user", "content": user_prompt},
         ],
     )
-
-    text = ""
-    try:
-        text = response.choices[0].message.content or ""
-    except Exception:
-        text = ""
-
-    text = _safe_str(text)
+    text = response.choices[0].message.content or ""
     if not text:
         raise RuntimeError("openai_empty_answer")
-
     return text
 
 
 def call_ai(
-    *,
     question: str,
     lang: str = "en",
     channel: str = "web",
     system_prompt: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Backward-compatible AI entry point used by the current repo.
-
-    Returns:
-    {
-      "ok": True,
-      "answer": "...",
-      "provider": "openai",
-      "model": "gpt-4o-mini"
-    }
-
-    or a structured failure:
-    {
-      "ok": False,
-      "error": "...",
-      "root_cause": "...",
-      "fix": "..."
-    }
-    """
     question = _safe_str(question)
     if not question:
         return {
@@ -139,14 +88,16 @@ def call_ai(
             "fix": "Provide a non-empty question.",
         }
 
-    prompt = system_prompt or _default_system_prompt(channel)
+    prompt = system_prompt or (
+        "You are Naija Tax Guide, a Nigerian tax assistant. "
+        "You can ONLY answer questions about Nigerian tax. "
+        "If the user asks anything not related to Nigerian tax, politely explain that you are designed exclusively for Nigerian tax questions and ask them to ask a tax‑related question. "
+        "Do not attempt to answer non‑tax questions. "
+        "Be practical, direct, and accurate. Do not invent legal citations, deadlines, rates, penalties, or procedures. If unsure, say so."
+    )
 
     try:
-        answer = _call_openai_chat(
-            system_prompt=prompt,
-            user_prompt=question,
-            temperature=0.2,
-        )
+        answer = _call_openai_chat(system_prompt=prompt, user_prompt=question, temperature=0.2)
         return {
             "ok": True,
             "answer": answer,
@@ -156,14 +107,13 @@ def call_ai(
             "channel": channel,
         }
     except Exception as e:
-        err = _safe_str(str(e)) or type(e).__name__
-
+        err = str(e)
         fix = "Check OPENAI_API_KEY and OpenAI package installation."
         if "openai_api_key_not_set" in err:
             fix = "Set OPENAI_API_KEY in your backend environment."
         elif "openai_sdk_missing" in err:
             fix = "Add the OpenAI SDK to requirements.txt and redeploy."
-        elif "openai_empty_answer" in err:
+        elif "empty_answer" in err:
             fix = "Inspect provider response and retry."
         elif "authentication" in err.lower() or "api key" in err.lower():
             fix = "Verify the OpenAI API key is valid."
@@ -178,132 +128,34 @@ def call_ai(
         }
 
 
-def _build_basis(candidates: List[Dict[str, Any]]) -> str:
-    blocks: List[str] = []
-
-    for idx, c in enumerate(candidates[:3], start=1):
-        answer = _safe_str(c.get("answer"))
-        topic = _safe_str(c.get("topic"))
-        intent_type = _safe_str(c.get("intent_type"))
-        jurisdiction = _safe_str(c.get("jurisdiction"))
-        trust_score = c.get("trust_score")
-        similarity = c.get("similarity")
-        match_type = _safe_str(c.get("match_type"))
-
-        if not answer:
-            continue
-
-        blocks.append(
-            "\n".join(
-                [
-                    f"Candidate {idx}:",
-                    f"- topic: {topic}",
-                    f"- intent_type: {intent_type}",
-                    f"- jurisdiction: {jurisdiction}",
-                    f"- trust_score: {trust_score}",
-                    f"- similarity: {similarity}",
-                    f"- match_type: {match_type}",
-                    f"- answer: {answer}",
-                ]
-            )
-        )
-
-    return "\n\n".join(blocks) if blocks else "No trusted basis available."
-
-
 def generate_grounded_answer(
-    *,
     question: str,
-    lang: str,
-    candidates: List[Dict[str, Any]],
-    grounding_context: str | None = None,
+    context: Optional[str] = None,
+    lang: str = "en",
+    channel: str = "web",
 ) -> str:
     """
-    Grounded synthesis entry point for the newer architecture.
-
-    If USE_LIVE_GROUNDED_AI is enabled and OpenAI is configured,
-    it will try a live grounded synthesis.
-    Otherwise it falls back to a controlled local synthesis string.
+    Simplified version that matches the call from ask_service.py.
+    Returns an empty string on failure (caller will fall back).
     """
-    question = _safe_str(question)
-    basis = _build_basis(candidates)
+    if not _truthy(os.getenv("USE_LIVE_GROUNDED_AI")):
+        return ""
+    if not _get_api_key():
+        return ""
 
-    use_live_provider = _truthy(os.getenv("USE_LIVE_GROUNDED_AI", ""))
-
-    if use_live_provider and _get_api_key():
-        system_prompt = (
-            "You are Naija Tax Guide, a grounded Nigerian tax assistant.\n"
-            "You can ONLY answer questions about Nigerian tax. "
-            "If the user asks anything not related to Nigerian tax, politely explain that you are designed exclusively for Nigerian tax questions and ask them to ask a tax‑related question.\n"
-            "Use only the provided basis and grounding context.\n"
-            "Do not invent laws, penalties, filing rules, rates, or deadlines.\n"
-            "If the evidence is insufficient, say so clearly.\n"
-            "Prefer the strongest matching approved material.\n"
-        )
-
-        user_prompt_parts = [
-            f"User question:\n{question}",
-            "",
-            "Grounded basis:",
-            basis,
-        ]
-
-        if grounding_context:
-            user_prompt_parts.extend(
-                [
-                    "",
-                    "Grounding context:",
-                    grounding_context,
-                ]
-            )
-
-        user_prompt_parts.extend(
-            [
-                "",
-                "Write a concise, practical answer for the user.",
-            ]
-        )
-
-        try:
-            return _call_openai_chat(
-                system_prompt=system_prompt,
-                user_prompt="\n".join(user_prompt_parts),
-                temperature=0.1,
-            )
-        except Exception:
-            # Safe fallback below
-            pass
-
-    if not candidates:
-        return (
-            "I am Naija Tax Guide, designed only for Nigerian tax questions. "
-            "I could not find a trusted answer in the tax library. Please ask a specific Nigerian tax question."
-        )
-
-    answer_lines = [
-        "Based on the strongest available Nigerian tax guidance in the system, here is the best supported answer:",
-        "",
-        f"Question: {question}",
-        "",
-        "Grounded basis:",
-        basis,
-    ]
-
-    if grounding_context:
-        answer_lines.extend(
-            [
-                "",
-                "Grounding context:",
-                grounding_context,
-            ]
-        )
-
-    answer_lines.extend(
-        [
-            "",
-            "Practical guidance:",
-            "Use the strongest matching Nigerian tax rule or approved answer above as the basis for your next step. If the situation involves registration, penalties, filing dates, or multi-branch structuring, verify the exact compliance context before acting.",
-        ]
+    system_prompt = (
+        "You are Naija Tax Guide, a grounded Nigerian tax assistant. "
+        "Answer only within Nigerian tax context. "
+        "If the question is not about Nigerian tax, politely explain that you only answer tax questions. "
+        "Be concise and practical. Do not invent information."
     )
 
-    return "\n".join(answer_lines).strip()
+    user_prompt = f"Question: {question}\n\n"
+    if context:
+        user_prompt += f"Context: {context}\n\n"
+    user_prompt += "Provide a helpful answer."
+
+    try:
+        return _call_openai_chat(system_prompt=system_prompt, user_prompt=user_prompt, temperature=0.2)
+    except Exception:
+        return ""
