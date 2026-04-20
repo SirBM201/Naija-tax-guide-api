@@ -1137,7 +1137,6 @@ def _process_ask_request(
         lang=lang,
         canonical_key=question_meta.get("canonical_key"),
     )
-    # Log what we found (this will appear in server logs)
     print(f"DEBUG priority_cache: question='{question}', lang='{lang}', found_source={priority_cached.get('source') if priority_cached else None}")
 
     if priority_cached:
@@ -1291,12 +1290,7 @@ def _process_ask_request(
             error="insufficient_credits_uncached",
         )
 
-    if short_q and not tax_rows:
-        debug["selected_mode"] = "clarification_short_question"
-        res = compose_clarification(question_meta=question_meta, debug=_filtered_debug(debug))
-        payload = res.__dict__
-        return _with_usage_meta(payload, usage_state=usage_state, balance=balance)
-
+    # Last resort: try AI generation for any question (including short or non-tax)
     ai_raw = _try_ai_generation(
         question=question,
         question_meta=question_meta,
@@ -1344,10 +1338,17 @@ def _process_ask_request(
                 debug=debug,
             )
 
-    debug["selected_mode"] = "clarification_fallback"
-    res = compose_clarification(question_meta=question_meta, debug=_filtered_debug(debug))
-    payload = res.__dict__
-    return _with_usage_meta(payload, usage_state=usage_state, balance=balance)
+    # If AI fails or returns empty, fall back to clarification
+    if short_q and not tax_rows:
+        debug["selected_mode"] = "clarification_short_question"
+        res = compose_clarification(question_meta=question_meta, debug=_filtered_debug(debug))
+        payload = res.__dict__
+        return _with_usage_meta(payload, usage_state=usage_state, balance=balance)
+    else:
+        debug["selected_mode"] = "clarification_fallback"
+        res = compose_clarification(question_meta=question_meta, debug=_filtered_debug(debug))
+        payload = res.__dict__
+        return _with_usage_meta(payload, usage_state=usage_state, balance=balance)
 
 
 def process_ask_request(
