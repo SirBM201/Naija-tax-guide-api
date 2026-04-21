@@ -1,49 +1,67 @@
-// app/api/tax/calculate/route.ts
 import { NextRequest, NextResponse } from 'next/server';
-import { resolve_paye_rule, can_handle_paye_rule } from '@/app/services/tax_rules/paye_rules';
-import { resolve_vat_rule, can_handle_vat_rule } from '@/app/services/tax_rules/vat_rules';
-import { resolve_pit_rule, can_handle_pit_rule } from '@/app/services/tax_rules/personal_income_tax_rules';
-import { resolve_cit_rule, can_handle_cit_rule } from '@/app/services/tax_rules/company_income_tax_rules'; // you may need to create/export these
+
+// Simple calculation functions (fallback if rule engine not yet integrated)
+function calculatePAYE(grossMonthly: number, pension: number = 0, nhf: number = 0): number {
+  const taxableIncome = grossMonthly - pension - nhf;
+  // Simplified PAYE bands (2024)
+  let tax = 0;
+  if (taxableIncome <= 300000) tax = 0;
+  else if (taxableIncome <= 600000) tax = (taxableIncome - 300000) * 0.07;
+  else if (taxableIncome <= 1100000) tax = 21000 + (taxableIncome - 600000) * 0.11;
+  else if (taxableIncome <= 1600000) tax = 76000 + (taxableIncome - 1100000) * 0.15;
+  else if (taxableIncome <= 3200000) tax = 151000 + (taxableIncome - 1600000) * 0.19;
+  else tax = 455000 + (taxableIncome - 3200000) * 0.24;
+  return Math.max(0, tax);
+}
+
+function calculateVAT(taxableSupplies: number, inputVAT: number = 0): number {
+  const outputVAT = taxableSupplies * 0.075;
+  return Math.max(0, outputVAT - inputVAT);
+}
+
+function calculateCIT(grossProfit: number, allowableExpenses: number): number {
+  const taxableProfit = Math.max(0, grossProfit - allowableExpenses);
+  // CIT rate is 20% for small companies, 30% for large; using 20% for MVP
+  return taxableProfit * 0.2;
+}
 
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const { type, inputs } = body; // type: 'paye', 'vat', 'cit'
+    const { type, inputs } = body;
 
     let result: any = {};
 
     switch (type) {
       case 'paye':
-        // inputs: monthly_gross_income, pension_contribution, nhf_contribution, etc.
-        const payeQuestion = `Calculate PAYE for monthly gross income of ${inputs.monthly_gross_income} with pension contribution ${inputs.pension_contribution || 0} and NHF ${inputs.nhf || 0}`;
-        if (can_handle_paye_rule(payeQuestion, 'paye', 'calculation')) {
-          const answer = resolve_paye_rule(payeQuestion, 'calculation');
-          result = { ok: true, answer, raw: { tax_due: extractNumber(answer), ...inputs } };
-        } else {
-          result = { ok: false, error: 'PAYE calculation rule not available' };
-        }
+        const payeTax = calculatePAYE(
+          inputs.monthly_gross_income || 0,
+          inputs.pension_contribution || 0,
+          inputs.nhf || 0
+        );
+        result = {
+          ok: true,
+          answer: `Your estimated PAYE tax per month is ₦${payeTax.toLocaleString()}. Annual: ₦${(payeTax * 12).toLocaleString()}.`,
+          raw: { tax_due: payeTax, ...inputs }
+        };
         break;
 
       case 'vat':
-        // inputs: taxable_supplies, exempt_supplies, input_vat
-        const vatQuestion = `Calculate VAT for taxable supplies ${inputs.taxable_supplies} with input VAT ${inputs.input_vat || 0}`;
-        if (can_handle_vat_rule(vatQuestion, 'vat', 'calculation')) {
-          const answer = resolve_vat_rule(vatQuestion, 'calculation');
-          result = { ok: true, answer, raw: { vat_payable: (inputs.taxable_supplies * 0.075) - (inputs.input_vat || 0), ...inputs } };
-        } else {
-          result = { ok: false, error: 'VAT calculation rule not available' };
-        }
+        const vatDue = calculateVAT(inputs.taxable_supplies || 0, inputs.input_vat || 0);
+        result = {
+          ok: true,
+          answer: `VAT payable is ₦${vatDue.toLocaleString()}.`,
+          raw: { vat_payable: vatDue, ...inputs }
+        };
         break;
 
       case 'cit':
-        // inputs: gross_profit, allowable_expenses, tax_reliefs
-        const citQuestion = `Calculate CIT for gross profit ${inputs.gross_profit} with expenses ${inputs.allowable_expenses}`;
-        if (can_handle_cit_rule(citQuestion, 'company_income_tax', 'calculation')) {
-          const answer = resolve_cit_rule(citQuestion, 'calculation');
-          result = { ok: true, answer, raw: { tax_due: (inputs.gross_profit - inputs.allowable_expenses) * 0.2, ...inputs } };
-        } else {
-          result = { ok: false, error: 'CIT calculation rule not available' };
-        }
+        const citDue = calculateCIT(inputs.gross_profit || 0, inputs.allowable_expenses || 0);
+        result = {
+          ok: true,
+          answer: `Company Income Tax (CIT) payable is ₦${citDue.toLocaleString()}.`,
+          raw: { tax_due: citDue, ...inputs }
+        };
         break;
 
       default:
@@ -55,9 +73,4 @@ export async function POST(req: NextRequest) {
     console.error(error);
     return NextResponse.json({ ok: false, error: 'Server error' }, { status: 500 });
   }
-}
-
-function extractNumber(str: string): number {
-  const match = str.match(/[\d,]+(?:\.\d+)?/);
-  return match ? parseFloat(match[0].replace(/,/g, '')) : 0;
 }
