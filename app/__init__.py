@@ -232,6 +232,7 @@ def create_app() -> Flask:
         "app.routes.admin_semantic",
         "app.routes.referrals",
         "app.routes.paystack_webhook",
+        "app.routes.tax",
     ]
     for dotted in required_modules:
         _register_bp(dotted, "bp", required=True, url_prefix=api_prefix)
