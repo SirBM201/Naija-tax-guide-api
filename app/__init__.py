@@ -3,7 +3,6 @@ import logging
 import os
 from flask import Flask
 from flask_cors import CORS
-from flask_session import Session
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -30,7 +29,7 @@ required_modules = [
     "app.routes.email_link",
     "app.routes.web_auth",
     "app.routes.web_session",
-    "app.routes.tax",          # <-- Tax filing endpoint
+    "app.routes.tax",  # Tax filing endpoint
 ]
 
 def create_app(config_override=None):
@@ -40,16 +39,14 @@ def create_app(config_override=None):
     # Base configuration
     # ------------------------------------------------------------
     app.config.update(
-        # Session settings (required for cross-origin cookie support)
         SECRET_KEY=os.environ.get("SECRET_KEY", "dev-secret-change-in-production"),
-        SESSION_TYPE="filesystem",          # or "redis" if you prefer
-        SESSION_COOKIE_SAMESITE="None",     # Allow cross-site requests
-        SESSION_COOKIE_SECURE=True,         # Requires HTTPS (set False for local dev)
+        
+        # Session cookie settings for cross-origin requests
+        SESSION_COOKIE_SAMESITE='None',
+        SESSION_COOKIE_SECURE=True,  # Set to False for local development (HTTP)
         SESSION_COOKIE_HTTPONLY=True,
-        SESSION_COOKIE_PATH="/",
-        PERMANENT_SESSION_LIFETIME=86400,   # 1 day
-
-        # CORS (overridden by flask-cors below, but kept for reference)
+        
+        # CORS settings
         CORS_ORIGINS=os.environ.get("CORS_ORIGINS", "https://www.naijataxguides.com").split(","),
     )
 
@@ -67,18 +64,13 @@ def create_app(config_override=None):
          methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
 
     # ------------------------------------------------------------
-    # Session init
-    # ------------------------------------------------------------
-    Session(app)
-
-    # ------------------------------------------------------------
     # Automatic blueprint registration
     # ------------------------------------------------------------
     for module_name in required_modules:
         try:
             module = importlib.import_module(module_name)
-            if hasattr(module, "bp"):
-                app.register_blueprint(module.bp, url_prefix="/api")
+            if hasattr(module, 'bp'):
+                app.register_blueprint(module.bp, url_prefix='/api')
                 logger.info(f"Registered blueprint: {module_name}")
             else:
                 logger.warning(f"Module {module_name} has no 'bp' attribute")
@@ -86,9 +78,9 @@ def create_app(config_override=None):
             logger.error(f"Failed to import {module_name}: {e}")
 
     # ------------------------------------------------------------
-    # Health check endpoint (simple)
+    # Simple health check endpoint
     # ------------------------------------------------------------
-    @app.route("/api/health", methods=["GET"])
+    @app.route('/api/health', methods=['GET'])
     def health():
         return {"ok": True, "status": "healthy"}
 
