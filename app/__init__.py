@@ -29,7 +29,7 @@ required_modules = [
     "app.routes.email_link",
     "app.routes.web_auth",
     "app.routes.web_session",
-    "app.routes.tax",  # Tax filing endpoint
+    "app.routes.tax",
 ]
 
 def create_app(config_override=None):
@@ -43,11 +43,12 @@ def create_app(config_override=None):
         
         # Session cookie settings for cross-origin requests
         SESSION_COOKIE_SAMESITE='None',
-        SESSION_COOKIE_SECURE=True,  # Set to False for local development (HTTP)
+        SESSION_COOKIE_SECURE=True,  # Set to False only for local HTTP development
         SESSION_COOKIE_HTTPONLY=True,
+        SESSION_COOKIE_PATH='/',
         
         # CORS settings
-        CORS_ORIGINS=os.environ.get("CORS_ORIGINS", "https://www.naijataxguides.com").split(","),
+        CORS_ORIGINS=os.environ.get("CORS_ORIGINS", "https://www.naijataxguides.com,http://localhost:3000").split(","),
     )
 
     # Allow config override (e.g., for testing)
@@ -55,12 +56,13 @@ def create_app(config_override=None):
         app.config.update(config_override)
 
     # ------------------------------------------------------------
-    # CORS setup – allow credentials from frontend domain
+    # CORS setup – allow credentials from frontend domains
     # ------------------------------------------------------------
     CORS(app,
          origins=app.config["CORS_ORIGINS"],
          supports_credentials=True,
-         allow_headers=["Content-Type", "Authorization"],
+         allow_headers=["Content-Type", "Authorization", "Cookie"],
+         expose_headers=["Set-Cookie"],
          methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
 
     # ------------------------------------------------------------
