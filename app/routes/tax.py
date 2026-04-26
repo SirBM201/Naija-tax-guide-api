@@ -1,7 +1,7 @@
 from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
-from flask import Blueprint, jsonify, request, g
+from flask import Blueprint, jsonify, request
 from app.core.supabase_client import supabase
 from app.services.auth_service import get_current_user
 import logging
@@ -10,26 +10,17 @@ logger = logging.getLogger(__name__)
 
 bp = Blueprint("tax", __name__)
 
-@bp.before_request
-def before_request():
-    """Log all requests to this blueprint for debugging"""
-    logger.info(f"Tax blueprint request: {request.method} {request.path} - Session: {bool(request.cookies)}")
 
 @bp.post("/tax/file")
 def file_tax_return():
     """
     Endpoint to file a tax return (PAYE, VAT, CIT).
-    Expects a JSON body with:
-    - taxType: "paye" | "vat" | "cit"
-    - inputs: dict containing the relevant financial details
-    - documents: list of file metadata (optional)
-    - userId: account ID (optional, extracted from auth if not provided)
     """
-    # Log request details for debugging
-    logger.info(f"Tax filing request received - Method: {request.method}, Headers: {dict(request.headers)}")
+    # Enhanced logging for debugging
+    logger.info(f"Tax filing request - Auth header: {request.headers.get('Authorization', 'None')[:50] if request.headers.get('Authorization') else 'None'}")
     logger.info(f"Cookies present: {list(request.cookies.keys()) if request.cookies else 'None'}")
     
-    # Authenticate user - this is critical
+    # Get authenticated user (now supports both Bearer token and session)
     current_user = get_current_user()
     
     if not current_user:
@@ -61,10 +52,14 @@ def file_tax_return():
     
     # Insert filing record into Supabase
     sb = supabase()
+    
+    # Get account_id from user object or request
+    account_id = user_id or current_user.get("account_id") or current_user.get("id")
+    
     filing_record = {
         "id": submission_id,
         "user_id": current_user.get("id"),
-        "account_id": user_id or current_user.get("account_id") or current_user.get("id"),
+        "account_id": account_id,
         "tax_type": tax_type,
         "inputs": inputs,
         "documents": documents,
@@ -83,7 +78,7 @@ def file_tax_return():
         logger.error(f"Database error: {str(e)}")
         return jsonify({"ok": False, "error": f"Database error: {str(e)}"}), 500
     
-    # Return success response including the generated reference
+    # Return success response
     return jsonify({
         "ok": True,
         "message": f"{tax_type.upper()} filing submitted successfully.",
