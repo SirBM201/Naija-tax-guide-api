@@ -16,22 +16,22 @@ def _truthy(v: str | None) -> bool:
 # ---------------------------------------------------------
 # ENV CONFIG (MAIL_* primary; SMTP_* fallback)
 # ---------------------------------------------------------
-MAIL_ENABLED = _truthy(os.getenv("MAIL_ENABLED", "0"))
+MAIL_ENABLED = _truthy(os.getenv("MAIL_ENABLED", "1"))  # Changed default to 1
 
-MAIL_HOST = (os.getenv("MAIL_HOST") or os.getenv("SMTP_HOST") or "").strip()
+MAIL_HOST = (os.getenv("MAIL_HOST") or os.getenv("SMTP_HOST") or "live.smtp.mailtrap.io").strip()
 MAIL_PORT = int((os.getenv("MAIL_PORT") or os.getenv("SMTP_PORT") or "587").strip() or "587")
 
 MAIL_USER = (os.getenv("MAIL_USER") or os.getenv("SMTP_USER") or "").strip()
 MAIL_PASS = (os.getenv("MAIL_PASS") or os.getenv("SMTP_PASS") or "").strip()
 
 MAIL_FROM_NAME = (os.getenv("MAIL_FROM_NAME") or "NaijaTax Guide").strip()
-MAIL_FROM_EMAIL = (os.getenv("MAIL_FROM_EMAIL") or os.getenv("SMTP_FROM") or MAIL_USER or "").strip()
+MAIL_FROM_EMAIL = (os.getenv("MAIL_FROM_EMAIL") or os.getenv("SMTP_FROM") or "noreply@naijataxguides.com").strip()
 
 MAIL_USE_SSL = _truthy(os.getenv("MAIL_USE_SSL", "0"))
 MAIL_USE_TLS = _truthy(os.getenv("MAIL_USE_TLS", "1"))
 
 DEFAULT_OTP_SUBJECT = (os.getenv("WEB_OTP_EMAIL_SUBJECT") or "Your NaijaTax Guide OTP").strip()
-SMTP_TIMEOUT_SECONDS = int((os.getenv("MAIL_TIMEOUT_SECONDS") or "8").strip() or "8")
+SMTP_TIMEOUT_SECONDS = int((os.getenv("MAIL_TIMEOUT_SECONDS") or "10").strip() or "10")
 
 
 def _smtp_config_snapshot(to_email: str) -> Dict[str, Any]:
@@ -81,10 +81,25 @@ def send_email(
             "debug": _smtp_config_snapshot(to_email),
         }
 
-    if not all([MAIL_HOST, MAIL_PORT, MAIL_USER, MAIL_PASS, MAIL_FROM_EMAIL]):
+    # Check for missing credentials
+    missing = []
+    if not MAIL_HOST:
+        missing.append("MAIL_HOST")
+    if not MAIL_PORT:
+        missing.append("MAIL_PORT")
+    if not MAIL_USER:
+        missing.append("MAIL_USER")
+    if not MAIL_PASS:
+        missing.append("MAIL_PASS")
+    if not MAIL_FROM_EMAIL:
+        missing.append("MAIL_FROM_EMAIL")
+    
+    if missing:
+        _log("mail_not_configured", missing=missing)
         return {
             "ok": False,
             "error": "mail_not_configured",
+            "missing": missing,
             "debug": _smtp_config_snapshot(to_email),
         }
 
@@ -144,6 +159,7 @@ def send_email(
         return {
             "ok": False,
             "error": "smtp_auth_failed",
+            "message": "SMTP authentication failed. Please check your Mailtrap username and password.",
             "root_cause": repr(e),
             "debug": _smtp_config_snapshot(to_email),
         }
@@ -152,6 +168,7 @@ def send_email(
         return {
             "ok": False,
             "error": "smtp_connect_failed",
+            "message": f"Could not connect to {MAIL_HOST}:{MAIL_PORT}",
             "root_cause": repr(e),
             "debug": _smtp_config_snapshot(to_email),
         }
@@ -160,6 +177,7 @@ def send_email(
         return {
             "ok": False,
             "error": "smtp_server_disconnected",
+            "message": "SMTP server disconnected unexpectedly",
             "root_cause": repr(e),
             "debug": _smtp_config_snapshot(to_email),
         }
@@ -168,6 +186,7 @@ def send_email(
         return {
             "ok": False,
             "error": "smtp_timeout",
+            "message": f"Connection timed out after {SMTP_TIMEOUT_SECONDS} seconds",
             "root_cause": repr(e),
             "debug": _smtp_config_snapshot(to_email),
         }
@@ -176,6 +195,7 @@ def send_email(
         return {
             "ok": False,
             "error": "smtp_timeout",
+            "message": f"Connection timed out after {SMTP_TIMEOUT_SECONDS} seconds",
             "root_cause": repr(e),
             "debug": _smtp_config_snapshot(to_email),
         }
@@ -184,42 +204,68 @@ def send_email(
         return {
             "ok": False,
             "error": "mail_send_failed",
+            "message": f"Unexpected error: {str(e)}",
             "root_cause": repr(e),
             "debug": _smtp_config_snapshot(to_email),
         }
 
 
 # ---------------------------------------------------------
-# OTP TEMPLATE
+# OTP TEMPLATE - Enhanced for better deliverability
 # ---------------------------------------------------------
 def send_otp_email(to_email: str, otp_code: str) -> Dict[str, Any]:
     subject = DEFAULT_OTP_SUBJECT
 
     html_body = f"""
-    <div style="font-family:Arial,sans-serif;max-width:600px;margin:auto">
-        <h2>NaijaTax Guide</h2>
-        <p>Your One-Time Password (OTP) is:</p>
-
-        <div style="
-            font-size:32px;
-            font-weight:bold;
-            letter-spacing:4px;
-            background:#f4f4f4;
-            padding:15px;
-            text-align:center;
-            border-radius:8px;
-        ">
-            {otp_code}
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>NaijaTax Guide OTP</title>
+    </head>
+    <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; padding: 20px;">
+        <div style="background: linear-gradient(135deg, #1a73e8 0%, #0d47a1 100%); padding: 30px 20px; border-radius: 12px 12px 0 0; text-align: center;">
+            <h1 style="color: white; margin: 0; font-size: 28px;">NaijaTax Guide</h1>
+            <p style="color: rgba(255,255,255,0.9); margin: 10px 0 0 0;">Your Trusted Tax Filing Platform</p>
         </div>
-
-        <p>This code expires in 10 minutes.</p>
-        <p>If you did not request this login, ignore this email.</p>
-        <hr>
-        <small>© NaijaTax Guide</small>
-    </div>
+        
+        <div style="background: #ffffff; padding: 30px; border-radius: 0 0 12px 12px; border: 1px solid #e0e0e0; border-top: none;">
+            <p style="font-size: 16px; margin: 0 0 20px 0;">Hello,</p>
+            <p style="font-size: 16px; margin: 0 0 10px 0;">Your One-Time Password (OTP) for login is:</p>
+            
+            <div style="text-align: center; margin: 30px 0;">
+                <span style="font-size: 42px; font-weight: bold; letter-spacing: 8px; background: #f5f5f5; padding: 15px 25px; border-radius: 12px; border: 2px solid #1a73e8; color: #1a73e8; font-family: monospace;">{otp_code}</span>
+            </div>
+            
+            <p style="font-size: 14px; color: #666; margin: 20px 0 10px 0;">This code will expire in <strong>10 minutes</strong>.</p>
+            <p style="font-size: 14px; color: #666; margin: 0 0 20px 0;">If you didn't request this, please ignore this email.</p>
+            
+            <hr style="margin: 30px 0; border: none; border-top: 1px solid #eee;">
+            
+            <p style="font-size: 12px; color: #999; text-align: center; margin: 0;">
+                NaijaTax Guide - Igniting Ideas. Building the Future.<br>
+                <a href="https://www.naijataxguides.com" style="color: #1a73e8; text-decoration: none;">www.naijataxguides.com</a>
+            </p>
+        </div>
+    </body>
+    </html>
     """
 
-    text_body = f"Your OTP code is: {otp_code}\nThis code expires in 10 minutes."
+    text_body = f"""NaijaTax Guide - Your OTP Code
+
+Hello,
+
+Your One-Time Password (OTP) for login is: {otp_code}
+
+This code will expire in 10 minutes.
+
+If you didn't request this, please ignore this email.
+
+---
+NaijaTax Guide - Igniting Ideas. Building the Future.
+https://www.naijataxguides.com
+"""
 
     return send_email(
         to_email=to_email,
