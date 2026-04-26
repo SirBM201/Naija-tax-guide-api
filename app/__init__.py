@@ -4,6 +4,7 @@ import os
 from flask import Flask, session, request, g
 from flask_cors import CORS
 from dotenv import load_dotenv
+from flask.sessions import SecureCookieSessionInterface
 
 # Load environment variables
 load_dotenv()
@@ -36,16 +37,21 @@ def create_app(config_override=None):
     app = Flask(__name__)
 
     # ------------------------------------------------------------
-    # Base configuration
+    # Base configuration - CRITICAL for session to work
     # ------------------------------------------------------------
     app.config.update(
         SECRET_KEY=os.environ.get("SECRET_KEY", "dev-secret-change-in-production"),
         
-        # Session cookie settings for cross-origin requests
+        # Session cookie settings
+        SESSION_COOKIE_NAME="ntg_session",
         SESSION_COOKIE_SAMESITE='None',
-        SESSION_COOKIE_SECURE=True,  # Set to False only for local HTTP development
+        SESSION_COOKIE_SECURE=True,  # Set to False for local HTTP development
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_PATH='/',
+        SESSION_COOKIE_DOMAIN=None,  # Allow current domain
+        
+        # Permanent session lifetime (30 days)
+        PERMANENT_SESSION_LIFETIME=2592000,
         
         # CORS settings
         CORS_ORIGINS=os.environ.get("CORS_ORIGINS", "https://www.naijataxguides.com,http://localhost:3000").split(","),
@@ -66,24 +72,30 @@ def create_app(config_override=None):
          methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
 
     # ------------------------------------------------------------
-    # Before request handler - ensure session is accessible
+    # Before request handler - ensure session is loaded and log it
     # ------------------------------------------------------------
     @app.before_request
     def before_request():
-        """Log request info and ensure session is loaded"""
+        """Log request info and ensure session is accessible"""
         # Skip for static files and health checks
         if request.path.startswith('/static') or request.path == '/api/health':
             return
         
         logger.debug(f"Request: {request.method} {request.path}")
         logger.debug(f"Cookies present: {list(request.cookies.keys()) if request.cookies else 'None'}")
-        
-        # Session will be automatically loaded by Flask
-        # This just ensures we can access it
-        if session.get('user_id'):
-            logger.debug(f"Session has user_id: {session.get('user_id')}")
-        elif request.cookies.get('ntg_session'):
-            logger.debug(f"ntg_session cookie found but not in Flask session yet")
+        logger.debug(f"Session keys before request: {list(session.keys()) if session else 'None'}")
+        logger.debug(f"Session user_id: {session.get('user_id')}")
+
+    # ------------------------------------------------------------
+    # After request handler - ensure session is saved
+    # ------------------------------------------------------------
+    @app.after_request
+    def after_request(response):
+        """Log session after request"""
+        if not request.path.startswith('/static') and request.path != '/api/health':
+            logger.debug(f"Session keys after request: {list(session.keys()) if session else 'None'}")
+            logger.debug(f"Session user_id after request: {session.get('user_id')}")
+        return response
 
     # ------------------------------------------------------------
     # Automatic blueprint registration
