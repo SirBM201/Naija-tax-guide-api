@@ -4,7 +4,6 @@ import os
 from flask import Flask, session, request, g
 from flask_cors import CORS
 from dotenv import load_dotenv
-from flask.sessions import SecureCookieSessionInterface
 
 # Load environment variables
 load_dotenv()
