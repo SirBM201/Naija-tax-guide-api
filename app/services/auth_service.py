@@ -46,25 +46,21 @@ def get_user_from_session_cookie() -> Dict[str, Any] | None:
         if ntg_session:
             logger.info(f"Found ntg_session cookie: {ntg_session[:20]}...")
             
-            # Get the Supabase client (not as a callable)
-            sb = supabase
-            
-            # Check if sb has auth attribute
-            if hasattr(sb, 'auth') and hasattr(sb.auth, 'get_user'):
-                try:
-                    # Try to validate the session with Supabase
-                    res = sb.auth.get_user(ntg_session)
-                    if res and hasattr(res, 'user') and res.user:
-                        logger.info(f"User authenticated via ntg_session cookie: {res.user.id}")
-                        return {
-                            "id": res.user.id,
-                            "email": res.user.email,
-                            "account_id": res.user.id,
-                        }
-                except Exception as e:
-                    logger.warning(f"Could not validate ntg_session with Supabase: {e}")
-            else:
-                logger.warning("Supabase client does not have expected auth methods")
+            # supabase is already a Client object - use it directly
+            try:
+                # Try to validate the session with Supabase
+                # The ntg_session cookie might be a Supabase access token
+                res = supabase.auth.get_user(ntg_session)
+                if res and hasattr(res, 'user') and res.user:
+                    user_data = res.user
+                    logger.info(f"User authenticated via ntg_session cookie: {user_data.id}")
+                    return {
+                        "id": user_data.id,
+                        "email": user_data.email,
+                        "account_id": user_data.id,
+                    }
+            except Exception as e:
+                logger.warning(f"Could not validate ntg_session with Supabase: {e}")
         
         return None
     except Exception as e:
@@ -74,23 +70,19 @@ def get_user_from_session_cookie() -> Dict[str, Any] | None:
 
 def get_user_from_bearer_token(token: str) -> Dict[str, Any] | None:
     """Validate Bearer token with Supabase"""
-    sb = supabase
     try:
-        if hasattr(sb, 'auth') and hasattr(sb.auth, 'get_user'):
-            res = sb.auth.get_user(token)
-            user = getattr(res, "user", None)
-            if not user:
-                logger.warning("Bearer token validation returned no user")
-                return None
-            
-            logger.info(f"User authenticated via Bearer token: {user.id if hasattr(user, 'id') else 'unknown'}")
-            
+        # supabase is already a Client object - use it directly
+        res = supabase.auth.get_user(token)
+        if res and hasattr(res, 'user') and res.user:
+            user_data = res.user
+            logger.info(f"User authenticated via Bearer token: {user_data.id}")
             return {
-                "id": user.id if hasattr(user, 'id') else user.get('id'),
-                "email": user.email if hasattr(user, 'email') else user.get('email'),
+                "id": user_data.id,
+                "email": user_data.email,
+                "account_id": user_data.id,
             }
         else:
-            logger.warning("Supabase client does not have auth.get_user method")
+            logger.warning("Bearer token validation returned no user")
             return None
     except Exception as e:
         logger.warning(f"Bearer token validation failed: {e}")
@@ -102,19 +94,29 @@ def get_current_user() -> Dict[str, Any] | None:
     Get currently authenticated user.
     
     Supports multiple authentication methods in this order:
-    1. Flask session (user_id stored in session)
-    2. ntg_session cookie (Supabase session)
+    1. ntg_session cookie (Supabase session) - PRIMARY for this app
+    2. Flask session (user_id stored in session)
     3. Bearer token from Authorization header
     
     Returns user dict with at minimum 'id' field, or None if not authenticated.
     """
-    # Method 1: Try Flask session first
+    # Method 1: Try ntg_session cookie first (most common for this app)
     user = get_user_from_session_cookie()
     if user:
         logger.debug("User authenticated via session cookie")
         return user
     
-    # Method 2: Try Bearer token
+    # Method 2: Try Flask session user_id
+    user_id = session.get("user_id")
+    if user_id:
+        logger.info(f"User found in Flask session (fallback): {user_id}")
+        return {
+            "id": user_id,
+            "email": session.get("user_email"),
+            "account_id": session.get("account_id") or user_id,
+        }
+    
+    # Method 3: Try Bearer token
     token = get_bearer_token()
     if token:
         user = get_user_from_bearer_token(token)
@@ -123,11 +125,11 @@ def get_current_user() -> Dict[str, Any] | None:
             return user
         logger.debug("Bearer token present but validation failed")
     
+    # Log detailed debug info for troubleshooting
     logger.warning("No valid authentication found for request")
-    
-    # Log detailed debug info
-    logger.debug(f"Request headers: {dict(request.headers)}")
+    logger.debug(f"Request path: {request.path}")
     logger.debug(f"Request cookies: {list(request.cookies.keys()) if request.cookies else 'None'}")
+    logger.debug(f"Authorization header present: {bool(request.headers.get('Authorization'))}")
     
     return None
 
