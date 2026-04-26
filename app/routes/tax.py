@@ -16,11 +16,10 @@ def file_tax_return():
     """
     Endpoint to file a tax return (PAYE, VAT, CIT).
     """
-    # Enhanced logging for debugging
-    logger.info(f"Tax filing request - Auth header: {request.headers.get('Authorization', 'None')[:50] if request.headers.get('Authorization') else 'None'}")
+    logger.info(f"Tax filing request received")
     logger.info(f"Cookies present: {list(request.cookies.keys()) if request.cookies else 'None'}")
     
-    # Get authenticated user (now supports both Bearer token and session)
+    # Get authenticated user - now properly reads session cookie
     current_user = get_current_user()
     
     if not current_user:
@@ -52,14 +51,10 @@ def file_tax_return():
     
     # Insert filing record into Supabase
     sb = supabase()
-    
-    # Get account_id from user object or request
-    account_id = user_id or current_user.get("account_id") or current_user.get("id")
-    
     filing_record = {
         "id": submission_id,
         "user_id": current_user.get("id"),
-        "account_id": account_id,
+        "account_id": user_id or current_user.get("account_id") or current_user.get("id"),
         "tax_type": tax_type,
         "inputs": inputs,
         "documents": documents,
