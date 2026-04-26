@@ -1,7 +1,7 @@
 import importlib
 import logging
 import os
-from flask import Flask
+from flask import Flask, session, request, g
 from flask_cors import CORS
 from dotenv import load_dotenv
 
@@ -64,6 +64,26 @@ def create_app(config_override=None):
          allow_headers=["Content-Type", "Authorization", "Cookie"],
          expose_headers=["Set-Cookie"],
          methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
+
+    # ------------------------------------------------------------
+    # Before request handler - ensure session is accessible
+    # ------------------------------------------------------------
+    @app.before_request
+    def before_request():
+        """Log request info and ensure session is loaded"""
+        # Skip for static files and health checks
+        if request.path.startswith('/static') or request.path == '/api/health':
+            return
+        
+        logger.debug(f"Request: {request.method} {request.path}")
+        logger.debug(f"Cookies present: {list(request.cookies.keys()) if request.cookies else 'None'}")
+        
+        # Session will be automatically loaded by Flask
+        # This just ensures we can access it
+        if session.get('user_id'):
+            logger.debug(f"Session has user_id: {session.get('user_id')}")
+        elif request.cookies.get('ntg_session'):
+            logger.debug(f"ntg_session cookie found but not in Flask session yet")
 
     # ------------------------------------------------------------
     # Automatic blueprint registration
