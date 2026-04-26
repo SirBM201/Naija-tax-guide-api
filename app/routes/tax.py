@@ -15,13 +15,14 @@ bp = Blueprint("tax", __name__)
 def file_tax_return():
     """File a tax return (PAYE, VAT, CIT)."""
     logger.info(f"Tax filing request received")
+    logger.info(f"Session keys: {list(session.keys()) if session else 'None'}")
     logger.info(f"Session user_id: {session.get('user_id')}")
     
     # Get authenticated user from your session system
     current_user = get_current_user()
     
     if not current_user:
-        logger.warning("No authenticated user found")
+        logger.warning("No authenticated user found for tax filing request")
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     
     logger.info(f"Authenticated user: {current_user.get('id')}")
@@ -39,7 +40,7 @@ def file_tax_return():
     user_id = data.get("userId", "")
     
     if tax_type not in ("paye", "vat", "cit"):
-        return jsonify({"ok": False, "error": "Invalid tax type"}), 400
+        return jsonify({"ok": False, "error": "Invalid tax type. Must be 'paye', 'vat', or 'cit'."}), 400
     
     # Generate reference
     submission_id = str(uuid.uuid4())
@@ -65,13 +66,14 @@ def file_tax_return():
         result = sb.table("tax_filings").insert(filing_record).execute()
         if not result.data:
             raise Exception("Insert failed")
+        logger.info(f"Successfully inserted tax filing with reference: {reference}")
     except Exception as e:
         logger.error(f"Database error: {e}")
-        return jsonify({"ok": False, "error": str(e)}), 500
+        return jsonify({"ok": False, "error": f"Database error: {str(e)}"}), 500
     
     return jsonify({
         "ok": True,
-        "message": f"{tax_type.upper()} filing submitted.",
+        "message": f"{tax_type.upper()} filing submitted successfully.",
         "reference": reference,
         "submittedAt": submitted_at,
     }), 200
