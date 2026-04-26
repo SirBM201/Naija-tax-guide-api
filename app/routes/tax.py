@@ -1,7 +1,7 @@
 from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request, session
 from app.core.supabase_client import supabase
 from app.services.auth_service import get_current_user
 import logging
@@ -13,20 +13,18 @@ bp = Blueprint("tax", __name__)
 
 @bp.post("/tax/file")
 def file_tax_return():
-    """
-    Endpoint to file a tax return (PAYE, VAT, CIT).
-    """
+    """File a tax return (PAYE, VAT, CIT)."""
     logger.info(f"Tax filing request received")
-    logger.info(f"Cookies present: {list(request.cookies.keys()) if request.cookies else 'None'}")
+    logger.info(f"Session user_id: {session.get('user_id')}")
     
-    # Get authenticated user - now properly reads session cookie
+    # Get authenticated user from your session system
     current_user = get_current_user()
     
     if not current_user:
-        logger.warning("No authenticated user found for tax filing request")
+        logger.warning("No authenticated user found")
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     
-    logger.info(f"Authenticated user: {current_user.get('id')}, Email: {current_user.get('email')}")
+    logger.info(f"Authenticated user: {current_user.get('id')}")
     
     # Parse request body
     try:
@@ -40,17 +38,16 @@ def file_tax_return():
     documents = data.get("documents", [])
     user_id = data.get("userId", "")
     
-    # Validate required fields
     if tax_type not in ("paye", "vat", "cit"):
-        return jsonify({"ok": False, "error": "Invalid tax type. Must be 'paye', 'vat', or 'cit'."}), 400
+        return jsonify({"ok": False, "error": "Invalid tax type"}), 400
     
-    # Generate a submission reference and timestamp
+    # Generate reference
     submission_id = str(uuid.uuid4())
     submitted_at = datetime.now(timezone.utc).isoformat()
     reference = f"TAX-{tax_type.upper()}-{submission_id[:8].upper()}"
     
-    # Insert filing record into Supabase
-    sb = supabase()
+    # Insert into database
+    sb = supabase
     filing_record = {
         "id": submission_id,
         "user_id": current_user.get("id"),
@@ -64,19 +61,17 @@ def file_tax_return():
     }
     
     try:
-        logger.info(f"Inserting tax filing record for user {current_user.get('id')}")
+        logger.info(f"Inserting tax filing: {reference}")
         result = sb.table("tax_filings").insert(filing_record).execute()
         if not result.data:
-            raise Exception("Failed to insert filing record")
-        logger.info(f"Successfully inserted tax filing with reference: {reference}")
+            raise Exception("Insert failed")
     except Exception as e:
-        logger.error(f"Database error: {str(e)}")
-        return jsonify({"ok": False, "error": f"Database error: {str(e)}"}), 500
+        logger.error(f"Database error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
     
-    # Return success response
     return jsonify({
         "ok": True,
-        "message": f"{tax_type.upper()} filing submitted successfully.",
+        "message": f"{tax_type.upper()} filing submitted.",
         "reference": reference,
         "submittedAt": submitted_at,
     }), 200
