@@ -31,8 +31,8 @@ required_modules = [
     "app.routes.web_auth",
     "app.routes.web_session",
     "app.routes.tax",
-    "app.routes.workspace",   # ADD THIS
-    "app.routes.link",         # ADD THIS
+    "app.routes.workspace",
+    "app.routes.link",
 ]
 
 def create_app(config_override=None):
@@ -50,13 +50,13 @@ def create_app(config_override=None):
         SESSION_FILE_THRESHOLD=500,
         SESSION_FILE_MODE=0o600,
         
-        # Session cookie settings - critical for cross-domain proxy
+        # Session cookie settings
         SESSION_COOKIE_NAME="ntg_session",
-        SESSION_COOKIE_SAMESITE='Lax',  # Lax works with proxy (same domain)
-        SESSION_COOKIE_SECURE=True,      # Must be True for HTTPS
+        SESSION_COOKIE_SAMESITE='Lax',
+        SESSION_COOKIE_SECURE=True,
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_PATH='/',
-        SESSION_COOKIE_DOMAIN=None,      # None = current domain only
+        SESSION_COOKIE_DOMAIN=None,
         
         # Permanent session lifetime (30 days)
         PERMANENT_SESSION_LIFETIME=2592000,
@@ -91,14 +91,12 @@ def create_app(config_override=None):
         if request.path.startswith('/static') or request.path == '/api/health':
             return
         
-        # Force session to load
         session.modified = True
         
-        logger.info(f"Request: {request.method} {request.path}")
-        logger.info(f"Session keys after load: {list(session.keys()) if session else 'None'}")
-        logger.info(f"Session user_id: {session.get('user_id')}")
+        logger.debug(f"Request: {request.method} {request.path}")
+        logger.debug(f"Session keys: {list(session.keys()) if session else 'None'}")
+        logger.debug(f"Session user_id: {session.get('user_id')}")
         
-        # Set user in g if exists in session
         if session.get('user_id'):
             g.user = {
                 "id": session.get('user_id'),
@@ -113,8 +111,8 @@ def create_app(config_override=None):
     def after_request(response):
         """Save session after request"""
         if not request.path.startswith('/static') and request.path != '/api/health':
-            logger.info(f"After request - Session keys: {list(session.keys()) if session else 'None'}")
-            logger.info(f"After request - Session user_id: {session.get('user_id')}")
+            logger.debug(f"After request - Session keys: {list(session.keys()) if session else 'None'}")
+            logger.debug(f"After request - Session user_id: {session.get('user_id')}")
         return response
 
     # ------------------------------------------------------------
