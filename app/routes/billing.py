@@ -597,6 +597,23 @@ def _extract_metadata(data: Dict[str, Any]) -> Dict[str, Any]:
     return md if isinstance(md, dict) else {}
 
 
+def _get_account_id_from_session() -> Optional[str]:
+    """Get account ID from Flask session first, then fallback to token auth."""
+    # First try Flask session
+    user_id = session.get("user_id")
+    if user_id:
+        logger.info(f"Account ID from session: {user_id}")
+        return user_id
+    
+    # Fallback to token/cookie auth
+    account_id, debug = get_account_id_from_request(request)
+    if account_id:
+        logger.info(f"Account ID from token/cookie: {account_id}")
+        return account_id
+    
+    return None
+
+
 # -------------------- ROUTES --------------------
 
 
@@ -864,23 +881,6 @@ def _load_payment_history(
     }
 
 
-def _get_account_id_from_session() -> Optional[str]:
-    """Get account ID from Flask session first, then fallback to token auth."""
-    # First try Flask session
-    user_id = session.get("user_id")
-    if user_id:
-        logger.info(f"Account ID from session: {user_id}")
-        return user_id
-    
-    # Fallback to token/cookie auth
-    account_id, debug = get_account_id_from_request(request)
-    if account_id:
-        logger.info(f"Account ID from token/cookie: {account_id}")
-        return account_id
-    
-    return None
-
-
 @bp.get("/billing/me")
 @bp.get("/billing/subscription")
 def billing_me():
@@ -935,7 +935,4 @@ def billing_me():
         payload["last_payment_reference"] = latest_success.get("reference")
     if latest_success and not payload.get("payment_method"):
         payload["payment_method"] = latest_success.get("payment_method")
-    return jsonify(payload), 200
-
-
-@bp.get("/billing/history")
+    return jsonify(payload),
