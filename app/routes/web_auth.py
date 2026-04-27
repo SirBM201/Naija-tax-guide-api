@@ -44,7 +44,7 @@ def _cookie_samesite() -> str:
     v = _env("WEB_AUTH_COOKIE_SAMESITE", "")
     if v:
         return v
-    return _env("COOKIE_SAMESITE", "Lax")  # Changed from "None" to "Lax"
+    return _env("COOKIE_SAMESITE", "Lax")
 
 
 def _cookie_domain() -> Optional[str]:
