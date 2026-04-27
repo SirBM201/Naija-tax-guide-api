@@ -15,7 +15,7 @@ def get_current_user() -> Dict[str, Any] | None:
             logger.info(f"User found in g: {g.user.get('id')}")
             return g.user
         
-        # Check Flask session
+        # Check Flask session directly
         user_id = session.get("user_id")
         if user_id:
             logger.info(f"User found in session: {user_id}")
