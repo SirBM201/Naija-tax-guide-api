@@ -93,9 +93,9 @@ def create_app(config_override=None):
         
         session.modified = True
         
-        logger.debug(f"Request: {request.method} {request.path}")
-        logger.debug(f"Session keys: {list(session.keys()) if session else 'None'}")
-        logger.debug(f"Session user_id: {session.get('user_id')}")
+        logger.info(f"Request: {request.method} {request.path}")
+        logger.info(f"Session keys: {list(session.keys()) if session else 'None'}")
+        logger.info(f"Session user_id: {session.get('user_id')}")
         
         if session.get('user_id'):
             g.user = {
@@ -111,8 +111,8 @@ def create_app(config_override=None):
     def after_request(response):
         """Save session after request"""
         if not request.path.startswith('/static') and request.path != '/api/health':
-            logger.debug(f"After request - Session keys: {list(session.keys()) if session else 'None'}")
-            logger.debug(f"After request - Session user_id: {session.get('user_id')}")
+            logger.info(f"After request - Session keys: {list(session.keys()) if session else 'None'}")
+            logger.info(f"After request - Session user_id: {session.get('user_id')}")
         return response
 
     # ------------------------------------------------------------
@@ -137,5 +137,3 @@ def create_app(config_override=None):
         return {"ok": True, "status": "healthy"}
 
     return app
-
-
