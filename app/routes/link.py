@@ -14,7 +14,10 @@ def get_link_status():
     current_user = get_current_user()
     
     if not current_user:
+        logger.warning("Link status: unauthorized")
         return jsonify({"ok": False, "error": "unauthorized"}), 401
+    
+    logger.info(f"Link status for user: {current_user.get('id')}")
     
     return jsonify({
         "ok": True,
