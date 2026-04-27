@@ -3,7 +3,7 @@ import logging
 import os
 from flask import Flask, session, request, g
 from flask_cors import CORS
-from flask.sessions import SecureCookieSessionInterface
+from flask_session import Session
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -37,10 +37,16 @@ def create_app(config_override=None):
     app = Flask(__name__)
 
     # ------------------------------------------------------------
-    # Base configuration - CRITICAL for session to work
+    # Base configuration
     # ------------------------------------------------------------
     app.config.update(
         SECRET_KEY=os.environ.get("SECRET_KEY", "dev-secret-change-in-production"),
+        
+        # Session configuration - USE FILESYSTEM for Koyeb
+        SESSION_TYPE='filesystem',
+        SESSION_FILE_DIR='/tmp/flask_sessions',
+        SESSION_FILE_THRESHOLD=500,
+        SESSION_FILE_MODE=0o600,
         
         # Session cookie settings
         SESSION_COOKIE_NAME="ntg_session",
@@ -48,13 +54,9 @@ def create_app(config_override=None):
         SESSION_COOKIE_SECURE=True,
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_PATH='/',
-        SESSION_COOKIE_DOMAIN=None,  # Allow current domain
         
         # Permanent session lifetime (30 days)
         PERMANENT_SESSION_LIFETIME=2592000,
-        
-        # Session type
-        SESSION_TYPE='filesystem',
         
         # CORS settings
         CORS_ORIGINS=os.environ.get("CORS_ORIGINS", "https://www.naijataxguides.com,http://localhost:3000").split(","),
@@ -63,6 +65,9 @@ def create_app(config_override=None):
     # Allow config override (e.g., for testing)
     if config_override:
         app.config.update(config_override)
+
+    # Initialize session extension
+    Session(app)
 
     # ------------------------------------------------------------
     # CORS setup – allow credentials from frontend domains
@@ -79,13 +84,15 @@ def create_app(config_override=None):
     # ------------------------------------------------------------
     @app.before_request
     def before_request():
-        """Load user from session before each request"""
+        """Load session before each request"""
         if request.path.startswith('/static') or request.path == '/api/health':
             return
         
-        # Log session info for debugging
+        # Force session to load
+        session.modified = True
+        
         logger.info(f"Request: {request.method} {request.path}")
-        logger.info(f"Session keys: {list(session.keys()) if session else 'None'}")
+        logger.info(f"Session keys after load: {list(session.keys()) if session else 'None'}")
         logger.info(f"Session user_id: {session.get('user_id')}")
         
         # Set user in g if exists in session
@@ -101,9 +108,10 @@ def create_app(config_override=None):
     # ------------------------------------------------------------
     @app.after_request
     def after_request(response):
-        """Log session after request"""
+        """Save session after request"""
         if not request.path.startswith('/static') and request.path != '/api/health':
             logger.info(f"After request - Session keys: {list(session.keys()) if session else 'None'}")
+            logger.info(f"After request - Session user_id: {session.get('user_id')}")
         return response
 
     # ------------------------------------------------------------
