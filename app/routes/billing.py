@@ -935,4 +935,26 @@ def billing_me():
         payload["last_payment_reference"] = latest_success.get("reference")
     if latest_success and not payload.get("payment_method"):
         payload["payment_method"] = latest_success.get("payment_method")
+    @bp.get("/billing/debug-state")
+def billing_debug_state():
+    account_id = _get_account_id_from_session()
+    
+    if not account_id:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    
+    return jsonify({
+        "ok": True,
+        "account_id": account_id,
+        "subscription_guard_snapshot": {
+            "access": {"allowed": True},
+            "plan_code": "free",
+            "daily_answers_limit": 0
+        },
+        "credit_balance": {"balance": 0, "used": 0},
+        "daily_usage_today": {"count": 0},
+        "whatsapp_linked": False,
+        "telegram_linked": False,
+        "whatsapp_verified": False,
+        "telegram_verified": False
+    }), 200
     return jsonify(payload),
