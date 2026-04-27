@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from typing import Any, Dict, Optional
 
-from flask import Blueprint, jsonify, request, make_response
+from flask import Blueprint, jsonify, request, make_response, session
 
 from app.core.config import WEB_AUTH_COOKIE_NAME
 from app.services.account_referral_bootstrap_service import bootstrap_account_referral_state
@@ -44,7 +44,7 @@ def _cookie_samesite() -> str:
     v = _env("WEB_AUTH_COOKIE_SAMESITE", "")
     if v:
         return v
-    return _env("COOKIE_SAMESITE", "None")
+    return _env("COOKIE_SAMESITE", "Lax")  # Changed from "None" to "Lax"
 
 
 def _cookie_domain() -> Optional[str]:
@@ -193,6 +193,16 @@ def verify_otp():
                 "root_cause": repr(e),
             }
 
+        # ✅ CRITICAL: Set Flask session for the tax endpoint
+        session['user_id'] = account_id
+        session['user_email'] = contact
+        session['account_id'] = account_id
+        session.permanent = True
+        session.modified = True
+        
+        print(f"[web_auth.verify_otp] Session set for user: {account_id}", flush=True)
+        print(f"[web_auth.verify_otp] Session keys: {list(session.keys())}", flush=True)
+
     token = (r.get("token") or "").strip()
 
     if _cookie_mode_enabled() and not _return_bearer_in_json():
@@ -201,6 +211,10 @@ def verify_otp():
 
     if referral_bootstrap is not None:
         r = {**r, "referral": referral_bootstrap}
+
+    # Add session info to response for debugging
+    r['session_set'] = True
+    r['session_user_id'] = session.get('user_id')
 
     resp = make_response(jsonify(r), 200)
     resp.headers["Cache-Control"] = "no-store"
@@ -241,6 +255,16 @@ def verify_otp():
 
 @bp.get("/web/auth/me")
 def me():
+    # First check Flask session
+    if session.get('user_id'):
+        return jsonify({
+            "ok": True, 
+            "account_id": session.get('user_id'),
+            "from_session": True,
+            "debug": {"session_found": True}
+        }), 200
+    
+    # Fallback to cookie method
     account_id, debug = get_account_id_from_request(request)
     if not account_id:
         resp = make_response(jsonify({"ok": False, "error": "unauthorized", "debug": debug}), 401)
@@ -254,6 +278,9 @@ def me():
 
 @bp.post("/web/auth/logout")
 def logout():
+    # Clear Flask session
+    session.clear()
+    
     r = logout_web_session(request)
 
     resp = make_response(jsonify(r), 200)
