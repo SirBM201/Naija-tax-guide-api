@@ -18,7 +18,7 @@ def file_tax_return():
     logger.info(f"Session keys: {list(session.keys()) if session else 'None'}")
     logger.info(f"Session user_id: {session.get('user_id')}")
     
-    # Get authenticated user from your session system
+    # Get authenticated user from Flask session
     current_user = get_current_user()
     
     if not current_user:
