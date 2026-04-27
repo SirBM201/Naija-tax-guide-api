@@ -33,6 +33,7 @@ required_modules = [
     "app.routes.tax",
     "app.routes.workspace",
     "app.routes.link",
+    "app.routes.referrals",
 ]
 
 def create_app(config_override=None):
