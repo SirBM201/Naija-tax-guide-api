@@ -137,3 +137,5 @@ def create_app(config_override=None):
         return {"ok": True, "status": "healthy"}
 
     return app
+
+
