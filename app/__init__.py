@@ -31,6 +31,8 @@ required_modules = [
     "app.routes.web_auth",
     "app.routes.web_session",
     "app.routes.tax",
+    "app.routes.workspace",   # ADD THIS
+    "app.routes.link",         # ADD THIS
 ]
 
 def create_app(config_override=None):
