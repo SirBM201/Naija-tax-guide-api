@@ -14,7 +14,10 @@ def get_workspace_limits():
     current_user = get_current_user()
     
     if not current_user:
+        logger.warning("Workspace limits: unauthorized")
         return jsonify({"ok": False, "error": "unauthorized"}), 401
+    
+    logger.info(f"Workspace limits for user: {current_user.get('id')}")
     
     return jsonify({
         "ok": True,
@@ -24,7 +27,9 @@ def get_workspace_limits():
         },
         "entitlements": {
             "ok": True,
-            "plan": {"name": "Free", "code": "free"},
+            "plan": {"name": "Free", "code": "free", "plan_family": "free"},
+            "plan_code": "free",
+            "plan_family": "free",
             "workspace_limits": {
                 "max_workspace_users": 1,
                 "max_linked_web_accounts": 1,
