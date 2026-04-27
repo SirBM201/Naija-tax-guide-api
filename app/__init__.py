@@ -42,18 +42,19 @@ def create_app(config_override=None):
     app.config.update(
         SECRET_KEY=os.environ.get("SECRET_KEY", "dev-secret-change-in-production"),
         
-        # Session configuration - USE FILESYSTEM for Koyeb
+        # Session configuration - use filesystem for Koyeb
         SESSION_TYPE='filesystem',
         SESSION_FILE_DIR='/tmp/flask_sessions',
         SESSION_FILE_THRESHOLD=500,
         SESSION_FILE_MODE=0o600,
         
-        # Session cookie settings
+        # Session cookie settings - critical for cross-domain proxy
         SESSION_COOKIE_NAME="ntg_session",
-        SESSION_COOKIE_SAMESITE='Lax',
-        SESSION_COOKIE_SECURE=True,
+        SESSION_COOKIE_SAMESITE='Lax',  # Lax works with proxy (same domain)
+        SESSION_COOKIE_SECURE=True,      # Must be True for HTTPS
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_PATH='/',
+        SESSION_COOKIE_DOMAIN=None,      # None = current domain only
         
         # Permanent session lifetime (30 days)
         PERMANENT_SESSION_LIFETIME=2592000,
@@ -80,7 +81,7 @@ def create_app(config_override=None):
          methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
 
     # ------------------------------------------------------------
-    # Before request handler - ensure session is loaded
+    # Before request handler
     # ------------------------------------------------------------
     @app.before_request
     def before_request():
@@ -104,7 +105,7 @@ def create_app(config_override=None):
             }
 
     # ------------------------------------------------------------
-    # After request handler - ensure session is saved
+    # After request handler
     # ------------------------------------------------------------
     @app.after_request
     def after_request(response):
