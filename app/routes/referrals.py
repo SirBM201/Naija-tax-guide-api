@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, Optional
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request, session
 
 from app.services.payout_service import (
     PayoutValidationError,
@@ -21,6 +21,7 @@ from app.services.referral_service import (
     list_rewards_for_account,
 )
 from app.services.web_auth_service import get_account_id_from_request
+from app.services.auth_service import get_current_user
 
 bp = Blueprint("referrals", __name__)
 logger = logging.getLogger(__name__)
@@ -28,7 +29,20 @@ ROUTE_VERSION = "referrals_route_v4_user_payout_flow"
 
 
 def _auth_account_id() -> tuple[Optional[str], Dict[str, Any]]:
-    return get_account_id_from_request(request)
+    """Get account ID from session first, then fallback to request auth."""
+    # First try session
+    user_id = session.get("user_id")
+    if user_id:
+        logger.info(f"Referrals: Account ID from session: {user_id}")
+        return user_id, {"auth_method": "session"}
+    
+    # Fallback to token/cookie auth
+    account_id, debug = get_account_id_from_request(request)
+    if account_id:
+        logger.info(f"Referrals: Account ID from request: {account_id}")
+        return account_id, debug
+    
+    return None, {"auth_method": "failed"}
 
 
 def _limit_arg(default: int = 50, minimum: int = 1, maximum: int = 500) -> int:
@@ -81,11 +95,18 @@ def referral_me():
                 "ok": True,
                 "route_version": ROUTE_VERSION,
                 "account_id": account_id,
+                "referral_code": f"NTG-{account_id[:8].upper()}",
+                "referral_link": f"https://www.naijataxguides.com/signup?ref=NTG-{account_id[:8].upper()}",
                 "profile": profile,
                 "summary": summary,
+                "total_referrals": summary.get("total_referrals", 0) if summary else 0,
+                "total_earned": summary.get("total_earned", 0) if summary else 0,
                 "approved_payout_balance": str(payout_balance),
                 "payout_account": payout_account,
                 "payout_eligibility": eligibility,
+                "eligible": eligibility.get("eligible", False) if eligibility else False,
+                "minimum_amount": eligibility.get("minimum_amount", 5000) if eligibility else 5000,
+                "current_balance": float(payout_balance) if payout_balance else 0,
                 "debug": {"auth": debug},
             }
         ), 200
@@ -217,6 +238,7 @@ def referral_payout_account_get():
                 "route_version": ROUTE_VERSION,
                 "account_id": account_id,
                 "payout_account": payout_account,
+                "has_account": payout_account is not None,
                 "debug": {"auth": debug},
             }
         ), 200
@@ -316,6 +338,10 @@ def referral_payout_eligibility():
                 "ok": True,
                 "route_version": ROUTE_VERSION,
                 "account_id": account_id,
+                "eligible": eligibility.get("eligible", False) if eligibility else False,
+                "minimum_amount": eligibility.get("minimum_amount", 5000) if eligibility else 5000,
+                "current_balance": eligibility.get("current_balance", 0) if eligibility else 0,
+                "reason": eligibility.get("reason") if eligibility else "Unknown",
                 "eligibility": eligibility,
                 "debug": {"auth": debug},
             }
