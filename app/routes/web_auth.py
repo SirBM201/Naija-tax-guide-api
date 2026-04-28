@@ -197,7 +197,6 @@ def verify_otp():
                 "root_cause": repr(e),
             }
 
-        # ✅ CRITICAL: Set Flask session for the tax endpoint
         session['user_id'] = account_id
         session['user_email'] = contact
         session['account_id'] = account_id
@@ -216,7 +215,6 @@ def verify_otp():
     if referral_bootstrap is not None:
         r = {**r, "referral": referral_bootstrap}
 
-    # Add session info to response for debugging
     r['session_set'] = True
     r['session_user_id'] = session.get('user_id')
 
@@ -258,16 +256,15 @@ def verify_otp():
 
 
 @bp.get("/web/auth/me")
-def me():
-    """Get current authenticated user info - returns format expected by frontend"""
+def web_auth_me():
+    """Get current authenticated user info - for web auth routes"""
     try:
-        # First check Flask session
         session_user_id = session.get('user_id')
         session_email = session.get('user_email')
         session_account_id = session.get('account_id')
         
         if session_user_id:
-            logger.info(f"me: Found authenticated user in session: {session_user_id}")
+            logger.info(f"web_auth_me: Found authenticated user in session: {session_user_id}")
             resp_data = {
                 "ok": True,
                 "authenticated": True,
@@ -282,10 +279,9 @@ def me():
             resp.headers["Cache-Control"] = "no-store"
             return resp
         
-        # Fallback to cookie/token method
         account_id, debug = get_account_id_from_request(request)
         if account_id:
-            logger.info(f"me: Found authenticated user via token: {account_id}")
+            logger.info(f"web_auth_me: Found authenticated user via token: {account_id}")
             resp_data = {
                 "ok": True,
                 "authenticated": True,
@@ -299,8 +295,7 @@ def me():
             resp.headers["Cache-Control"] = "no-store"
             return resp
         
-        # Not authenticated
-        logger.warning(f"me: No authenticated user found. Debug: {debug}")
+        logger.warning(f"web_auth_me: No authenticated user found. Debug: {debug}")
         resp = make_response(jsonify({
             "ok": False,
             "authenticated": False,
@@ -310,7 +305,7 @@ def me():
         return resp
         
     except Exception as e:
-        logger.error(f"me: Error in /me endpoint: {e}")
+        logger.error(f"web_auth_me: Error: {e}")
         resp = make_response(jsonify({
             "ok": False,
             "authenticated": False,
@@ -320,9 +315,14 @@ def me():
         return resp
 
 
+@bp.get("/me")
+def simple_me():
+    """Simple /me endpoint for frontend compatibility"""
+    return web_auth_me()
+
+
 @bp.post("/web/auth/logout")
 def logout():
-    # Clear Flask session
     session.clear()
     logger.info("logout: Session cleared")
     
