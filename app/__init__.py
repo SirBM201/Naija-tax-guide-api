@@ -240,6 +240,7 @@ def create_app() -> Flask:
         "app.routes.link",
         "app.routes.referrals",
         "app.routes.entry",
+        "app.routes.history",
     ]
     for dotted in required_modules:
         _register_bp(dotted, "bp", required=True, url_prefix=api_prefix)
