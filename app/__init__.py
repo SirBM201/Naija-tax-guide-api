@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import uuid
+import warnings
 from typing import Any, Dict, Optional, Tuple, List, Union
 
 from flask import Flask, jsonify, request
@@ -25,7 +26,6 @@ def _truthy(v: str | None) -> bool:
 
 
 def _cookie_mode_enabled() -> bool:
-    # Cookie auth mode requires explicit origins + credentials
     if _truthy(os.getenv("COOKIE_AUTH_ENABLED", "1")):
         return True
     if _truthy(os.getenv("WEB_AUTH_ENABLED", "")) and (os.getenv("COOKIE_SAMESITE") or "").strip():
@@ -75,17 +75,44 @@ def _safe_get_env_bool(name: str) -> bool:
 def create_app() -> Flask:
     app = Flask(__name__)
 
+    # ============================================================
+    # SECRET KEY CONFIGURATION (REQUIRED FOR SESSIONS)
+    # ============================================================
+    secret_key = os.environ.get("SECRET_KEY", "").strip()
+    if not secret_key:
+        # Generate a temporary key for development only
+        if os.getenv("FLASK_ENV") == "development":
+            secret_key = "dev-secret-key-do-not-use-in-production"
+            warnings.warn("WARNING: Using temporary SECRET_KEY. Set SECRET_KEY environment variable for production!")
+        else:
+            raise RuntimeError(
+                "SECRET_KEY environment variable is required in production. "
+                "Generate one with: python -c 'import secrets; print(secrets.token_hex(32))'"
+            )
+    app.config["SECRET_KEY"] = secret_key
+
+    # ============================================================
+    # SESSION CONFIGURATION
+    # ============================================================
+    app.config.update(
+        SESSION_COOKIE_NAME="ntg_session",
+        SESSION_COOKIE_HTTPONLY=True,
+        SESSION_COOKIE_SECURE=_safe_get_env_bool("SESSION_COOKIE_SECURE") or not os.getenv("FLASK_ENV") == "development",
+        SESSION_COOKIE_SAMESITE=os.getenv("SESSION_COOKIE_SAMESITE", "Lax"),
+        SESSION_COOKIE_PATH="/",
+        PERMANENT_SESSION_LIFETIME=int(os.getenv("PERMANENT_SESSION_LIFETIME", "2592000")),
+    )
+
     api_prefix = _normalize_api_prefix(API_PREFIX)
 
-    # ---------- CORS ----------
+    # ============================================================
+    # CORS CONFIGURATION
+    # ============================================================
     cookie_mode = _cookie_mode_enabled()
     origins, supports_credentials, cors_err = _parse_origins(CORS_ORIGINS, cookie_mode=cookie_mode)
     if cors_err:
         raise RuntimeError(f"[CORS] {cors_err}")
 
-    # When cookie_mode=True:
-    # - supports_credentials must be True
-    # - origins must be explicit list (not '*')
     CORS(
         app,
         resources={rf"{api_prefix}/*": {"origins": origins}},
@@ -102,10 +129,12 @@ def create_app() -> Flask:
         expose_headers=["Set-Cookie", "X-Request-Id"],
         methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         max_age=86400,
-        vary_header=True,  # IMPORTANT: Vary: Origin for credentialed requests
+        vary_header=True,
     )
 
-    # ---------- Request id ----------
+    # ============================================================
+    # REQUEST ID MIDDLEWARE
+    # ============================================================
     @app.before_request
     def _assign_request_id():
         rid = (request.headers.get("X-Request-Id") or "").strip()
@@ -119,7 +148,6 @@ def create_app() -> Flask:
         if rid:
             resp.headers["X-Request-Id"] = rid
 
-        # extra safety: avoid caching auth responses
         if request.path.startswith(f"{api_prefix}/web/auth/"):
             resp.headers["Cache-Control"] = "no-store"
 
@@ -131,7 +159,9 @@ def create_app() -> Flask:
     def _debug_enabled() -> bool:
         return (request.headers.get("X-Debug") or "").strip() == "1"
 
-    # ---------- Boot report ----------
+    # ============================================================
+    # BLUEPRINT REGISTRATION
+    # ============================================================
     boot: Dict[str, Any] = {
         "api_prefix": api_prefix,
         "cookie_mode": cookie_mode,
@@ -170,15 +200,15 @@ def create_app() -> Flask:
         bp_name = getattr(obj, "name", None) or f"{dotted}:{attr}"
 
         if not hasattr(app, "_bp_names"):
-            app._bp_names = set()  # type: ignore[attr-defined]
-        if bp_name in app._bp_names:  # type: ignore[attr-defined]
+            app._bp_names = set()
+        if bp_name in app._bp_names:
             msg = f"[boot] Duplicate blueprint name detected: {bp_name} from {dotted}:{attr}"
             entry["error"] = msg
             boot["failed"].append(entry)
             if required and strict:
                 raise RuntimeError(msg)
             return
-        app._bp_names.add(bp_name)  # type: ignore[attr-defined]
+        app._bp_names.add(bp_name)
 
         if url_prefix is not None:
             app.register_blueprint(obj, url_prefix=url_prefix)
@@ -188,7 +218,7 @@ def create_app() -> Flask:
         entry["bp_name"] = bp_name
         boot["registered"].append(entry)
 
-    # ---------- REQUIRED routes (CORE API) ----------
+    # REQUIRED BLUEPRINTS - CORE API
     required_modules = [
         "app.routes.health",
         "app.routes.accounts",
@@ -214,7 +244,7 @@ def create_app() -> Flask:
     for dotted in required_modules:
         _register_bp(dotted, "bp", required=True, url_prefix=api_prefix)
 
-    # ---------- OPTIONAL routes ----------
+    # OPTIONAL BLUEPRINTS
     _register_bp("app.routes.cron", "bp", alias_name="cron", required=False, url_prefix=api_prefix)
     _register_bp("app.routes.whatsapp", "bp", required=False, url_prefix=api_prefix)
     _register_bp("app.routes.telegram", "bp", required=False, url_prefix=api_prefix)
@@ -222,7 +252,7 @@ def create_app() -> Flask:
     _register_bp("app.routes.web_chat", "bp", required=False, url_prefix=api_prefix)
     _register_bp("app.routes.paystack_webhook", "bp", required=False, url_prefix=api_prefix)
 
-    # ---------- DEBUG routes ----------
+    # DEBUG BLUEPRINTS (optional, only when enabled)
     if _safe_get_env_bool("ENABLE_DEBUG_ROUTES"):
         _register_bp("app.routes._debug", "bp", required=False, url_prefix=api_prefix)
         _register_bp("app.routes.debug_routes", "bp", required=False, url_prefix=api_prefix)
@@ -231,7 +261,9 @@ def create_app() -> Flask:
         _register_bp("app.routes.debug_otp", "bp", required=False, url_prefix=api_prefix)
         _register_bp("app.routes.paystack_debug", "bp", required=False, url_prefix=api_prefix)
 
-    # ---------- Boot report endpoint ----------
+    # ============================================================
+    # BOOT REPORT ENDPOINT
+    # ============================================================
     @app.get(f"{api_prefix}/_boot")
     def boot_report():
         admin_key_set = bool((os.getenv("ADMIN_KEY") or "").strip())
@@ -244,7 +276,9 @@ def create_app() -> Flask:
             }
         ), 200
 
-    # ---------- Runtime diagnostics ----------
+    # ============================================================
+    # RUNTIME DIAGNOSTICS ENDPOINT
+    # ============================================================
     @app.get(f"{api_prefix}/_diag")
     def runtime_diag():
         hints: List[str] = []
@@ -265,9 +299,10 @@ def create_app() -> Flask:
             hints.append("Supabase service key is missing -> RPC/table calls may fail.")
 
         if not (os.getenv("PAYSTACK_WEBHOOK_SECRET") or "").strip():
-            hints.append("PAYSTACK_WEBHOOK_SECRET is missing. Paystack signature verification will fail for /api/billing/webhook.")
+            hints.append("PAYSTACK_WEBHOOK_SECRET is missing. Paystack signature verification will fail.")
 
         env_view = {
+            "SECRET_KEY_SET": bool(app.config.get("SECRET_KEY") and app.config["SECRET_KEY"] != "dev-secret-key-do-not-use-in-production"),
             "ADMIN_KEY_SET": bool((os.getenv("ADMIN_KEY") or "").strip()),
             "API_PREFIX": api_prefix,
             "COOKIE_MODE": cookie_mode,
@@ -280,12 +315,16 @@ def create_app() -> Flask:
 
         return jsonify({"ok": True, "request_id": _rid(), "env": env_view, "hints": hints}), 200
 
-    # ---------- Preflight safety net ----------
+    # ============================================================
+    # PREFLIGHT SAFETY NET
+    # ============================================================
     @app.route(f"{api_prefix}/<path:_any>", methods=["OPTIONS"])
     def _api_preflight(_any: str):
         return ("", 204)
 
-    # ---------- Global error handler (always JSON) ----------
+    # ============================================================
+    # GLOBAL ERROR HANDLER (ALWAYS JSON)
+    # ============================================================
     @app.errorhandler(Exception)
     def _handle_any_error(e: Exception):
         status = getattr(e, "code", 500)
