@@ -77,3 +77,67 @@ def file_tax_return():
         "reference": reference,
         "submittedAt": submitted_at,
     }), 200
+
+
+@bp.get("/tax/filing/<filing_id>")
+def get_filing(filing_id):
+    """Get a specific tax filing by ID"""
+    logger.info(f"Fetching filing: {filing_id}")
+    
+    current_user = get_current_user()
+    if not current_user:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    
+    try:
+        result = supabase.table("tax_filings").select("*").eq("id", filing_id).eq("user_id", current_user.get("id")).execute()
+        
+        if not result.data:
+            return jsonify({"ok": False, "error": "Filing not found"}), 404
+        
+        filing = result.data[0]
+        return jsonify({
+            "ok": True,
+            "filing": {
+                "id": filing.get("id"),
+                "tax_type": filing.get("tax_type"),
+                "reference": filing.get("reference"),
+                "status": filing.get("status"),
+                "submitted_at": filing.get("submitted_at"),
+                "details": filing.get("inputs", {})
+            }
+        }), 200
+    except Exception as e:
+        logger.error(f"Error fetching filing: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.get("/tax/filings")
+def list_filings():
+    """List all tax filings for the user"""
+    logger.info("Listing all filings")
+    
+    current_user = get_current_user()
+    if not current_user:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    
+    try:
+        result = supabase.table("tax_filings").select("*").eq("user_id", current_user.get("id")).order("submitted_at", desc=True).execute()
+        
+        filings = []
+        for filing in (result.data or []):
+            filings.append({
+                "id": filing.get("id"),
+                "tax_type": filing.get("tax_type"),
+                "reference": filing.get("reference"),
+                "status": filing.get("status"),
+                "submitted_at": filing.get("submitted_at"),
+                "inputs": filing.get("inputs", {})
+            })
+        
+        return jsonify({
+            "ok": True,
+            "filings": filings
+        }), 200
+    except Exception as e:
+        logger.error(f"Error listing filings: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
