@@ -45,7 +45,7 @@ def _parse_origins(
 
     if raw == "*":
         if cookie_mode:
-            return [], True, "CORS_ORIGINS='*' is not allowed with cookie auth. Use explicit comma-separated origins."
+            return [], True, "CORS_ORIGINS='*' is not allowed with cookie auth."
         return "*", False, None
 
     origins = [o.strip() for o in raw.split(",") if o.strip()]
@@ -76,23 +76,19 @@ def create_app() -> Flask:
     app = Flask(__name__)
 
     # ============================================================
-    # SECRET KEY CONFIGURATION (REQUIRED FOR SESSIONS)
+    # SECRET KEY
     # ============================================================
     secret_key = os.environ.get("SECRET_KEY", "").strip()
     if not secret_key:
-        # Generate a temporary key for development only
         if os.getenv("FLASK_ENV") == "development":
             secret_key = "dev-secret-key-do-not-use-in-production"
-            warnings.warn("WARNING: Using temporary SECRET_KEY. Set SECRET_KEY environment variable for production!")
+            warnings.warn("Using temporary SECRET_KEY (development only)")
         else:
-            raise RuntimeError(
-                "SECRET_KEY environment variable is required in production. "
-                "Generate one with: python -c 'import secrets; print(secrets.token_hex(32))'"
-            )
+            raise RuntimeError("SECRET_KEY is required in production")
     app.config["SECRET_KEY"] = secret_key
 
     # ============================================================
-    # SESSION CONFIGURATION
+    # SESSION CONFIG
     # ============================================================
     app.config.update(
         SESSION_COOKIE_NAME="ntg_session",
@@ -106,7 +102,7 @@ def create_app() -> Flask:
     api_prefix = _normalize_api_prefix(API_PREFIX)
 
     # ============================================================
-    # CORS CONFIGURATION
+    # CORS
     # ============================================================
     cookie_mode = _cookie_mode_enabled()
     origins, supports_credentials, cors_err = _parse_origins(CORS_ORIGINS, cookie_mode=cookie_mode)
@@ -118,13 +114,8 @@ def create_app() -> Flask:
         resources={rf"{api_prefix}/*": {"origins": origins}},
         supports_credentials=supports_credentials,
         allow_headers=[
-            "Content-Type",
-            "Authorization",
-            "X-Auth-Token",
-            "X-Requested-With",
-            "X-Admin-Key",
-            "X-Debug",
-            "X-Request-Id",
+            "Content-Type", "Authorization", "X-Auth-Token",
+            "X-Requested-With", "X-Admin-Key", "X-Debug", "X-Request-Id",
         ],
         expose_headers=["Set-Cookie", "X-Request-Id"],
         methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
@@ -133,7 +124,7 @@ def create_app() -> Flask:
     )
 
     # ============================================================
-    # REQUEST ID MIDDLEWARE
+    # REQUEST ID
     # ============================================================
     @app.before_request
     def _assign_request_id():
@@ -147,10 +138,6 @@ def create_app() -> Flask:
         rid = str(request.environ.get("REQUEST_ID") or "")
         if rid:
             resp.headers["X-Request-Id"] = rid
-
-        if request.path.startswith(f"{api_prefix}/web/auth/"):
-            resp.headers["Cache-Control"] = "no-store"
-
         return resp
 
     def _rid() -> str:
@@ -164,61 +151,25 @@ def create_app() -> Flask:
     # ============================================================
     boot: Dict[str, Any] = {
         "api_prefix": api_prefix,
-        "cookie_mode": cookie_mode,
-        "cors": {"origins": origins, "supports_credentials": supports_credentials},
-        "strict": (os.getenv("STRICT_BLUEPRINTS", "1").strip() != "0"),
-        "debug_routes_enabled": _safe_get_env_bool("ENABLE_DEBUG_ROUTES"),
         "registered": [],
         "failed": [],
     }
-    strict = bool(boot["strict"])
 
-    def _register_bp(
-        dotted: str,
-        attr: str = "bp",
-        *,
-        alias_name: Optional[str] = None,
-        required: bool = True,
-        url_prefix: Optional[str] = api_prefix,
-    ):
+    def _register_bp(dotted: str, attr: str = "bp", *, required=True):
         obj, err = _import_attr(dotted, attr)
-        entry: Dict[str, Any] = {
-            "module": dotted,
-            "attr": attr,
-            "alias_name": alias_name or dotted.split(".")[-1],
-            "url_prefix": url_prefix,
-            "required": required,
-        }
 
         if obj is None:
-            entry["error"] = err
-            boot["failed"].append(entry)
-            if required and strict:
-                raise RuntimeError(f"[boot] REQUIRED blueprint import failed: {err}")
+            boot["failed"].append({"module": dotted, "error": err})
+            if required:
+                raise RuntimeError(f"Blueprint failed: {err}")
             return
 
-        bp_name = getattr(obj, "name", None) or f"{dotted}:{attr}"
+        app.register_blueprint(obj, url_prefix=api_prefix)
+        boot["registered"].append(dotted)
 
-        if not hasattr(app, "_bp_names"):
-            app._bp_names = set()
-        if bp_name in app._bp_names:
-            msg = f"[boot] Duplicate blueprint name detected: {bp_name} from {dotted}:{attr}"
-            entry["error"] = msg
-            boot["failed"].append(entry)
-            if required and strict:
-                raise RuntimeError(msg)
-            return
-        app._bp_names.add(bp_name)
-
-        if url_prefix is not None:
-            app.register_blueprint(obj, url_prefix=url_prefix)
-        else:
-            app.register_blueprint(obj)
-
-        entry["bp_name"] = bp_name
-        boot["registered"].append(entry)
-
-    # REQUIRED BLUEPRINTS - CORE API
+    # ============================================================
+    # REQUIRED BLUEPRINTS
+    # ============================================================
     required_modules = [
         "app.routes.health",
         "app.routes.accounts",
@@ -241,114 +192,68 @@ def create_app() -> Flask:
         "app.routes.referrals",
         "app.routes.entry",
         "app.routes.history",
+
+        # ✅ FIXED MISSING ONES
+        "app.routes.channel",
+        "app.routes.support",
+        "app.routes.dev",
     ]
-    for dotted in required_modules:
-        _register_bp(dotted, "bp", required=True, url_prefix=api_prefix)
 
+    for m in required_modules:
+        _register_bp(m, required=True)
+
+    # ============================================================
     # OPTIONAL BLUEPRINTS
-    _register_bp("app.routes.cron", "bp", alias_name="cron", required=False, url_prefix=api_prefix)
-    _register_bp("app.routes.whatsapp", "bp", required=False, url_prefix=api_prefix)
-    _register_bp("app.routes.telegram", "bp", required=False, url_prefix=api_prefix)
-    _register_bp("app.routes.web_ask", "bp", required=False, url_prefix=api_prefix)
-    _register_bp("app.routes.web_chat", "bp", required=False, url_prefix=api_prefix)
-    _register_bp("app.routes.paystack_webhook", "bp", required=False, url_prefix=api_prefix)
+    # ============================================================
+    optional_modules = [
+        "app.routes.cron",
+        "app.routes.whatsapp",
+        "app.routes.telegram",
+        "app.routes.web_ask",
+        "app.routes.web_chat",
+        "app.routes.paystack_webhook",
+        "app.routes.channel_admin",
+        "app.routes.support_admin",
+    ]
 
-    # DEBUG BLUEPRINTS (optional, only when enabled)
-    if _safe_get_env_bool("ENABLE_DEBUG_ROUTES"):
-        _register_bp("app.routes._debug", "bp", required=False, url_prefix=api_prefix)
-        _register_bp("app.routes.debug_routes", "bp", required=False, url_prefix=api_prefix)
-        _register_bp("app.routes.debug_auth", "bp", required=False, url_prefix=api_prefix)
-        _register_bp("app.routes.debug_mail", "bp", required=False, url_prefix=api_prefix)
-        _register_bp("app.routes.debug_otp", "bp", required=False, url_prefix=api_prefix)
-        _register_bp("app.routes.paystack_debug", "bp", required=False, url_prefix=api_prefix)
+    for m in optional_modules:
+        _register_bp(m, required=False)
 
     # ============================================================
-    # BOOT REPORT ENDPOINT
+    # ROUTE INSPECTOR
     # ============================================================
-    @app.get(f"{api_prefix}/_boot")
-    def boot_report():
-        admin_key_set = bool((os.getenv("ADMIN_KEY") or "").strip())
-        return jsonify(
-            {
-                "ok": True,
-                "request_id": _rid(),
-                "admin_key_set": admin_key_set,
-                "boot": boot,
-            }
-        ), 200
+    @app.get(f"{api_prefix}/_routes")
+    def list_routes():
+        routes = []
+        for rule in app.url_map.iter_rules():
+            methods = sorted([m for m in rule.methods if m not in ("HEAD", "OPTIONS")])
+            routes.append({"rule": str(rule), "methods": methods})
 
-    # ============================================================
-    # RUNTIME DIAGNOSTICS ENDPOINT
-    # ============================================================
-    @app.get(f"{api_prefix}/_diag")
-    def runtime_diag():
-        hints: List[str] = []
-
-        cron_registered = any((r.get("alias_name") == "cron") for r in boot.get("registered", []))
-        if not cron_registered:
-            hints.append("Cron blueprint is NOT registered. Confirm app/routes/cron.py exists and exports bp = Blueprint(...).")
-
-        if cookie_mode and origins == "*":
-            hints.append("COOKIE_MODE is enabled but CORS origins are '*'. Use explicit origins when cookies are used.")
-
-        if cookie_mode and (isinstance(origins, list) and not origins):
-            hints.append("COOKIE_MODE is enabled but parsed origins list is empty. Set CORS_ORIGINS to your frontend URL(s).")
-
-        if not (os.getenv("SUPABASE_URL") or "").strip():
-            hints.append("SUPABASE_URL is missing -> Supabase RPC/table calls will fail.")
-        if not (os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY") or "").strip():
-            hints.append("Supabase service key is missing -> RPC/table calls may fail.")
-
-        if not (os.getenv("PAYSTACK_WEBHOOK_SECRET") or "").strip():
-            hints.append("PAYSTACK_WEBHOOK_SECRET is missing. Paystack signature verification will fail.")
-
-        env_view = {
-            "SECRET_KEY_SET": bool(app.config.get("SECRET_KEY") and app.config["SECRET_KEY"] != "dev-secret-key-do-not-use-in-production"),
-            "ADMIN_KEY_SET": bool((os.getenv("ADMIN_KEY") or "").strip()),
-            "API_PREFIX": api_prefix,
-            "COOKIE_MODE": cookie_mode,
-            "CORS_ORIGINS_MODE": ("*" if origins == "*" else "list"),
-            "ENABLE_DEBUG_ROUTES": _safe_get_env_bool("ENABLE_DEBUG_ROUTES"),
-            "STRICT_BLUEPRINTS": strict,
-            "SUPPORTS_CREDENTIALS": supports_credentials,
-            "WEB_AUTH_ENABLED": _safe_get_env_bool("WEB_AUTH_ENABLED"),
-        }
-
-        return jsonify({"ok": True, "request_id": _rid(), "env": env_view, "hints": hints}), 200
+        return jsonify({
+            "ok": True,
+            "request_id": _rid(),
+            "routes": sorted(routes, key=lambda x: x["rule"])
+        }), 200
 
     # ============================================================
-    # PREFLIGHT SAFETY NET
+    # DUPLICATE ROUTE DETECTION
     # ============================================================
-    @app.route(f"{api_prefix}/<path:_any>", methods=["OPTIONS"])
-    def _api_preflight(_any: str):
-        return ("", 204)
+    @app.before_first_request
+    def _check_duplicates():
+        rules = [r.rule for r in app.url_map.iter_rules()]
+        if len(rules) != len(set(rules)):
+            warnings.warn("Duplicate routes detected!")
 
     # ============================================================
-    # GLOBAL ERROR HANDLER (ALWAYS JSON)
+    # ERROR HANDLER
     # ============================================================
     @app.errorhandler(Exception)
-    def _handle_any_error(e: Exception):
-        status = getattr(e, "code", 500)
-        msg = str(e) or type(e).__name__
-
-        out: Dict[str, Any] = {
+    def _handle_error(e: Exception):
+        return jsonify({
             "ok": False,
             "request_id": _rid(),
             "error": type(e).__name__,
-            "message": msg[:800],
-        }
-
-        if _debug_enabled():
-            import traceback as _tb
-
-            out["debug"] = {
-                "path": request.path,
-                "method": request.method,
-                "content_type": request.content_type,
-            }
-            out["traceback"] = _tb.format_exc(limit=60)
-
-        return jsonify(out), status
+            "message": str(e),
+        }), getattr(e, "code", 500)
 
     return app
-
