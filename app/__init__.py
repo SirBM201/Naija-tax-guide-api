@@ -213,10 +213,10 @@ def create_app() -> Flask:
         _register_bp(m, required=False)
 
     # ============================================================
-    # ROUTE INSPECTOR
+    # ROUTE INSPECTOR (renamed to avoid conflict with main.py)
     # ============================================================
-    @app.get(f"{api_prefix}/_routes")
-    def list_routes():
+    @app.get(f"{api_prefix}/_debug_routes")
+    def debug_list_routes():
         routes = []
         for rule in app.url_map.iter_rules():
             methods = sorted([m for m in rule.methods if m not in ("HEAD", "OPTIONS")])
