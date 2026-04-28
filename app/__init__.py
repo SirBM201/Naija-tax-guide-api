@@ -155,7 +155,7 @@ def create_app() -> Flask:
         "failed": [],
     }
 
-    def _register_bp(dotted: str, attr: str = "bp", *, required=True):
+    def _register_bp(dotted: str, attr: str = "bp", *, required: bool = True):
         obj, err = _import_attr(dotted, attr)
 
         if obj is None:
@@ -168,7 +168,7 @@ def create_app() -> Flask:
         boot["registered"].append(dotted)
 
     # ============================================================
-    # REQUIRED BLUEPRINTS
+    # REQUIRED BLUEPRINTS (All files that exist)
     # ============================================================
     required_modules = [
         "app.routes.health",
@@ -192,18 +192,13 @@ def create_app() -> Flask:
         "app.routes.referrals",
         "app.routes.entry",
         "app.routes.history",
-
-        # ✅ FIXED MISSING ONES
-        "app.routes.channel",
-        "app.routes.support",
-        "app.routes.dev",
     ]
 
     for m in required_modules:
         _register_bp(m, required=True)
 
     # ============================================================
-    # OPTIONAL BLUEPRINTS
+    # OPTIONAL BLUEPRINTS (May not exist, won't crash if missing)
     # ============================================================
     optional_modules = [
         "app.routes.cron",
@@ -212,8 +207,6 @@ def create_app() -> Flask:
         "app.routes.web_ask",
         "app.routes.web_chat",
         "app.routes.paystack_webhook",
-        "app.routes.channel_admin",
-        "app.routes.support_admin",
     ]
 
     for m in optional_modules:
@@ -234,15 +227,6 @@ def create_app() -> Flask:
             "request_id": _rid(),
             "routes": sorted(routes, key=lambda x: x["rule"])
         }), 200
-
-    # ============================================================
-    # DUPLICATE ROUTE DETECTION
-    # ============================================================
-    @app.before_first_request
-    def _check_duplicates():
-        rules = [r.rule for r in app.url_map.iter_rules()]
-        if len(rules) != len(set(rules)):
-            warnings.warn("Duplicate routes detected!")
 
     # ============================================================
     # ERROR HANDLER
