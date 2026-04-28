@@ -1,3 +1,4 @@
+# app/routes/web_auth.py
 from __future__ import annotations
 
 import os
@@ -14,6 +15,9 @@ from app.services.web_auth_service import (
     get_account_id_from_request,
 )
 from app.services.mail_service import send_otp_email
+import logging
+
+logger = logging.getLogger(__name__)
 
 bp = Blueprint("web_auth", __name__)
 
@@ -255,31 +259,72 @@ def verify_otp():
 
 @bp.get("/web/auth/me")
 def me():
-    # First check Flask session
-    if session.get('user_id'):
-        return jsonify({
-            "ok": True, 
-            "account_id": session.get('user_id'),
-            "from_session": True,
-            "debug": {"session_found": True}
-        }), 200
-    
-    # Fallback to cookie method
-    account_id, debug = get_account_id_from_request(request)
-    if not account_id:
-        resp = make_response(jsonify({"ok": False, "error": "unauthorized", "debug": debug}), 401)
+    """Get current authenticated user info - returns format expected by frontend"""
+    try:
+        # First check Flask session
+        session_user_id = session.get('user_id')
+        session_email = session.get('user_email')
+        session_account_id = session.get('account_id')
+        
+        if session_user_id:
+            logger.info(f"me: Found authenticated user in session: {session_user_id}")
+            resp_data = {
+                "ok": True,
+                "authenticated": True,
+                "account_id": session_account_id or session_user_id,
+                "user": {
+                    "id": session_user_id,
+                    "email": session_email,
+                    "account_id": session_account_id or session_user_id
+                }
+            }
+            resp = make_response(jsonify(resp_data), 200)
+            resp.headers["Cache-Control"] = "no-store"
+            return resp
+        
+        # Fallback to cookie/token method
+        account_id, debug = get_account_id_from_request(request)
+        if account_id:
+            logger.info(f"me: Found authenticated user via token: {account_id}")
+            resp_data = {
+                "ok": True,
+                "authenticated": True,
+                "account_id": account_id,
+                "user": {
+                    "id": account_id,
+                    "account_id": account_id
+                }
+            }
+            resp = make_response(jsonify(resp_data), 200)
+            resp.headers["Cache-Control"] = "no-store"
+            return resp
+        
+        # Not authenticated
+        logger.warning(f"me: No authenticated user found. Debug: {debug}")
+        resp = make_response(jsonify({
+            "ok": False,
+            "authenticated": False,
+            "error": "unauthorized"
+        }), 401)
         resp.headers["Cache-Control"] = "no-store"
         return resp
-
-    resp = make_response(jsonify({"ok": True, "account_id": account_id, "debug": debug}), 200)
-    resp.headers["Cache-Control"] = "no-store"
-    return resp
+        
+    except Exception as e:
+        logger.error(f"me: Error in /me endpoint: {e}")
+        resp = make_response(jsonify({
+            "ok": False,
+            "authenticated": False,
+            "error": str(e)
+        }), 500)
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
 
 
 @bp.post("/web/auth/logout")
 def logout():
     # Clear Flask session
     session.clear()
+    logger.info("logout: Session cleared")
     
     r = logout_web_session(request)
 
