@@ -243,8 +243,6 @@ def create_app() -> Flask:
         "app.routes.entry",
         "app.routes.history",
         "app.routes.support",
-        "app.routes.channel",
-        "app.routes.dev",
     ]
     for dotted in required_modules:
         _register_bp(dotted, "bp", required=True, url_prefix=api_prefix)
