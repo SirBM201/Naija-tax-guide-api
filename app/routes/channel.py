@@ -1,21 +1,26 @@
 # app/routes/channel.py
 from __future__ import annotations
 
-import os
+import secrets
 import logging
-from flask import Blueprint, jsonify, request, session
+from datetime import datetime, timezone, timedelta
+from flask import Blueprint, jsonify, request
 
 from app.services.auth_service import get_current_user
-from app.services.channel_linking_service import (
-    generate_link_code,
-    get_linked_channels,
-    unlink_channel,
-    get_channel_status,
-)
+from app.core.supabase_client import supabase
 
 logger = logging.getLogger(__name__)
 
 bp = Blueprint("channel", __name__)
+
+
+def _normalize_provider(provider: str) -> str:
+    p = str(provider or "").strip().lower()
+    if p in {"wa", "whatsapp", "waba"}:
+        return "wa"
+    if p in {"tg", "telegram"}:
+        return "tg"
+    return p
 
 
 @bp.get("/channel/status")
@@ -28,7 +33,30 @@ def channel_status():
     account_id = current_user.get("account_id") or current_user.get("id")
     
     try:
-        channels = get_linked_channels(account_id)
+        # Get channel identities for this account
+        result = supabase().table("channel_identities") \
+            .select("*") \
+            .eq("account_id", account_id) \
+            .execute()
+        
+        channels = []
+        for identity in (result.data or []):
+            channel_type = identity.get("channel_type", "")
+            if channel_type == "whatsapp":
+                channels.append({
+                    "provider": "whatsapp",
+                    "linked": True,
+                    "linked_at": identity.get("created_at"),
+                    "user_id": identity.get("provider_user_id")
+                })
+            elif channel_type == "telegram":
+                channels.append({
+                    "provider": "telegram",
+                    "linked": True,
+                    "linked_at": identity.get("created_at"),
+                    "user_id": identity.get("provider_user_id")
+                })
+        
         return jsonify({
             "ok": True,
             "channels": channels,
@@ -47,20 +75,36 @@ def generate_code():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     
     account_id = current_user.get("account_id") or current_user.get("id")
-    provider = request.get_json().get("provider", "").strip().lower()
+    data = request.get_json() or {}
+    provider = data.get("provider", "").strip().lower()
+    provider = _normalize_provider(provider)
     
-    if provider not in ("wa", "tg", "whatsapp", "telegram"):
+    if provider not in ("wa", "tg"):
         return jsonify({"ok": False, "error": "Invalid provider. Use 'wa' or 'tg'"}), 400
     
-    # Normalize provider
-    if provider == "whatsapp":
-        provider = "wa"
-    elif provider == "telegram":
-        provider = "tg"
-    
     try:
-        result = generate_link_code(account_id, provider)
-        return jsonify(result), 200 if result.get("ok") else 400
+        # Generate 8-character code
+        code = secrets.token_urlsafe(6).upper().replace("-", "").replace("_", "")[:8]
+        expires_at = datetime.now(timezone.utc) + timedelta(minutes=30)
+        
+        result = supabase().table("link_tokens").insert({
+            "code": code,
+            "provider": provider,
+            "auth_user_id": account_id,
+            "expires_at": expires_at.isoformat(),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "used": False
+        }).execute()
+        
+        if not result.data:
+            return jsonify({"ok": False, "error": "failed_to_generate_code"}), 500
+        
+        return jsonify({
+            "ok": True,
+            "code": code,
+            "expires_at": expires_at.isoformat(),
+            "message": f"Share this code on {provider.upper()} to link your account"
+        }), 200
     except Exception as e:
         logger.error(f"Generate code error: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -77,17 +121,23 @@ def unlink():
     data = request.get_json() or {}
     provider = data.get("provider", "").strip().lower()
     
-    if provider not in ("wa", "tg", "whatsapp", "telegram"):
-        return jsonify({"ok": False, "error": "Invalid provider"}), 400
+    if provider not in ("whatsapp", "telegram"):
+        return jsonify({"ok": False, "error": "Invalid provider. Use 'whatsapp' or 'telegram'"}), 400
     
-    if provider == "whatsapp":
-        provider = "wa"
-    elif provider == "telegram":
-        provider = "tg"
+    channel_type = "whatsapp" if provider == "whatsapp" else "telegram"
     
     try:
-        result = unlink_channel(account_id, provider)
-        return jsonify(result), 200 if result.get("ok") else 400
+        # Delete channel identity
+        supabase().table("channel_identities") \
+            .delete() \
+            .eq("account_id", account_id) \
+            .eq("channel_type", channel_type) \
+            .execute()
+        
+        return jsonify({
+            "ok": True,
+            "message": f"{provider} unlinked successfully"
+        }), 200
     except Exception as e:
         logger.error(f"Unlink error: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -103,10 +153,22 @@ def linked_channels():
     account_id = current_user.get("account_id") or current_user.get("id")
     
     try:
-        channels = get_linked_channels(account_id)
+        result = supabase().table("channel_identities") \
+            .select("channel_type") \
+            .eq("account_id", account_id) \
+            .execute()
+        
+        linked = []
+        for identity in (result.data or []):
+            channel_type = identity.get("channel_type", "")
+            if channel_type == "whatsapp":
+                linked.append("whatsapp")
+            elif channel_type == "telegram":
+                linked.append("telegram")
+        
         return jsonify({
             "ok": True,
-            "linked": [c for c in channels if c.get("linked")],
+            "linked": linked,
             "available": ["whatsapp", "telegram"]
         }), 200
     except Exception as e:
