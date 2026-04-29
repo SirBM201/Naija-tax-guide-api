@@ -11,13 +11,10 @@ from flask import Blueprint, jsonify, request
 
 from app.core.supabase_client import supabase
 from app.services.web_auth_service import get_account_id_from_request
-from app.services.mail_service import send_mail
+from app.services.mail_service import send_email
 
 logger = logging.getLogger(__name__)
 
-# ============================================================
-# BLUEPRINT DEFINITION
-# ============================================================
 bp = Blueprint("support", __name__)
 
 
@@ -42,10 +39,6 @@ def _support_to_email() -> str:
         or _env("MAIL_USER")
         or _env("SMTP_USER")
     )
-
-
-def _support_from_name() -> str:
-    return _env("SUPPORT_FROM_NAME", "Naija Tax Guide Support")
 
 
 @bp.get("/support/health")
@@ -96,7 +89,6 @@ def get_ticket(ticket_id: str):
         return jsonify({"ok": False, "error": "unauthorized", "debug": auth_debug}), 401
 
     try:
-        # Get ticket
         ticket_result = _sb().table("support_tickets") \
             .select("*") \
             .eq("ticket_id", ticket_id) \
@@ -106,7 +98,6 @@ def get_ticket(ticket_id: str):
         if not ticket_result.data:
             return jsonify({"ok": False, "error": "ticket_not_found"}), 404
         
-        # Get messages
         messages_result = _sb().table("support_ticket_messages") \
             .select("*") \
             .eq("ticket_id", ticket_id) \
@@ -138,7 +129,6 @@ def reply_ticket(ticket_id: str):
         return jsonify({"ok": False, "error": "message_required"}), 400
 
     try:
-        # Verify ticket exists and belongs to user
         ticket_result = _sb().table("support_tickets") \
             .select("id, ticket_id, status") \
             .eq("ticket_id", ticket_id) \
@@ -151,7 +141,6 @@ def reply_ticket(ticket_id: str):
         ticket = ticket_result.data[0]
         now = datetime.now(timezone.utc).isoformat()
         
-        # Add message
         _sb().table("support_ticket_messages").insert({
             "ticket_id": ticket_id,
             "account_id": account_id,
@@ -161,7 +150,6 @@ def reply_ticket(ticket_id: str):
             "created_at": now
         }).execute()
         
-        # Update ticket status
         _sb().table("support_tickets") \
             .update({"status": "open", "updated_at": now, "last_message_preview": message[:200]}) \
             .eq("id", ticket["id"]) \
@@ -196,7 +184,6 @@ def submit_support():
         now = datetime.now(timezone.utc).isoformat()
         new_ticket_id = _ticket_id()
         
-        # Create ticket
         ticket_result = _sb().table("support_tickets").insert({
             "ticket_id": new_ticket_id,
             "account_id": account_id,
@@ -210,7 +197,6 @@ def submit_support():
         if not ticket_result.data:
             return jsonify({"ok": False, "error": "failed_to_create_ticket"}), 500
         
-        # Add initial message
         _sb().table("support_ticket_messages").insert({
             "ticket_id": new_ticket_id,
             "account_id": account_id,
@@ -220,16 +206,14 @@ def submit_support():
             "created_at": now
         }).execute()
         
-        # Try to send email notification
         support_email = _support_to_email()
         if support_email:
             try:
-                send_mail(
-                    to=support_email,
+                send_email(
+                    to_email=support_email,
                     subject=f"[Support] New ticket {new_ticket_id}: {subject}",
-                    text=f"New support ticket from account {account_id}\n\nTicket ID: {new_ticket_id}\nSubject: {subject}\n\nMessage:\n{message}",
-                    html=f"<h3>New Support Ticket</h3><p><strong>Ticket ID:</strong> {new_ticket_id}</p><p><strong>Subject:</strong> {subject}</p><p><strong>Message:</strong></p><p>{message}</p>",
-                    debug=True
+                    html_body=f"<h3>New Support Ticket</h3><p><strong>Ticket ID:</strong> {new_ticket_id}</p><p><strong>Subject:</strong> {subject}</p><p><strong>Message:</strong></p><p>{message}</p>",
+                    text_body=f"New support ticket from account {account_id}\n\nTicket ID: {new_ticket_id}\nSubject: {subject}\n\nMessage:\n{message}"
                 )
             except Exception as mail_error:
                 logger.warning(f"Support email notification failed: {mail_error}")
