@@ -218,7 +218,7 @@ def create_app() -> Flask:
         boot["registered"].append(entry)
 
     # ============================================================
-    # REQUIRED BLUEPRINTS
+    # REQUIRED BLUEPRINTS (CORE API - ALL EXISTING FILES)
     # ============================================================
     required_modules = [
         "app.routes.health",
@@ -250,7 +250,7 @@ def create_app() -> Flask:
         _register_bp(dotted, "bp", required=True, url_prefix=api_prefix)
 
     # ============================================================
-    # OPTIONAL BLUEPRINTS
+    # OPTIONAL BLUEPRINTS (WON'T CRASH IF MISSING)
     # ============================================================
     optional_modules = [
         "app.routes.cron",
@@ -259,15 +259,13 @@ def create_app() -> Flask:
         "app.routes.web_ask",
         "app.routes.web_chat",
         "app.routes.paystack_webhook",
-        "app.routes.channel_admin",
-        "app.routes.support_admin",
     ]
 
     for dotted in optional_modules:
         _register_bp(dotted, "bp", required=False, url_prefix=api_prefix)
 
     # ============================================================
-    # DEBUG BLUEPRINTS
+    # DEBUG BLUEPRINTS (ONLY WHEN ENABLED)
     # ============================================================
     if _safe_get_env_bool("ENABLE_DEBUG_ROUTES"):
         _register_bp("app.routes._debug", "bp", required=False, url_prefix=api_prefix)
