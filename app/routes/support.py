@@ -1,79 +1,248 @@
-@bp.post("/support/ticket")
-def create_ticket():
-    """Alternative endpoint for creating a support ticket (simpler version)"""
-    account_id, auth_debug = get_account_id_from_request(request)
-    if not account_id:
-        return _unauthorized(auth_debug)
-    
-    body = _safe_json()
-    
-    # Map simpler fields to your existing structure
-    simplified_body = {
-        "full_name": body.get("fullName") or body.get("name"),
-        "contact_email": body.get("email") or body.get("contactEmail"),
-        "issue_type": body.get("category") or body.get("issueType") or "general",
-        "priority": "normal",
-        "subject": body.get("subject") or "Support Request",
-        "message": body.get("message") or body.get("description"),
-        "channel": "web",
-    }
-    
-    # Override request.json temporarily and call existing submit_support
-    original_json = request.get_json
-    request.get_json = lambda silent=True: simplified_body
-    
-    try:
-        return submit_support()
-    finally:
-        request.get_json = original_json
+# app/routes/support.py
+from __future__ import annotations
+
+import os
+import uuid
+import logging
+from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timezone
+
+from flask import Blueprint, jsonify, request
+
+from app.core.supabase_client import supabase
+from app.services.web_auth_service import get_account_id_from_request
+from app.services.mail_service import send_mail
+
+logger = logging.getLogger(__name__)
+
+# ============================================================
+# BLUEPRINT DEFINITION
+# ============================================================
+bp = Blueprint("support", __name__)
+
+
+def _sb():
+    return supabase()
+
+
+def _env(name: str, default: str = "") -> str:
+    return (os.getenv(name, default) or default).strip()
+
+
+def _ticket_id() -> str:
+    return f"NTG-{str(uuid.uuid4()).split('-')[0].upper()}"
+
+
+def _support_to_email() -> str:
+    return (
+        _env("SUPPORT_TO_EMAIL")
+        or _env("SUPPORT_EMAIL")
+        or _env("MAIL_FROM_EMAIL")
+        or _env("SMTP_FROM")
+        or _env("MAIL_USER")
+        or _env("SMTP_USER")
+    )
+
+
+def _support_from_name() -> str:
+    return _env("SUPPORT_FROM_NAME", "Naija Tax Guide Support")
 
 
 @bp.get("/support/health")
 def support_health():
     """Health check endpoint"""
     to_email = _support_to_email()
-    return (
-        jsonify(
-            {
-                "ok": True,
-                "route_group": "support",
-                "mail_ready": bool(to_email),
-                "support_to_email": to_email or None,
-                "endpoints": ["/support", "/support/tickets", "/support/tickets/<id>", "/support/tickets/<id>/reply"]
-            }
-        ),
-        200,
-    )
+    return jsonify({
+        "ok": True,
+        "route_group": "support",
+        "mail_ready": bool(to_email),
+        "support_to_email": to_email or None,
+        "endpoints": ["/support", "/support/tickets", "/support/tickets/<id>", "/support/tickets/<id>/reply"]
+    }), 200
 
 
-@bp.get("/support/stats")
-def support_stats():
-    """Get support statistics for the authenticated user"""
+@bp.get("/support/tickets")
+def list_tickets():
+    """List user's support tickets"""
     account_id, auth_debug = get_account_id_from_request(request)
     if not account_id:
-        return _unauthorized(auth_debug)
+        return jsonify({"ok": False, "error": "unauthorized", "debug": auth_debug}), 401
+
+    limit = request.args.get("limit", 50, type=int)
     
     try:
-        # Get statistics about user's tickets
-        tickets, err = _list_tickets_for_account(account_id, limit=1000)
-        if err:
-            return _fail(error=err.get("error") or "stats_failed", status=500)
-        
-        open_count = len([t for t in tickets if t.get("status") == "open"])
-        in_progress_count = len([t for t in tickets if t.get("status") == "in_progress"])
-        closed_count = len([t for t in tickets if t.get("status") == "closed"])
+        result = _sb().table("support_tickets") \
+            .select("*") \
+            .eq("account_id", account_id) \
+            .order("created_at", desc=True) \
+            .limit(limit) \
+            .execute()
         
         return jsonify({
             "ok": True,
-            "stats": {
-                "total": len(tickets),
-                "open": open_count,
-                "in_progress": in_progress_count,
-                "closed": closed_count
-            }
+            "tickets": result.data or [],
+            "count": len(result.data or [])
         }), 200
     except Exception as e:
-        return _fail(error="stats_failed", root_cause=str(e), status=500)
+        logger.error(f"List tickets error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.get("/support/tickets/<ticket_id>")
+def get_ticket(ticket_id: str):
+    """Get a specific support ticket with messages"""
+    account_id, auth_debug = get_account_id_from_request(request)
+    if not account_id:
+        return jsonify({"ok": False, "error": "unauthorized", "debug": auth_debug}), 401
+
+    try:
+        # Get ticket
+        ticket_result = _sb().table("support_tickets") \
+            .select("*") \
+            .eq("ticket_id", ticket_id) \
+            .eq("account_id", account_id) \
+            .execute()
+        
+        if not ticket_result.data:
+            return jsonify({"ok": False, "error": "ticket_not_found"}), 404
+        
+        # Get messages
+        messages_result = _sb().table("support_ticket_messages") \
+            .select("*") \
+            .eq("ticket_id", ticket_id) \
+            .eq("account_id", account_id) \
+            .order("created_at", asc=True) \
+            .execute()
+        
+        return jsonify({
+            "ok": True,
+            "ticket": ticket_result.data[0],
+            "messages": messages_result.data or []
+        }), 200
+    except Exception as e:
+        logger.error(f"Get ticket error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.post("/support/tickets/<ticket_id>/reply")
+def reply_ticket(ticket_id: str):
+    """Reply to a support ticket"""
+    account_id, auth_debug = get_account_id_from_request(request)
+    if not account_id:
+        return jsonify({"ok": False, "error": "unauthorized", "debug": auth_debug}), 401
+
+    body = request.get_json(silent=True) or {}
+    message = (body.get("message") or "").strip()
+    
+    if not message:
+        return jsonify({"ok": False, "error": "message_required"}), 400
+
+    try:
+        # Verify ticket exists and belongs to user
+        ticket_result = _sb().table("support_tickets") \
+            .select("id, ticket_id, status") \
+            .eq("ticket_id", ticket_id) \
+            .eq("account_id", account_id) \
+            .execute()
+        
+        if not ticket_result.data:
+            return jsonify({"ok": False, "error": "ticket_not_found"}), 404
+        
+        ticket = ticket_result.data[0]
+        now = datetime.now(timezone.utc).isoformat()
+        
+        # Add message
+        _sb().table("support_ticket_messages").insert({
+            "ticket_id": ticket_id,
+            "account_id": account_id,
+            "message": message,
+            "sender_type": "user",
+            "is_internal_note": False,
+            "created_at": now
+        }).execute()
+        
+        # Update ticket status
+        _sb().table("support_tickets") \
+            .update({"status": "open", "updated_at": now, "last_message_preview": message[:200]}) \
+            .eq("id", ticket["id"]) \
+            .execute()
+        
+        return jsonify({
+            "ok": True,
+            "message": "Reply added successfully"
+        }), 200
+    except Exception as e:
+        logger.error(f"Reply ticket error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.post("/support")
+def submit_support():
+    """Create a new support ticket"""
+    account_id, auth_debug = get_account_id_from_request(request)
+    if not account_id:
+        return jsonify({"ok": False, "error": "unauthorized", "debug": auth_debug}), 401
+
+    body = request.get_json(silent=True) or {}
+    
+    subject = (body.get("subject") or "").strip()
+    message = (body.get("message") or "").strip()
+    category = (body.get("category") or "general").strip()
+    
+    if not subject or not message:
+        return jsonify({"ok": False, "error": "subject_and_message_required"}), 400
+    
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        new_ticket_id = _ticket_id()
+        
+        # Create ticket
+        ticket_result = _sb().table("support_tickets").insert({
+            "ticket_id": new_ticket_id,
+            "account_id": account_id,
+            "subject": subject,
+            "category": category,
+            "status": "open",
+            "created_at": now,
+            "updated_at": now
+        }).execute()
+        
+        if not ticket_result.data:
+            return jsonify({"ok": False, "error": "failed_to_create_ticket"}), 500
+        
+        # Add initial message
+        _sb().table("support_ticket_messages").insert({
+            "ticket_id": new_ticket_id,
+            "account_id": account_id,
+            "message": message,
+            "sender_type": "user",
+            "is_internal_note": False,
+            "created_at": now
+        }).execute()
+        
+        # Try to send email notification
+        support_email = _support_to_email()
+        if support_email:
+            try:
+                send_mail(
+                    to=support_email,
+                    subject=f"[Support] New ticket {new_ticket_id}: {subject}",
+                    text=f"New support ticket from account {account_id}\n\nTicket ID: {new_ticket_id}\nSubject: {subject}\n\nMessage:\n{message}",
+                    html=f"<h3>New Support Ticket</h3><p><strong>Ticket ID:</strong> {new_ticket_id}</p><p><strong>Subject:</strong> {subject}</p><p><strong>Message:</strong></p><p>{message}</p>",
+                    debug=True
+                )
+            except Exception as mail_error:
+                logger.warning(f"Support email notification failed: {mail_error}")
+        
+        return jsonify({
+            "ok": True,
+            "message": "Support ticket created successfully",
+            "ticket_id": new_ticket_id,
+            "ticket": ticket_result.data[0]
+        }), 201
+    except Exception as e:
+        logger.error(f"Submit support error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @bp.delete("/support/tickets/<ticket_id>/close")
@@ -81,32 +250,56 @@ def close_ticket(ticket_id: str):
     """Close a support ticket"""
     account_id, auth_debug = get_account_id_from_request(request)
     if not account_id:
-        return _unauthorized(auth_debug)
-    
-    ticket_id = (ticket_id or "").strip()
-    if not ticket_id:
-        return _fail(error="ticket_id_required", status=400)
-    
-    ticket, err = _find_ticket_for_account(account_id, ticket_id)
-    if err:
-        return _fail(error=err.get("error") or "ticket_lookup_failed", status=500)
-    
-    if not ticket:
-        return _fail(error="ticket_not_found", status=404)
-    
-    # Update ticket status to closed
+        return jsonify({"ok": False, "error": "unauthorized", "debug": auth_debug}), 401
+
     try:
-        _sb().table("support_tickets") \
-            .update({"status": "closed"}) \
-            .eq("id", ticket["id"]) \
+        now = datetime.now(timezone.utc).isoformat()
+        
+        result = _sb().table("support_tickets") \
+            .update({"status": "closed", "closed_at": now, "updated_at": now}) \
+            .eq("ticket_id", ticket_id) \
+            .eq("account_id", account_id) \
             .execute()
         
-        refreshed_ticket, _ = _find_ticket_for_account(account_id, ticket_id)
+        if not result.data:
+            return jsonify({"ok": False, "error": "ticket_not_found"}), 404
         
         return jsonify({
             "ok": True,
-            "message": "Ticket closed successfully",
-            "ticket": refreshed_ticket or ticket
+            "message": "Ticket closed successfully"
         }), 200
     except Exception as e:
-        return _fail(error="close_failed", root_cause=str(e), status=500)
+        logger.error(f"Close ticket error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.get("/support/stats")
+def support_stats():
+    """Get support statistics for the authenticated user"""
+    account_id, auth_debug = get_account_id_from_request(request)
+    if not account_id:
+        return jsonify({"ok": False, "error": "unauthorized", "debug": auth_debug}), 401
+
+    try:
+        result = _sb().table("support_tickets") \
+            .select("status") \
+            .eq("account_id", account_id) \
+            .execute()
+        
+        tickets = result.data or []
+        open_count = len([t for t in tickets if t.get("status") == "open"])
+        closed_count = len([t for t in tickets if t.get("status") == "closed"])
+        in_progress_count = len([t for t in tickets if t.get("status") == "in_progress"])
+        
+        return jsonify({
+            "ok": True,
+            "stats": {
+                "total": len(tickets),
+                "open": open_count,
+                "closed": closed_count,
+                "in_progress": in_progress_count
+            }
+        }), 200
+    except Exception as e:
+        logger.error(f"Support stats error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
