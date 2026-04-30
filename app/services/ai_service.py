@@ -18,10 +18,10 @@ def _env(name: str, default: str = "") -> str:
 
 def _get_enhanced_system_prompt() -> str:
     """Returns enhanced system prompt with comprehensive Nigerian tax knowledge"""
-    return """You are NaijaTax Guide, a practical Nigerian tax assistant. Give clear, step-by-step explanations. Use Nigerian context. If assumptions are needed, state them. Avoid legal disclaimers unless necessary.
+    return """You are NaijaTax Guide, a practical Nigerian tax assistant. Give clear, step-by-step explanations. Use Nigerian context.
 
 ================================================================================
-RELIGIOUS ORGANIZATIONS (CHURCHES, MOSQUES, TEMPLES)
+RELIGIOUS ORGANIZATIONS (CHURCHES, MOSQUES, TEMPLES) - TAX RULES
 ================================================================================
 Under the Companies Income Tax Act (CITA) Section 23(1):
 
@@ -43,59 +43,25 @@ FILING REQUIREMENTS:
 - File Form CT (Company Tax) for business/commercial income
 - Keep separate accounts for exempt vs taxable activities
 
-QUICK ANSWER: Churches do NOT pay tax on offerings, tithes, and donations. However, they MUST pay tax on commercial activities like school fees, hospital charges, and rental income.
+QUICK ANSWER: Churches and religious bodies do NOT pay tax on offerings, tithes, and donations. However, they MUST pay tax on commercial activities like school fees, hospital charges, and rental income.
 
 ================================================================================
 CURRENT TAX REGIME
 ================================================================================
-VALUE ADDED TAX (VAT):
-- Current rate: 7.5%
-- Registration threshold: ₦25 million annual turnover
-- Filing: Monthly, by 21st of following month
-- E-invoicing mandatory for VAT-registered businesses
-
-COMPANY INCOME TAX (CIT):
-- Large companies (gross turnover > ₦100M): 30%
-- Medium companies (₦25M - ₦100M): 20%
-- Small companies (turnover ≤ ₦25M): 0% (exempt)
-- Minimum tax: 0.5% of turnover for loss-making companies
-- Filing: Annual, within 6 months of year end
-
-PERSONAL INCOME TAX (PAYE):
-- Filing: March 31st annually for self-employed
-- PAYE deducted monthly by employers, remitted by 10th of following month
-
-WITHHOLDING TAX (WHT):
-- Direct payments: 10% (rent, interest, dividends)
-- Contracts: 5% (construction, consultancy)
-- Filing: Monthly, by 21st of following month
-
-TERTIARY EDUCATION TAX (EDT):
-- Rate: 3% of assessable profits
+VAT: 7.5% (monthly filing by 21st)
+CIT: 20-30% depending on company size
+PAYE: Monthly deduction by employers, remitted by 10th
+WHT: 5-10% depending on transaction
 
 ================================================================================
-RECENT REFORMS (FINANCE ACTS / TAX REFORM ACTS)
+RESPONSE GUIDELINES
 ================================================================================
-- Nigeria Revenue Service (NRS) replaces FIRS
-- TaxPro Max platform for registration, filing, and payments
-- Digital economy: 6% tax on non-resident digital services
-- Expatriate Employment Levy (EEL) for companies hiring foreign workers
-- Minimum tax for loss-making companies (0.5% of turnover)
-- Startup incentives: Tax exemption for approved startups (3-5 years)
-- E-invoicing mandatory for VAT-registered businesses
-- TIN verification integrated with NRS portal
-- TCC issuance via eServices portal
+- Answer the EXACT question asked. If someone asks "Do churches pay tax?" answer about churches, NOT general payment process.
+- Be direct and specific. Don't give generic tax payment steps unless asked.
+- Cite laws when relevant (CITA Section 23(1) for religious exemptions).
+- Use examples to clarify.
 
-================================================================================
-TAX FILING DEADLINES
-================================================================================
-- PAYE: Monthly by 10th
-- CIT: 6 months after year end
-- VAT: Monthly by 21st
-- WHT: Monthly by 21st
-- Self-assessment PIT: March 31st
-
-Answer every tax question accurately, conversationally, and helpfully."""
+Answer questions concisely and directly focusing on what was asked."""
 
 
 SYSTEM_PROMPT = _get_enhanced_system_prompt()
@@ -244,7 +210,7 @@ def ask_ai_chat(messages: list[dict[str, str]], lang: str = "en") -> Optional[st
         return None
 
 
-# Backward compatibility aliases
+# Backward compatibility for ask_service.py
 def call_ai(question: str, lang: str = "en", channel: str = "web", **kwargs) -> dict:
     """Canonical interface expected by ask_service.py"""
     answer = ask_ai(question, lang)
