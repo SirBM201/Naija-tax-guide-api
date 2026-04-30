@@ -16,7 +16,8 @@ bp = Blueprint("whatsapp", __name__)
 WA_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "").strip()
 
 LINK_CODE_RE = re.compile(r"^[A-Z0-9]{8}$")
-MENU_RE = re.compile(r"^(7|menu|help)$", re.IGNORECASE)
+MENU_NUMBER_RE = re.compile(r"^[1-6]$")
+WELCOME_SENT_KEY = "welcome_sent"
 
 
 def _extract_message(body: dict) -> tuple[str, str]:
@@ -69,22 +70,52 @@ def _try_consume_link_code(provider_user_id: str, raw_text: str) -> dict:
     return {"ok": False, "reason": row.get("reason") or "consume_failed", "rpc": row}
 
 
-def _send_menu(phone: str):
+def _send_main_menu(phone: str):
+    """Send the main numbered menu"""
     menu = (
-        "📋 *Naija Tax Guide Menu*\n\n"
-        "7️⃣ - Show this menu\n\n"
-        "*Ask tax questions directly*\n"
-        "Just type your tax question and I'll answer!\n\n"
-        "Examples:\n"
-        "• What is PAYE tax?\n"
-        "• When is VAT due?\n"
-        "• How to calculate CIT?\n\n"
-        "*To link with your web account:*\n"
-        "1. Login on website\n"
-        "2. Generate LINK CODE\n"
-        "3. Send the 8-character code here"
+        "*Naija Tax Guide* ✅\n\n"
+        "Reply with:\n"
+        "1️⃣ – Ask a tax question\n"
+        "2️⃣ – Check AI credits balance\n"
+        "3️⃣ – Check current plan\n"
+        "4️⃣ – Upgrade subscription\n"
+        "5️⃣ – Link website account\n"
+        "6️⃣ – Help / how to use this bot\n\n"
+        "You can also type your tax question directly at any time."
     )
     send_whatsapp_text(phone, menu)
+
+
+def _send_help(phone: str):
+    """Send help message"""
+    help_msg = (
+        "*How to use Naija Tax Guide* 🤖\n\n"
+        "• *Ask tax questions*: Just type your question naturally\n"
+        "  Example: 'What is PAYE tax?' or 'When is VAT due?'\n\n"
+        "• *Get your AI credits balance*: Reply with 2\n\n"
+        "• *Check your plan*: Reply with 3\n\n"
+        "• *Upgrade subscription*: Reply with 4\n\n"
+        "• *Link WhatsApp to website*: Reply with 5\n\n"
+        "• *Show this menu again*: Reply with 6\n\n"
+        "Need more help? Visit our website or contact support."
+    )
+    send_whatsapp_text(phone, help_msg)
+
+
+def _send_welcome(phone: str):
+    """Send welcome message for new users"""
+    welcome = (
+        "Welcome to Naija Tax Guide ✅\n\n"
+        "Reply with:\n"
+        "1 – Ask a tax question\n"
+        "2 – Check AI credits balance\n"
+        "3 – Check current plan\n"
+        "4 – Upgrade subscription\n"
+        "5 – Link website account\n"
+        "6 – Help / how to use this bot\n\n"
+        "You can also type your tax question directly at any time."
+    )
+    send_whatsapp_text(phone, welcome)
 
 
 @bp.get("/whatsapp/webhook")
@@ -109,18 +140,62 @@ def wa_webhook_receive():
 
         # Ensure account exists
         upsert_account(provider="wa", provider_user_id=from_phone, display_name=None, phone=from_phone)
-
         lk = lookup_account(provider="wa", provider_user_id=from_phone)
+
         if not lk.get("ok"):
             send_whatsapp_text(from_phone, "System error. Please try again.")
             return jsonify({"ok": True})
 
-        # Handle menu request
-        if MENU_RE.match(text):
-            _send_menu(from_phone)
-            return jsonify({"ok": True, "menu": True})
+        account_id = lk.get("account_id") or from_phone
 
-        # Handle linking code (optional)
+        # Check if this is a new user (no conversation history) - send welcome
+        if not text:
+            _send_welcome(from_phone)
+            return jsonify({"ok": True})
+
+        # Handle numbered menu options
+        if MENU_NUMBER_RE.match(text):
+            option = int(text)
+            
+            if option == 1:
+                # Ask a tax question - prompt user
+                send_whatsapp_text(from_phone, "Please type your tax question and I'll answer it.")
+                return jsonify({"ok": True})
+            
+            elif option == 2:
+                # Check AI credits balance
+                send_whatsapp_text(from_phone, "🔍 *AI Credits Balance*\n\nYou have 0 credits remaining.\n\nTo get more credits, upgrade your plan or purchase additional credits on the website.")
+                return jsonify({"ok": True})
+            
+            elif option == 3:
+                # Check current plan
+                send_whatsapp_text(from_phone, "📋 *Your Current Plan*\n\nPlan: Free\nAI Credits: 0/month\nDaily Questions: Limited\n\nUpgrade for more features and unlimited questions!")
+                return jsonify({"ok": True})
+            
+            elif option == 4:
+                # Upgrade subscription
+                send_whatsapp_text(from_phone, "💎 *Upgrade Your Plan*\n\nVisit our website to upgrade:\nhttps://www.naijataxguides.com/plans\n\nGet more AI credits and unlimited tax questions!")
+                return jsonify({"ok": True})
+            
+            elif option == 5:
+                # Link website account
+                send_whatsapp_text(
+                    from_phone,
+                    "🔗 *Link to Website*\n\n"
+                    "1. Login to your account on our website\n"
+                    "2. Go to Settings → WhatsApp Linking\n"
+                    "3. Generate an 8-character code\n"
+                    "4. Send that code here\n\n"
+                    "Once linked, your WhatsApp will be connected to your web account!"
+                )
+                return jsonify({"ok": True})
+            
+            elif option == 6:
+                # Help menu
+                _send_help(from_phone)
+                return jsonify({"ok": True})
+
+        # Handle linking code
         if LINK_CODE_RE.match(text.upper()):
             attempt = _try_consume_link_code(from_phone, text)
             if attempt.get("ok"):
@@ -128,22 +203,24 @@ def wa_webhook_receive():
                     from_phone,
                     "✅ *WhatsApp linked successfully!*\n\n"
                     "Your account is now connected to the web.\n"
-                    "You can still ask tax questions anytime."
+                    "You can now access your history and credits from the website."
                 )
                 return jsonify({"ok": True, "linked": True})
             else:
                 send_whatsapp_text(
                     from_phone,
                     "❌ *Invalid link code*\n\n"
-                    "Generate a new code on the website and try again.\n\n"
-                    "Reply with '7' to see the menu."
+                    "Please generate a new code on the website and try again.\n\n"
+                    "Reply with 6 for help."
                 )
                 return jsonify({"ok": True, "linked": False})
 
+        # Handle help variations
+        if text.lower() in ["help", "menu", "start", "?"]:
+            _send_main_menu(from_phone)
+            return jsonify({"ok": True})
+
         # Answer tax question directly
-        account_id = lk.get("account_id") or from_phone
-        
-        # Call ask_guarded with the correct parameters
         result = ask_guarded({
             "question": text,
             "account_id": account_id,
@@ -156,17 +233,15 @@ def wa_webhook_receive():
             if answer:
                 send_whatsapp_text(from_phone, answer)
             else:
-                send_whatsapp_text(from_phone, "I couldn't find an answer to that question. Please try rephrasing.")
+                send_whatsapp_text(from_phone, "I couldn't find an answer to that question. Please try rephrasing.\n\nReply with 6 for help.")
         else:
-            error = result.get("error", "unknown_error")
             send_whatsapp_text(
                 from_phone,
-                f"Sorry, I encountered an error. Please try again later.\n\nReply with '7' to see the menu."
+                "Sorry, I encountered an error. Please try again later.\n\nReply with 6 for help."
             )
 
         return jsonify({"ok": True, "answered": True})
 
     except Exception as e:
         logging.exception(f"WA webhook error: {e}")
-        send_whatsapp_text(from_phone, f"Sorry, an error occurred. Please try again later.")
         return jsonify({"ok": True})
