@@ -4,13 +4,11 @@ from __future__ import annotations
 """
 AI SERVICE (BOOT-SAFE, CANONICAL EXPORTS)
 
-This file guarantees:
-  - call_ai(...) exists (canonical name)
-  - call_ai returns a dict: { ok: bool, answer?: str, error?: str }
+This file MUST NOT crash boot due to missing exports.
 
 Provider strategy:
-  - If OPENAI_API_KEY exists -> try OpenAI
-  - Else -> returns clear error (boot-safe)
+  - If OPENAI_API_KEY exists -> try OpenAI (optional dependency-safe)
+  - Else -> returns a clear error (so boot still works)
 """
 
 import os
@@ -31,7 +29,7 @@ def _truthy(v: str | None) -> bool:
 
 def _clip(s: str, n: int = 280) -> str:
     s = str(s or "")
-    return s if len(s) <= n else s[:n] + "..."
+    return s if len(s) <= n else s[:n] + "…"
 
 
 def _debug_enabled() -> bool:
@@ -44,7 +42,7 @@ def _dbg(msg: str) -> None:
 
 
 def _get_system_prompt() -> str:
-    """Returns the comprehensive system prompt with Nigerian tax knowledge"""
+    """Returns comprehensive system prompt with Nigerian tax knowledge"""
     current_year = datetime.now().strftime('%Y')
     
     return f"""You are Naija Tax Guide, an expert AI tax assistant specializing in Nigerian taxation.
@@ -70,33 +68,31 @@ MUST PAY TAX (COMMERCIAL ACTIVITIES):
 FILING REQUIREMENTS:
 - Religious organizations with commercial activities must register for tax
 - File Form CT (Company Tax) for business/commercial income
+- Keep separate accounts for exempt vs taxable activities
 - Non-commercial religious income is exempt but should be documented
+
+QUICK ANSWER: Churches do NOT pay tax on offerings, tithes, and donations. However, they MUST pay tax on commercial activities like school fees, hospital charges, and rental income.
 
 ================================================================================
 CURRENT TAX REGIME ({current_year})
 ================================================================================
 VALUE ADDED TAX (VAT):
-- Rate: 7.5% (unchanged from recent budgets)
+- Current rate: 7.5%
 - Registration threshold: ₦25 million annual turnover
 - Filing: Monthly, by 21st of following month
+- E-invoicing mandatory for VAT-registered businesses
 
 COMPANY INCOME TAX (CIT):
 - Large companies (gross turnover > ₦100M): 30%
 - Medium companies (₦25M - ₦100M): 20%
-- Small companies (gross turnover ≤ ₦25M): 0% (exempt)
-- Minimum tax: 0.5% of turnover for companies reporting losses
+- Small companies (turnover ≤ ₦25M): 0% (exempt)
+- Minimum tax: 0.5% of turnover for loss-making companies
 - Filing: Annual, within 6 months of year end
 
 PERSONAL INCOME TAX (PAYE):
-- Tax bands (annual income):
-  * Up to ₦300,000: 7%
-  * ₦300,001 - ₦600,000: 11%
-  * ₦600,001 - ₦1,100,000: 15%
-  * ₦1,100,001 - ₦1,600,000: 19%
-  * ₦1,600,001 - ₦3,200,000: 21%
-  * Above ₦3,200,000: 24%
+- Tax bands based on chargeable income
 - Consolidated Relief Allowance: ₦200,000 OR 1% of income (whichever higher) + 20% of gross income
-- Filing: March 31st annually for self-employed; PAYE deducted monthly by employers
+- Filing: March 31st annually for self-employed; monthly deduction by employers
 
 WITHHOLDING TAX (WHT):
 - Direct payments: 10% (rent, interest, dividends)
@@ -107,22 +103,20 @@ WITHHOLDING TAX (WHT):
 TERTIARY EDUCATION TAX (EDT):
 - Rate: 3% of assessable profits
 - Applies to all companies registered in Nigeria
-- Filing: Same as CIT (annual)
-
-CAPITAL GAINS TAX (CGT):
-- Rate: 10% on capital gains from asset disposal
-- Exemptions: Principal residence, agricultural property, government securities
 
 ================================================================================
-RECENT REFORMS (FINANCE ACTS 2020-2024)
+RECENT REFORMS (FINANCE ACTS / TAX REFORM ACTS)
 ================================================================================
-- Digital economy: 6% tax on non-resident digital services (Netflix, Google, Meta)
+- Nigeria Revenue Service (NRS) replaces FIRS
+- TaxPro Max platform for registration, filing, and payments
+- Digital economy: 6% tax on non-resident digital services
 - Expatriate Employment Levy (EEL) for companies hiring foreign workers
-- Minimum tax introduced for loss-making companies (0.5% of turnover)
+- Minimum tax for loss-making companies (0.5% of turnover)
 - Startup incentives: Tax exemption for approved startups (3-5 years)
-- Cryptocurrency taxation: Capital gains on digital assets
-- VAT on online/digital services from foreign providers
-- Non-resident companies providing digital services must register for VAT
+- Cryptocurrency/digital asset taxation introduced
+- E-invoicing mandatory for VAT-registered businesses
+- TIN verification integrated with NRS portal
+- TCC issuance via eServices portal
 
 ================================================================================
 TAX FILING DEADLINES
@@ -132,7 +126,6 @@ TAX FILING DEADLINES
 - CIT: Within 6 months of accounting year end (max 12 months with extension)
 - VAT: Monthly, by 21st of following month
 - WHT: Monthly, by 21st of following month
-- EDT: Same as CIT deadline
 
 ================================================================================
 RESPONSE GUIDELINES
@@ -141,22 +134,12 @@ RESPONSE GUIDELINES
 2. Cite specific laws when possible (CITA, PITA, VAT Act, Finance Acts)
 3. If a question is ambiguous, ask for clarification
 4. Always note that tax laws change and suggest verifying with a tax professional
-5. For specific personal/corporate tax situations, give general principles only (no binding advice)
-6. Be empathetic - tax can be confusing. Guide users step by step
-7. Use examples to illustrate complex concepts
+5. For specific personal/corporate tax situations, give general principles only
+6. Use examples to illustrate complex concepts
 
-================================================================================
-COMMON QUESTION PATTERNS
-================================================================================
-- "Do churches pay tax?" → Explain exemption vs commercial activities
-- "What is PAYE?" → Explain Pay As You Earn system
-- "When is VAT due?" → Monthly by 21st
-- "How to register for tax?" → Step by step process
-- "What's new in tax regime?" → List Finance Act changes
+Current date: {current_year}
 
-Current year: {current_year}
-
-Answer every tax question accurately, conversationally, and helpfully. You are helping Nigerians understand their tax obligations better."""
+Answer every tax question accurately, conversationally, and helpfully."""
 
 
 # -----------------------------
@@ -171,8 +154,8 @@ def call_ai(
     max_tokens: int = 700,
 ) -> Dict[str, Any]:
     """
-    Canonical function for AI calls.
-    
+    Canonical function expected by ask_service/routes.
+
     Returns:
       { ok: True, answer: "..." }
       { ok: False, error: "...", root_cause: "...", fix: "..." }
@@ -213,7 +196,7 @@ def call_ai(
     }
 
 
-# Backwards compatibility aliases
+# Backwards/alternate names (optional safety)
 def ask_ai(*args, **kwargs) -> Dict[str, Any]:
     """Alias for older code paths."""
     return call_ai(*args, **kwargs)
@@ -253,7 +236,7 @@ def generate_grounded_answer(
 
 
 # -----------------------------
-# OpenAI implementation
+# OpenAI implementation (dependency-safe)
 # -----------------------------
 def _call_openai(
     *,
@@ -265,10 +248,10 @@ def _call_openai(
 ) -> Dict[str, Any]:
     """
     Uses OpenAI if the SDK is installed.
+    If the SDK isn't installed, returns a clear error (still boot-safe).
     """
     api_key = _env("OPENAI_API_KEY", "")
     model = _env("OPENAI_MODEL", _env("AI_MODEL", "gpt-4o-mini"))
-    
     if not api_key:
         return {
             "ok": False,
@@ -277,7 +260,7 @@ def _call_openai(
             "fix": "Set OPENAI_API_KEY in backend environment variables.",
         }
 
-    # Import SDK safely
+    # Import in a try/except so missing dependency never breaks boot
     try:
         from openai import OpenAI
     except Exception as e:
@@ -293,7 +276,7 @@ def _call_openai(
 
         sys = system_prompt or _get_system_prompt()
 
-        # Try Responses API first (newer), fallback to ChatCompletions
+        # Use Responses API style if available, fallback to ChatCompletions if not
         try:
             resp = client.responses.create(
                 model=model,
@@ -324,7 +307,7 @@ def _call_openai(
                 "ok": False,
                 "error": "openai_empty_answer",
                 "root_cause": "OpenAI returned empty content.",
-                "fix": "Check provider status and model name.",
+                "fix": "Check provider status, model name, and request payload.",
                 "details": {"model": model, "lang": lang, "channel": channel},
             }
 
