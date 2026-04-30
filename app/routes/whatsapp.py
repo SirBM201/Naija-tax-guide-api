@@ -10,7 +10,6 @@ from app.services.accounts_service import upsert_account, lookup_account
 from app.core.supabase_client import supabase
 from app.services.ask_service import ask_guarded
 from app.services.outbound_service import send_whatsapp_text
-from app.services.guest_access_service import ensure_guest_session
 
 bp = Blueprint("whatsapp", __name__)
 
@@ -21,7 +20,6 @@ MENU_RE = re.compile(r"^(7|menu|help)$", re.IGNORECASE)
 
 
 def _extract_message(body: dict) -> tuple[str, str]:
-    """Returns (from_phone, text). If no text message, returns ("","")."""
     entry = (body.get("entry") or [None])[0] or {}
     changes = (entry.get("changes") or [None])[0] or {}
     value = changes.get("value") or {}
@@ -72,7 +70,6 @@ def _try_consume_link_code(provider_user_id: str, raw_text: str) -> dict:
 
 
 def _send_menu(phone: str):
-    """Send the interactive menu"""
     menu = (
         "📋 *Naija Tax Guide Menu*\n\n"
         "7️⃣ - Show this menu\n\n"
@@ -103,12 +100,6 @@ def wa_webhook_verify():
 
 @bp.post("/whatsapp/webhook")
 def wa_webhook_receive():
-    """
-    NEW FLOW:
-    - Always answer tax questions immediately (standalone mode)
-    - Optional linking for web account integration
-    - Menu support with '7' or 'menu' or 'help'
-    """
     body = request.get_json(silent=True) or {}
 
     try:
@@ -116,11 +107,13 @@ def wa_webhook_receive():
         if not from_phone:
             return jsonify({"ok": True, "ignored": True})
 
-        # Ensure guest session exists for tracking (but don't require linking)
-        try:
-            ensure_guest_session(request)
-        except Exception:
-            pass  # Guest session is optional for WhatsApp
+        # Ensure account exists
+        upsert_account(provider="wa", provider_user_id=from_phone, display_name=None, phone=from_phone)
+
+        lk = lookup_account(provider="wa", provider_user_id=from_phone)
+        if not lk.get("ok"):
+            send_whatsapp_text(from_phone, "System error. Please try again.")
+            return jsonify({"ok": True})
 
         # Handle menu request
         if MENU_RE.match(text):
@@ -137,7 +130,7 @@ def wa_webhook_receive():
                     "Your account is now connected to the web.\n"
                     "You can still ask tax questions anytime."
                 )
-                return jsonify({"ok": True, "linked": True, "linked_now": True})
+                return jsonify({"ok": True, "linked": True})
             else:
                 send_whatsapp_text(
                     from_phone,
@@ -147,36 +140,33 @@ def wa_webhook_receive():
                 )
                 return jsonify({"ok": True, "linked": False})
 
-        # Answer tax question directly (NO LINKING REQUIRED!)
-        resp = ask_guarded(
-            {
-                "provider": "wa",
-                "provider_user_id": from_phone,
-                "question": text,
-                "lang": "en",
-                "mode": "text",
-            }
-        )
-
-        answer = (resp.get("answer") or resp.get("message") or "").strip()
-        if not answer:
-            answer = (
-                "I couldn't process that right now. Please try again.\n\n"
-                "Reply with '7' to see the menu."
-            )
-
-        send_whatsapp_text(from_phone, answer)
+        # Answer tax question directly
+        account_id = lk.get("account_id") or from_phone
         
-        # Add a helpful tip for new users
-        if "linked" not in resp and "welcome" not in answer.lower():
+        # Call ask_guarded with the correct parameters
+        result = ask_guarded({
+            "question": text,
+            "account_id": account_id,
+            "lang": "en",
+            "channel": "whatsapp"
+        })
+
+        if result.get("ok"):
+            answer = result.get("answer", "")
+            if answer:
+                send_whatsapp_text(from_phone, answer)
+            else:
+                send_whatsapp_text(from_phone, "I couldn't find an answer to that question. Please try rephrasing.")
+        else:
+            error = result.get("error", "unknown_error")
             send_whatsapp_text(
                 from_phone,
-                "\n💡 *Tip:* Reply with '7' anytime to see the menu.\n"
-                "To link with your web account, send your 8-character link code."
+                f"Sorry, I encountered an error. Please try again later.\n\nReply with '7' to see the menu."
             )
 
         return jsonify({"ok": True, "answered": True})
 
     except Exception as e:
-        logging.exception("WA webhook error: %s", e)
+        logging.exception(f"WA webhook error: {e}")
+        send_whatsapp_text(from_phone, f"Sorry, an error occurred. Please try again later.")
         return jsonify({"ok": True})
