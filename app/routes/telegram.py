@@ -58,8 +58,7 @@ def _send_menu(chat_id: str):
         "Examples:\n"
         "• What is PAYE tax?\n"
         "• When is VAT due?\n"
-        "• How to calculate CIT?\n"
-        "• Do churches pay tax in Nigeria?\n\n"
+        "• How to calculate CIT?\n\n"
         "*To link with your web account:*\n"
         "1. Login on website\n"
         "2. Generate LINK CODE\n"
@@ -71,8 +70,8 @@ def _send_menu(chat_id: str):
 @bp.post("/telegram/webhook")
 def tg_webhook():
     """
-    NEW FLOW (Channel-first):
-    - Always answer tax questions immediately (standalone mode)
+    Telegram webhook handler - Channel-first approach:
+    - Answers tax questions immediately (no linking required)
     - Optional linking for web account integration
     - Menu support with '7', 'menu', 'help', '/start'
     """
@@ -105,6 +104,7 @@ def tg_webhook():
 
     # Ensure account exists for tracking (not required for answering)
     upsert_account(provider="tg", provider_user_id=tg_user_id, display_name=display_name, phone=None)
+    lk = lookup_account(provider="tg", provider_user_id=tg_user_id)
 
     # Handle menu request (/start, 7, menu, help)
     if MENU_RE.match(text) or text.lower() == "/start":
@@ -132,29 +132,32 @@ def tg_webhook():
             )
             return jsonify({"ok": True, "linked": False})
 
+    # Get account_id from lookup
+    account_id = lk.get("account_id") or tg_user_id
+
     # Answer tax question directly (NO LINKING REQUIRED!)
     try:
-        resp = ask_guarded(
-            {
-                "provider": "tg",
-                "provider_user_id": tg_user_id,
-                "question": text,
-                "lang": "en",
-                "mode": "text",
-            }
-        )
+        result = ask_guarded({
+            "question": text,
+            "account_id": account_id,
+            "lang": "en",
+            "channel": "telegram"
+        })
 
-        answer = (resp.get("answer") or resp.get("message") or "").strip()
-        if not answer:
-            answer = (
-                "I couldn't process that right now. Please try again.\n\n"
-                "Send '7' to see the menu."
+        if result.get("ok"):
+            answer = result.get("answer", "")
+            if answer:
+                send_telegram_text(chat_id, answer)
+            else:
+                send_telegram_text(chat_id, "I couldn't find an answer to that question. Please try rephrasing.\n\nSend '7' for menu.")
+        else:
+            error = result.get("error", "unknown_error")
+            send_telegram_text(
+                chat_id,
+                f"Sorry, I encountered an error. Please try again later.\n\nSend '7' for menu."
             )
 
-        send_telegram_text(chat_id, answer)
-        
         # Add helpful tip for new users (only if not already linked)
-        lk = lookup_account(provider="tg", provider_user_id=tg_user_id)
         if not lk.get("linked"):
             send_telegram_text(
                 chat_id,
@@ -165,7 +168,7 @@ def tg_webhook():
         return jsonify({"ok": True, "answered": True})
 
     except Exception as e:
-        logging.exception("TG webhook error: %s", e)
+        logging.exception(f"TG webhook error: {e}")
         send_telegram_text(
             chat_id,
             "Sorry, I encountered an error. Please try again later.\n\nSend '7' for menu."
