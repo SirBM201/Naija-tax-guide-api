@@ -894,9 +894,4 @@ def _finalize_ai_success(
     daily_after = _safe_int((daily_result or {}).get("count"), _safe_int(usage_state.get("daily_ai_usage"), 0) + 1)
     monthly_after = _safe_int(usage_state.get("monthly_ai_usage"), 0) + 1
 
-    payload = dict(result or {})
-    meta = dict(payload.get("meta") or {})
-    meta["ai_used_month"] = monthly_after
-    meta["monthly_ai_used"] = monthly_after
-    meta["daily_usage"] = daily_after
-    meta["daily_limit"] = _safe_int(usage_state
+    payload = dict(result
