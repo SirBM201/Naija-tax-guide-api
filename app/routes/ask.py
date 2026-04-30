@@ -1,12 +1,10 @@
+# app/routes/ask.py
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, Optional, Tuple
-
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request, session
 
 from app.services.ask_service import ask_guarded
-from app.services.qa_history_service import log_history_item_best_effort
 from app.services.web_auth_service import get_account_id_from_request
 
 bp = Blueprint("ask", __name__)
@@ -16,180 +14,115 @@ def _truthy(v: str | None) -> bool:
     return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _env(name: str, default: str = "") -> str:
+    return (os.getenv(name, default) or default).strip()
+
+
 def _debug_enabled() -> bool:
-    return _truthy(os.getenv("DEBUG_AI")) or _truthy(os.getenv("SHOW_ASK_DEBUG"))
+    return _truthy(_env("ASK_DEBUG", "0")) or _truthy(_env("DEBUG", "0"))
 
 
-def _safe_json() -> Dict[str, Any]:
-    return request.get_json(silent=True) or {}
+def _get_bearer_token() -> str:
+    h = (request.headers.get("Authorization") or "").strip()
+    if h.lower().startswith("bearer "):
+        return h[7:].strip()
+    return ""
 
 
-def _safe_text(value: Any) -> str:
-    return str(value or "").strip()
+def _is_dev_bypass_request() -> bool:
+    """
+    Allow dev bypass ONLY when the request includes the correct token.
+    This lets your frontend bypass mode work even when there is no subscription yet.
+    """
+    expected = (_env("BYPASS_TOKEN") or _env("DEV_BYPASS_TOKEN") or "").strip()
+    if not expected:
+        return False
+
+    bearer = _get_bearer_token()
+    x_token = (request.headers.get("X-Auth-Token") or "").strip()
+
+    return bearer == expected or x_token == expected
 
 
-def _normalize_lang(value: Any) -> str:
-    text = _safe_text(value).lower()
-    return text or "en"
+def _get_account_id_from_session() -> str | None:
+    """Get account_id from Flask session"""
+    return session.get("account_id") or session.get("user_id")
 
 
-def _normalize_channel(value: Any) -> str:
-    text = _safe_text(value).lower()
-    return text or "web"
+@bp.post("/ask")
+def ask():
+    """
+    Unified guarded AI endpoint.
 
-
-def _extract_account_id(auth_result: Any) -> Tuple[Optional[str], Dict[str, Any]]:
-    if isinstance(auth_result, str):
-        account_id = auth_result.strip()
-        return (account_id or None, {})
-
-    if isinstance(auth_result, tuple):
-        first = auth_result[0] if len(auth_result) > 0 else None
-        second = auth_result[1] if len(auth_result) > 1 and isinstance(auth_result[1], dict) else {}
-
-        if isinstance(first, str):
-            account_id = first.strip()
-            return (account_id or None, second)
-
-        return (None, {"error": "invalid_auth_tuple", "raw": repr(auth_result)})
-
-    if isinstance(auth_result, dict):
-        account_id = str(auth_result.get("account_id") or "").strip()
-        return (account_id or None, dict(auth_result))
-
-    return (None, {"error": "unsupported_auth_result", "raw_type": str(type(auth_result))})
-
-
-def _build_unauthorized(auth_debug: Dict[str, Any]):
-    body: Dict[str, Any] = {
-        "ok": False,
-        "error": "unauthorized",
-        "message": "Authentication required.",
+    Preferred (web cookie/bearer auth):
+    {
+      "question": "<text>",
+      "lang": "en|pcm|yo|ig|ha" (optional),
+      "channel": "<optional>"
     }
-    if _debug_enabled():
-        body["debug"] = {"auth": auth_debug}
-    return jsonify(body), 401
 
+    Backwards compatible:
+    {
+      "account_id": "<uuid>" OR
+      "provider": "wa|tg|web",
+      "provider_user_id": "<id>",
+      "question": "<text>",
+      "lang": "...",
+      "channel": "..."
+    }
+    """
+    body = request.get_json(silent=True) or {}
 
-def _history_source_from_result(result: Dict[str, Any], channel: str) -> str:
-    source = _safe_text(result.get("source")).lower()
-    if source in {"", "ai", "direct_cache", "cache", "rules_engine", "tax_process_composer", "ai_grounded"}:
-        return channel
-    return source
-
-
-def _history_flags_from_result(result: Dict[str, Any]) -> Tuple[bool, int, bool, Optional[str]]:
-    mode = _safe_text(result.get("mode")).lower()
-    meta = dict(result.get("meta") or {})
-
-    from_cache = mode == "direct_cache"
-    credits_before = meta.get("credits_left_before")
-    credits_after = meta.get("credits_left") or meta.get("credit_balance")
-
-    credits_consumed = 0
-    try:
-        if credits_before is not None and credits_after is not None:
-            credits_consumed = max(0, int(credits_before) - int(credits_after))
-    except Exception:
-        credits_consumed = 0
-
-    usage_charged = bool(credits_consumed > 0 or mode == "ai_grounded")
-    plan_code = _safe_text(meta.get("plan_code")) or None
-    return from_cache, credits_consumed, usage_charged, plan_code
-
-
-def _handle_ask():
-    payload = _safe_json()
-    question = _safe_text(payload.get("question"))
-    lang = _normalize_lang(payload.get("lang") or "en")
-    channel = _normalize_channel(payload.get("channel") or "web")
-
+    question = (body.get("question") or "").strip()
     if not question:
-        return jsonify(
-            {
-                "ok": False,
-                "error": "missing_question",
-                "message": "Question is required.",
-            }
-        ), 400
+        return jsonify({"ok": False, "error": "question_required"}), 400
 
-    auth_raw = get_account_id_from_request(request)
-    account_id, auth_debug = _extract_account_id(auth_raw)
+    # Dev bypass support (token-protected)
+    if _is_dev_bypass_request():
+        body["__bypass"] = True
 
-    if not account_id:
-        return _build_unauthorized(auth_debug)
+    # If account_id not provided, derive from session FIRST, then cookie/bearer
+    if not (body.get("account_id") or "").strip():
+        # First try Flask session
+        session_account_id = _get_account_id_from_session()
+        if session_account_id:
+            body["account_id"] = session_account_id
+            body.setdefault("provider", "web")
+            body.setdefault("__auth_source", "session")
+        else:
+            # Fallback to token/cookie auth
+            account_id, source = get_account_id_from_request(request)
+            if account_id:
+                body["account_id"] = account_id
+                body.setdefault("provider", "web")
+                body.setdefault("__auth_source", source)
 
     try:
-        result = ask_guarded(
-            account_id=account_id,
-            question=question,
-            lang=lang,
-            channel=channel,
-        )
+        resp = ask_guarded(body)
 
-        if not isinstance(result, dict):
-            body: Dict[str, Any] = {
-                "ok": False,
-                "error": "invalid_ask_result",
-                "message": "Ask service returned an invalid response.",
-            }
-            if _debug_enabled():
-                body["debug"] = {
-                    "result_type": str(type(result)),
-                    "account_id": account_id,
-                }
-            return jsonify(body), 500
+        # status mapping
+        status = 200
+        if not resp.get("ok"):
+            if resp.get("error") in {"question_required", "invalid_request", "account_required", "account_invalid"}:
+                status = 400
+            elif resp.get("error") in {"unauthorized", "missing_token", "invalid_token", "session_expired"}:
+                status = 401
+            elif resp.get("error") in {"insufficient_credits"}:
+                status = 402
+            else:
+                status = 500
 
-        result.setdefault("ok", True)
+        return jsonify(resp), status
 
-        answer_text = _safe_text(result.get("answer"))
-        if result.get("ok") and question and answer_text:
-            from_cache, credits_consumed, usage_charged, plan_code = _history_flags_from_result(result)
-            log_history_item_best_effort(
-                account_id=account_id,
-                question=question,
-                answer=answer_text,
-                lang=lang,
-                source=_history_source_from_result(result, channel),
-                from_cache=from_cache,
-                canonical_key=None,
-                normalized_question=question.lower(),
-                plan_code=plan_code,
-                credits_consumed=credits_consumed,
-                usage_charged=usage_charged,
-                channel=channel,
-            )
-
-        return jsonify(result), 200
-
-    except Exception as exc:
-        body: Dict[str, Any] = {
-            "ok": False,
-            "error": "ask_failed",
-            "message": "We could not complete your request right now.",
-        }
-
+    except Exception as e:
         if _debug_enabled():
-            body["debug"] = {
-                "exception_type": exc.__class__.__name__,
-                "exception": str(exc),
-                "account_id": account_id,
-                "auth": auth_debug,
-            }
+            return jsonify(
+                {
+                    "ok": False,
+                    "error": "ask_failed",
+                    "root_cause": f"{type(e).__name__}: {str(e)}",
+                    "fix": "Check server logs for the traceback and confirm ask_service + dependencies exports exist.",
+                }
+            ), 500
 
-        return jsonify(body), 500
-
-
-@bp.route("/ask", methods=["POST", "OPTIONS"], strict_slashes=False)
-def ask_no_slash():
-    if request.method == "OPTIONS":
-        return ("", 200)
-    return _handle_ask()
-
-
-@bp.route("/ask/", methods=["POST", "OPTIONS"], strict_slashes=False)
-def ask_with_slash():
-    if request.method == "OPTIONS":
-        return ("", 200)
-    return _handle_ask()
-
+        return jsonify({"ok": False, "error": "ask_failed"}), 500
