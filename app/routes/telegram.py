@@ -14,7 +14,7 @@ from app.services.outbound_service import send_telegram_text
 bp = Blueprint("telegram", __name__)
 
 LINK_CODE_RE = re.compile(r"^[A-Z0-9]{8}$")
-MENU_RE = re.compile(r"^(7|menu|help|start)$", re.IGNORECASE)
+MENU_NUMBER_RE = re.compile(r"^[1-6]$")
 
 
 def _try_consume_link_code(provider_user_id: str, raw_text: str) -> dict:
@@ -48,36 +48,55 @@ def _try_consume_link_code(provider_user_id: str, raw_text: str) -> dict:
     return {"ok": False, "reason": row.get("reason") or "consume_failed", "rpc": row}
 
 
-def _send_menu(chat_id: str):
-    """Send the interactive menu"""
+def _send_main_menu(chat_id: str):
     menu = (
-        "📋 *Naija Tax Guide Menu*\n\n"
-        "7️⃣ - Show this menu\n\n"
-        "*Ask tax questions directly*\n"
-        "Just type your tax question and I'll answer!\n\n"
-        "Examples:\n"
-        "• What is PAYE tax?\n"
-        "• When is VAT due?\n"
-        "• How to calculate CIT?\n\n"
-        "*To link with your web account:*\n"
-        "1. Login on website\n"
-        "2. Generate LINK CODE\n"
-        "3. Send the 8-character code here"
+        "*Naija Tax Guide* ✅\n\n"
+        "Reply with:\n"
+        "1️⃣ – Ask a tax question\n"
+        "2️⃣ – Check AI credits balance\n"
+        "3️⃣ – Check current plan\n"
+        "4️⃣ – Upgrade subscription\n"
+        "5️⃣ – Link website account\n"
+        "6️⃣ – Help / how to use this bot\n\n"
+        "You can also type your tax question directly at any time."
     )
     send_telegram_text(chat_id, menu)
 
 
+def _send_help(chat_id: str):
+    help_msg = (
+        "*How to use Naija Tax Guide* 🤖\n\n"
+        "• *Ask tax questions*: Just type your question naturally\n"
+        "  Example: 'What is PAYE tax?' or 'When is VAT due?'\n\n"
+        "• *Get your AI credits balance*: Reply with 2\n\n"
+        "• *Check your plan*: Reply with 3\n\n"
+        "• *Upgrade subscription*: Reply with 4\n\n"
+        "• *Link Telegram to website*: Reply with 5\n\n"
+        "• *Show this menu again*: Reply with 6\n\n"
+        "Need more help? Visit our website or contact support."
+    )
+    send_telegram_text(chat_id, help_msg)
+
+
+def _send_welcome(chat_id: str):
+    welcome = (
+        "Welcome to Naija Tax Guide ✅\n\n"
+        "Reply with:\n"
+        "1 – Ask a tax question\n"
+        "2 – Check AI credits balance\n"
+        "3 – Check current plan\n"
+        "4 – Upgrade subscription\n"
+        "5 – Link website account\n"
+        "6 – Help / how to use this bot\n\n"
+        "You can also type your tax question directly at any time."
+    )
+    send_telegram_text(chat_id, welcome)
+
+
 @bp.post("/telegram/webhook")
 def tg_webhook():
-    """
-    Telegram webhook handler - Channel-first approach:
-    - Answers tax questions immediately (no linking required)
-    - Optional linking for web account integration
-    - Menu support with '7', 'menu', 'help', '/start'
-    """
     update = request.get_json(silent=True) or {}
 
-    # Handle callback queries if needed
     if update.get("callback_query"):
         return jsonify({"ok": True, "ignored": True})
 
@@ -97,45 +116,78 @@ def tg_webhook():
     if not tg_user_id or not chat_id:
         return jsonify({"ok": True, "ignored": True})
 
-    # Handle different message types
-    if not text:
-        send_telegram_text(chat_id, "Send your tax question as text and I will reply.\n\nSend '7' for menu.")
-        return jsonify({"ok": True})
-
-    # Ensure account exists for tracking (not required for answering)
+    # Ensure account exists
     upsert_account(provider="tg", provider_user_id=tg_user_id, display_name=display_name, phone=None)
     lk = lookup_account(provider="tg", provider_user_id=tg_user_id)
 
-    # Handle menu request (/start, 7, menu, help)
-    if MENU_RE.match(text) or text.lower() == "/start":
-        _send_menu(chat_id)
-        return jsonify({"ok": True, "menu": True})
+    account_id = lk.get("account_id") or tg_user_id
 
-    # Handle linking code (OPTIONAL)
+    # Send welcome for new users with no text
+    if not text:
+        _send_welcome(chat_id)
+        return jsonify({"ok": True})
+
+    # Handle numbered menu options
+    if MENU_NUMBER_RE.match(text):
+        option = int(text)
+        
+        if option == 1:
+            send_telegram_text(chat_id, "Please type your tax question and I'll answer it.")
+            return jsonify({"ok": True})
+        
+        elif option == 2:
+            send_telegram_text(chat_id, "🔍 *AI Credits Balance*\n\nYou have 0 credits remaining.\n\nTo get more credits, upgrade your plan or purchase additional credits on the website.")
+            return jsonify({"ok": True})
+        
+        elif option == 3:
+            send_telegram_text(chat_id, "📋 *Your Current Plan*\n\nPlan: Free\nAI Credits: 0/month\nDaily Questions: Limited\n\nUpgrade for more features and unlimited questions!")
+            return jsonify({"ok": True})
+        
+        elif option == 4:
+            send_telegram_text(chat_id, "💎 *Upgrade Your Plan*\n\nVisit our website to upgrade:\nhttps://www.naijataxguides.com/plans")
+            return jsonify({"ok": True})
+        
+        elif option == 5:
+            send_telegram_text(
+                chat_id,
+                "🔗 *Link to Website*\n\n"
+                "1. Login to your account on our website\n"
+                "2. Go to Settings → Telegram Linking\n"
+                "3. Generate an 8-character code\n"
+                "4. Send that code here\n\n"
+                "Once linked, your Telegram will be connected to your web account!"
+            )
+            return jsonify({"ok": True})
+        
+        elif option == 6:
+            _send_help(chat_id)
+            return jsonify({"ok": True})
+
+    # Handle linking code
     if LINK_CODE_RE.match(text.upper()):
         attempt = _try_consume_link_code(tg_user_id, text)
         if attempt.get("ok"):
             send_telegram_text(
                 chat_id,
                 "✅ *Telegram linked successfully!*\n\n"
-                "Your account is now connected to the web.\n"
-                "You can still ask tax questions anytime.\n\n"
-                "Send '7' for menu."
+                "Your account is now connected to the web."
             )
-            return jsonify({"ok": True, "linked": True, "linked_now": True})
+            return jsonify({"ok": True, "linked": True})
         else:
             send_telegram_text(
                 chat_id,
                 "❌ *Invalid link code*\n\n"
-                "Generate a new code on the website and try again.\n\n"
-                "Send '7' to see the menu."
+                "Please generate a new code on the website and try again.\n\n"
+                "Reply with 6 for help."
             )
             return jsonify({"ok": True, "linked": False})
 
-    # Get account_id from lookup
-    account_id = lk.get("account_id") or tg_user_id
+    # Handle help variations
+    if text.lower() in ["help", "menu", "start", "/start", "?"]:
+        _send_main_menu(chat_id)
+        return jsonify({"ok": True})
 
-    # Answer tax question directly (NO LINKING REQUIRED!)
+    # Answer tax question directly
     try:
         result = ask_guarded({
             "question": text,
@@ -149,28 +201,13 @@ def tg_webhook():
             if answer:
                 send_telegram_text(chat_id, answer)
             else:
-                send_telegram_text(chat_id, "I couldn't find an answer to that question. Please try rephrasing.\n\nSend '7' for menu.")
+                send_telegram_text(chat_id, "I couldn't find an answer to that question. Please try rephrasing.\n\nReply with 6 for help.")
         else:
-            error = result.get("error", "unknown_error")
-            send_telegram_text(
-                chat_id,
-                f"Sorry, I encountered an error. Please try again later.\n\nSend '7' for menu."
-            )
-
-        # Add helpful tip for new users (only if not already linked)
-        if not lk.get("linked"):
-            send_telegram_text(
-                chat_id,
-                "\n💡 *Tip:* Send '7' anytime to see the menu.\n"
-                "To link with your web account, send your 8-character link code."
-            )
+            send_telegram_text(chat_id, "Sorry, I encountered an error. Please try again later.\n\nReply with 6 for help.")
 
         return jsonify({"ok": True, "answered": True})
 
     except Exception as e:
         logging.exception(f"TG webhook error: {e}")
-        send_telegram_text(
-            chat_id,
-            "Sorry, I encountered an error. Please try again later.\n\nSend '7' for menu."
-        )
+        send_telegram_text(chat_id, "Sorry, I encountered an error. Please try again later.")
         return jsonify({"ok": True})
