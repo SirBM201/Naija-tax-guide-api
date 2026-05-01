@@ -1,7 +1,6 @@
 # app/routes/telegram.py
 from __future__ import annotations
 
-import os
 import re
 import logging
 from flask import Blueprint, request, jsonify
@@ -10,11 +9,18 @@ from app.services.accounts_service import upsert_account, lookup_account
 from app.core.supabase_client import supabase
 from app.services.ask_service import ask_guarded
 from app.services.outbound_service import send_telegram_text
+from app.services.channel_credit_service import (
+    get_credit_balance,
+    get_credit_packages_menu,
+    validate_package_number,
+    create_credit_payment,
+    format_balance_message
+)
 
 bp = Blueprint("telegram", __name__)
 
 LINK_CODE_RE = re.compile(r"^[A-Z0-9]{8}$")
-MENU_NUMBER_RE = re.compile(r"^[1-6]$")
+MENU_NUMBER_RE = re.compile(r"^[1-7]$")
 
 
 def _try_consume_link_code(provider_user_id: str, raw_text: str) -> dict:
@@ -57,7 +63,8 @@ def _send_main_menu(chat_id: str):
         "3️⃣ – Check current plan\n"
         "4️⃣ – Upgrade subscription\n"
         "5️⃣ – Link website account\n"
-        "6️⃣ – Help / how to use this bot\n\n"
+        "6️⃣ – Buy AI credits\n"
+        "7️⃣ – Help / how to use\n\n"
         "You can also type your tax question directly at any time."
     )
     send_telegram_text(chat_id, menu)
@@ -68,12 +75,13 @@ def _send_help(chat_id: str):
         "*How to use Naija Tax Guide* 🤖\n\n"
         "• *Ask tax questions*: Just type your question naturally\n"
         "  Example: 'What is PAYE tax?' or 'When is VAT due?'\n\n"
-        "• *Get your AI credits balance*: Reply with 2\n\n"
+        "• *Check credits*: Reply with 2\n\n"
         "• *Check your plan*: Reply with 3\n\n"
         "• *Upgrade subscription*: Reply with 4\n\n"
         "• *Link Telegram to website*: Reply with 5\n\n"
-        "• *Show this menu again*: Reply with 6\n\n"
-        "Need more help? Visit our website or contact support."
+        "• *Buy AI credits*: Reply with 6\n\n"
+        "• *Show this menu again*: Reply with 7\n\n"
+        "Need more help? Email support@naijataxguides.com"
     )
     send_telegram_text(chat_id, help_msg)
 
@@ -87,7 +95,8 @@ def _send_welcome(chat_id: str):
         "3 – Check current plan\n"
         "4 – Upgrade subscription\n"
         "5 – Link website account\n"
-        "6 – Help / how to use this bot\n\n"
+        "6 – Buy AI credits\n"
+        "7 – Help / how to use\n\n"
         "You can also type your tax question directly at any time."
     )
     send_telegram_text(chat_id, welcome)
@@ -120,11 +129,20 @@ def tg_webhook():
     upsert_account(provider="tg", provider_user_id=tg_user_id, display_name=display_name, phone=None)
     lk = lookup_account(provider="tg", provider_user_id=tg_user_id)
 
+    if not lk.get("ok"):
+        send_telegram_text(chat_id, "System error. Please try again.")
+        return jsonify({"ok": True})
+
     account_id = lk.get("account_id") or tg_user_id
 
     # Send welcome for new users with no text
     if not text:
         _send_welcome(chat_id)
+        return jsonify({"ok": True})
+
+    # Handle /start command
+    if text.lower() == "/start":
+        _send_main_menu(chat_id)
         return jsonify({"ok": True})
 
     # Handle numbered menu options
@@ -136,15 +154,30 @@ def tg_webhook():
             return jsonify({"ok": True})
         
         elif option == 2:
-            send_telegram_text(chat_id, "🔍 *AI Credits Balance*\n\nYou have 0 credits remaining.\n\nTo get more credits, upgrade your plan or purchase additional credits on the website.")
+            # Check AI credits balance
+            balance = get_credit_balance(account_id)
+            send_telegram_text(chat_id, format_balance_message(balance))
             return jsonify({"ok": True})
         
         elif option == 3:
-            send_telegram_text(chat_id, "📋 *Your Current Plan*\n\nPlan: Free\nAI Credits: 0/month\nDaily Questions: Limited\n\nUpgrade for more features and unlimited questions!")
+            send_telegram_text(
+                chat_id,
+                "📋 *Your Current Plan*\n\n"
+                "Plan: Free\n"
+                "AI Credits: 10/month\n"
+                "Daily Questions: Unlimited\n\n"
+                "Reply with 6 to buy more credits."
+            )
             return jsonify({"ok": True})
         
         elif option == 4:
-            send_telegram_text(chat_id, "💎 *Upgrade Your Plan*\n\nVisit our website to upgrade:\nhttps://www.naijataxguides.com/plans")
+            send_telegram_text(
+                chat_id,
+                "💎 *Upgrade Your Plan*\n\n"
+                "Visit our website to upgrade:\n"
+                "https://www.naijataxguides.com/plans\n\n"
+                "Or reply with 6 to buy credits."
+            )
             return jsonify({"ok": True})
         
         elif option == 5:
@@ -160,8 +193,28 @@ def tg_webhook():
             return jsonify({"ok": True})
         
         elif option == 6:
-            _send_help(chat_id)
+            # Buy AI Credits
+            credit_menu = get_credit_packages_menu()
+            send_telegram_text(chat_id, credit_menu)
             return jsonify({"ok": True})
+        
+        elif option == 7:
+            _send_main_menu(chat_id)
+            return jsonify({"ok": True})
+
+    # Handle credit package selection
+    if text in ["1", "2", "3", "4"]:
+        package_num = int(text)
+        package = validate_package_number(package_num)
+        if package:
+            result = create_credit_payment(account_id, package_num, "telegram", str(tg_user_id))
+            if result.get("ok"):
+                send_telegram_text(chat_id, result["message"])
+            else:
+                send_telegram_text(chat_id, f"❌ {result.get('message', 'Please try again.')}")
+        else:
+            send_telegram_text(chat_id, "❌ Invalid package number. Please select 1-4.\n\nSend 6 to see available packages.")
+        return jsonify({"ok": True})
 
     # Handle linking code
     if LINK_CODE_RE.match(text.upper()):
@@ -170,7 +223,8 @@ def tg_webhook():
             send_telegram_text(
                 chat_id,
                 "✅ *Telegram linked successfully!*\n\n"
-                "Your account is now connected to the web."
+                "Your account is now connected to the web.\n"
+                "You can now access your history and credits from the website."
             )
             return jsonify({"ok": True, "linked": True})
         else:
@@ -178,12 +232,12 @@ def tg_webhook():
                 chat_id,
                 "❌ *Invalid link code*\n\n"
                 "Please generate a new code on the website and try again.\n\n"
-                "Reply with 6 for help."
+                "Reply with 7 for help."
             )
             return jsonify({"ok": True, "linked": False})
 
     # Handle help variations
-    if text.lower() in ["help", "menu", "start", "/start", "?"]:
+    if text.lower() in ["help", "menu", "?"]:
         _send_main_menu(chat_id)
         return jsonify({"ok": True})
 
@@ -201,9 +255,12 @@ def tg_webhook():
             if answer:
                 send_telegram_text(chat_id, answer)
             else:
-                send_telegram_text(chat_id, "I couldn't find an answer to that question. Please try rephrasing.\n\nReply with 6 for help.")
+                send_telegram_text(chat_id, "I couldn't find an answer to that question. Please try rephrasing.\n\nReply with 7 for help.")
         else:
-            send_telegram_text(chat_id, "Sorry, I encountered an error. Please try again later.\n\nReply with 6 for help.")
+            send_telegram_text(
+                chat_id,
+                "Sorry, I encountered an error. Please try again later.\n\nReply with 7 for help."
+            )
 
         return jsonify({"ok": True, "answered": True})
 
