@@ -24,11 +24,10 @@ from app.services.channel_subscription_service import (
     get_user_subscription,
     format_subscription_message,
     get_user_email,
-    store_user_email,
     request_email_message,
     detect_plan_from_text,
     has_active_subscription,
-    get_credit_balance_with_subscription
+    activate_subscription
 )
 
 bp = Blueprint("whatsapp", __name__)
@@ -141,19 +140,27 @@ def _send_welcome(phone: str):
     send_whatsapp_text(phone, welcome)
 
 
-@bp.get("/whatsapp/webhook")
-def wa_webhook_verify():
-    mode = request.args.get("hub.mode")
-    token = request.args.get("hub.verify_token")
-    challenge = request.args.get("hub.challenge")
+@bp.route("/whatsapp/webhook", methods=["GET", "POST"])
+def wa_webhook():
+    """Handle WhatsApp webhook - supports both GET (verification) and POST (messages)"""
+    
+    # GET request - Meta/WhatsApp verification
+    if request.method == "GET":
+        mode = request.args.get("hub.mode")
+        token = request.args.get("hub.verify_token")
+        challenge = request.args.get("hub.challenge")
 
-    if mode == "subscribe" and token and WA_VERIFY_TOKEN and token == WA_VERIFY_TOKEN:
-        return (challenge or ""), 200
-    return "Forbidden", 403
+        if mode == "subscribe" and token and WA_VERIFY_TOKEN and token == WA_VERIFY_TOKEN:
+            return challenge, 200
+        return "Forbidden", 403
+    
+    # POST request - incoming messages
+    if request.method == "POST":
+        return _handle_whatsapp_message()
 
 
-@bp.post("/whatsapp/webhook")
-def wa_webhook_receive():
+def _handle_whatsapp_message():
+    """Handle incoming WhatsApp messages"""
     global user_states
     body = request.get_json(silent=True) or {}
 
@@ -207,7 +214,7 @@ def wa_webhook_receive():
                 send_whatsapp_text(from_phone, "❌ Invalid email. Send a valid email or 'cancel' to abort.")
             return jsonify({"ok": True})
 
-        # Check if user has active subscription for unlimited credits
+        # Check if user has active subscription
         has_subscription = has_active_subscription(account_id)
         
         # Handle numbered menu options
@@ -219,13 +226,12 @@ def wa_webhook_receive():
                 return jsonify({"ok": True})
             
             elif option == 2:
-                # Check credits - show unlimited if subscribed
                 if has_subscription:
                     sub = get_user_subscription(account_id)
                     send_whatsapp_text(
                         from_phone,
                         f"💎 *UNLIMITED AI ACCESS* ✅\n\n"
-                        f"You have an active {sub.get('plan_code', '').replace('_', ' ').title()} subscription.\n\n"
+                        f"You have an active subscription.\n\n"
                         f"✨ No credit limits! Ask as many tax questions as you want.\n\n"
                         f"Reply with 3 to view your plan details."
                     )
@@ -235,13 +241,11 @@ def wa_webhook_receive():
                 return jsonify({"ok": True})
             
             elif option == 3:
-                # Check subscription plan
                 message = format_subscription_message(account_id)
                 send_whatsapp_text(from_phone, message)
                 return jsonify({"ok": True})
             
             elif option == 4:
-                # View all subscription plans
                 plans_menu = get_plans_list_menu()
                 send_whatsapp_text(from_phone, plans_menu)
                 return jsonify({"ok": True})
@@ -259,12 +263,11 @@ def wa_webhook_receive():
                 return jsonify({"ok": True})
             
             elif option == 6:
-                # Buy credits - but if subscribed, they don't need credits
                 if has_subscription:
                     send_whatsapp_text(
                         from_phone,
                         "✨ You have an active subscription with UNLIMITED credits!\n\n"
-                        "No need to buy credits - you can ask unlimited tax questions.\n\n"
+                        "No need to buy credits.\n\n"
                         "Reply with 3 to view your plan details."
                     )
                 else:
@@ -276,7 +279,7 @@ def wa_webhook_receive():
                 _send_main_menu(from_phone)
                 return jsonify({"ok": True})
 
-        # Handle credit package selection (1-4)
+        # Handle credit package selection
         if not has_subscription and text in ["1", "2", "3", "4"]:
             package_num = int(text)
             package = validate_package_number(package_num)
@@ -290,7 +293,7 @@ def wa_webhook_receive():
                 send_whatsapp_text(from_phone, "❌ Invalid package. Send 6 to see packages.")
             return jsonify({"ok": True})
 
-        # Handle subscription plan selection (by number, name, or amount)
+        # Handle subscription plan selection
         plan_num, detected_plan = detect_plan_from_text(text)
         
         if detected_plan:
