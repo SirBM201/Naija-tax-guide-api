@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import uuid
+import os
 import logging
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
@@ -60,6 +61,43 @@ def validate_package_number(package_num: int) -> Optional[Dict[str, Any]]:
     return CREDIT_PACKAGES.get(package_num)
 
 
+def get_or_create_account_id(channel_type: str, provider_user_id: str) -> str:
+    """
+    Get or create an account ID for a channel user (WhatsApp/Telegram)
+    This ensures every user has an account_id even without email
+    """
+    try:
+        # Look up existing account
+        result = _sb().table("accounts") \
+            .select("account_id") \
+            .eq("provider", channel_type) \
+            .eq("provider_user_id", provider_user_id) \
+            .limit(1) \
+            .execute()
+        
+        if result.data:
+            account_id = result.data[0].get("account_id")
+            if account_id:
+                return account_id
+        
+        # Create new account if none exists
+        new_account_id = str(uuid.uuid4())
+        _sb().table("accounts").insert({
+            "id": new_account_id,
+            "account_id": new_account_id,
+            "provider": channel_type,
+            "provider_user_id": provider_user_id,
+            "created_at": datetime.now(timezone.utc).isoformat()
+        }).execute()
+        
+        return new_account_id
+        
+    except Exception as e:
+        logger.error(f"Error getting/creating account: {e}")
+        # Fallback: use provider_user_id as identifier
+        return provider_user_id
+
+
 def create_credit_payment(
     account_id: str, 
     package_num: int, 
@@ -67,7 +105,7 @@ def create_credit_payment(
     provider_user_id: str
 ) -> Dict[str, Any]:
     """
-    Create a Paystack payment for credit purchase
+    Create a Paystack payment for credit purchase (NO EMAIL REQUIRED)
     
     Args:
         account_id: The user's account ID
@@ -90,9 +128,8 @@ def create_credit_payment(
     amount_kobo = package["amount_kobo"]
     credits = package["credits"]
     amount_ngn = package["amount_ngn"]
-    callback_url = os.getenv("PAYSTACK_CALLBACK_URL", "https://www.naijataxguides.com/billing")
     
-    # Store transaction record
+    # Store transaction record with channel user info
     try:
         _sb().table("paystack_transactions").insert({
             "reference": reference,
@@ -115,10 +152,10 @@ def create_credit_payment(
         logger.error(f"Error storing transaction: {e}")
     
     try:
-        # Initialize Paystack transaction
+        # Initialize Paystack transaction with NO EMAIL (pass None)
         result = initialize_transaction(
             amount=amount_kobo,
-            email=None,
+            email=None,  # ✅ NO EMAIL REQUIRED
             reference=reference,
             metadata={
                 "account_id": account_id,
@@ -127,8 +164,7 @@ def create_credit_payment(
                 "type": "credit_purchase",
                 "channel_type": channel_type,
                 "provider_user_id": provider_user_id
-            },
-            callback_url=callback_url
+            }
         )
         
         if result.get("status") and result.get("data", {}).get("authorization_url"):
@@ -138,13 +174,14 @@ def create_credit_payment(
                 "reference": reference,
                 "amount_ngn": amount_ngn,
                 "credits": credits,
-                "message": f"💰 *Payment Link*\n\nClick to pay ₦{amount_ngn:,} for {credits} AI credits:\n\n{result['data']['authorization_url']}\n\nAfter payment, your credits will be added automatically."
+                "message": f"💰 *Payment Link*\n\nClick to pay ₦{amount_ngn:,} for {credits} AI credits:\n\n{result['data']['authorization_url']}\n\n✅ After payment, your credits will be added automatically.\n\n💡 No email needed - we'll identify you via WhatsApp!"
             }
         else:
+            error_msg = result.get("message", "Payment initialization failed")
             return {
                 "ok": False,
                 "error": "payment_link_failed",
-                "message": "Could not generate payment link. Please try again later."
+                "message": f"Could not generate payment link: {error_msg}\n\nPlease try again later."
             }
     except Exception as e:
         logger.error(f"Error creating payment link: {e}")
@@ -201,9 +238,43 @@ def format_balance_message(balance: int) -> str:
     if balance == 0:
         return ("💎 *AI Credits Balance*\n\n"
                 "You have *0 credits* remaining.\n\n"
+                "Each credit = 1 AI tax question.\n\n"
                 "To buy credits, reply with 6.")
     else:
         return (f"💎 *AI Credits Balance*\n\n"
                 f"You have *{balance} credits* remaining.\n\n"
                 f"Each credit = 1 AI tax question.\n\n"
                 f"To buy more credits, reply with 6.")
+
+
+def get_user_email_status(account_id: str) -> Dict[str, Any]:
+    """
+    Optional: Check if user has an email associated with their account
+    This can be used to optionally request email only if needed
+    """
+    try:
+        result = _sb().table("accounts") \
+            .select("email") \
+            .eq("account_id", account_id) \
+            .limit(1) \
+            .execute()
+        
+        if result.data and result.data[0].get("email"):
+            return {"has_email": True, "email": result.data[0]["email"]}
+        return {"has_email": False, "email": None}
+    except Exception as e:
+        logger.error(f"Error checking email status: {e}")
+        return {"has_email": False, "email": None}
+
+
+def request_email_optional(account_id: str, channel_type: str, provider_user_id: str) -> str:
+    """
+    Optional: Politely ask for email only for receipt delivery
+    This does NOT block payment processing
+    """
+    return (
+        "📧 *Optional: Email for Receipts*\n\n"
+        "To receive payment receipts via email (optional), reply with your email address.\n\n"
+        "Or reply 'skip' to continue without email.\n\n"
+        "Your credits will be added either way after payment."
+    )
