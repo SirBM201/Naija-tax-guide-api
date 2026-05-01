@@ -59,7 +59,7 @@ def get_plans_from_db() -> Dict[int, Dict[str, Any]]:
                 "amount_kobo": row.get("price", 0) * 100,
                 "credits": credits,
                 "monthly_credits": monthly_credits,
-                "daily_limit": row.get("daily_answers_limit", 0),
+                "daily_limit": 0,  # NO DAILY LIMIT - unlimited for subscribers
                 "duration_days": duration_days,
                 "billing_cycle": billing_cycle,
                 "cycle_text": f"per {billing_cycle}",
@@ -76,22 +76,11 @@ def get_plans_from_db() -> Dict[int, Dict[str, Any]]:
         return plans
     except Exception as e:
         logger.error(f"Error fetching plans: {e}")
-        # Fallback plans
-        return {
-            1: {"code": "starter_monthly", "name": "Starter", "full_name": "Starter Monthly", "amount_ngn": 5000, "amount_kobo": 500000, "credits": 100, "monthly_credits": 100, "daily_limit": 10, "duration_days": 30, "billing_cycle": "monthly", "cycle_text": "per month", "keywords": ["starter", "starter monthly", "monthly"]},
-            2: {"code": "starter_quarterly", "name": "Starter", "full_name": "Starter Quarterly", "amount_ngn": 14000, "amount_kobo": 1400000, "credits": 300, "monthly_credits": 100, "daily_limit": 10, "duration_days": 90, "billing_cycle": "quarterly", "cycle_text": "per quarter", "keywords": ["starter", "starter quarterly", "quarterly"]},
-            3: {"code": "starter_yearly", "name": "Starter", "full_name": "Starter Yearly", "amount_ngn": 51000, "amount_kobo": 5100000, "credits": 1200, "monthly_credits": 100, "daily_limit": 10, "duration_days": 365, "billing_cycle": "yearly", "cycle_text": "per year", "keywords": ["starter", "starter yearly", "yearly"]},
-            4: {"code": "professional_monthly", "name": "Professional", "full_name": "Professional Monthly", "amount_ngn": 12000, "amount_kobo": 1200000, "credits": 300, "monthly_credits": 300, "daily_limit": 20, "duration_days": 30, "billing_cycle": "monthly", "cycle_text": "per month", "keywords": ["professional", "professional monthly", "monthly"]},
-            5: {"code": "professional_quarterly", "name": "Professional", "full_name": "Professional Quarterly", "amount_ngn": 33600, "amount_kobo": 3360000, "credits": 900, "monthly_credits": 300, "daily_limit": 20, "duration_days": 90, "billing_cycle": "quarterly", "cycle_text": "per quarter", "keywords": ["professional", "professional quarterly", "quarterly"]},
-            6: {"code": "professional_yearly", "name": "Professional", "full_name": "Professional Yearly", "amount_ngn": 122400, "amount_kobo": 12240000, "credits": 3600, "monthly_credits": 300, "daily_limit": 20, "duration_days": 365, "billing_cycle": "yearly", "cycle_text": "per year", "keywords": ["professional", "professional yearly", "yearly"]},
-            7: {"code": "business_monthly", "name": "Business", "full_name": "Business Monthly", "amount_ngn": 25000, "amount_kobo": 2500000, "credits": 800, "monthly_credits": 800, "daily_limit": 50, "duration_days": 30, "billing_cycle": "monthly", "cycle_text": "per month", "keywords": ["business", "business monthly", "monthly"]},
-            8: {"code": "business_quarterly", "name": "Business", "full_name": "Business Quarterly", "amount_ngn": 70000, "amount_kobo": 7000000, "credits": 2400, "monthly_credits": 800, "daily_limit": 50, "duration_days": 90, "billing_cycle": "quarterly", "cycle_text": "per quarter", "keywords": ["business", "business quarterly", "quarterly"]},
-            9: {"code": "business_yearly", "name": "Business", "full_name": "Business Yearly", "amount_ngn": 255000, "amount_kobo": 25500000, "credits": 9600, "monthly_credits": 800, "daily_limit": 50, "duration_days": 365, "billing_cycle": "yearly", "cycle_text": "per year", "keywords": ["business", "business yearly", "yearly"]},
-        }
+        return {}
 
 
 def get_plans_list_menu() -> str:
-    """Simple numbered list of all plans"""
+    """Simple numbered list of all plans - NO DAILY LIMIT displayed"""
     plans = get_plans_from_db()
     
     if not plans:
@@ -134,15 +123,6 @@ def detect_plan_from_text(text: str) -> Tuple[Optional[int], Optional[Dict[str, 
         if num in plans:
             return num, plans[num]
     
-    # Check by amount
-    import re
-    amount_match = re.search(r'(\d{4,})', text_lower)
-    if amount_match:
-        amount = int(amount_match.group(1))
-        for num, plan in plans.items():
-            if plan["amount_ngn"] == amount:
-                return num, plan
-    
     # Check by name keywords
     for num, plan in plans.items():
         for keyword in plan.get("keywords", []):
@@ -169,8 +149,21 @@ def get_user_email(account_id: str) -> Optional[str]:
 
 
 def store_user_email(account_id: str, email: str) -> bool:
-    """Store user's email for future subscription use"""
+    """Store user's email for future subscription use - handles duplicate gracefully"""
     try:
+        # Check if email already exists in another account
+        existing = _sb().table("accounts") \
+            .select("account_id, email") \
+            .eq("email", email.lower()) \
+            .execute()
+        
+        if existing.data:
+            # Email exists in another account - don't store, just return success
+            # The user can still proceed with subscription
+            logger.info(f"Email {email} already exists in another account")
+            return True
+        
+        # Update the user's account with email
         _sb().table("accounts") \
             .update({"email": email.lower()}) \
             .eq("account_id", account_id) \
@@ -178,7 +171,7 @@ def store_user_email(account_id: str, email: str) -> bool:
         return True
     except Exception as e:
         logger.error(f"Error storing email: {e}")
-        return False
+        return True  # Return True anyway - email is optional
 
 
 def request_email_message() -> str:
@@ -209,7 +202,7 @@ def create_subscription_payment(
             "plan": plan
         }
     
-    # Validate email
+    # Validate email format
     if "@" not in email or "." not in email or len(email) < 5:
         return {
             "ok": False,
@@ -220,7 +213,7 @@ def create_subscription_payment(
     reference = f"SUB_{plan['code']}_{uuid.uuid4().hex[:8]}"
     amount_kobo = plan["amount_kobo"]
     
-    # Store user's email
+    # Store user's email (handles duplicate gracefully)
     store_user_email(account_id, email)
     
     # Store transaction record
@@ -278,7 +271,7 @@ def create_subscription_payment(
                 "message": f"💎 *{plan['full_name']} Subscription*\n\n"
                           f"💰 Amount: ₦{plan['amount_ngn']:,}\n"
                           f"🎯 Credits: {plan['credits']} AI credits per {billing_display}\n"
-                          f"📊 Daily limit: {plan['daily_limit']} questions\n"
+                          f"✨ No daily limits - unlimited questions!\n"
                           f"🔄 Auto-renews {plan['billing_cycle']}\n\n"
                           f"🔗 Click to pay:\n{result['data']['authorization_url']}\n\n"
                           f"✅ Payment confirms your subscription\n"
@@ -307,10 +300,13 @@ def activate_subscription(account_id: str, plan_code: str, reference: str) -> Di
         # Determine duration and get plan details
         if "yearly" in plan_code:
             duration_days = 365
+            billing_cycle = "yearly"
         elif "quarterly" in plan_code:
             duration_days = 90
+            billing_cycle = "quarterly"
         else:
             duration_days = 30
+            billing_cycle = "monthly"
         
         current_period_end = (now + timedelta(days=duration_days)).isoformat()
         now_iso = now.isoformat()
@@ -355,7 +351,7 @@ def activate_subscription(account_id: str, plan_code: str, reference: str) -> Di
             }).execute()
         
         logger.info(f"Subscription activated for account {account_id}: {plan_code} until {current_period_end}")
-        return {"ok": True, "plan_code": plan_code, "expires_at": current_period_end, "duration_days": duration_days}
+        return {"ok": True, "plan_code": plan_code, "expires_at": current_period_end, "duration_days": duration_days, "billing_cycle": billing_cycle}
         
     except Exception as e:
         logger.error(f"Error activating subscription: {e}")
@@ -402,7 +398,7 @@ def has_active_subscription(account_id: str) -> bool:
 
 
 def format_subscription_message(account_id: str) -> str:
-    """Format subscription status message - shows actual credits"""
+    """Format subscription status message - NO DAILY LIMIT for subscribers"""
     subscription = get_user_subscription(account_id)
     
     if subscription and subscription.get("is_active"):
@@ -416,13 +412,11 @@ def format_subscription_message(account_id: str) -> str:
             plan_name = plan["full_name"]
             credits = plan["credits"]
             monthly_credits = plan.get("monthly_credits", credits)
-            daily_limit = plan.get("daily_limit", 0)
             billing_cycle = plan.get("billing_cycle", "monthly")
         else:
             plan_name = plan_code.replace("_", " ").title()
             credits = "?"
             monthly_credits = "?"
-            daily_limit = "?"
             billing_cycle = "monthly"
         
         expiry_text = ""
@@ -433,21 +427,21 @@ def format_subscription_message(account_id: str) -> str:
             except:
                 pass
         
-        # Format credit display based on billing cycle
+        # Format credit display based on billing cycle - NO DAILY LIMIT
         if billing_cycle == "monthly":
             credit_display = f"{credits} AI credits per month"
-            access_text = f"You have {credits} AI credits to use this month."
+            access_text = f"✨ You have {credits} AI credits to use this month."
         elif billing_cycle == "quarterly":
             credit_display = f"{credits} AI credits per quarter ({monthly_credits} per month)"
-            access_text = f"You have {credits} AI credits to use over the next 3 months."
+            access_text = f"✨ You have {credits} AI credits to use over the next 3 months."
         else:  # yearly
             credit_display = f"{credits} AI credits per year ({monthly_credits} per month)"
-            access_text = f"You have {credits} AI credits to use over the next year."
+            access_text = f"✨ You have {credits} AI credits to use over the next year."
         
         return (f"📋 *YOUR SUBSCRIPTION*\n\n"
                 f"✅ Plan: {plan_name}\n"
                 f"🎯 Credits: {credit_display}\n"
-                f"📊 Daily limit: {daily_limit} questions/day\n"
+                f"📊 Daily limit: Unlimited ✨\n"
                 f"{expiry_text}\n\n"
                 f"{access_text}\n"
                 f"🔄 Auto-renews {billing_cycle}\n\n"
