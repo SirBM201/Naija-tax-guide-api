@@ -244,6 +244,7 @@ def create_app() -> Flask:
         "app.routes.history",
         "app.routes.support",
         "app.routes.channel",
+        "app.routes.channel_payment_return",
     ]
 
     for dotted in required_modules:
