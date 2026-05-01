@@ -18,7 +18,7 @@ from app.services.channel_credit_service import (
     format_balance_message
 )
 from app.services.channel_subscription_service import (
-    get_subscription_plans_menu,
+    get_plans_list_menu,
     validate_plan_number,
     create_subscription_payment,
     get_user_subscription,
@@ -34,7 +34,7 @@ WA_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "").strip()
 LINK_CODE_RE = re.compile(r"^[A-Z0-9]{8}$")
 MENU_NUMBER_RE = re.compile(r"^[1-7]$")
 
-# Track user states for multi-step flows (in production, use Redis or database)
+# Track user states for multi-step flows
 user_states = {}
 
 
@@ -95,7 +95,7 @@ def _send_main_menu(phone: str):
         "1️⃣ – Ask a tax question\n"
         "2️⃣ – Check AI credits balance\n"
         "3️⃣ – Check current plan\n"
-        "4️⃣ – Upgrade subscription\n"
+        "4️⃣ – View & upgrade subscription plans\n"
         "5️⃣ – Link website account\n"
         "6️⃣ – Buy AI credits\n"
         "7️⃣ – Help / how to use\n\n"
@@ -111,7 +111,7 @@ def _send_help(phone: str):
         "  Example: 'What is PAYE tax?' or 'When is VAT due?'\n\n"
         "• *Check credits*: Reply with 2\n\n"
         "• *Check your plan*: Reply with 3\n\n"
-        "• *Upgrade subscription*: Reply with 4\n\n"
+        "• *View/upgrade subscription*: Reply with 4\n\n"
         "• *Link WhatsApp to website*: Reply with 5\n\n"
         "• *Buy AI credits*: Reply with 6\n\n"
         "• *Show this menu again*: Reply with 7\n\n"
@@ -127,7 +127,7 @@ def _send_welcome(phone: str):
         "1 – Ask a tax question\n"
         "2 – Check AI credits balance\n"
         "3 – Check current plan\n"
-        "4 – Upgrade subscription\n"
+        "4 – View & upgrade subscription plans\n"
         "5 – Link website account\n"
         "6 – Buy AI credits\n"
         "7 – Help / how to use\n\n"
@@ -176,13 +176,12 @@ def wa_webhook_receive():
         # Handle email collection for subscription (awaiting_email state)
         if user_state.get("awaiting_email"):
             email = text.strip().lower()
-            plan_num = user_state.get("pending_plan_num")
+            plan_code = user_state.get("pending_plan_code")
             
             if "@" in email and "." in email:
-                # Valid email, create subscription
                 result = create_subscription_payment(
                     account_id=account_id,
-                    plan_num=plan_num,
+                    plan_identifier=plan_code,
                     channel_type="whatsapp",
                     provider_user_id=from_phone,
                     email=email
@@ -221,17 +220,9 @@ def wa_webhook_receive():
                 return jsonify({"ok": True})
             
             elif option == 4:
-                # Upgrade subscription
-                current_sub = get_user_subscription(account_id)
-                if current_sub:
-                    send_whatsapp_text(from_phone, format_subscription_message(current_sub))
-                    send_whatsapp_text(
-                        from_phone,
-                        "To upgrade or change your plan, please visit our website:\nhttps://www.naijataxguides.com/plans\n\nOr contact support."
-                    )
-                else:
-                    plans_menu = get_subscription_plans_menu()
-                    send_whatsapp_text(from_phone, plans_menu)
+                # View all subscription plans
+                plans_menu = get_plans_list_menu()
+                send_whatsapp_text(from_phone, plans_menu)
                 return jsonify({"ok": True})
             
             elif option == 5:
@@ -270,18 +261,16 @@ def wa_webhook_receive():
                 send_whatsapp_text(from_phone, "❌ Invalid package number. Please select 1-4.\n\nSend 6 to see available packages.")
             return jsonify({"ok": True})
 
-        # Handle subscription plan selection (1-3) - check if user has email
-        if text in ["1", "2", "3"]:
+        # Handle subscription plan selection (1-9 for all plans)
+        if text.isdigit() and 1 <= int(text) <= 9:
             plan_num = int(text)
             plan = validate_plan_number(plan_num)
             if plan:
-                # Check if user has an email
                 user_email = get_user_email(account_id)
                 if user_email:
-                    # User has email, create subscription directly
                     result = create_subscription_payment(
                         account_id=account_id,
-                        plan_num=plan_num,
+                        plan_identifier=plan_num,
                         channel_type="whatsapp",
                         provider_user_id=from_phone,
                         email=user_email
@@ -291,11 +280,10 @@ def wa_webhook_receive():
                     else:
                         send_whatsapp_text(from_phone, f"❌ {result.get('message', 'Please try again.')}")
                 else:
-                    # Need email first
-                    user_states[from_phone] = {"awaiting_email": True, "pending_plan_num": plan_num}
+                    user_states[from_phone] = {"awaiting_email": True, "pending_plan_code": plan["code"]}
                     send_whatsapp_text(from_phone, request_email_message())
             else:
-                send_whatsapp_text(from_phone, "❌ Invalid plan number. Please select 1-3.\n\nSend 4 to see available plans.")
+                send_whatsapp_text(from_phone, "❌ Invalid plan number. Please send 4 to see available plans.")
             return jsonify({"ok": True})
 
         # Handle linking code
