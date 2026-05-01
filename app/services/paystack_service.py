@@ -1,3 +1,4 @@
+# app/services/paystack_service.py
 from __future__ import annotations
 
 import hmac
@@ -126,17 +127,27 @@ def _build_channel_callback_url(
 
 def initialize_transaction(
     *,
-    email: str,
+    email: Optional[str] = None,  # ✅ Now optional for channel purchases
     amount_kobo: int,
     reference: str,
     metadata: Optional[Dict[str, Any]] = None,
     currency: Optional[str] = None,
     callback_url: Optional[str] = None,
 ) -> Dict[str, Any]:
-    email = (email or "").strip().lower()
-    if not email:
-        raise ValueError("missing_email")
-
+    """
+    Initialize a Paystack transaction.
+    
+    For channel purchases (WhatsApp/Telegram), email can be None.
+    Paystack will still accept the transaction without email.
+    
+    Args:
+        email: Optional - can be None for channel purchases
+        amount_kobo: Amount in kobo (e.g., 50000 = ₦500)
+        reference: Unique transaction reference
+        metadata: Additional data (channel_type, provider_user_id, etc.)
+        currency: Currency code (defaults to NGN)
+        callback_url: Optional callback URL after payment
+    """
     ref = (reference or "").strip()
     if not ref:
         raise ValueError("missing_reference")
@@ -147,13 +158,29 @@ def initialize_transaction(
 
     md = metadata or {}
 
+    # Build payload - email is optional for channel purchases
     payload: Dict[str, Any] = {
-        "email": email,
         "amount": kobo,
         "currency": (currency or PAYSTACK_CURRENCY or "NGN"),
         "reference": ref,
         "metadata": md,
     }
+    
+    # Only add email if provided (channel purchases can skip)
+    if email:
+        payload["email"] = email
+    else:
+        # For channel purchases without email, use a placeholder format
+        # But we don't require user to provide it
+        channel_type = _clean(md.get("channel_type"))
+        provider_user_id = _clean(md.get("provider_user_id"))
+        if channel_type and provider_user_id:
+            # Paystack accepts any string as email - we use a descriptive placeholder
+            # This ensures the transaction is tracked but user never needs to know
+            payload["email"] = f"{channel_type}_{provider_user_id}@whatsapp.ng"
+        else:
+            # Fallback - paystack will still accept but may show empty
+            payload["email"] = f"customer_{ref[:12]}@pay.ng"
 
     cb = _clean(callback_url)
     if not cb:
