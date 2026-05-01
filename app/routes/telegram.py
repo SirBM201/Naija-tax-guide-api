@@ -17,7 +17,7 @@ from app.services.channel_credit_service import (
     format_balance_message
 )
 from app.services.channel_subscription_service import (
-    get_subscription_plans_menu,
+    get_plans_list_menu,
     validate_plan_number,
     create_subscription_payment,
     get_user_subscription,
@@ -73,7 +73,7 @@ def _send_main_menu(chat_id: str):
         "1️⃣ – Ask a tax question\n"
         "2️⃣ – Check AI credits balance\n"
         "3️⃣ – Check current plan\n"
-        "4️⃣ – Upgrade subscription\n"
+        "4️⃣ – View & upgrade subscription plans\n"
         "5️⃣ – Link website account\n"
         "6️⃣ – Buy AI credits\n"
         "7️⃣ – Help / how to use\n\n"
@@ -89,7 +89,7 @@ def _send_help(chat_id: str):
         "  Example: 'What is PAYE tax?' or 'When is VAT due?'\n\n"
         "• *Check credits*: Reply with 2\n\n"
         "• *Check your plan*: Reply with 3\n\n"
-        "• *Upgrade subscription*: Reply with 4\n\n"
+        "• *View/upgrade subscription*: Reply with 4\n\n"
         "• *Link Telegram to website*: Reply with 5\n\n"
         "• *Buy AI credits*: Reply with 6\n\n"
         "• *Show this menu again*: Reply with 7\n\n"
@@ -105,7 +105,7 @@ def _send_welcome(chat_id: str):
         "1 – Ask a tax question\n"
         "2 – Check AI credits balance\n"
         "3 – Check current plan\n"
-        "4 – Upgrade subscription\n"
+        "4 – View & upgrade subscription plans\n"
         "5 – Link website account\n"
         "6 – Buy AI credits\n"
         "7 – Help / how to use\n\n"
@@ -163,12 +163,12 @@ def tg_webhook():
     # Handle email collection for subscription (awaiting_email state)
     if user_state.get("awaiting_email"):
         email = text.strip().lower()
-        plan_num = user_state.get("pending_plan_num")
+        plan_code = user_state.get("pending_plan_code")
         
         if "@" in email and "." in email:
             result = create_subscription_payment(
                 account_id=account_id,
-                plan_num=plan_num,
+                plan_identifier=plan_code,
                 channel_type="telegram",
                 provider_user_id=tg_user_id,
                 email=email
@@ -205,16 +205,8 @@ def tg_webhook():
             return jsonify({"ok": True})
         
         elif option == 4:
-            current_sub = get_user_subscription(account_id)
-            if current_sub:
-                send_telegram_text(chat_id_str, format_subscription_message(current_sub))
-                send_telegram_text(
-                    chat_id_str,
-                    "To upgrade or change your plan, please visit our website:\nhttps://www.naijataxguides.com/plans\n\nOr contact support."
-                )
-            else:
-                plans_menu = get_subscription_plans_menu()
-                send_telegram_text(chat_id_str, plans_menu)
+            plans_menu = get_plans_list_menu()
+            send_telegram_text(chat_id_str, plans_menu)
             return jsonify({"ok": True})
         
         elif option == 5:
@@ -252,8 +244,8 @@ def tg_webhook():
             send_telegram_text(chat_id_str, "❌ Invalid package number. Please select 1-4.\n\nSend 6 to see available packages.")
         return jsonify({"ok": True})
 
-    # Handle subscription plan selection (1-3)
-    if text in ["1", "2", "3"]:
+    # Handle subscription plan selection (1-9 for all plans)
+    if text.isdigit() and 1 <= int(text) <= 9:
         plan_num = int(text)
         plan = validate_plan_number(plan_num)
         if plan:
@@ -261,7 +253,7 @@ def tg_webhook():
             if user_email:
                 result = create_subscription_payment(
                     account_id=account_id,
-                    plan_num=plan_num,
+                    plan_identifier=plan_num,
                     channel_type="telegram",
                     provider_user_id=tg_user_id,
                     email=user_email
@@ -271,10 +263,10 @@ def tg_webhook():
                 else:
                     send_telegram_text(chat_id_str, f"❌ {result.get('message', 'Please try again.')}")
             else:
-                user_states[chat_id_str] = {"awaiting_email": True, "pending_plan_num": plan_num}
+                user_states[chat_id_str] = {"awaiting_email": True, "pending_plan_code": plan["code"]}
                 send_telegram_text(chat_id_str, request_email_message())
         else:
-            send_telegram_text(chat_id_str, "❌ Invalid plan number. Please select 1-3.\n\nSend 4 to see available plans.")
+            send_telegram_text(chat_id_str, "❌ Invalid plan number. Please send 4 to see available plans.")
         return jsonify({"ok": True})
 
     # Handle linking code
