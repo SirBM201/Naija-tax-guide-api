@@ -16,11 +16,23 @@ from app.services.channel_credit_service import (
     create_credit_payment,
     format_balance_message
 )
+from app.services.channel_subscription_service import (
+    get_subscription_plans_menu,
+    validate_plan_number,
+    create_subscription_payment,
+    get_user_subscription,
+    format_subscription_message,
+    get_user_email,
+    request_email_message
+)
 
 bp = Blueprint("telegram", __name__)
 
 LINK_CODE_RE = re.compile(r"^[A-Z0-9]{8}$")
 MENU_NUMBER_RE = re.compile(r"^[1-7]$")
+
+# Track user states for multi-step flows
+user_states = {}
 
 
 def _try_consume_link_code(provider_user_id: str, raw_text: str) -> dict:
@@ -104,6 +116,7 @@ def _send_welcome(chat_id: str):
 
 @bp.post("/telegram/webhook")
 def tg_webhook():
+    global user_states
     update = request.get_json(silent=True) or {}
 
     if update.get("callback_query"):
@@ -115,6 +128,7 @@ def tg_webhook():
 
     chat = msg.get("chat") or {}
     chat_id = chat.get("id")
+    chat_id_str = str(chat_id)
 
     text = (msg.get("text") or "").strip()
 
@@ -130,19 +144,46 @@ def tg_webhook():
     lk = lookup_account(provider="tg", provider_user_id=tg_user_id)
 
     if not lk.get("ok"):
-        send_telegram_text(chat_id, "System error. Please try again.")
+        send_telegram_text(chat_id_str, "System error. Please try again.")
         return jsonify({"ok": True})
 
     account_id = lk.get("account_id") or tg_user_id
+    user_state = user_states.get(chat_id_str, {})
 
     # Send welcome for new users with no text
     if not text:
-        _send_welcome(chat_id)
+        _send_welcome(chat_id_str)
         return jsonify({"ok": True})
 
     # Handle /start command
     if text.lower() == "/start":
-        _send_main_menu(chat_id)
+        _send_main_menu(chat_id_str)
+        return jsonify({"ok": True})
+
+    # Handle email collection for subscription (awaiting_email state)
+    if user_state.get("awaiting_email"):
+        email = text.strip().lower()
+        plan_num = user_state.get("pending_plan_num")
+        
+        if "@" in email and "." in email:
+            result = create_subscription_payment(
+                account_id=account_id,
+                plan_num=plan_num,
+                channel_type="telegram",
+                provider_user_id=tg_user_id,
+                email=email
+            )
+            
+            if result.get("ok"):
+                send_telegram_text(chat_id_str, result["message"])
+            else:
+                send_telegram_text(chat_id_str, f"❌ {result.get('message', 'Please try again.')}")
+            
+            # Clear state
+            user_states.pop(chat_id_str, None)
+        else:
+            send_telegram_text(chat_id_str, "❌ Invalid email address. Please send a valid email (e.g., example@gmail.com)")
+        
         return jsonify({"ok": True})
 
     # Handle numbered menu options
@@ -150,39 +191,35 @@ def tg_webhook():
         option = int(text)
         
         if option == 1:
-            send_telegram_text(chat_id, "Please type your tax question and I'll answer it.")
+            send_telegram_text(chat_id_str, "Please type your tax question and I'll answer it.")
             return jsonify({"ok": True})
         
         elif option == 2:
-            # Check AI credits balance
             balance = get_credit_balance(account_id)
-            send_telegram_text(chat_id, format_balance_message(balance))
+            send_telegram_text(chat_id_str, format_balance_message(balance))
             return jsonify({"ok": True})
         
         elif option == 3:
-            send_telegram_text(
-                chat_id,
-                "📋 *Your Current Plan*\n\n"
-                "Plan: Free\n"
-                "AI Credits: 10/month\n"
-                "Daily Questions: Unlimited\n\n"
-                "Reply with 6 to buy more credits."
-            )
+            current_sub = get_user_subscription(account_id)
+            send_telegram_text(chat_id_str, format_subscription_message(current_sub))
             return jsonify({"ok": True})
         
         elif option == 4:
-            send_telegram_text(
-                chat_id,
-                "💎 *Upgrade Your Plan*\n\n"
-                "Visit our website to upgrade:\n"
-                "https://www.naijataxguides.com/plans\n\n"
-                "Or reply with 6 to buy credits."
-            )
+            current_sub = get_user_subscription(account_id)
+            if current_sub:
+                send_telegram_text(chat_id_str, format_subscription_message(current_sub))
+                send_telegram_text(
+                    chat_id_str,
+                    "To upgrade or change your plan, please visit our website:\nhttps://www.naijataxguides.com/plans\n\nOr contact support."
+                )
+            else:
+                plans_menu = get_subscription_plans_menu()
+                send_telegram_text(chat_id_str, plans_menu)
             return jsonify({"ok": True})
         
         elif option == 5:
             send_telegram_text(
-                chat_id,
+                chat_id_str,
                 "🔗 *Link to Website*\n\n"
                 "1. Login to your account on our website\n"
                 "2. Go to Settings → Telegram Linking\n"
@@ -193,27 +230,51 @@ def tg_webhook():
             return jsonify({"ok": True})
         
         elif option == 6:
-            # Buy AI Credits
             credit_menu = get_credit_packages_menu()
-            send_telegram_text(chat_id, credit_menu)
+            send_telegram_text(chat_id_str, credit_menu)
             return jsonify({"ok": True})
         
         elif option == 7:
-            _send_main_menu(chat_id)
+            _send_main_menu(chat_id_str)
             return jsonify({"ok": True})
 
-    # Handle credit package selection
+    # Handle credit package selection (1-4)
     if text in ["1", "2", "3", "4"]:
         package_num = int(text)
         package = validate_package_number(package_num)
         if package:
-            result = create_credit_payment(account_id, package_num, "telegram", str(tg_user_id))
+            result = create_credit_payment(account_id, package_num, "telegram", tg_user_id)
             if result.get("ok"):
-                send_telegram_text(chat_id, result["message"])
+                send_telegram_text(chat_id_str, result["message"])
             else:
-                send_telegram_text(chat_id, f"❌ {result.get('message', 'Please try again.')}")
+                send_telegram_text(chat_id_str, f"❌ {result.get('message', 'Please try again.')}")
         else:
-            send_telegram_text(chat_id, "❌ Invalid package number. Please select 1-4.\n\nSend 6 to see available packages.")
+            send_telegram_text(chat_id_str, "❌ Invalid package number. Please select 1-4.\n\nSend 6 to see available packages.")
+        return jsonify({"ok": True})
+
+    # Handle subscription plan selection (1-3)
+    if text in ["1", "2", "3"]:
+        plan_num = int(text)
+        plan = validate_plan_number(plan_num)
+        if plan:
+            user_email = get_user_email(account_id)
+            if user_email:
+                result = create_subscription_payment(
+                    account_id=account_id,
+                    plan_num=plan_num,
+                    channel_type="telegram",
+                    provider_user_id=tg_user_id,
+                    email=user_email
+                )
+                if result.get("ok"):
+                    send_telegram_text(chat_id_str, result["message"])
+                else:
+                    send_telegram_text(chat_id_str, f"❌ {result.get('message', 'Please try again.')}")
+            else:
+                user_states[chat_id_str] = {"awaiting_email": True, "pending_plan_num": plan_num}
+                send_telegram_text(chat_id_str, request_email_message())
+        else:
+            send_telegram_text(chat_id_str, "❌ Invalid plan number. Please select 1-3.\n\nSend 4 to see available plans.")
         return jsonify({"ok": True})
 
     # Handle linking code
@@ -221,7 +282,7 @@ def tg_webhook():
         attempt = _try_consume_link_code(tg_user_id, text)
         if attempt.get("ok"):
             send_telegram_text(
-                chat_id,
+                chat_id_str,
                 "✅ *Telegram linked successfully!*\n\n"
                 "Your account is now connected to the web.\n"
                 "You can now access your history and credits from the website."
@@ -229,7 +290,7 @@ def tg_webhook():
             return jsonify({"ok": True, "linked": True})
         else:
             send_telegram_text(
-                chat_id,
+                chat_id_str,
                 "❌ *Invalid link code*\n\n"
                 "Please generate a new code on the website and try again.\n\n"
                 "Reply with 7 for help."
@@ -238,7 +299,7 @@ def tg_webhook():
 
     # Handle help variations
     if text.lower() in ["help", "menu", "?"]:
-        _send_main_menu(chat_id)
+        _send_main_menu(chat_id_str)
         return jsonify({"ok": True})
 
     # Answer tax question directly
@@ -253,12 +314,12 @@ def tg_webhook():
         if result.get("ok"):
             answer = result.get("answer", "")
             if answer:
-                send_telegram_text(chat_id, answer)
+                send_telegram_text(chat_id_str, answer)
             else:
-                send_telegram_text(chat_id, "I couldn't find an answer to that question. Please try rephrasing.\n\nReply with 7 for help.")
+                send_telegram_text(chat_id_str, "I couldn't find an answer to that question. Please try rephrasing.\n\nReply with 7 for help.")
         else:
             send_telegram_text(
-                chat_id,
+                chat_id_str,
                 "Sorry, I encountered an error. Please try again later.\n\nReply with 7 for help."
             )
 
@@ -266,5 +327,5 @@ def tg_webhook():
 
     except Exception as e:
         logging.exception(f"TG webhook error: {e}")
-        send_telegram_text(chat_id, "Sorry, I encountered an error. Please try again later.")
+        send_telegram_text(chat_id_str, "Sorry, I encountered an error. Please try again later.")
         return jsonify({"ok": True})
