@@ -70,6 +70,15 @@ def store_user_email(account_id: str, email: str) -> bool:
         return False
 
 
+def request_email_message() -> str:
+    """Message to request email from user"""
+    return (
+        "📧 *Email Required for Subscription*\n\n"
+        "To set up your monthly subscription (auto-renewing), we need your email address for payment receipts and subscription management.\n\n"
+        "Please send your email address (e.g., example@gmail.com):"
+    )
+
+
 def create_subscription_payment(
     account_id: str,
     plan_num: int,
@@ -103,8 +112,17 @@ def create_subscription_payment(
         return {
             "ok": False,
             "error": "email_required",
-            "message": "For monthly subscriptions, we need your email address to send payment receipts and manage your subscription.\n\nPlease send your email address (e.g., example@gmail.com)",
-            "awaiting_email": True
+            "message": request_email_message(),
+            "awaiting_email": True,
+            "plan_num": plan_num
+        }
+    
+    # Validate email format
+    if "@" not in email or "." not in email:
+        return {
+            "ok": False,
+            "error": "invalid_email",
+            "message": "Please send a valid email address (e.g., example@gmail.com)"
         }
     
     reference = f"SUB_{plan['code']}_{uuid.uuid4().hex[:8]}"
@@ -138,7 +156,7 @@ def create_subscription_payment(
         # Initialize Paystack transaction
         result = initialize_transaction(
             amount_kobo=amount_kobo,
-            email=email,  # Required for subscription
+            email=email,
             reference=reference,
             metadata={
                 "account_id": account_id,
@@ -156,6 +174,7 @@ def create_subscription_payment(
                 "reference": reference,
                 "amount_ngn": plan["amount_ngn"],
                 "plan_name": plan["name"],
+                "credits": plan["credits"],
                 "message": f"💎 *{plan['name']} Subscription*\n\n"
                           f"Click to pay ₦{plan['amount_ngn']:,} for {plan['name']} plan:\n\n"
                           f"{result['data']['authorization_url']}\n\n"
@@ -164,10 +183,11 @@ def create_subscription_payment(
                           f"📧 Receipts will be sent to: {email}"
             }
         else:
+            error_msg = result.get("message", "Payment initialization failed")
             return {
                 "ok": False,
                 "error": "payment_link_failed",
-                "message": "Could not generate payment link. Please try again."
+                "message": f"Could not generate payment link: {error_msg}\n\nPlease try again."
             }
     except Exception as e:
         logger.error(f"Error creating subscription: {e}")
@@ -223,26 +243,3 @@ def format_subscription_message(subscription: Optional[Dict[str, Any]]) -> str:
                 "Status: Active ✅\n"
                 "AI Credits: 10/month\n\n"
                 "Reply with 4 to upgrade to a paid plan.")
-
-
-def cancel_subscription(account_id: str) -> Dict[str, Any]:
-    """Cancel user's subscription (requires Paystack API call)"""
-    try:
-        # Get subscription details
-        sub = get_user_subscription(account_id)
-        if not sub:
-            return {"ok": False, "message": "No active subscription found"}
-        
-        # Call Paystack API to cancel (implement based on your Paystack integration)
-        # This would require storing Paystack subscription code
-        
-        # Update local status
-        _sb().table("user_subscriptions") \
-            .update({"status": "cancelled", "updated_at": datetime.now(timezone.utc).isoformat()}) \
-            .eq("account_id", account_id) \
-            .execute()
-        
-        return {"ok": True, "message": "Subscription cancelled. You will not be charged next month."}
-    except Exception as e:
-        logger.error(f"Error cancelling subscription: {e}")
-        return {"ok": False, "error": str(e)}
