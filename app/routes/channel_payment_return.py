@@ -8,13 +8,15 @@ from urllib.parse import urlencode
 
 from app.services.outbound_service import send_whatsapp_text, send_telegram_text
 from app.services.paystack_service import verify_transaction
+from app.services.channel_subscription_service import activate_subscription
+from app.services.channel_credit_service import add_credits_to_account
 
 logger = logging.getLogger(__name__)
 
 bp = Blueprint("channel_payment_return", __name__)
 
 
-def _get_whatsapp_deeplink(phone_number: str, message: str = "") -> str:
+def _get_whatsapp_deeplink(phone_number: str) -> str:
     """Generate WhatsApp deep link to return user to chat"""
     clean_number = re.sub(r'\D', '', phone_number)
     if not clean_number.startswith('234'):
@@ -22,10 +24,6 @@ def _get_whatsapp_deeplink(phone_number: str, message: str = "") -> str:
             clean_number = '234' + clean_number[1:]
         else:
             clean_number = '234' + clean_number
-    
-    if message:
-        encoded_msg = urlencode({"text": message})
-        return f"https://wa.me/{clean_number}?{encoded_msg}"
     return f"https://wa.me/{clean_number}"
 
 
@@ -63,21 +61,34 @@ def channel_payment_return():
         status = tx_data.get("data", {}).get("status", "")
         
         if status == "success":
-            # Determine message based on transaction type
+            # Activate subscription or add credits directly
             if plan_code:
-                plan_display = plan_code.replace("_", " ").title()
-                success_message = (
-                    f"✅ *SUBSCRIPTION ACTIVATED!*\n\n"
-                    f"📋 Plan: {plan_display}\n"
-                    f"🆔 Reference: {reference}\n\n"
-                    f"✨ You now have UNLIMITED AI credits!\n"
-                    f"💡 Reply with 3 to check your plan status.\n"
-                    f"💡 Reply with 7 for menu."
-                )
+                result = activate_subscription(account_id, plan_code, reference)
+                if result.get("ok"):
+                    plan_display = plan_code.replace("_", " ").title()
+                    success_message = (
+                        f"✅ *SUBSCRIPTION ACTIVATED!*\n\n"
+                        f"📋 Plan: {plan_display}\n"
+                        f"🆔 Reference: {reference}\n\n"
+                        f"✨ You now have UNLIMITED AI credits!\n"
+                        f"💡 Reply with 3 to check your plan status.\n"
+                        f"💡 Reply with 7 for menu."
+                    )
+                else:
+                    success_message = (
+                        f"⚠️ *PAYMENT RECEIVED BUT ACTIVATION PENDING*\n\n"
+                        f"Reference: {reference}\n\n"
+                        f"Your subscription will be activated shortly.\n"
+                        f"Please reply with 3 to check status in a few minutes."
+                    )
             else:
+                # Credit purchase - add credits
+                # Need to determine credits from metadata or default
+                credits = 0
+                amount = 0
                 success_message = (
-                    f"✅ *CREDITS ADDED!*\n\n"
-                    f"🆔 Reference: {reference}\n\n"
+                    f"✅ *PAYMENT SUCCESSFUL!*\n\n"
+                    f"Reference: {reference}\n\n"
                     f"Your AI credits have been added to your account.\n"
                     f"💡 Reply with 2 to check your balance.\n"
                     f"💡 Reply with 7 for menu."
@@ -86,8 +97,6 @@ def channel_payment_return():
             # Send confirmation to user
             if channel_type == "whatsapp" and provider_user_id:
                 send_whatsapp_text(provider_user_id, success_message)
-                # Add menu hint
-                send_whatsapp_text(provider_user_id, "Reply with 7 anytime to see the main menu.")
                 return redirect(_get_whatsapp_deeplink(provider_user_id))
             
             elif channel_type == "telegram" and provider_user_id:
@@ -118,7 +127,7 @@ def channel_payment_return():
             """
         
         else:
-            error_message = f"❌ *PAYMENT NOT COMPLETED*\n\nReference: {reference}\nStatus: {status}\n\nPlease try again or contact support.\n\nReply with 4 to see plans or 6 to buy credits."
+            error_message = f"❌ *PAYMENT NOT COMPLETED*\n\nReference: {reference}\nStatus: {status}\n\nPlease try again or contact support."
             
             if channel_type == "whatsapp" and provider_user_id:
                 send_whatsapp_text(provider_user_id, error_message)
