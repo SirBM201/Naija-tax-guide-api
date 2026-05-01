@@ -90,6 +90,13 @@ def get_or_create_account_id(channel_type: str, provider_user_id: str) -> str:
             "created_at": datetime.now(timezone.utc).isoformat()
         }).execute()
         
+        # Also create credit balance record
+        _sb().table("ai_credit_balances").insert({
+            "account_id": new_account_id,
+            "balance": 0,
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }).execute()
+        
         return new_account_id
         
     except Exception as e:
@@ -154,7 +161,7 @@ def create_credit_payment(
     try:
         # Initialize Paystack transaction with NO EMAIL (pass None)
         result = initialize_transaction(
-            amount=amount_kobo,
+            amount_kobo=amount_kobo,
             email=None,  # ✅ NO EMAIL REQUIRED
             reference=reference,
             metadata={
@@ -217,13 +224,16 @@ def add_credits_to_account(account_id: str, credits: int, reference: str) -> boo
             }).execute()
         
         # Log credit addition
-        _sb().table("ai_credit_events").insert({
-            "account_id": account_id,
-            "event_type": "credit_purchase",
-            "credits": credits,
-            "reference": reference,
-            "created_at": datetime.now(timezone.utc).isoformat()
-        }).execute()
+        try:
+            _sb().table("ai_credit_events").insert({
+                "account_id": account_id,
+                "event_type": "credit_purchase",
+                "credits": credits,
+                "reference": reference,
+                "created_at": datetime.now(timezone.utc).isoformat()
+            }).execute()
+        except Exception:
+            pass  # Event logging is optional
         
         logger.info(f"Added {credits} credits to account {account_id} via {reference}")
         return True
@@ -265,16 +275,3 @@ def get_user_email_status(account_id: str) -> Dict[str, Any]:
     except Exception as e:
         logger.error(f"Error checking email status: {e}")
         return {"has_email": False, "email": None}
-
-
-def request_email_optional(account_id: str, channel_type: str, provider_user_id: str) -> str:
-    """
-    Optional: Politely ask for email only for receipt delivery
-    This does NOT block payment processing
-    """
-    return (
-        "📧 *Optional: Email for Receipts*\n\n"
-        "To receive payment receipts via email (optional), reply with your email address.\n\n"
-        "Or reply 'skip' to continue without email.\n\n"
-        "Your credits will be added either way after payment."
-    )
