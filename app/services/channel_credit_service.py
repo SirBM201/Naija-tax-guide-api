@@ -152,17 +152,22 @@ def create_credit_payment(
                 "package": package_num,
                 "type": "credit_purchase",
                 "channel_type": channel_type,
-                "provider_user_id": provider_user_id
+                "provider_user_id": provider_user_id,
+                "amount_ngn": amount_ngn
             }
         }).execute()
     except Exception as e:
         logger.error(f"Error storing transaction: {e}")
     
+    # Build callback URL that returns to WhatsApp
+    base_url = os.getenv("PUBLIC_BACKEND_BASE_URL", "https://incredible-nonie-bmsconcept-37359733.koyeb.app")
+    callback_url = f"{base_url}/api/channel/payment/return?channel_type={channel_type}&provider_user_id={provider_user_id}&account_id={account_id}"
+    
     try:
-        # Initialize Paystack transaction with NO EMAIL (pass None)
+        # Initialize Paystack transaction with NO EMAIL
         result = initialize_transaction(
             amount_kobo=amount_kobo,
-            email=None,  # ✅ NO EMAIL REQUIRED
+            email=None,
             reference=reference,
             metadata={
                 "account_id": account_id,
@@ -170,8 +175,10 @@ def create_credit_payment(
                 "package": package_num,
                 "type": "credit_purchase",
                 "channel_type": channel_type,
-                "provider_user_id": provider_user_id
-            }
+                "provider_user_id": provider_user_id,
+                "amount_ngn": amount_ngn
+            },
+            callback_url=callback_url
         )
         
         if result.get("status") and result.get("data", {}).get("authorization_url"):
@@ -202,44 +209,57 @@ def create_credit_payment(
 def add_credits_to_account(account_id: str, credits: int, reference: str) -> bool:
     """Add credits to user's balance after successful payment"""
     try:
+        # Check if user has active subscription - if so, skip (they have unlimited)
+        try:
+            from app.services.channel_subscription_service import has_active_subscription
+            if has_active_subscription(account_id):
+                logger.info(f"User {account_id} has active subscription, skipping credit addition")
+                return True
+        except Exception:
+            pass  # If subscription check fails, still add credits
+        
+        # Check existing balance
         existing = _sb().table("ai_credit_balances") \
             .select("balance") \
             .eq("account_id", account_id) \
             .execute()
+        
+        now = datetime.now(timezone.utc).isoformat()
         
         if existing.data:
             new_balance = existing.data[0].get("balance", 0) + credits
             _sb().table("ai_credit_balances") \
                 .update({
                     "balance": new_balance,
-                    "updated_at": datetime.now(timezone.utc).isoformat()
+                    "updated_at": now
                 }) \
                 .eq("account_id", account_id) \
                 .execute()
+            logger.info(f"Updated balance for {account_id}: +{credits} = {new_balance}")
         else:
             _sb().table("ai_credit_balances").insert({
                 "account_id": account_id,
                 "balance": credits,
-                "updated_at": datetime.now(timezone.utc).isoformat()
+                "updated_at": now
             }).execute()
+            logger.info(f"Created balance for {account_id}: {credits} credits")
         
-        # Log credit addition
+        # Log the credit addition (optional)
         try:
             _sb().table("ai_credit_events").insert({
                 "account_id": account_id,
                 "event_type": "credit_purchase",
                 "credits": credits,
                 "reference": reference,
-                "created_at": datetime.now(timezone.utc).isoformat()
+                "created_at": now
             }).execute()
         except Exception:
             pass  # Event logging is optional
         
-        logger.info(f"Added {credits} credits to account {account_id} via {reference}")
         return True
         
     except Exception as e:
-        logger.error(f"Error adding credits: {e}")
+        logger.error(f"Error adding credits to account {account_id}: {e}")
         return False
 
 
@@ -259,8 +279,7 @@ def format_balance_message(balance: int) -> str:
 
 def get_user_email_status(account_id: str) -> Dict[str, Any]:
     """
-    Optional: Check if user has an email associated with their account
-    This can be used to optionally request email only if needed
+    Check if user has an email associated with their account
     """
     try:
         result = _sb().table("accounts") \
