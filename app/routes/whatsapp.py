@@ -45,7 +45,7 @@ bp = Blueprint("whatsapp", __name__)
 WA_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "").strip()
 
 LINK_CODE_RE = re.compile(r"^[A-Z0-9]{8}$")
-MENU_NUMBER_RE = re.compile(r"^[1-7]$")
+MENU_NUMBER_RE = re.compile(r"^[1-8]$")
 
 # Track user states for multi-step flows
 user_states = {}
@@ -122,13 +122,12 @@ def _send_tax_menu(phone: str):
     menu = (
         "*📋 TAX FILING & MANAGEMENT*\n\n"
         "Reply with:\n"
-        "🇵 - File PAYE Tax\n"
-        "🇻 - File VAT\n"
-        "🇨 - File CIT (Company Tax)\n"
-        "📜 - View my filing history\n"
-        "📎 - Download my receipt\n"
-        "📅 - View tax deadlines\n"
-        "🔙 - Back to main menu\n\n"
+        "P - File PAYE Tax\n"
+        "V - File VAT\n"
+        "C - File CIT (Company Tax)\n"
+        "H - View my filing history\n"
+        "D - View tax deadlines\n"
+        "B - Back to main menu\n\n"
         "Type 'file paye', 'file vat', or 'file cit' to start filing."
     )
     send_whatsapp_text(phone, menu)
@@ -177,7 +176,9 @@ def _handle_paye_filing_step(phone: str, account_id: str, user_state: dict, text
     
     if step == 1:
         try:
-            amount = float(text.replace(",", "").replace("₦", "").strip())
+            # Remove currency symbols and commas
+            clean_text = text.replace(",", "").replace("₦", "").replace("N", "").strip()
+            amount = float(clean_text)
             inputs["monthly_gross_income"] = amount
             save_filing_draft(account_id, "paye", inputs, [], step + 1)
             user_states[phone] = {"filing_type": "paye", "step": 2, "draft": {"inputs": inputs}}
@@ -187,7 +188,8 @@ def _handle_paye_filing_step(phone: str, account_id: str, user_state: dict, text
     
     elif step == 2:
         try:
-            amount = float(text.replace(",", "").replace("₦", "").strip())
+            clean_text = text.replace(",", "").replace("₦", "").replace("N", "").strip()
+            amount = float(clean_text)
             inputs["pension_contribution"] = amount
             save_filing_draft(account_id, "paye", inputs, [], step + 1)
             user_states[phone] = {"filing_type": "paye", "step": 3, "draft": {"inputs": inputs}}
@@ -197,7 +199,8 @@ def _handle_paye_filing_step(phone: str, account_id: str, user_state: dict, text
     
     elif step == 3:
         try:
-            amount = float(text.replace(",", "").replace("₦", "").strip())
+            clean_text = text.replace(",", "").replace("₦", "").replace("N", "").strip()
+            amount = float(clean_text)
             inputs["nhf"] = amount
             save_filing_draft(account_id, "paye", inputs, [], step + 1)
             
@@ -233,7 +236,7 @@ def _handle_paye_filing_step(phone: str, account_id: str, user_state: dict, text
                                f"📅 Date: {datetime.fromisoformat(submitted_at).strftime('%d %B %Y, %H:%M')}\n"
                                f"💰 Monthly Tax: ₦{monthly_tax:,.2f}\n\n"
                                f"📎 You can download your receipt from the web dashboard.\n"
-                               f"Reply with 'history' to see all filings.")
+                               f"Reply with H to see all filings.")
                 
                 send_whatsapp_text(phone, success_msg)
                 user_states.pop(phone, None)
@@ -258,7 +261,8 @@ def _handle_vat_filing_step(phone: str, account_id: str, user_state: dict, text:
     
     if step == 1:
         try:
-            amount = float(text.replace(",", "").replace("₦", "").strip())
+            clean_text = text.replace(",", "").replace("₦", "").replace("N", "").strip()
+            amount = float(clean_text)
             inputs["taxable_supplies"] = amount
             save_filing_draft(account_id, "vat", inputs, [], step + 1)
             user_states[phone] = {"filing_type": "vat", "step": 2, "draft": {"inputs": inputs}}
@@ -268,7 +272,8 @@ def _handle_vat_filing_step(phone: str, account_id: str, user_state: dict, text:
     
     elif step == 2:
         try:
-            amount = float(text.replace(",", "").replace("₦", "").strip())
+            clean_text = text.replace(",", "").replace("₦", "").replace("N", "").strip()
+            amount = float(clean_text)
             inputs["input_vat"] = amount
             save_filing_draft(account_id, "vat", inputs, [], step + 1)
             
@@ -301,7 +306,7 @@ def _handle_vat_filing_step(phone: str, account_id: str, user_state: dict, text:
                                f"📅 Date: {datetime.fromisoformat(submitted_at).strftime('%d %B %Y, %H:%M')}\n"
                                f"💰 VAT Payable: ₦{vat_payable:,.2f}\n\n"
                                f"📎 You can download your receipt from the web dashboard.\n"
-                               f"Reply with 'history' to see all filings.")
+                               f"Reply with H to see all filings.")
                 
                 send_whatsapp_text(phone, success_msg)
                 user_states.pop(phone, None)
@@ -326,7 +331,8 @@ def _handle_cit_filing_step(phone: str, account_id: str, user_state: dict, text:
     
     if step == 1:
         try:
-            amount = float(text.replace(",", "").replace("₦", "").strip())
+            clean_text = text.replace(",", "").replace("₦", "").replace("N", "").strip()
+            amount = float(clean_text)
             inputs["gross_profit"] = amount
             save_filing_draft(account_id, "cit", inputs, [], step + 1)
             user_states[phone] = {"filing_type": "cit", "step": 2, "draft": {"inputs": inputs}}
@@ -336,7 +342,8 @@ def _handle_cit_filing_step(phone: str, account_id: str, user_state: dict, text:
     
     elif step == 2:
         try:
-            amount = float(text.replace(",", "").replace("₦", "").strip())
+            clean_text = text.replace(",", "").replace("₦", "").replace("N", "").strip()
+            amount = float(clean_text)
             inputs["allowable_expenses"] = amount
             save_filing_draft(account_id, "cit", inputs, [], step + 1)
             
@@ -373,7 +380,7 @@ def _handle_cit_filing_step(phone: str, account_id: str, user_state: dict, text:
                                f"📅 Date: {datetime.fromisoformat(submitted_at).strftime('%d %B %Y, %H:%M')}\n"
                                f"💰 CIT Payable: ₦{cit_payable:,.2f}\n\n"
                                f"📎 You can download your receipt from the web dashboard.\n"
-                               f"Reply with 'history' to see all filings.")
+                               f"Reply with H to see all filings.")
                 
                 send_whatsapp_text(phone, success_msg)
                 user_states.pop(phone, None)
@@ -409,31 +416,24 @@ def _handle_tax_filing_command(phone: str, account_id: str, text: str):
         send_whatsapp_text(phone, "📋 *CIT Filing - Step 1 of 3*\n\nEnter your gross profit for the period:\n(Example: 10000000)")
         return True
     
-    elif text_lower in ["history", "my filings", "filing history"]:
-        filings = get_user_filings(account_id, limit=10)
-        if filings:
-            msg = "📋 *Your Tax Filings*\n\n"
-            for f in filings[:5]:
-                msg += f"• *{f.get('tax_type', '').upper()}*: {f.get('reference', 'N/A')}\n"
-                msg += f"  Status: {f.get('status', 'N/A')}\n"
-                msg += f"  Date: {f.get('submitted_at', '')[:10] if f.get('submitted_at') else 'N/A'}\n\n"
-            if len(filings) > 5:
-                msg += f"\n+ {len(filings) - 5} more. Visit web for full history."
-            send_whatsapp_text(phone, msg)
-        else:
-            send_whatsapp_text(phone, "📋 No tax filings found. Reply with 'file paye' to file your first tax.")
-        return True
-    
-    elif text_lower in ["deadlines", "tax deadlines", "filing deadlines"]:
-        send_whatsapp_text(phone, "📅 *Tax Deadlines*\n\n"
-                           "• PAYE: Monthly by 10th\n"
-                           "• VAT: Monthly by 21st\n"
-                           "• CIT: 6 months after year end\n"
-                           "• Annual Returns: March 31st\n\n"
-                           "Set reminders in your web dashboard.")
-        return True
-    
     return False
+
+
+def _handle_filing_history(phone: str, account_id: str):
+    """Send filing history to user"""
+    filings = get_user_filings(account_id, limit=10)
+    if filings:
+        msg = "📋 *Your Tax Filings*\n\n"
+        for f in filings[:5]:
+            msg += f"• *{f.get('tax_type', '').upper()}*: {f.get('reference', 'N/A')}\n"
+            msg += f"  Status: {f.get('status', 'N/A')}\n"
+            msg += f"  Date: {f.get('submitted_at', '')[:10] if f.get('submitted_at') else 'N/A'}\n\n"
+        if len(filings) > 5:
+            msg += f"\n+ {len(filings) - 5} more. Visit web for full history."
+        send_whatsapp_text(phone, msg)
+    else:
+        send_whatsapp_text(phone, "📋 No tax filings found. Reply with P to file PAYE tax.")
+    return True
 
 
 def _handle_continue_filing(phone: str, account_id: str, text: str):
@@ -495,7 +495,9 @@ def _handle_whatsapp_message():
             _send_welcome(from_phone)
             return jsonify({"ok": True})
 
-        # Handle email collection for subscription
+        # ============================================================
+        # 1. Handle email collection for subscription
+        # ============================================================
         if user_state.get("awaiting_email"):
             email = text.strip().lower()
             pending_plan = user_state.get("pending_plan")
@@ -524,19 +526,26 @@ def _handle_whatsapp_message():
                 send_whatsapp_text(from_phone, "❌ Invalid email. Send a valid email or 'cancel' to abort.")
             return jsonify({"ok": True})
 
-        # Handle in-progress filing continuation
+        # ============================================================
+        # 2. CRITICAL: Check for in-progress filing FIRST
+        #    This prevents numbers from being mistaken for link codes
+        # ============================================================
         if user_state.get("filing_type") and user_state.get("step"):
             _handle_continue_filing(from_phone, account_id, text)
             return jsonify({"ok": True})
 
-        # Handle tax filing commands
+        # ============================================================
+        # 3. Handle tax filing commands (starts new filing)
+        # ============================================================
         if _handle_tax_filing_command(from_phone, account_id, text):
             return jsonify({"ok": True})
 
         # Check if user has active subscription
         has_subscription = has_active_subscription(account_id)
         
-        # Handle numbered menu options
+        # ============================================================
+        # 4. Handle numbered menu options (1-8)
+        # ============================================================
         if MENU_NUMBER_RE.match(text):
             option = int(text)
             
@@ -546,7 +555,6 @@ def _handle_whatsapp_message():
             
             elif option == 2:
                 if has_subscription:
-                    sub = get_user_subscription(account_id)
                     send_whatsapp_text(
                         from_phone,
                         f"💎 *UNLIMITED AI ACCESS* ✅\n\n"
@@ -602,7 +610,9 @@ def _handle_whatsapp_message():
                 _send_main_menu(from_phone)
                 return jsonify({"ok": True})
 
-        # Handle single-character tax menu options (P, V, C, etc.)
+        # ============================================================
+        # 5. Handle single-character tax menu options (P, V, C, H, D, B)
+        # ============================================================
         if text.upper() == "P":
             user_states[from_phone] = {"filing_type": "paye", "step": 1, "draft": {"inputs": {}}}
             send_whatsapp_text(from_phone, "📋 *PAYE Tax Filing - Step 1 of 4*\n\nPlease provide your monthly gross income:\n(Example: 750000)")
@@ -618,22 +628,10 @@ def _handle_whatsapp_message():
             send_whatsapp_text(from_phone, "📋 *CIT Filing - Step 1 of 3*\n\nEnter your gross profit for the period:\n(Example: 10000000)")
             return jsonify({"ok": True})
         
-        elif text.lower() in ["history", "📜"]:
-            filings = get_user_filings(account_id, limit=10)
-            if filings:
-                msg = "📋 *Your Tax Filings*\n\n"
-                for f in filings[:5]:
-                    msg += f"• *{f.get('tax_type', '').upper()}*: {f.get('reference', 'N/A')}\n"
-                    msg += f"  Status: {f.get('status', 'N/A')}\n"
-                    msg += f"  Date: {f.get('submitted_at', '')[:10] if f.get('submitted_at') else 'N/A'}\n\n"
-                if len(filings) > 5:
-                    msg += f"\n+ {len(filings) - 5} more. Visit web for full history."
-                send_whatsapp_text(from_phone, msg)
-            else:
-                send_whatsapp_text(from_phone, "📋 No tax filings found. Reply with 'P' to file PAYE tax.")
-            return jsonify({"ok": True})
+        elif text.upper() == "H":
+            return jsonify(_handle_filing_history(from_phone, account_id))
         
-        elif text.lower() in ["deadlines", "📅"]:
+        elif text.upper() == "D":
             send_whatsapp_text(from_phone, "📅 *Tax Deadlines*\n\n"
                                "• PAYE: Monthly by 10th\n"
                                "• VAT: Monthly by 21st\n"
@@ -642,11 +640,13 @@ def _handle_whatsapp_message():
                                "Set reminders in your web dashboard.")
             return jsonify({"ok": True})
         
-        elif text.lower() in ["back", "🔙", "main menu"]:
+        elif text.upper() == "B":
             _send_main_menu(from_phone)
             return jsonify({"ok": True})
 
-        # Handle credit package selection (1-4)
+        # ============================================================
+        # 6. Handle credit package selection (1-4)
+        # ============================================================
         if not has_subscription and text in ["1", "2", "3", "4"]:
             package_num = int(text)
             package = validate_package_number(package_num)
@@ -660,7 +660,9 @@ def _handle_whatsapp_message():
                 send_whatsapp_text(from_phone, "❌ Invalid package. Send 6 to see packages.")
             return jsonify({"ok": True})
 
-        # Handle subscription plan selection (1-9)
+        # ============================================================
+        # 7. Handle subscription plan selection (1-9)
+        # ============================================================
         if text.isdigit() and 1 <= int(text) <= 9:
             plan_num = int(text)
             plan = validate_plan_number(plan_num)
@@ -685,7 +687,9 @@ def _handle_whatsapp_message():
                 send_whatsapp_text(from_phone, "❌ Invalid plan number. Send 4 to see plans.")
             return jsonify({"ok": True})
 
-        # Handle linking code
+        # ============================================================
+        # 8. Handle linking code (MOVED AFTER filing checks)
+        # ============================================================
         if LINK_CODE_RE.match(text.upper()):
             attempt = _try_consume_link_code(from_phone, text)
             if attempt.get("ok"):
@@ -704,12 +708,16 @@ def _handle_whatsapp_message():
                 )
                 return jsonify({"ok": True, "linked": False})
 
-        # Handle help variations
+        # ============================================================
+        # 9. Handle help variations
+        # ============================================================
         if text.lower() in ["help", "menu", "start", "?", "/start"]:
             _send_main_menu(from_phone)
             return jsonify({"ok": True})
 
-        # Answer tax question directly
+        # ============================================================
+        # 10. Answer tax question directly
+        # ============================================================
         result = ask_guarded({
             "question": text,
             "account_id": account_id,
