@@ -185,13 +185,12 @@ def _parse_amount(text: str) -> float:
 
 
 def _handle_paye_filing_step(phone: str, account_id: str, user_state: dict, text: str):
-    """Handle PAYE filing guided flow - SIMPLIFIED"""
+    """Handle PAYE filing guided flow"""
     step = user_state.get("step", 1)
     draft = user_state.get("draft", {})
     inputs = draft.get("inputs", {})
     
     if step == 1:
-        # Step 1: Ask for monthly gross income
         try:
             amount = _parse_amount(text)
             inputs["monthly_gross_income"] = amount
@@ -266,13 +265,12 @@ def _handle_paye_filing_step(phone: str, account_id: str, user_state: dict, text
 
 
 def _handle_vat_filing_step(phone: str, account_id: str, user_state: dict, text: str):
-    """Handle VAT filing guided flow - SIMPLIFIED"""
+    """Handle VAT filing guided flow"""
     step = user_state.get("step", 1)
     draft = user_state.get("draft", {})
     inputs = draft.get("inputs", {})
     
     if step == 1:
-        # Step 1: Ask for total sales
         try:
             amount = _parse_amount(text)
             inputs["sales_amount"] = amount
@@ -288,7 +286,6 @@ def _handle_vat_filing_step(phone: str, account_id: str, user_state: dict, text:
             inputs["purchases_amount"] = amount
             save_filing_draft(account_id, "vat", inputs, [], step + 1)
             
-            # Calculate VAT
             sales = inputs.get("sales_amount", 0)
             purchases = amount
             vat_rate = 7.5
@@ -312,7 +309,6 @@ def _handle_vat_filing_step(phone: str, account_id: str, user_state: dict, text:
     
     elif step == 3:
         if text.lower() == "confirm":
-            # Prepare inputs for submission
             sales = inputs.get("sales_amount", 0)
             purchases = inputs.get("purchases_amount", 0)
             submission_inputs = {
@@ -351,13 +347,12 @@ def _handle_vat_filing_step(phone: str, account_id: str, user_state: dict, text:
 
 
 def _handle_cit_filing_step(phone: str, account_id: str, user_state: dict, text: str):
-    """Handle CIT filing guided flow - SIMPLIFIED"""
+    """Handle CIT filing guided flow"""
     step = user_state.get("step", 1)
     draft = user_state.get("draft", {})
     inputs = draft.get("inputs", {})
     
     if step == 1:
-        # Step 1: Ask for total revenue
         try:
             amount = _parse_amount(text)
             inputs["revenue"] = amount
@@ -373,17 +368,15 @@ def _handle_cit_filing_step(phone: str, account_id: str, user_state: dict, text:
             inputs["expenses"] = amount
             save_filing_draft(account_id, "cit", inputs, [], step + 1)
             
-            # Calculate CIT
             revenue = inputs.get("revenue", 0)
             expenses = amount
             profit = max(0, revenue - expenses)
             
-            # Determine applicable rate based on revenue
-            if revenue > 100000000:  # Large company > ₦100M
+            if revenue > 100000000:
                 applicable_rate = 30
-            elif revenue > 25000000:  # Medium company ₦25M - ₦100M
+            elif revenue > 25000000:
                 applicable_rate = 20
-            else:  # Small company ≤ ₦25M
+            else:
                 applicable_rate = 0
             
             cit_payable = profit * (applicable_rate / 100)
@@ -406,7 +399,6 @@ def _handle_cit_filing_step(phone: str, account_id: str, user_state: dict, text:
     
     elif step == 3:
         if text.lower() == "confirm":
-            # Prepare inputs for submission
             submission_inputs = {
                 "gross_profit": inputs.get("revenue", 0) - inputs.get("expenses", 0),
                 "allowable_expenses": inputs.get("expenses", 0),
@@ -443,8 +435,13 @@ def _handle_cit_filing_step(phone: str, account_id: str, user_state: dict, text:
 
 
 def _handle_tax_filing_command(phone: str, account_id: str, text: str):
-    """Handle tax filing commands"""
+    """Handle tax filing commands - ONLY if not already in a filing"""
     text_lower = text.lower().strip()
+    
+    # CRITICAL: Check if user is already in a filing flow
+    if user_states.get(phone, {}).get("filing_type"):
+        # User is already filing something - ignore new commands
+        return False
     
     if text_lower in ["file paye", "file paye tax", "paye", "p"]:
         user_states[phone] = {"filing_type": "paye", "step": 1, "draft": {"inputs": {}}}
@@ -482,7 +479,7 @@ def _handle_filing_history(phone: str, account_id: str):
 
 
 def _handle_continue_filing(phone: str, account_id: str, text: str):
-    """Continue an in-progress filing"""
+    """Continue an in-progress filing for ANY tax type"""
     user_state = user_states.get(phone, {})
     filing_type = user_state.get("filing_type")
     
@@ -500,7 +497,6 @@ def _handle_continue_filing(phone: str, account_id: str, text: str):
 def wa_webhook():
     """Handle WhatsApp webhook - supports both GET (verification) and POST (messages)"""
     
-    # GET request - Meta/WhatsApp verification
     if request.method == "GET":
         mode = request.args.get("hub.mode")
         token = request.args.get("hub.verify_token")
@@ -510,7 +506,6 @@ def wa_webhook():
             return challenge, 200
         return "Forbidden", 403
     
-    # POST request - incoming messages
     return _handle_whatsapp_message()
 
 
@@ -524,7 +519,6 @@ def _handle_whatsapp_message():
         if not from_phone:
             return jsonify({"ok": True, "ignored": True})
 
-        # Ensure account exists
         upsert_account(provider="wa", provider_user_id=from_phone, display_name=None, phone=from_phone)
         lk = lookup_account(provider="wa", provider_user_id=from_phone)
 
@@ -535,7 +529,6 @@ def _handle_whatsapp_message():
         account_id = lk.get("account_id") or from_phone
         user_state = user_states.get(from_phone, {})
 
-        # Send welcome for new users with no text
         if not text:
             _send_welcome(from_phone)
             return jsonify({"ok": True})
@@ -572,8 +565,10 @@ def _handle_whatsapp_message():
             return jsonify({"ok": True})
 
         # ============================================================
-        # 2. CRITICAL FIX: Check for in-progress filing FIRST
-        #    This MUST happen BEFORE link code detection
+        # 2. CRITICAL: Check for in-progress filing FIRST
+        #    This applies to ALL tax types: PAYE, VAT, CIT
+        #    This MUST happen BEFORE link code detection, menu options,
+        #    and especially BEFORE single-character commands (P, V, C)
         # ============================================================
         if user_state.get("filing_type") and user_state.get("step"):
             _handle_continue_filing(from_phone, account_id, text)
@@ -581,11 +576,11 @@ def _handle_whatsapp_message():
 
         # ============================================================
         # 3. Handle tax filing commands (starts new filing)
+        #    Added protection to prevent overwriting existing filing
         # ============================================================
         if _handle_tax_filing_command(from_phone, account_id, text):
             return jsonify({"ok": True})
 
-        # Check if user has active subscription
         has_subscription = has_active_subscription(account_id)
         
         # ============================================================
@@ -657,6 +652,8 @@ def _handle_whatsapp_message():
 
         # ============================================================
         # 5. Handle single-character tax menu options (P, V, C, H, D, B)
+        #    IMPORTANT: We already checked for active filing above,
+        #    so these won't overwrite an in-progress filing.
         # ============================================================
         if text.upper() == "P":
             user_states[from_phone] = {"filing_type": "paye", "step": 1, "draft": {"inputs": {}}}
@@ -674,7 +671,8 @@ def _handle_whatsapp_message():
             return jsonify({"ok": True})
         
         elif text.upper() == "H":
-            return jsonify(_handle_filing_history(from_phone, account_id))
+            _handle_filing_history(from_phone, account_id)
+            return jsonify({"ok": True})
         
         elif text.upper() == "D":
             send_whatsapp_text(from_phone, "📅 *Tax Deadlines*\n\n"
@@ -722,67 +720,3 @@ def _handle_whatsapp_message():
                         email=user_email
                     )
                     if result.get("ok"):
-                        send_whatsapp_text(from_phone, result["message"])
-                    else:
-                        send_whatsapp_text(from_phone, f"❌ {result.get('message', 'Please try again.')}")
-                else:
-                    user_states[from_phone] = {"awaiting_email": True, "pending_plan": plan}
-                    send_whatsapp_text(from_phone, request_email_message())
-            else:
-                send_whatsapp_text(from_phone, "❌ Invalid plan number. Send 4 to see plans.")
-            return jsonify({"ok": True})
-
-        # ============================================================
-        # 8. Handle linking code (ONLY if not in a tax filing flow)
-        #    The filing check at the top ensures this only runs
-        #    when user is NOT actively filing taxes
-        # ============================================================
-        if LINK_CODE_RE.match(text.upper()):
-            attempt = _try_consume_link_code(from_phone, text)
-            if attempt.get("ok"):
-                send_whatsapp_text(
-                    from_phone,
-                    "✅ *WhatsApp linked successfully!*\n\n"
-                    "Your account is now connected to the web."
-                )
-                return jsonify({"ok": True, "linked": True})
-            else:
-                send_whatsapp_text(
-                    from_phone,
-                    "❌ *Invalid link code*\n\n"
-                    "Generate a new code on the website.\n\n"
-                    "Reply 8 for help."
-                )
-                return jsonify({"ok": True, "linked": False})
-
-        # ============================================================
-        # 9. Handle help variations
-        # ============================================================
-        if text.lower() in ["help", "menu", "start", "?", "/start"]:
-            _send_main_menu(from_phone)
-            return jsonify({"ok": True})
-
-        # ============================================================
-        # 10. Answer tax question directly
-        # ============================================================
-        result = ask_guarded({
-            "question": text,
-            "account_id": account_id,
-            "lang": "en",
-            "channel": "whatsapp"
-        })
-
-        if result.get("ok"):
-            answer = result.get("answer", "")
-            if answer:
-                send_whatsapp_text(from_phone, answer)
-            else:
-                send_whatsapp_text(from_phone, "I couldn't find an answer. Please try rephrasing.\n\nReply 8 for menu.")
-        else:
-            send_whatsapp_text(from_phone, "Sorry, I encountered an error. Please try again.\n\nReply 8 for menu.")
-
-        return jsonify({"ok": True})
-
-    except Exception as e:
-        logging.exception(f"WA webhook error: {e}")
-        return jsonify({"ok": True})
