@@ -122,13 +122,14 @@ def _send_tax_menu(phone: str):
     menu = (
         "*📋 TAX FILING & MANAGEMENT*\n\n"
         "Reply with:\n"
-        "P - File PAYE Tax\n"
-        "V - File VAT\n"
-        "C - File CIT (Company Tax)\n"
+        "P - File PAYE Tax (Salary tax)\n"
+        "V - File VAT (Sales tax)\n"
+        "C - File CIT (Company tax)\n"
         "H - View my filing history\n"
         "D - View tax deadlines\n"
         "B - Back to main menu\n\n"
-        "Type 'file paye', 'file vat', or 'file cit' to start filing."
+        "Each filing takes 2-3 minutes.\n"
+        "We'll guide you step by step!"
     )
     send_whatsapp_text(phone, menu)
 
@@ -168,39 +169,51 @@ def _send_welcome(phone: str):
     send_whatsapp_text(phone, welcome)
 
 
+def _parse_amount(text: str) -> float:
+    """Parse amount from text - handles millions, commas, currency symbols"""
+    clean = text.replace(",", "").replace("₦", "").replace("N", "").replace("naira", "").strip().lower()
+    
+    # Handle "25M" or "25 million" format
+    if "m" in clean:
+        if "million" in clean:
+            clean = clean.replace("million", "").strip()
+        else:
+            clean = clean.replace("m", "").strip()
+        return float(clean) * 1000000
+    
+    return float(clean)
+
+
 def _handle_paye_filing_step(phone: str, account_id: str, user_state: dict, text: str):
-    """Handle PAYE filing guided flow"""
+    """Handle PAYE filing guided flow - SIMPLIFIED"""
     step = user_state.get("step", 1)
     draft = user_state.get("draft", {})
     inputs = draft.get("inputs", {})
     
     if step == 1:
+        # Step 1: Ask for monthly gross income
         try:
-            # Remove currency symbols and commas
-            clean_text = text.replace(",", "").replace("₦", "").replace("N", "").strip()
-            amount = float(clean_text)
+            amount = _parse_amount(text)
             inputs["monthly_gross_income"] = amount
             save_filing_draft(account_id, "paye", inputs, [], step + 1)
             user_states[phone] = {"filing_type": "paye", "step": 2, "draft": {"inputs": inputs}}
-            send_whatsapp_text(phone, f"✅ Received: ₦{amount:,.2f}\n\n📋 Step 2 of 4: Pension Contribution\nEnter your monthly pension contribution (usually 8% of gross income):")
+            send_whatsapp_text(phone, f"✅ Received: ₦{amount:,.2f}\n\n📋 Step 2 of 3: Pension Contribution\nEnter your monthly pension contribution (usually 8% of salary, or 0 if none):")
         except ValueError:
-            send_whatsapp_text(phone, "❌ Please enter a valid amount (e.g., 750000)")
+            send_whatsapp_text(phone, "❌ Please enter a valid amount (e.g., 750000 or 750k or 0.75M)")
     
     elif step == 2:
         try:
-            clean_text = text.replace(",", "").replace("₦", "").replace("N", "").strip()
-            amount = float(clean_text)
+            amount = _parse_amount(text)
             inputs["pension_contribution"] = amount
             save_filing_draft(account_id, "paye", inputs, [], step + 1)
             user_states[phone] = {"filing_type": "paye", "step": 3, "draft": {"inputs": inputs}}
-            send_whatsapp_text(phone, f"✅ Received: ₦{amount:,.2f}\n\n📋 Step 3 of 4: NHF Contribution\nEnter your NHF contribution (if any, or 0):")
+            send_whatsapp_text(phone, f"✅ Received: ₦{amount:,.2f}\n\n📋 Step 3 of 3: NHF Contribution\nEnter your NHF contribution (if any, or 0):")
         except ValueError:
-            send_whatsapp_text(phone, "❌ Please enter a valid amount")
+            send_whatsapp_text(phone, "❌ Please enter a valid amount (e.g., 15000 or 15k)")
     
     elif step == 3:
         try:
-            clean_text = text.replace(",", "").replace("₦", "").replace("N", "").strip()
-            amount = float(clean_text)
+            amount = _parse_amount(text)
             inputs["nhf"] = amount
             save_filing_draft(account_id, "paye", inputs, [], step + 1)
             
@@ -209,12 +222,11 @@ def _handle_paye_filing_step(phone: str, account_id: str, user_state: dict, text
             annual_tax = calc.get("annual_tax_payable", 0)
             
             preview = (f"📋 *PAYE Filing Summary*\n\n"
-                       f"• Monthly Gross Income: ₦{inputs.get('monthly_gross_income', 0):,.2f}\n"
-                       f"• Pension Contribution: ₦{inputs.get('pension_contribution', 0):,.2f}\n"
-                       f"• NHF Contribution: ₦{inputs.get('nhf', 0):,.2f}\n"
-                       f"• Annual Taxable Income: ₦{calc.get('chargeable_income', 0):,.2f}\n"
-                       f"• *Annual Tax Payable: ₦{annual_tax:,.2f}*\n"
-                       f"• *Monthly Tax Deduction: ₦{monthly_tax:,.2f}*\n\n"
+                       f"• Monthly Salary: ₦{inputs.get('monthly_gross_income', 0):,.2f}\n"
+                       f"• Pension: ₦{inputs.get('pension_contribution', 0):,.2f}\n"
+                       f"• NHF: ₦{inputs.get('nhf', 0):,.2f}\n"
+                       f"• *Monthly Tax: ₦{monthly_tax:,.2f}*\n"
+                       f"• *Annual Tax: ₦{annual_tax:,.2f}*\n\n"
                        f"Reply with 'confirm' to submit, or 'cancel' to abort")
             
             user_states[phone] = {"filing_type": "paye", "step": 4, "draft": {"inputs": inputs}, "calculation": calc}
@@ -235,7 +247,7 @@ def _handle_paye_filing_step(phone: str, account_id: str, user_state: dict, text
                                f"📋 Reference: {reference}\n"
                                f"📅 Date: {datetime.fromisoformat(submitted_at).strftime('%d %B %Y, %H:%M')}\n"
                                f"💰 Monthly Tax: ₦{monthly_tax:,.2f}\n\n"
-                               f"📎 You can download your receipt from the web dashboard.\n"
+                               f"📎 Receipt will be available shortly.\n"
                                f"Reply with H to see all filings.")
                 
                 send_whatsapp_text(phone, success_msg)
@@ -254,47 +266,62 @@ def _handle_paye_filing_step(phone: str, account_id: str, user_state: dict, text
 
 
 def _handle_vat_filing_step(phone: str, account_id: str, user_state: dict, text: str):
-    """Handle VAT filing guided flow"""
+    """Handle VAT filing guided flow - SIMPLIFIED"""
     step = user_state.get("step", 1)
     draft = user_state.get("draft", {})
     inputs = draft.get("inputs", {})
     
     if step == 1:
+        # Step 1: Ask for total sales
         try:
-            clean_text = text.replace(",", "").replace("₦", "").replace("N", "").strip()
-            amount = float(clean_text)
-            inputs["taxable_supplies"] = amount
+            amount = _parse_amount(text)
+            inputs["sales_amount"] = amount
             save_filing_draft(account_id, "vat", inputs, [], step + 1)
             user_states[phone] = {"filing_type": "vat", "step": 2, "draft": {"inputs": inputs}}
-            send_whatsapp_text(phone, f"✅ Received: ₦{amount:,.2f}\n\n📋 Step 2 of 3: Input VAT\nEnter your input VAT (VAT paid on purchases):")
+            send_whatsapp_text(phone, f"✅ Received: ₦{amount:,.2f}\n\n📋 Step 2 of 3: Total Purchases\nEnter your total purchases (excluding VAT) for the period:\n(Example: 10000000 or 10M)")
         except ValueError:
-            send_whatsapp_text(phone, "❌ Please enter a valid amount")
+            send_whatsapp_text(phone, "❌ Please enter a valid amount (e.g., 25000000 or 25M)")
     
     elif step == 2:
         try:
-            clean_text = text.replace(",", "").replace("₦", "").replace("N", "").strip()
-            amount = float(clean_text)
-            inputs["input_vat"] = amount
+            amount = _parse_amount(text)
+            inputs["purchases_amount"] = amount
             save_filing_draft(account_id, "vat", inputs, [], step + 1)
             
-            calc = calculate_tax("vat", inputs)
-            vat_payable = calc.get("vat_payable", 0)
+            # Calculate VAT
+            sales = inputs.get("sales_amount", 0)
+            purchases = amount
+            vat_rate = 7.5
+            output_vat = sales * (vat_rate / 100)
+            input_vat = purchases * (vat_rate / 100)
+            vat_payable = max(0, output_vat - input_vat)
             
             preview = (f"📋 *VAT Filing Summary*\n\n"
-                       f"• Taxable Supplies: ₦{inputs.get('taxable_supplies', 0):,.2f}\n"
-                       f"• Input VAT: ₦{inputs.get('input_vat', 0):,.2f}\n"
-                       f"• Output VAT (7.5%): ₦{calc.get('output_vat', 0):,.2f}\n"
+                       f"• Total Sales: ₦{sales:,.2f}\n"
+                       f"• Total Purchases: ₦{purchases:,.2f}\n"
+                       f"• VAT Rate: 7.5%\n"
+                       f"• VAT on Sales: ₦{output_vat:,.2f}\n"
+                       f"• VAT on Purchases: ₦{input_vat:,.2f}\n"
                        f"• *VAT Payable: ₦{vat_payable:,.2f}*\n\n"
                        f"Reply with 'confirm' to submit, or 'cancel' to abort")
             
-            user_states[phone] = {"filing_type": "vat", "step": 3, "draft": {"inputs": inputs}, "calculation": calc}
+            user_states[phone] = {"filing_type": "vat", "step": 3, "draft": {"inputs": inputs}, "calculation": {"vat_payable": vat_payable, "output_vat": output_vat, "input_vat": input_vat}}
             send_whatsapp_text(phone, preview)
         except ValueError:
-            send_whatsapp_text(phone, "❌ Please enter a valid amount")
+            send_whatsapp_text(phone, "❌ Please enter a valid amount (e.g., 10000000 or 10M)")
     
     elif step == 3:
         if text.lower() == "confirm":
-            result = submit_tax_filing(account_id, "vat", inputs, [])
+            # Prepare inputs for submission
+            sales = inputs.get("sales_amount", 0)
+            purchases = inputs.get("purchases_amount", 0)
+            submission_inputs = {
+                "taxable_supplies": sales,
+                "input_vat": purchases * 0.075,
+                "sales_amount": sales,
+                "purchases_amount": purchases
+            }
+            result = submit_tax_filing(account_id, "vat", submission_inputs, [])
             if result.get("ok"):
                 calc = result.get("calculation", {})
                 vat_payable = calc.get("vat_payable", 0)
@@ -305,7 +332,7 @@ def _handle_vat_filing_step(phone: str, account_id: str, user_state: dict, text:
                                f"📋 Reference: {reference}\n"
                                f"📅 Date: {datetime.fromisoformat(submitted_at).strftime('%d %B %Y, %H:%M')}\n"
                                f"💰 VAT Payable: ₦{vat_payable:,.2f}\n\n"
-                               f"📎 You can download your receipt from the web dashboard.\n"
+                               f"📎 Receipt will be available shortly.\n"
                                f"Reply with H to see all filings.")
                 
                 send_whatsapp_text(phone, success_msg)
@@ -324,51 +351,69 @@ def _handle_vat_filing_step(phone: str, account_id: str, user_state: dict, text:
 
 
 def _handle_cit_filing_step(phone: str, account_id: str, user_state: dict, text: str):
-    """Handle CIT filing guided flow"""
+    """Handle CIT filing guided flow - SIMPLIFIED"""
     step = user_state.get("step", 1)
     draft = user_state.get("draft", {})
     inputs = draft.get("inputs", {})
     
     if step == 1:
+        # Step 1: Ask for total revenue
         try:
-            clean_text = text.replace(",", "").replace("₦", "").replace("N", "").strip()
-            amount = float(clean_text)
-            inputs["gross_profit"] = amount
+            amount = _parse_amount(text)
+            inputs["revenue"] = amount
             save_filing_draft(account_id, "cit", inputs, [], step + 1)
             user_states[phone] = {"filing_type": "cit", "step": 2, "draft": {"inputs": inputs}}
-            send_whatsapp_text(phone, f"✅ Received: ₦{amount:,.2f}\n\n📋 Step 2 of 3: Allowable Expenses\nEnter your allowable expenses:")
+            send_whatsapp_text(phone, f"✅ Received: ₦{amount:,.2f}\n\n📋 Step 2 of 3: Total Expenses\nEnter your total allowable expenses for the period:\n(Example: 5000000 or 5M)")
         except ValueError:
-            send_whatsapp_text(phone, "❌ Please enter a valid amount")
+            send_whatsapp_text(phone, "❌ Please enter a valid amount (e.g., 25000000 or 25M)")
     
     elif step == 2:
         try:
-            clean_text = text.replace(",", "").replace("₦", "").replace("N", "").strip()
-            amount = float(clean_text)
-            inputs["allowable_expenses"] = amount
+            amount = _parse_amount(text)
+            inputs["expenses"] = amount
             save_filing_draft(account_id, "cit", inputs, [], step + 1)
             
-            calc = calculate_tax("cit", inputs)
-            cit_payable = calc.get("cit_payable", 0)
-            company_size = calc.get("company_size", "N/A")
-            rate = calc.get("applicable_rate", 0)
+            # Calculate CIT
+            revenue = inputs.get("revenue", 0)
+            expenses = amount
+            profit = max(0, revenue - expenses)
+            
+            # Determine applicable rate based on revenue
+            if revenue > 100000000:  # Large company > ₦100M
+                applicable_rate = 30
+            elif revenue > 25000000:  # Medium company ₦25M - ₦100M
+                applicable_rate = 20
+            else:  # Small company ≤ ₦25M
+                applicable_rate = 0
+            
+            cit_payable = profit * (applicable_rate / 100)
+            company_size = "Large" if revenue > 100000000 else "Medium" if revenue > 25000000 else "Small"
             
             preview = (f"📋 *CIT Filing Summary*\n\n"
-                       f"• Gross Profit: ₦{inputs.get('gross_profit', 0):,.2f}\n"
-                       f"• Allowable Expenses: ₦{inputs.get('allowable_expenses', 0):,.2f}\n"
-                       f"• Assessable Profit: ₦{calc.get('assessable_profit', 0):,.2f}\n"
-                       f"• Company Size: {company_size.title()}\n"
-                       f"• Applicable Rate: {rate}%\n"
+                       f"• Total Revenue: ₦{revenue:,.2f}\n"
+                       f"• Total Expenses: ₦{expenses:,.2f}\n"
+                       f"• Profit: ₦{profit:,.2f}\n"
+                       f"• Company Size: {company_size}\n"
+                       f"• Tax Rate: {applicable_rate}%\n"
                        f"• *CIT Payable: ₦{cit_payable:,.2f}*\n\n"
+                       f"*Small companies (≤₦25M revenue) pay 0% tax!*\n\n"
                        f"Reply with 'confirm' to submit, or 'cancel' to abort")
             
-            user_states[phone] = {"filing_type": "cit", "step": 3, "draft": {"inputs": inputs}, "calculation": calc}
+            user_states[phone] = {"filing_type": "cit", "step": 3, "draft": {"inputs": inputs}, "calculation": {"cit_payable": cit_payable, "profit": profit, "rate": applicable_rate}}
             send_whatsapp_text(phone, preview)
         except ValueError:
-            send_whatsapp_text(phone, "❌ Please enter a valid amount")
+            send_whatsapp_text(phone, "❌ Please enter a valid amount (e.g., 5000000 or 5M)")
     
     elif step == 3:
         if text.lower() == "confirm":
-            result = submit_tax_filing(account_id, "cit", inputs, [])
+            # Prepare inputs for submission
+            submission_inputs = {
+                "gross_profit": inputs.get("revenue", 0) - inputs.get("expenses", 0),
+                "allowable_expenses": inputs.get("expenses", 0),
+                "revenue": inputs.get("revenue", 0),
+                "expenses": inputs.get("expenses", 0)
+            }
+            result = submit_tax_filing(account_id, "cit", submission_inputs, [])
             if result.get("ok"):
                 calc = result.get("calculation", {})
                 cit_payable = calc.get("cit_payable", 0)
@@ -379,7 +424,7 @@ def _handle_cit_filing_step(phone: str, account_id: str, user_state: dict, text:
                                f"📋 Reference: {reference}\n"
                                f"📅 Date: {datetime.fromisoformat(submitted_at).strftime('%d %B %Y, %H:%M')}\n"
                                f"💰 CIT Payable: ₦{cit_payable:,.2f}\n\n"
-                               f"📎 You can download your receipt from the web dashboard.\n"
+                               f"📎 Receipt will be available shortly.\n"
                                f"Reply with H to see all filings.")
                 
                 send_whatsapp_text(phone, success_msg)
@@ -401,19 +446,19 @@ def _handle_tax_filing_command(phone: str, account_id: str, text: str):
     """Handle tax filing commands"""
     text_lower = text.lower().strip()
     
-    if text_lower in ["file paye", "file paye tax", "paye"]:
+    if text_lower in ["file paye", "file paye tax", "paye", "p"]:
         user_states[phone] = {"filing_type": "paye", "step": 1, "draft": {"inputs": {}}}
-        send_whatsapp_text(phone, "📋 *PAYE Tax Filing - Step 1 of 4*\n\nPlease provide your monthly gross income:\n(Example: 750000)")
+        send_whatsapp_text(phone, "📋 *PAYE Tax Filing - Step 1 of 3*\n\nWhat is your monthly salary?\n(Example: 750000 or 750k or 0.75M)")
         return True
     
-    elif text_lower in ["file vat", "file vat tax", "vat"]:
+    elif text_lower in ["file vat", "file vat tax", "vat", "v"]:
         user_states[phone] = {"filing_type": "vat", "step": 1, "draft": {"inputs": {}}}
-        send_whatsapp_text(phone, "📋 *VAT Filing - Step 1 of 3*\n\nEnter your total taxable supplies for the period:\n(Example: 5000000)")
+        send_whatsapp_text(phone, "📋 *VAT Filing - Step 1 of 3*\n\nWhat is your total sales for the period?\n(Example: 25000000 or 25M)")
         return True
     
-    elif text_lower in ["file cit", "file cit tax", "file company tax", "cit"]:
+    elif text_lower in ["file cit", "file cit tax", "file company tax", "cit", "c"]:
         user_states[phone] = {"filing_type": "cit", "step": 1, "draft": {"inputs": {}}}
-        send_whatsapp_text(phone, "📋 *CIT Filing - Step 1 of 3*\n\nEnter your gross profit for the period:\n(Example: 10000000)")
+        send_whatsapp_text(phone, "📋 *CIT Filing - Step 1 of 3*\n\nWhat is your company's total revenue for the period?\n(Example: 50000000 or 50M)")
         return True
     
     return False
@@ -425,14 +470,14 @@ def _handle_filing_history(phone: str, account_id: str):
     if filings:
         msg = "📋 *Your Tax Filings*\n\n"
         for f in filings[:5]:
-            msg += f"• *{f.get('tax_type', '').upper()}*: {f.get('reference', 'N/A')}\n"
-            msg += f"  Status: {f.get('status', 'N/A')}\n"
-            msg += f"  Date: {f.get('submitted_at', '')[:10] if f.get('submitted_at') else 'N/A'}\n\n"
+            status_emoji = "✅" if f.get('status') == 'submitted' else "⏳"
+            msg += f"{status_emoji} *{f.get('tax_type', '').upper()}*: {f.get('reference', 'N/A')}\n"
+            msg += f"   📅 {f.get('submitted_at', '')[:10] if f.get('submitted_at') else 'N/A'}\n\n"
         if len(filings) > 5:
             msg += f"\n+ {len(filings) - 5} more. Visit web for full history."
         send_whatsapp_text(phone, msg)
     else:
-        send_whatsapp_text(phone, "📋 No tax filings found. Reply with P to file PAYE tax.")
+        send_whatsapp_text(phone, "📋 No tax filings found. Reply with P to file PAYE tax, V for VAT, or C for CIT.")
     return True
 
 
@@ -528,7 +573,6 @@ def _handle_whatsapp_message():
 
         # ============================================================
         # 2. CRITICAL: Check for in-progress filing FIRST
-        #    This prevents numbers from being mistaken for link codes
         # ============================================================
         if user_state.get("filing_type") and user_state.get("step"):
             _handle_continue_filing(from_phone, account_id, text)
@@ -615,17 +659,17 @@ def _handle_whatsapp_message():
         # ============================================================
         if text.upper() == "P":
             user_states[from_phone] = {"filing_type": "paye", "step": 1, "draft": {"inputs": {}}}
-            send_whatsapp_text(from_phone, "📋 *PAYE Tax Filing - Step 1 of 4*\n\nPlease provide your monthly gross income:\n(Example: 750000)")
+            send_whatsapp_text(from_phone, "📋 *PAYE Tax Filing - Step 1 of 3*\n\nWhat is your monthly salary?\n(Example: 750000 or 750k or 0.75M)")
             return jsonify({"ok": True})
         
         elif text.upper() == "V":
             user_states[from_phone] = {"filing_type": "vat", "step": 1, "draft": {"inputs": {}}}
-            send_whatsapp_text(from_phone, "📋 *VAT Filing - Step 1 of 3*\n\nEnter your total taxable supplies for the period:\n(Example: 5000000)")
+            send_whatsapp_text(from_phone, "📋 *VAT Filing - Step 1 of 3*\n\nWhat is your total sales for the period?\n(Example: 25000000 or 25M)")
             return jsonify({"ok": True})
         
         elif text.upper() == "C":
             user_states[from_phone] = {"filing_type": "cit", "step": 1, "draft": {"inputs": {}}}
-            send_whatsapp_text(from_phone, "📋 *CIT Filing - Step 1 of 3*\n\nEnter your gross profit for the period:\n(Example: 10000000)")
+            send_whatsapp_text(from_phone, "📋 *CIT Filing - Step 1 of 3*\n\nWhat is your company's total revenue for the period?\n(Example: 50000000 or 50M)")
             return jsonify({"ok": True})
         
         elif text.upper() == "H":
