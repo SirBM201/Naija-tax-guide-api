@@ -572,7 +572,8 @@ def _handle_whatsapp_message():
             return jsonify({"ok": True})
 
         # ============================================================
-        # 2. CRITICAL: Check for in-progress filing FIRST
+        # 2. CRITICAL FIX: Check for in-progress filing FIRST
+        #    This MUST happen BEFORE link code detection
         # ============================================================
         if user_state.get("filing_type") and user_state.get("step"):
             _handle_continue_filing(from_phone, account_id, text)
@@ -732,7 +733,9 @@ def _handle_whatsapp_message():
             return jsonify({"ok": True})
 
         # ============================================================
-        # 8. Handle linking code (MOVED AFTER filing checks)
+        # 8. Handle linking code (ONLY if not in a tax filing flow)
+        #    The filing check at the top ensures this only runs
+        #    when user is NOT actively filing taxes
         # ============================================================
         if LINK_CODE_RE.match(text.upper()):
             attempt = _try_consume_link_code(from_phone, text)
