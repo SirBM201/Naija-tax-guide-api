@@ -720,3 +720,67 @@ def _handle_whatsapp_message():
                         email=user_email
                     )
                     if result.get("ok"):
+                        send_whatsapp_text(from_phone, result["message"])
+                    else:
+                        send_whatsapp_text(from_phone, f"❌ {result.get('message', 'Please try again.')}")
+                else:
+                    user_states[from_phone] = {"awaiting_email": True, "pending_plan": plan}
+                    send_whatsapp_text(from_phone, request_email_message())
+            else:
+                send_whatsapp_text(from_phone, "❌ Invalid plan number. Send 4 to see plans.")
+            return jsonify({"ok": True})
+
+        # ============================================================
+        # 8. Handle linking code (ONLY if not in any tax filing flow)
+        #    The filing check at Section 2 ensures this only runs
+        #    when user is NOT actively filing PAYE, VAT, or CIT
+        # ============================================================
+        if LINK_CODE_RE.match(text.upper()):
+            attempt = _try_consume_link_code(from_phone, text)
+            if attempt.get("ok"):
+                send_whatsapp_text(
+                    from_phone,
+                    "✅ *WhatsApp linked successfully!*\n\n"
+                    "Your account is now connected to the web."
+                )
+                return jsonify({"ok": True, "linked": True})
+            else:
+                send_whatsapp_text(
+                    from_phone,
+                    "❌ *Invalid link code*\n\n"
+                    "Generate a new code on the website.\n\n"
+                    "Reply 8 for help."
+                )
+                return jsonify({"ok": True, "linked": False})
+
+        # ============================================================
+        # 9. Handle help variations
+        # ============================================================
+        if text.lower() in ["help", "menu", "start", "?", "/start"]:
+            _send_main_menu(from_phone)
+            return jsonify({"ok": True})
+
+        # ============================================================
+        # 10. Answer tax question directly
+        # ============================================================
+        result = ask_guarded({
+            "question": text,
+            "account_id": account_id,
+            "lang": "en",
+            "channel": "whatsapp"
+        })
+
+        if result.get("ok"):
+            answer = result.get("answer", "")
+            if answer:
+                send_whatsapp_text(from_phone, answer)
+            else:
+                send_whatsapp_text(from_phone, "I couldn't find an answer. Please try rephrasing.\n\nReply 8 for menu.")
+        else:
+            send_whatsapp_text(from_phone, "Sorry, I encountered an error. Please try again.\n\nReply 8 for menu.")
+
+        return jsonify({"ok": True})
+
+    except Exception as e:
+        logging.exception(f"WA webhook error: {e}")
+        return jsonify({"ok": True})
