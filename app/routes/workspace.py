@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 from flask import Blueprint, jsonify, request, session
 from app.core.supabase_client import supabase
 from app.services.auth_service import get_current_user
