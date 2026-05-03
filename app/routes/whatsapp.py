@@ -438,22 +438,34 @@ def _handle_tax_filing_command(phone: str, account_id: str, text: str):
     """Handle tax filing commands - ONLY if not already in a filing"""
     text_lower = text.lower().strip()
     
-    # CRITICAL: Check if user is already in a filing flow
+    # Check if user is already in a filing flow
     if user_states.get(phone, {}).get("filing_type"):
-        # User is already filing something - ignore new commands
         return False
     
     if text_lower in ["file paye", "file paye tax", "paye", "p"]:
+        # Delete any existing draft for this tax type
+        try:
+            supabase().table("tax_filing_drafts").delete().eq("user_id", account_id).eq("tax_type", "paye").eq("status", "in_progress").execute()
+        except:
+            pass
         user_states[phone] = {"filing_type": "paye", "step": 1, "draft": {"inputs": {}}}
         send_whatsapp_text(phone, "📋 *PAYE Tax Filing - Step 1 of 3*\n\nWhat is your monthly salary?\n(Example: 750000 or 750k or 0.75M)")
         return True
     
     elif text_lower in ["file vat", "file vat tax", "vat", "v"]:
+        try:
+            supabase().table("tax_filing_drafts").delete().eq("user_id", account_id).eq("tax_type", "vat").eq("status", "in_progress").execute()
+        except:
+            pass
         user_states[phone] = {"filing_type": "vat", "step": 1, "draft": {"inputs": {}}}
         send_whatsapp_text(phone, "📋 *VAT Filing - Step 1 of 3*\n\nWhat is your total sales for the period?\n(Example: 25000000 or 25M)")
         return True
     
     elif text_lower in ["file cit", "file cit tax", "file company tax", "cit", "c"]:
+        try:
+            supabase().table("tax_filing_drafts").delete().eq("user_id", account_id).eq("tax_type", "cit").eq("status", "in_progress").execute()
+        except:
+            pass
         user_states[phone] = {"filing_type": "cit", "step": 1, "draft": {"inputs": {}}}
         send_whatsapp_text(phone, "📋 *CIT Filing - Step 1 of 3*\n\nWhat is your company's total revenue for the period?\n(Example: 50000000 or 50M)")
         return True
@@ -476,6 +488,36 @@ def _handle_filing_history(phone: str, account_id: str):
     else:
         send_whatsapp_text(phone, "📋 No tax filings found. Reply with P to file PAYE tax, V for VAT, or C for CIT.")
     return True
+
+
+def _restore_filing_state_from_db(phone: str, account_id: str) -> dict:
+    """Restore user's filing state from database if exists"""
+    try:
+        draft_result = (
+            supabase()
+            .table("tax_filing_drafts")
+            .select("*")
+            .eq("user_id", account_id)
+            .eq("status", "in_progress")
+            .maybe_single()
+            .execute()
+        )
+        
+        if draft_result.data:
+            draft = draft_result.data
+            filing_type = draft.get("tax_type")
+            step = draft.get("current_step", 1)
+            inputs = draft.get("inputs", {})
+            
+            return {
+                "filing_type": filing_type,
+                "step": step,
+                "draft": {"inputs": inputs}
+            }
+    except Exception as e:
+        logging.error(f"Failed to restore filing state for {phone}: {e}")
+    
+    return {}
 
 
 def _handle_continue_filing(phone: str, account_id: str, text: str):
@@ -565,18 +607,31 @@ def _handle_whatsapp_message():
             return jsonify({"ok": True})
 
         # ============================================================
-        # 2. CRITICAL: Check for in-progress filing FIRST
-        #    This applies to ALL tax types: PAYE, VAT, CIT
-        #    This MUST happen BEFORE link code detection, menu options,
-        #    and especially BEFORE single-character commands (P, V, C)
+        # 2. CRITICAL: Check for in-progress filing
+        #    First check memory, then database if not found
         # ============================================================
-        if user_state.get("filing_type") and user_state.get("step"):
+        
+        # Check memory first
+        filing_type = user_state.get("filing_type")
+        step = user_state.get("step")
+        
+        # If not in memory, try to restore from database
+        if not filing_type or not step:
+            restored_state = _restore_filing_state_from_db(from_phone, account_id)
+            if restored_state:
+                user_states[from_phone] = restored_state
+                user_state = user_states[from_phone]
+                filing_type = user_state.get("filing_type")
+                step = user_state.get("step")
+                logging.info(f"Restored {filing_type} filing step {step} for {from_phone}")
+        
+        # If we have an active filing, handle it
+        if filing_type and step:
             _handle_continue_filing(from_phone, account_id, text)
             return jsonify({"ok": True})
 
         # ============================================================
         # 3. Handle tax filing commands (starts new filing)
-        #    Added protection to prevent overwriting existing filing
         # ============================================================
         if _handle_tax_filing_command(from_phone, account_id, text):
             return jsonify({"ok": True})
@@ -652,20 +707,31 @@ def _handle_whatsapp_message():
 
         # ============================================================
         # 5. Handle single-character tax menu options (P, V, C, H, D, B)
-        #    IMPORTANT: We already checked for active filing above,
-        #    so these won't overwrite an in-progress filing.
         # ============================================================
         if text.upper() == "P":
+            # Delete any existing draft first
+            try:
+                supabase().table("tax_filing_drafts").delete().eq("user_id", account_id).eq("tax_type", "paye").eq("status", "in_progress").execute()
+            except:
+                pass
             user_states[from_phone] = {"filing_type": "paye", "step": 1, "draft": {"inputs": {}}}
             send_whatsapp_text(from_phone, "📋 *PAYE Tax Filing - Step 1 of 3*\n\nWhat is your monthly salary?\n(Example: 750000 or 750k or 0.75M)")
             return jsonify({"ok": True})
         
         elif text.upper() == "V":
+            try:
+                supabase().table("tax_filing_drafts").delete().eq("user_id", account_id).eq("tax_type", "vat").eq("status", "in_progress").execute()
+            except:
+                pass
             user_states[from_phone] = {"filing_type": "vat", "step": 1, "draft": {"inputs": {}}}
             send_whatsapp_text(from_phone, "📋 *VAT Filing - Step 1 of 3*\n\nWhat is your total sales for the period?\n(Example: 25000000 or 25M)")
             return jsonify({"ok": True})
         
         elif text.upper() == "C":
+            try:
+                supabase().table("tax_filing_drafts").delete().eq("user_id", account_id).eq("tax_type", "cit").eq("status", "in_progress").execute()
+            except:
+                pass
             user_states[from_phone] = {"filing_type": "cit", "step": 1, "draft": {"inputs": {}}}
             send_whatsapp_text(from_phone, "📋 *CIT Filing - Step 1 of 3*\n\nWhat is your company's total revenue for the period?\n(Example: 50000000 or 50M)")
             return jsonify({"ok": True})
@@ -732,8 +798,6 @@ def _handle_whatsapp_message():
 
         # ============================================================
         # 8. Handle linking code (ONLY if not in any tax filing flow)
-        #    The filing check at Section 2 ensures this only runs
-        #    when user is NOT actively filing PAYE, VAT, or CIT
         # ============================================================
         if LINK_CODE_RE.match(text.upper()):
             attempt = _try_consume_link_code(from_phone, text)
