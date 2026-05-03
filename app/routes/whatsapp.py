@@ -848,3 +848,4 @@ def _handle_whatsapp_message():
     except Exception as e:
         logging.exception(f"WA webhook error: {e}")
         return jsonify({"ok": True})
+
