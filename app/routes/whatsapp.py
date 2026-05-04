@@ -122,23 +122,6 @@ def _send_tax_menu(phone: str):
     send_whatsapp_text(phone, menu)
 
 
-def _send_help(phone: str):
-    help_msg = (
-        "*📖 Help Guide*\n\n"
-        "• *Ask tax questions*: Type your question naturally\n"
-        "  Example: 'What is PAYE tax?'\n\n"
-        "• *Check credits*: Reply 2\n\n"
-        "• *View subscription*: Reply 3\n\n"
-        "• *View/upgrade plans*: Reply 4\n\n"
-        "• *Link to website*: Reply 5\n\n"
-        "• *Buy credits*: Reply 6\n\n"
-        "• *File taxes*: Reply 7 then choose tax type\n\n"
-        "• *Show menu*: Reply 8\n\n"
-        "Need help? Email support@naijataxguides.com"
-    )
-    send_whatsapp_text(phone, help_msg)
-
-
 def _send_welcome(phone: str):
     welcome = (
         "*Welcome to Naija Tax Guide!* ✅\n\n"
@@ -171,58 +154,60 @@ def _parse_amount(text: str) -> float:
     return float(clean)
 
 
-def _load_filing_from_db(account_id: str, tax_type: str):
-    """Load filing state from database"""
+def _get_active_filing(account_id: str):
+    """Check database for any active filing - returns (tax_type, step, inputs) or None"""
     try:
+        # Query for any in_progress filing
         result = supabase.table("tax_filing_drafts")\
             .select("*")\
             .eq("user_id", account_id)\
-            .eq("tax_type", tax_type)\
             .eq("status", "in_progress")\
-            .maybe_single()\
+            .limit(1)\
             .execute()
         
-        if result.data:
+        if result.data and len(result.data) > 0:
+            draft = result.data[0]
             return {
-                "filing_type": result.data.get("tax_type"),
-                "step": result.data.get("current_step", 1),
-                "draft": {"inputs": result.data.get("inputs", {})}
+                "filing_type": draft.get("tax_type"),
+                "step": draft.get("current_step", 1),
+                "inputs": draft.get("inputs", {})
             }
     except Exception as e:
-        logging.error(f"Failed to load filing from DB: {e}")
+        logging.error(f"Failed to get active filing: {e}")
     
     return None
 
 
-def _handle_paye_filing_step(phone: str, account_id: str, user_state: dict, text: str):
-    step = user_state.get("step", 1)
-    inputs = user_state.get("draft", {}).get("inputs", {})
-    
+def _handle_paye_filing(phone: str, account_id: str, step: int, inputs: dict, text: str):
     if step == 1:
         try:
             amount = _parse_amount(text)
             inputs["monthly_gross_income"] = amount
-            save_filing_draft(account_id, "paye", inputs, [], step + 1)
-            user_states[phone] = {"filing_type": "paye", "step": 2, "draft": {"inputs": inputs}}
+            save_filing_draft(account_id, "paye", inputs, [], 2)
+            user_states[phone] = {"filing_type": "paye", "step": 2, "inputs": inputs}
             send_whatsapp_text(phone, f"✅ Received: ₦{amount:,.2f}\n\n📋 Step 2 of 3: Pension Contribution\nEnter your monthly pension contribution (usually 8% of salary, or 0 if none):")
+            return True
         except ValueError:
             send_whatsapp_text(phone, "❌ Please enter a valid amount (e.g., 750000 or 750k)")
+            return True
     
     elif step == 2:
         try:
             amount = _parse_amount(text)
             inputs["pension_contribution"] = amount
-            save_filing_draft(account_id, "paye", inputs, [], step + 1)
-            user_states[phone] = {"filing_type": "paye", "step": 3, "draft": {"inputs": inputs}}
+            save_filing_draft(account_id, "paye", inputs, [], 3)
+            user_states[phone] = {"filing_type": "paye", "step": 3, "inputs": inputs}
             send_whatsapp_text(phone, f"✅ Received: ₦{amount:,.2f}\n\n📋 Step 3 of 3: NHF Contribution\nEnter your NHF contribution (if any, or 0):")
+            return True
         except ValueError:
             send_whatsapp_text(phone, "❌ Please enter a valid amount")
+            return True
     
     elif step == 3:
         try:
             amount = _parse_amount(text)
             inputs["nhf"] = amount
-            save_filing_draft(account_id, "paye", inputs, [], step + 1)
+            save_filing_draft(account_id, "paye", inputs, [], 4)
             
             calc = calculate_tax("paye", inputs)
             monthly_tax = calc.get("monthly_tax_payable", 0)
@@ -234,10 +219,12 @@ def _handle_paye_filing_step(phone: str, account_id: str, user_state: dict, text
                        f"• *Monthly Tax: ₦{monthly_tax:,.2f}*\n\n"
                        f"Reply with 'confirm' to submit, or 'cancel' to abort")
             
-            user_states[phone] = {"filing_type": "paye", "step": 4, "draft": {"inputs": inputs}, "calculation": calc}
+            user_states[phone] = {"filing_type": "paye", "step": 4, "inputs": inputs}
             send_whatsapp_text(phone, preview)
+            return True
         except ValueError:
             send_whatsapp_text(phone, "❌ Please enter a valid amount")
+            return True
     
     elif step == 4:
         if text.lower() == "confirm":
@@ -247,12 +234,7 @@ def _handle_paye_filing_step(phone: str, account_id: str, user_state: dict, text
                 monthly_tax = calc.get("monthly_tax_payable", 0)
                 reference = result.get("reference", "N/A")
                 
-                success_msg = (f"✅ *PAYE Filing Submitted!*\n\n"
-                               f"📋 Reference: {reference}\n"
-                               f"💰 Monthly Tax: ₦{monthly_tax:,.2f}\n\n"
-                               f"Reply with H to see all filings.")
-                
-                send_whatsapp_text(phone, success_msg)
+                send_whatsapp_text(phone, f"✅ *PAYE Filing Submitted!*\n\n📋 Reference: {reference}\n💰 Monthly Tax: ₦{monthly_tax:,.2f}\n\nReply with H to see all filings.")
                 user_states.pop(phone, None)
                 delete_filing_draft(account_id, "paye")
             else:
@@ -263,29 +245,29 @@ def _handle_paye_filing_step(phone: str, account_id: str, user_state: dict, text
             send_whatsapp_text(phone, "❌ Filing cancelled.")
         else:
             send_whatsapp_text(phone, "Reply with 'confirm' to submit or 'cancel' to abort")
+        return True
     
-    return True
+    return False
 
 
-def _handle_vat_filing_step(phone: str, account_id: str, user_state: dict, text: str):
-    step = user_state.get("step", 1)
-    inputs = user_state.get("draft", {}).get("inputs", {})
-    
+def _handle_vat_filing(phone: str, account_id: str, step: int, inputs: dict, text: str):
     if step == 1:
         try:
             amount = _parse_amount(text)
             inputs["sales_amount"] = amount
-            save_filing_draft(account_id, "vat", inputs, [], step + 1)
-            user_states[phone] = {"filing_type": "vat", "step": 2, "draft": {"inputs": inputs}}
+            save_filing_draft(account_id, "vat", inputs, [], 2)
+            user_states[phone] = {"filing_type": "vat", "step": 2, "inputs": inputs}
             send_whatsapp_text(phone, f"✅ Received: ₦{amount:,.2f}\n\n📋 Step 2 of 3: Total Purchases\nEnter your total purchases (excluding VAT):")
+            return True
         except ValueError:
             send_whatsapp_text(phone, "❌ Please enter a valid amount")
+            return True
     
     elif step == 2:
         try:
             amount = _parse_amount(text)
             inputs["purchases_amount"] = amount
-            save_filing_draft(account_id, "vat", inputs, [], step + 1)
+            save_filing_draft(account_id, "vat", inputs, [], 3)
             
             sales = inputs.get("sales_amount", 0)
             purchases = amount
@@ -300,10 +282,12 @@ def _handle_vat_filing_step(phone: str, account_id: str, user_state: dict, text:
                        f"• *VAT Payable: ₦{vat_payable:,.2f}*\n\n"
                        f"Reply with 'confirm' to submit, or 'cancel' to abort")
             
-            user_states[phone] = {"filing_type": "vat", "step": 3, "draft": {"inputs": inputs}}
+            user_states[phone] = {"filing_type": "vat", "step": 3, "inputs": inputs}
             send_whatsapp_text(phone, preview)
+            return True
         except ValueError:
             send_whatsapp_text(phone, "❌ Please enter a valid amount")
+            return True
     
     elif step == 3:
         if text.lower() == "confirm":
@@ -326,29 +310,31 @@ def _handle_vat_filing_step(phone: str, account_id: str, user_state: dict, text:
             delete_filing_draft(account_id, "vat")
             user_states.pop(phone, None)
             send_whatsapp_text(phone, "❌ Filing cancelled.")
+        else:
+            send_whatsapp_text(phone, "Reply with 'confirm' to submit or 'cancel' to abort")
+        return True
     
-    return True
+    return False
 
 
-def _handle_cit_filing_step(phone: str, account_id: str, user_state: dict, text: str):
-    step = user_state.get("step", 1)
-    inputs = user_state.get("draft", {}).get("inputs", {})
-    
+def _handle_cit_filing(phone: str, account_id: str, step: int, inputs: dict, text: str):
     if step == 1:
         try:
             amount = _parse_amount(text)
             inputs["revenue"] = amount
-            save_filing_draft(account_id, "cit", inputs, [], step + 1)
-            user_states[phone] = {"filing_type": "cit", "step": 2, "draft": {"inputs": inputs}}
+            save_filing_draft(account_id, "cit", inputs, [], 2)
+            user_states[phone] = {"filing_type": "cit", "step": 2, "inputs": inputs}
             send_whatsapp_text(phone, f"✅ Received: ₦{amount:,.2f}\n\n📋 Step 2 of 3: Total Expenses\nEnter your total allowable expenses:")
+            return True
         except ValueError:
             send_whatsapp_text(phone, "❌ Please enter a valid amount (e.g., 25000000 or 25M)")
+            return True
     
     elif step == 2:
         try:
             amount = _parse_amount(text)
             inputs["expenses"] = amount
-            save_filing_draft(account_id, "cit", inputs, [], step + 1)
+            save_filing_draft(account_id, "cit", inputs, [], 3)
             
             revenue = inputs.get("revenue", 0)
             expenses = amount
@@ -373,10 +359,12 @@ def _handle_cit_filing_step(phone: str, account_id: str, user_state: dict, text:
                        f"• *CIT Payable: ₦{cit_payable:,.2f}*\n\n"
                        f"Reply with 'confirm' to submit, or 'cancel' to abort")
             
-            user_states[phone] = {"filing_type": "cit", "step": 3, "draft": {"inputs": inputs}}
+            user_states[phone] = {"filing_type": "cit", "step": 3, "inputs": inputs}
             send_whatsapp_text(phone, preview)
+            return True
         except ValueError:
             send_whatsapp_text(phone, "❌ Please enter a valid amount")
+            return True
     
     elif step == 3:
         if text.lower() == "confirm":
@@ -399,20 +387,9 @@ def _handle_cit_filing_step(phone: str, account_id: str, user_state: dict, text:
             delete_filing_draft(account_id, "cit")
             user_states.pop(phone, None)
             send_whatsapp_text(phone, "❌ Filing cancelled.")
-    
-    return True
-
-
-def _handle_continue_filing(phone: str, account_id: str, text: str):
-    user_state = user_states.get(phone, {})
-    filing_type = user_state.get("filing_type")
-    
-    if filing_type == "paye":
-        return _handle_paye_filing_step(phone, account_id, user_state, text)
-    elif filing_type == "vat":
-        return _handle_vat_filing_step(phone, account_id, user_state, text)
-    elif filing_type == "cit":
-        return _handle_cit_filing_step(phone, account_id, user_state, text)
+        else:
+            send_whatsapp_text(phone, "Reply with 'confirm' to submit or 'cancel' to abort")
+        return True
     
     return False
 
@@ -428,7 +405,6 @@ def _handle_filing_history(phone: str, account_id: str):
         send_whatsapp_text(phone, msg)
     else:
         send_whatsapp_text(phone, "📋 No tax filings found. Reply with P to file PAYE tax, V for VAT, or C for CIT.")
-    return True
 
 
 @bp.route("/whatsapp/webhook", methods=["GET", "POST"])
@@ -462,7 +438,7 @@ def wa_webhook():
             _send_welcome(from_phone)
             return jsonify({"ok": True})
         
-        # Check for email collection
+        # Handle email collection for subscription
         if user_state.get("awaiting_email"):
             email = text.strip().lower()
             pending_plan = user_state.get("pending_plan")
@@ -481,38 +457,51 @@ def wa_webhook():
                 send_whatsapp_text(from_phone, "❌ Invalid email. Send a valid email or 'cancel' to abort.")
             return jsonify({"ok": True})
         
-        # ========== CRITICAL: Check for in-progress filing FIRST ==========
+        # ========== CRITICAL: Check for active filing ==========
         # Check memory first
-        if user_state.get("filing_type") and user_state.get("step"):
-            _handle_continue_filing(from_phone, account_id, text)
-            return jsonify({"ok": True})
+        filing_type = user_state.get("filing_type")
+        step = user_state.get("step")
+        inputs = user_state.get("inputs", {})
         
-        # Check database for active filing
-        for tax_type in ["paye", "vat", "cit"]:
-            db_state = _load_filing_from_db(account_id, tax_type)
-            if db_state:
-                user_states[from_phone] = db_state
-                _handle_continue_filing(from_phone, account_id, text)
-                return jsonify({"ok": True})
+        # If not in memory, check database
+        if not filing_type:
+            active = _get_active_filing(account_id)
+            if active:
+                filing_type = active["filing_type"]
+                step = active["step"]
+                inputs = active["inputs"]
+                user_states[from_phone] = {"filing_type": filing_type, "step": step, "inputs": inputs}
+                logging.info(f"Restored filing from DB: {filing_type} step {step}")
+        
+        # Process active filing
+        if filing_type and step:
+            if filing_type == "paye":
+                _handle_paye_filing(from_phone, account_id, step, inputs, text)
+            elif filing_type == "vat":
+                _handle_vat_filing(from_phone, account_id, step, inputs, text)
+            elif filing_type == "cit":
+                _handle_cit_filing(from_phone, account_id, step, inputs, text)
+            return jsonify({"ok": True})
         
         # ========== START NEW FILING ==========
         text_lower = text.lower().strip()
         
         if text_lower in ["paye", "p"]:
-            user_states[from_phone] = {"filing_type": "paye", "step": 1, "draft": {"inputs": {}}}
+            user_states[from_phone] = {"filing_type": "paye", "step": 1, "inputs": {}}
             send_whatsapp_text(from_phone, "📋 *PAYE Tax Filing - Step 1 of 3*\n\nWhat is your monthly salary?\n(Example: 750000 or 750k)")
             return jsonify({"ok": True})
         
         if text_lower in ["vat", "v"]:
-            user_states[from_phone] = {"filing_type": "vat", "step": 1, "draft": {"inputs": {}}}
+            user_states[from_phone] = {"filing_type": "vat", "step": 1, "inputs": {}}
             send_whatsapp_text(from_phone, "📋 *VAT Filing - Step 1 of 3*\n\nWhat is your total sales for the period?\n(Example: 25000000 or 25M)")
             return jsonify({"ok": True})
         
         if text_lower in ["cit", "c"]:
-            user_states[from_phone] = {"filing_type": "cit", "step": 1, "draft": {"inputs": {}}}
+            user_states[from_phone] = {"filing_type": "cit", "step": 1, "inputs": {}}
             send_whatsapp_text(from_phone, "📋 *CIT Filing - Step 1 of 3*\n\nWhat is your company's total revenue for the period?\n(Example: 50000000 or 50M)")
             return jsonify({"ok": True})
         
+        # Handle menu commands
         if text.upper() == "H":
             _handle_filing_history(from_phone, account_id)
             return jsonify({"ok": True})
@@ -525,7 +514,10 @@ def wa_webhook():
             _send_main_menu(from_phone)
             return jsonify({"ok": True})
         
-        # Handle menu numbers
+        if text.upper() == "7" or text_lower == "tax":
+            _send_tax_menu(from_phone)
+            return jsonify({"ok": True})
+        
         if MENU_NUMBER_RE.match(text):
             option = int(text)
             if option == 7:
@@ -541,7 +533,7 @@ def wa_webhook():
                 send_whatsapp_text(from_phone, "🔗 *Link to Website*\n\n1. Login to website\n2. Go to Settings → WhatsApp Linking\n3. Generate an 8-character code\n4. Send the code here")
                 return jsonify({"ok": True})
         
-        # Handle link codes
+        # Handle link codes (only if not in filing)
         if LINK_CODE_RE.match(text.upper()):
             attempt = _try_consume_link_code(from_phone, text)
             if attempt.get("ok"):
