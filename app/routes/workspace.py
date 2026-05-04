@@ -6,7 +6,6 @@ from flask import Blueprint, request, jsonify
 
 from app.core.supabase_client import supabase
 from app.services.auth_service import get_current_user
-from app.services.accounts_service import lookup_account, upsert_account
 
 logger = logging.getLogger(__name__)
 
@@ -33,43 +32,6 @@ def _get_account_id_from_auth_user(auth_user_id: str) -> str | None:
     return None
 
 
-def _get_or_create_account_from_email(email: str) -> dict | None:
-    """Get or create account record from email"""
-    if not email:
-        return None
-    
-    try:
-        # First, try to find existing account by email
-        result = supabase().table("accounts")\
-            .select("id, account_id, auth_user_id, display_name, email")\
-            .eq("email", email)\
-            .maybe_single()\
-            .execute()
-        
-        if result.data:
-            return result.data
-        
-        # Create a placeholder account for the email (will need to link later)
-        # This creates a basic account record that can be linked later
-        new_account = {
-            "account_id": str(uuid.uuid4()),
-            "email": email,
-            "display_name": email.split("@")[0],
-            "provider": "email",
-            "provider_user_id": email,
-        }
-        
-        insert_result = supabase().table("accounts").insert(new_account).execute()
-        
-        if insert_result.data:
-            return insert_result.data[0]
-        
-    except Exception as e:
-        logger.error(f"Failed to get/create account from email: {e}")
-    
-    return None
-
-
 @bp.get("/limits")
 def get_workspace_limits():
     """Get workspace limits for the current user"""
@@ -86,9 +48,8 @@ def get_workspace_limits():
         return jsonify({"ok": False, "error": "account not found"}), 404
     
     try:
-        # Get user's subscription/plan
         sub_result = supabase().table("user_subscriptions")\
-            .select("plan_code, plan_family, subscription")\
+            .select("plan_code, plan_family")\
             .eq("account_id", account_id)\
             .eq("is_active", True)\
             .maybe_single()\
@@ -103,7 +64,6 @@ def get_workspace_limits():
             plan_code = sub_result.data.get("plan_code", "free")
             plan_family = sub_result.data.get("plan_family", "free")
             
-            # Plan limits based on plan_code
             if plan_family in ["pro", "business"] or plan_code in ["pro", "business"]:
                 max_workspace_users = 10
                 max_linked_web_accounts = 10
@@ -111,9 +71,8 @@ def get_workspace_limits():
                 max_workspace_users = 5
                 max_linked_web_accounts = 5
         
-        # Count workspace members/owners
         members_result = supabase().table("workspace_members")\
-            .select("id, role")\
+            .select("id")\
             .eq("owner_account_id", account_id)\
             .execute()
         
@@ -167,42 +126,30 @@ def list_workspace_members():
         return jsonify({"ok": False, "error": "account not found"}), 404
     
     try:
-        # Get owner info
         owner_result = supabase().table("accounts")\
             .select("id, account_id, display_name, email, created_at, updated_at, provider, provider_user_id")\
             .eq("id", account_id)\
             .maybe_single()\
             .execute()
         
-        owner = None
-        if owner_result.data:
-            owner = owner_result.data
+        owner = owner_result.data if owner_result.data else None
         
-        # Get members
         members_result = supabase().table("workspace_members")\
-            .select("""
-                id,
-                owner_account_id,
-                member_account_id,
-                role,
-                status,
-                created_at,
-                updated_at,
-                member_account:member_account_id (
-                    display_name,
-                    email,
-                    provider,
-                    provider_user_id,
-                    account_id
-                )
-            """)\
+            .select("id, owner_account_id, member_account_id, role, status, created_at, updated_at")\
             .eq("owner_account_id", account_id)\
             .execute()
         
         members = []
         if members_result.data:
             for m in members_result.data:
-                member_account = m.get("member_account", {})
+                member_acc = supabase().table("accounts")\
+                    .select("display_name, email, provider, provider_user_id, account_id")\
+                    .eq("id", m.get("member_account_id"))\
+                    .maybe_single()\
+                    .execute()
+                
+                member_data = member_acc.data if member_acc.data else {}
+                
                 members.append({
                     "id": m.get("id"),
                     "owner_account_id": m.get("owner_account_id"),
@@ -211,13 +158,12 @@ def list_workspace_members():
                     "status": m.get("status", "active"),
                     "created_at": m.get("created_at"),
                     "updated_at": m.get("updated_at"),
-                    "member_email": member_account.get("email") if isinstance(member_account, dict) else None,
-                    "member_display_name": member_account.get("display_name") if isinstance(member_account, dict) else None,
-                    "member_provider": member_account.get("provider") if isinstance(member_account, dict) else None,
-                    "member_provider_user_id": member_account.get("provider_user_id") if isinstance(member_account, dict) else None,
+                    "member_email": member_data.get("email"),
+                    "member_display_name": member_data.get("display_name"),
+                    "member_provider": member_data.get("provider"),
+                    "member_provider_user_id": member_data.get("provider_user_id"),
                 })
         
-        # Get plan info (same as limits endpoint)
         sub_result = supabase().table("user_subscriptions")\
             .select("plan_code, plan_family")\
             .eq("account_id", account_id)\
@@ -279,7 +225,6 @@ def add_workspace_member():
     if not member_email:
         return jsonify({"ok": False, "error": "member_email required"}), 400
     
-    # Check if email belongs to an existing account
     member_account = None
     try:
         result = supabase().table("accounts")\
@@ -295,12 +240,10 @@ def add_workspace_member():
     
     if not member_account:
         return jsonify({
-            "ok": False, 
-            "error": "No account found with this email. User must sign up first.",
-            "fix": "Ask the user to create an account on the web platform before adding them to the workspace."
+            "ok": False,
+            "error": "No account found with this email. User must sign up first."
         }), 404
     
-    # Check if already a member
     try:
         existing = supabase().table("workspace_members")\
             .select("id")\
@@ -314,7 +257,6 @@ def add_workspace_member():
     except Exception as e:
         logger.error(f"Failed to check existing membership: {e}")
     
-    # Get plan limits
     sub_result = supabase().table("user_subscriptions")\
         .select("plan_family")\
         .eq("account_id", owner_account_id)\
@@ -330,7 +272,6 @@ def add_workspace_member():
         elif plan_family == "team":
             max_workspace_users = 5
     
-    # Count current members
     count_result = supabase().table("workspace_members")\
         .select("id", count="exact")\
         .eq("owner_account_id", owner_account_id)\
@@ -341,11 +282,9 @@ def add_workspace_member():
     if current_count >= max_workspace_users:
         return jsonify({
             "ok": False,
-            "error": f"Workspace limit reached (max {max_workspace_users} members). Upgrade your plan to add more members.",
-            "fix": "Upgrade your subscription to add more workspace members."
+            "error": f"Workspace limit reached (max {max_workspace_users} members). Upgrade your plan."
         }), 403
     
-    # Add the member
     try:
         insert_data = {
             "owner_account_id": owner_account_id,
@@ -359,8 +298,7 @@ def add_workspace_member():
         if result.data:
             return jsonify({
                 "ok": True,
-                "message": f"Successfully added {member_email} to workspace.",
-                "member": result.data[0]
+                "message": f"Successfully added {member_email} to workspace."
             })
         else:
             return jsonify({"ok": False, "error": "Failed to add member"}), 500
@@ -390,12 +328,11 @@ def remove_workspace_member():
     if not member_account_id:
         return jsonify({"ok": False, "error": "member_account_id required"}), 400
     
-    # Prevent removing self
     if member_account_id == owner_account_id:
         return jsonify({"ok": False, "error": "Cannot remove the workspace owner"}), 403
     
     try:
-        result = supabase().table("workspace_members")\
+        supabase().table("workspace_members")\
             .delete()\
             .eq("owner_account_id", owner_account_id)\
             .eq("member_account_id", member_account_id)\
@@ -415,4 +352,3 @@ def remove_workspace_member():
 def health():
     """Health check endpoint"""
     return jsonify({"ok": True, "status": "healthy"})
-'@ | Out-File -FilePath "C:\Users\sirbm\Naija-tax-guide-api\app\routes\workspace.py" -Encoding UTF8
