@@ -68,7 +68,7 @@ def _try_consume_link_code(provider_user_id: str, raw_text: str) -> dict:
         return {"ok": False, "reason": "not_a_code"}
 
     try:
-        res = supabase().rpc(
+        res = supabase.rpc(
             "consume_link_token",
             {
                 "p_provider": "wa",
@@ -174,7 +174,7 @@ def _parse_amount(text: str) -> float:
 def _load_filing_from_db(account_id: str, tax_type: str):
     """Load filing state from database"""
     try:
-        result = supabase().table("tax_filing_drafts")\
+        result = supabase.table("tax_filing_drafts")\
             .select("*")\
             .eq("user_id", account_id)\
             .eq("tax_type", tax_type)\
@@ -481,7 +481,7 @@ def wa_webhook():
                 send_whatsapp_text(from_phone, "❌ Invalid email. Send a valid email or 'cancel' to abort.")
             return jsonify({"ok": True})
         
-        # ========== CRITICAL FIX: Check for in-progress filing FIRST ==========
+        # ========== CRITICAL: Check for in-progress filing FIRST ==========
         # Check memory first
         if user_state.get("filing_type") and user_state.get("step"):
             _handle_continue_filing(from_phone, account_id, text)
