@@ -1,3 +1,4 @@
+# app/routes/whatsapp.py
 from __future__ import annotations
 
 import os
@@ -196,7 +197,6 @@ def _save_state_to_db(account_id: str, context: str, data: dict, step: int = Non
     try:
         expires_at = (datetime.utcnow() + timedelta(hours=SAVED_STATE_TIMEOUT_HOURS)).isoformat()
         
-        # Check if existing saved state
         existing = supabase.table("user_saved_states")\
             .select("id")\
             .eq("user_id", account_id)\
@@ -304,7 +304,6 @@ def _show_filing_step(phone: str, tax_type: str, step: int, inputs: dict):
 
 def _handle_paye_filing(phone: str, account_id: str, step: int, inputs: dict, text: str):
     """Handle PAYE filing steps"""
-    # Handle back command
     if text == "*" and step > 1:
         new_step = step - 1
         user_states[phone] = {"context": "filing", "sub_context": "paye", "step": new_step, "inputs": inputs}
@@ -558,7 +557,6 @@ def _handle_filing_history(phone: str, account_id: str):
 
 def _handle_resume(phone: str, account_id: str):
     """Resume saved activity"""
-    # Check for saved filing first
     active = _get_active_filing(account_id)
     if active:
         user_states[phone] = {
@@ -570,7 +568,6 @@ def _handle_resume(phone: str, account_id: str):
         _show_filing_step(phone, active["filing_type"], active["step"], active["inputs"])
         return True
     
-    # Check for other saved states
     saved = _load_state_from_db(account_id)
     if saved:
         context = saved.get("context")
@@ -622,14 +619,30 @@ def wa_webhook():
             _send_welcome(from_phone)
             return jsonify({"ok": True})
         
+        # Handle email collection for subscription
+        if user_state.get("awaiting_email"):
+            email = text.strip().lower()
+            pending_plan = user_state.get("pending_plan")
+            if email == "cancel" or email == "0":
+                user_states.pop(from_phone, None)
+                send_whatsapp_text(from_phone, "Subscription cancelled.")
+                return jsonify({"ok": True})
+            if "@" in email and "." in email:
+                result = create_subscription_payment(account_id, pending_plan, "whatsapp", from_phone, email)
+                if result.get("ok"):
+                    send_whatsapp_text(from_phone, result["message"])
+                else:
+                    send_whatsapp_text(from_phone, f"❌ {result.get('message', 'Please try again.')}")
+                user_states.pop(from_phone, None)
+            else:
+                send_whatsapp_text(from_phone, "❌ Invalid email. Send a valid email, 'cancel' to abort, or '#' to save and exit.\n\n💡 # - Save & Menu | 0 - Cancel")
+            return jsonify({"ok": True})
+        
         # ========== GLOBAL COMMANDS (work everywhere) ==========
         
-        # # - Save & Menu
         if text == "#":
             current_context = user_state.get("context")
-            
             if current_context == "filing":
-                # Save filing to DB
                 save_filing_draft(
                     account_id,
                     user_state.get("sub_context"),
@@ -644,12 +657,10 @@ def wa_webhook():
                 send_whatsapp_text(from_phone, "✅ Progress saved. You can resume later with 9.")
             else:
                 send_whatsapp_text(from_phone, "ℹ️ Nothing to save.")
-            
             _send_main_menu(from_phone)
             user_states.pop(from_phone, None)
             return jsonify({"ok": True})
         
-        # 0 - Cancel (clear all state)
         if text == "0":
             current_context = user_state.get("context")
             if current_context == "filing":
@@ -659,37 +670,8 @@ def wa_webhook():
             send_whatsapp_text(from_phone, "❌ Cancelled. All progress cleared.\n\nReply 8 for main menu.")
             return jsonify({"ok": True})
         
-        # 9 - Resume
         if text == "9":
             _handle_resume(from_phone, account_id)
-            return jsonify({"ok": True})
-        
-        # Handle email collection for subscription
-        if user_state.get("awaiting_email"):
-            email = text.strip().lower()
-            pending_plan = user_state.get("pending_plan")
-            
-            if email == "cancel" or email == "0":
-                user_states.pop(from_phone, None)
-                send_whatsapp_text(from_phone, "❌ Subscription cancelled. Reply 8 for main menu.")
-                return jsonify({"ok": True})
-            
-            if text == "#":
-                _save_state_to_db(account_id, "subscription_email", {"plan": pending_plan, "email": None})
-                send_whatsapp_text(from_phone, "✅ Progress saved. You can resume later with 9.")
-                _send_main_menu(from_phone)
-                user_states.pop(from_phone, None)
-                return jsonify({"ok": True})
-            
-            if "@" in email and "." in email:
-                result = create_subscription_payment(account_id, pending_plan, "whatsapp", from_phone, email)
-                if result.get("ok"):
-                    send_whatsapp_text(from_phone, result["message"])
-                else:
-                    send_whatsapp_text(from_phone, f"❌ {result.get('message', 'Please try again.')}")
-                user_states.pop(from_phone, None)
-            else:
-                send_whatsapp_text(from_phone, "❌ Invalid email. Send a valid email, 'cancel' to abort, or '#' to save and exit.\n\n💡 # - Save & Menu | 0 - Cancel")
             return jsonify({"ok": True})
         
         # ========== CHECK FOR ACTIVE FILING ==========
@@ -710,7 +692,6 @@ def wa_webhook():
                     "inputs": inputs
                 }
         
-        # Process active filing
         if filing_type and step and step < 4:
             if filing_type == "paye":
                 _handle_paye_filing(from_phone, account_id, step, inputs, text)
@@ -723,57 +704,31 @@ def wa_webhook():
         # ========== START NEW FILING ==========
         text_lower = text.lower().strip()
         
-        # Check for existing saved filing before starting new        def check_and_start_new(tax_type: str, prompt: str):
-            existing = _get_active_filing(account_id)
-            if existing and existing["filing_type"] == tax_type:
-                send_whatsapp_text(from_phone, f"📋 You have an unfinished {tax_type.upper()} filing.\n\nReply RESUME to continue, or NEW to start over.\n\n💡 # - Save & Menu | 0 - Cancel")
-                user_states[from_phone] = {"context": "conflict", "pending_tax_type": tax_type, "pending_prompt": prompt}
-                return True
-            return False
-        
         if text_lower in ["paye", "p"]:
-            if check_and_start_new("paye", "📋 *PAYE Tax Filing - Step 1 of 3*\n\nWhat is your monthly salary?\n(Example: 750000 or 750k)"):
-                return jsonify({"ok": True})
+            try:
+                supabase.table("tax_filing_drafts").delete().eq("user_id", account_id).eq("tax_type", "paye").eq("status", "in_progress").execute()
+            except:
+                pass
             user_states[from_phone] = {"context": "filing", "sub_context": "paye", "step": 1, "inputs": {}}
             send_whatsapp_text(from_phone, "📋 *PAYE Tax Filing - Step 1 of 3*\n\nWhat is your monthly salary?\n(Example: 750000 or 750k)\n\n💡 * - Back | # - Save & Menu | 0 - Cancel")
             return jsonify({"ok": True})
         
         if text_lower in ["vat", "v"]:
-            if check_and_start_new("vat", "📋 *VAT Filing - Step 1 of 3*\n\nWhat is your total sales for the period?\n(Example: 25000000 or 25M)"):
-                return jsonify({"ok": True})
+            try:
+                supabase.table("tax_filing_drafts").delete().eq("user_id", account_id).eq("tax_type", "vat").eq("status", "in_progress").execute()
+            except:
+                pass
             user_states[from_phone] = {"context": "filing", "sub_context": "vat", "step": 1, "inputs": {}}
             send_whatsapp_text(from_phone, "📋 *VAT Filing - Step 1 of 3*\n\nWhat is your total sales for the period?\n(Example: 25000000 or 25M)\n\n💡 * - Back | # - Save & Menu | 0 - Cancel")
             return jsonify({"ok": True})
         
         if text_lower in ["cit", "c"]:
-            if check_and_start_new("cit", "📋 *CIT Filing - Step 1 of 3*\n\nWhat is your company's total revenue for the period?\n(Example: 50000000 or 50M)"):
-                return jsonify({"ok": True})
+            try:
+                supabase.table("tax_filing_drafts").delete().eq("user_id", account_id).eq("tax_type", "cit").eq("status", "in_progress").execute()
+            except:
+                pass
             user_states[from_phone] = {"context": "filing", "sub_context": "cit", "step": 1, "inputs": {}}
             send_whatsapp_text(from_phone, "📋 *CIT Filing - Step 1 of 3*\n\nWhat is your company's total revenue for the period?\n(Example: 50000000 or 50M)\n\n💡 * - Back | # - Save & Menu | 0 - Cancel")
-            return jsonify({"ok": True})
-        
-        # Handle conflict resolution (RESUME / NEW)
-        if user_state.get("context") == "conflict":
-            if text.upper() == "RESUME":
-                active = _get_active_filing(account_id)
-                if active:
-                    user_states[from_phone] = {
-                        "context": "filing",
-                        "sub_context": active["filing_type"],
-                        "step": active["step"],
-                        "inputs": active["inputs"]
-                    }
-                    _show_filing_step(from_phone, active["filing_type"], active["step"], active["inputs"])
-                else:
-                    send_whatsapp_text(from_phone, "No saved filing found. Starting new one.")
-                    send_whatsapp_text(from_phone, user_state.get("pending_prompt", ""))
-                    user_states[from_phone] = {"context": "filing", "sub_context": user_state.get("pending_tax_type"), "step": 1, "inputs": {}}
-            elif text.upper() == "NEW":
-                delete_filing_draft(account_id, user_state.get("pending_tax_type"))
-                user_states[from_phone] = {"context": "filing", "sub_context": user_state.get("pending_tax_type"), "step": 1, "inputs": {}}
-                send_whatsapp_text(from_phone, user_state.get("pending_prompt", ""))
-            else:
-                send_whatsapp_text(from_phone, "Reply RESUME to continue your filing, or NEW to start over.\n\n💡 # - Save & Menu | 0 - Cancel")
             return jsonify({"ok": True})
         
         # ========== MENU COMMANDS ==========
@@ -876,7 +831,7 @@ def wa_webhook():
             _send_main_menu(from_phone)
             return jsonify({"ok": True})
         
-        # Handle back command (*) in non-filing contexts
+        # Handle back command in non-filing contexts
         if text == "*":
             if user_state.get("context"):
                 user_states.pop(from_phone, None)
