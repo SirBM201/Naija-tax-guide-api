@@ -162,6 +162,9 @@ def _send_reminders_for_channel(channel: str, contact: str, deadlines: List[Dict
             if channel == "whatsapp":
                 send_whatsapp_text(contact, message)
 
+@bp.route("/cron/test", methods=["GET", "POST"])
+def cron_test():
+    return jsonify({"ok": True, "method": request.method, "headers": dict(request.headers)}), 200
 
 @bp.route("/cron/send-deadline-reminders", methods=["GET", "POST"])
 def cron_send_deadline_reminders():
