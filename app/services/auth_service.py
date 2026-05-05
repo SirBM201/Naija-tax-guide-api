@@ -1,33 +1,38 @@
-# app/services/auth_service.py
-from typing import Any, Dict
-from flask import request
-from app.core.supabase_client import supabase
+from typing import Any, Dict, Optional
+from flask import request, session, g
+import logging
 
-
-def get_bearer_token() -> str | None:
-    auth = request.headers.get("Authorization", "")
-    if not auth.lower().startswith("bearer "):
-        return None
-    return auth.split(" ", 1)[1].strip() or None
+logger = logging.getLogger(__name__)
 
 
 def get_current_user() -> Dict[str, Any] | None:
     """
-    Validates Supabase JWT by asking Supabase Auth using service role.
-    Requires Authorization: Bearer <access_token>
+    Get currently authenticated user from Flask session.
     """
-    token = get_bearer_token()
-    if not token:
+    try:
+        # First check if user is in g (set by before_request)
+        if hasattr(g, 'user') and g.user:
+            logger.info(f"User found in g: {g.user.get('id')}")
+            return g.user
+        
+        # Check Flask session directly
+        user_id = session.get("user_id")
+        if user_id:
+            logger.info(f"User found in session: {user_id}")
+            return {
+                "id": user_id,
+                "email": session.get("user_email"),
+                "account_id": session.get("account_id") or user_id,
+            }
+        
+        logger.warning("No authenticated user found")
+        return None
+        
+    except Exception as e:
+        logger.error(f"Error getting current user: {e}")
         return None
 
-    sb = supabase()
-    try:
-        # supabase-py supports auth.get_user(token)
-        res = sb.auth.get_user(token)
-        # Depending on supabase-py version, object shape may differ
-        user = getattr(res, "user", None) or res.get("user") if isinstance(res, dict) else None
-        if not user:
-            return None
-        return user if isinstance(user, dict) else user.model_dump()
-    except Exception:
-        return None
+
+def require_auth() -> Optional[Dict[str, Any]]:
+    """Helper for routes that require authentication."""
+    return get_current_user()

@@ -1,0 +1,143 @@
+from __future__ import annotations
+import uuid
+from datetime import datetime, timezone
+from flask import Blueprint, jsonify, request, session
+from app.core.supabase_client import supabase
+from app.services.auth_service import get_current_user
+import logging
+
+logger = logging.getLogger(__name__)
+
+bp = Blueprint("tax", __name__)
+
+
+@bp.post("/tax/file")
+def file_tax_return():
+    """File a tax return (PAYE, VAT, CIT)."""
+    logger.info(f"Tax filing request received")
+    logger.info(f"Session keys: {list(session.keys()) if session else 'None'}")
+    logger.info(f"Session user_id: {session.get('user_id')}")
+    
+    # Get authenticated user from Flask session
+    current_user = get_current_user()
+    
+    if not current_user:
+        logger.warning("No authenticated user found for tax filing request")
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    
+    logger.info(f"Authenticated user: {current_user.get('id')}")
+    
+    # Parse request body
+    try:
+        data = request.get_json(silent=True) or {}
+    except Exception as e:
+        logger.error(f"Failed to parse JSON: {e}")
+        return jsonify({"ok": False, "error": "Invalid JSON body"}), 400
+    
+    tax_type = data.get("taxType", "").strip().lower()
+    inputs = data.get("inputs", {})
+    documents = data.get("documents", [])
+    user_id = data.get("userId", "")
+    
+    if tax_type not in ("paye", "vat", "cit"):
+        return jsonify({"ok": False, "error": "Invalid tax type. Must be 'paye', 'vat', or 'cit'."}), 400
+    
+    # Generate reference
+    submission_id = str(uuid.uuid4())
+    submitted_at = datetime.now(timezone.utc).isoformat()
+    reference = f"TAX-{tax_type.upper()}-{submission_id[:8].upper()}"
+    
+    # Insert into database
+    sb = supabase
+    filing_record = {
+        "id": submission_id,
+        "user_id": current_user.get("id"),
+        "account_id": user_id or current_user.get("account_id") or current_user.get("id"),
+        "tax_type": tax_type,
+        "inputs": inputs,
+        "documents": documents,
+        "reference": reference,
+        "status": "submitted",
+        "submitted_at": submitted_at,
+    }
+    
+    try:
+        logger.info(f"Inserting tax filing: {reference}")
+        result = sb.table("tax_filings").insert(filing_record).execute()
+        if not result.data:
+            raise Exception("Insert failed")
+        logger.info(f"Successfully inserted tax filing with reference: {reference}")
+    except Exception as e:
+        logger.error(f"Database error: {e}")
+        return jsonify({"ok": False, "error": f"Database error: {str(e)}"}), 500
+    
+    return jsonify({
+        "ok": True,
+        "message": f"{tax_type.upper()} filing submitted successfully.",
+        "reference": reference,
+        "submittedAt": submitted_at,
+    }), 200
+
+
+@bp.get("/tax/filing/<filing_id>")
+def get_filing(filing_id):
+    """Get a specific tax filing by ID"""
+    logger.info(f"Fetching filing: {filing_id}")
+    
+    current_user = get_current_user()
+    if not current_user:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    
+    try:
+        result = supabase.table("tax_filings").select("*").eq("id", filing_id).eq("user_id", current_user.get("id")).execute()
+        
+        if not result.data:
+            return jsonify({"ok": False, "error": "Filing not found"}), 404
+        
+        filing = result.data[0]
+        return jsonify({
+            "ok": True,
+            "filing": {
+                "id": filing.get("id"),
+                "tax_type": filing.get("tax_type"),
+                "reference": filing.get("reference"),
+                "status": filing.get("status"),
+                "submitted_at": filing.get("submitted_at"),
+                "details": filing.get("inputs", {})
+            }
+        }), 200
+    except Exception as e:
+        logger.error(f"Error fetching filing: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.get("/tax/filings")
+def list_filings():
+    """List all tax filings for the user"""
+    logger.info("Listing all filings")
+    
+    current_user = get_current_user()
+    if not current_user:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    
+    try:
+        result = supabase.table("tax_filings").select("*").eq("user_id", current_user.get("id")).order("submitted_at", desc=True).execute()
+        
+        filings = []
+        for filing in (result.data or []):
+            filings.append({
+                "id": filing.get("id"),
+                "tax_type": filing.get("tax_type"),
+                "reference": filing.get("reference"),
+                "status": filing.get("status"),
+                "submitted_at": filing.get("submitted_at"),
+                "inputs": filing.get("inputs", {})
+            })
+        
+        return jsonify({
+            "ok": True,
+            "filings": filings
+        }), 200
+    except Exception as e:
+        logger.error(f"Error listing filings: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500

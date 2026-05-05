@@ -1,208 +1,220 @@
 # app/services/ai_service.py
 from __future__ import annotations
 
-"""
-AI SERVICE (BOOT-SAFE, CANONICAL EXPORTS)
-
-This file MUST NOT crash boot due to missing exports.
-
-Your crash:
-  ImportError: cannot import name 'call_ai' from 'app.services.ai_service'
-
-So this module guarantees:
-  - call_ai(...) exists (canonical name)
-  - call_ai returns a dict: { ok: bool, answer?: str, error?: str, root_cause?: str, fix?: str }
-
-Provider strategy:
-  - If OPENAI_API_KEY exists -> try OpenAI (optional dependency-safe)
-  - Else -> returns a clear error (so boot still works, and you see what to set)
-
-No matter what, importing this module will NOT crash your app boot.
-"""
-
 import os
-from typing import Any, Dict, Optional
+from typing import Optional
+
+try:
+    from openai import OpenAI  # type: ignore
+except Exception:
+    OpenAI = None  # type: ignore
+
+_last_error: str = ""
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
 def _env(name: str, default: str = "") -> str:
     return (os.getenv(name, default) or default).strip()
 
 
-def _truthy(v: str | None) -> bool:
-    return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+def _get_enhanced_system_prompt() -> str:
+    """Returns enhanced system prompt with comprehensive Nigerian tax knowledge"""
+    return """You are NaijaTax Guide, a Nigerian tax assistant.
+
+CRITICAL RULE: Answer the EXACT question asked. Do NOT give generic tax payment steps unless specifically asked.
+
+RELIGIOUS BODIES (CHURCHES, MOSQUES) TAX RULES:
+
+Question: "Do churches pay tax in Nigeria?"
+CORRECT ANSWER: Under CITA Section 23(1), religious bodies are EXEMPT from tax on:
+- Offerings, tithes, and donations
+- Worship activities and religious services
+- Grants and gifts for religious purposes
+
+HOWEVER, churches MUST pay tax on commercial activities:
+- School fees from church-run schools
+- Hospital charges from church-owned hospitals
+- Rental income from non-worship properties
+- Any business for profit
+
+So the correct direct answer: "Churches do NOT pay tax on offerings and donations, but they MUST pay tax on commercial activities like school fees and rental income."
+
+Question: "Are religious bodies asked to pay tax?"
+CORRECT ANSWER: Yes, but only on commercial activities. Religious bodies are exempt from tax on offerings, tithes, and donations under CITA Section 23(1). However, they must pay tax on business income like school fees, hospital charges, and rental income.
+
+GENERAL TAX RULES:
+- VAT: 7.5% (monthly filing by 21st)
+- CIT: 20-30% depending on company size
+- PAYE: Monthly deduction by employers, remitted by 10th
+- WHT: 5-10% depending on transaction
+
+RESPONSE FORMAT:
+- Be direct and specific
+- Answer the question immediately in the first sentence
+- Only provide steps if the question asks "how to"
+
+Remember: Answer the exact question asked. Do not provide generic payment steps unless asked for them."""
 
 
-def _clip(s: str, n: int = 280) -> str:
-    s = str(s or "")
-    return s if len(s) <= n else s[:n] + "…"
+SYSTEM_PROMPT = _get_enhanced_system_prompt()
 
 
-def _debug_enabled() -> bool:
-    return _truthy(_env("AI_DEBUG", "0")) or _truthy(_env("DEBUG", "0"))
+def _set_last_error(msg: str) -> None:
+    global _last_error
+    _last_error = (msg or "").strip()
 
 
-def _dbg(msg: str) -> None:
-    if _debug_enabled():
-        print(msg, flush=True)
+def last_ai_error() -> str:
+    return _last_error
 
 
-# -----------------------------
-# Canonical API
-# -----------------------------
-def call_ai(
-    *,
-    question: str,
-    lang: str = "en",
-    channel: str = "web",
-    system_prompt: Optional[str] = None,
-    max_tokens: int = 700,
-) -> Dict[str, Any]:
-    """
-    Canonical function expected by ask_service/routes.
-
-    Returns:
-      { ok: True, answer: "..." }
-      { ok: False, error: "...", root_cause: "...", fix: "..." }
-    """
-    q = (question or "").strip()
-    if not q:
-        return {
-            "ok": False,
-            "error": "question_required",
-            "root_cause": "question_empty",
-            "fix": "Pass a non-empty question string to call_ai(question=...).",
-        }
-
-    # Choose provider
-    if _env("OPENAI_API_KEY", ""):
-        return _call_openai(
-            question=q,
-            lang=lang,
-            channel=channel,
-            system_prompt=system_prompt,
-            max_tokens=max_tokens,
-        )
-
-    # No provider configured -> boot-safe error
-    return {
-        "ok": False,
-        "error": "ai_not_configured",
-        "root_cause": "No AI provider API key is configured on the backend.",
-        "fix": (
-            "Set one provider key in your backend env. "
-            "For OpenAI set OPENAI_API_KEY (and optionally OPENAI_MODEL)."
-        ),
-        "details": {
-            "expected_env": ["OPENAI_API_KEY", "OPENAI_MODEL(optional)"],
-            "lang": lang,
-            "channel": channel,
-        },
-    }
-
-
-# Backwards/alternate names (optional safety)
-def ask_ai(*args, **kwargs) -> Dict[str, Any]:
-    """Alias for older code paths."""
-    return call_ai(*args, **kwargs)
-
-
-def generate_ai_answer(*args, **kwargs) -> Dict[str, Any]:
-    """Alias for older code paths."""
-    return call_ai(*args, **kwargs)
-
-
-# -----------------------------
-# OpenAI implementation (dependency-safe)
-# -----------------------------
-def _call_openai(
-    *,
-    question: str,
-    lang: str,
-    channel: str,
-    system_prompt: Optional[str],
-    max_tokens: int,
-) -> Dict[str, Any]:
-    """
-    Uses OpenAI if the SDK is installed.
-    If the SDK isn't installed, returns a clear error (still boot-safe).
-    """
+def _get_client() -> Optional["OpenAI"]:
     api_key = _env("OPENAI_API_KEY", "")
-    model = _env("OPENAI_MODEL", _env("AI_MODEL", "gpt-4o-mini"))
     if not api_key:
-        return {
-            "ok": False,
-            "error": "openai_missing_key",
-            "root_cause": "OPENAI_API_KEY is empty",
-            "fix": "Set OPENAI_API_KEY in backend environment variables.",
-        }
+        _set_last_error("OPENAI_API_KEY not set")
+        return None
+    if OpenAI is None:
+        _set_last_error("openai package not installed")
+        return None
+    return OpenAI(api_key=api_key)
 
-    # Import in a try/except so missing dependency never breaks boot
+
+def ask_ai(question: str, lang: str = "en") -> Optional[str]:
+    """Single-turn ask."""
+    client = _get_client()
+    if client is None:
+        return None
+
+    model = _env("OPENAI_MODEL", "gpt-4o-mini")
+    prompt = f"""{SYSTEM_PROMPT}
+
+User question: {question}
+
+Remember: Answer directly. If asked about churches/religious bodies, give the specific answer about offerings being exempt and commercial activities being taxable. Do NOT give general tax payment steps."""
+
     try:
-        from openai import OpenAI  # type: ignore
-    except Exception as e:
-        return {
-            "ok": False,
-            "error": "openai_sdk_missing",
-            "root_cause": f"OpenAI SDK import failed: {type(e).__name__}: {_clip(str(e))}",
-            "fix": "Add openai to requirements.txt (pip install openai) or switch provider implementation.",
-        }
-
-    try:
-        client = OpenAI(api_key=api_key)
-
-        sys = system_prompt or (
-            "You are Naija Tax Guide. Answer clearly, correctly, and concisely. "
-            "If unsure, say so and suggest what info is needed."
+        resp = client.responses.create(
+            model=model,
+            input=prompt,
+            temperature=0.3,
         )
 
-        # Use Responses API style if available, fallback to ChatCompletions if not.
-        # (Keep compatibility and avoid boot-time assumptions.)
-        try:
-            resp = client.responses.create(
-                model=model,
-                input=[
-                    {"role": "system", "content": sys},
-                    {"role": "user", "content": question},
-                ],
-                max_output_tokens=int(max_tokens or 700),
-            )
-            # Most SDKs expose output_text
-            answer = getattr(resp, "output_text", None)
-            if not answer:
-                # fallback extraction if needed
-                answer = str(resp)
-        except Exception:
-            # Older style
-            resp = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": sys},
-                    {"role": "user", "content": question},
-                ],
-                max_tokens=int(max_tokens or 700),
-            )
-            answer = (resp.choices[0].message.content or "").strip()
+        out = getattr(resp, "output", None)
+        if not out:
+            _set_last_error("No output from model")
+            return None
 
-        answer = (answer or "").strip()
-        if not answer:
-            return {
-                "ok": False,
-                "error": "openai_empty_answer",
-                "root_cause": "OpenAI returned empty content.",
-                "fix": "Check provider status, model name, and request payload.",
-                "details": {"model": model, "lang": lang, "channel": channel},
-            }
+        for item in out:
+            if getattr(item, "type", None) == "message":
+                for c in (getattr(item, "content", None) or []):
+                    if getattr(c, "type", None) == "output_text":
+                        text = (getattr(c, "text", "") or "").strip()
+                        if text:
+                            _set_last_error("")
+                            return text
 
-        return {"ok": True, "answer": answer, "provider": "openai", "model": model}
+        _set_last_error("No output_text content found")
+        return None
 
     except Exception as e:
-        return {
-            "ok": False,
-            "error": "openai_call_failed",
-            "root_cause": f"{type(e).__name__}: {_clip(str(e))}",
-            "fix": "Check OPENAI_API_KEY, model name, outbound network access, and OpenAI account status.",
-            "details": {"model": model, "lang": lang, "channel": channel},
-        }
+        msg = str(e).lower()
+
+        if "401" in msg or "unauthorized" in msg or "invalid_api_key" in msg:
+            _set_last_error("OpenAI 401 Unauthorized (check OPENAI_API_KEY in Koyeb env vars)")
+            return None
+
+        if "429" in msg or "rate limit" in msg or "quota" in msg:
+            _set_last_error("OpenAI rate/quota limit reached (429). Try again later.")
+            return None
+
+        if "timeout" in msg:
+            _set_last_error("OpenAI request timed out. Try again.")
+            return None
+
+        _set_last_error(f"OpenAI request failed: {type(e).__name__}")
+        return None
+
+
+def ask_ai_chat(messages: list[dict[str, str]], lang: str = "en") -> Optional[str]:
+    """Chat-style AI call. messages: [{role, content}]"""
+    client = _get_client()
+    if client is None:
+        return None
+
+    model = _env("OPENAI_MODEL", "gpt-4o-mini")
+
+    cleaned: list[dict[str, str]] = []
+    for m in (messages or []):
+        role = (m.get("role") or "").strip().lower()
+        if role not in {"user", "assistant", "system"}:
+            continue
+        content = (m.get("content") or "").strip()
+        if not content:
+            continue
+        cleaned.append({"role": role, "content": content})
+
+    if not cleaned:
+        _set_last_error("empty chat")
+        return None
+
+    system = SYSTEM_PROMPT
+    if lang:
+        system = f"{SYSTEM_PROMPT}\n\n[Language: {lang}]"
+
+    input_msgs = [{"role": "system", "content": system}] + cleaned
+
+    try:
+        resp = client.responses.create(
+            model=model,
+            input=input_msgs,
+            temperature=0.3,
+        )
+
+        out = getattr(resp, "output", None)
+        if not out:
+            _set_last_error("No output from model")
+            return None
+
+        for item in out:
+            if getattr(item, "type", None) == "message":
+                for c in (getattr(item, "content", None) or []):
+                    if getattr(c, "type", None) == "output_text":
+                        text = (getattr(c, "text", "") or "").strip()
+                        if text:
+                            _set_last_error("")
+                            return text
+
+        _set_last_error("No output_text content found")
+        return None
+
+    except Exception as e:
+        msg = str(e).lower()
+
+        if "401" in msg or "unauthorized" in msg or "invalid_api_key" in msg:
+            _set_last_error("OpenAI 401 Unauthorized (check OPENAI_API_KEY in Koyeb env vars)")
+            return None
+
+        if "429" in msg or "rate limit" in msg or "quota" in msg:
+            _set_last_error("OpenAI rate/quota limit reached (429). Try again later.")
+            return None
+
+        if "timeout" in msg:
+            _set_last_error("OpenAI request timed out. Try again.")
+            return None
+
+        _set_last_error(f"OpenAI request failed: {type(e).__name__}")
+        return None
+
+
+# Backward compatibility for ask_service.py
+def call_ai(question: str, lang: str = "en", channel: str = "web", **kwargs) -> dict:
+    """Canonical interface expected by ask_service.py"""
+    answer = ask_ai(question, lang)
+    if answer:
+        return {"ok": True, "answer": answer}
+    return {"ok": False, "error": last_ai_error() or "AI call failed"}
+
+
+def generate_grounded_answer(question: str, context: str = "", lang: str = "en", channel: str = "web") -> str:
+    """Generate an answer with optional context grounding"""
+    answer = ask_ai(question, lang)
+    return answer or "I couldn't process that question right now. Please try again."
