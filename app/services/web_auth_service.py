@@ -474,9 +474,7 @@ def _insert_web_session(*, account_row_id: str, ip: Optional[str], user_agent: O
                 "fingerprint": fingerprint,
             }, None
 
-        attempts.append(
-            {"try": n, "status": dbg.get("status"), "root_cause": dbg.get("error_body") or data, "supabase": dbg}
-        )
+        attempts.append({"try": n, "status": dbg.get("status"), "root_cause": dbg.get("error_body") or data, "supabase": dbg})
 
         if _looks_like_unique_violation(dbg):
             if TOKEN_INSERT_RETRY_SLEEP_MS > 0:
