@@ -205,6 +205,8 @@ def create_app() -> Flask:
         "app.routes.email_link",
         "app.routes.web_auth",
         "app.routes.web_session",
+        "app.routes.whatsapp",
+        "app.routes.workspace",
     ]
     for dotted in required_modules:
         _register_bp(dotted, "bp", required=True, url_prefix=api_prefix)
