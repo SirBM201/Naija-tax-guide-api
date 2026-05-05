@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import os
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request, session
 
 from app.services.ask_service import ask_guarded
 from app.services.web_auth_service import get_account_id_from_request
@@ -44,6 +44,11 @@ def _is_dev_bypass_request() -> bool:
     return bearer == expected or x_token == expected
 
 
+def _get_account_id_from_session() -> str | None:
+    """Get account_id from Flask session"""
+    return session.get("account_id") or session.get("user_id")
+
+
 @bp.post("/ask")
 def ask():
     """
@@ -76,13 +81,21 @@ def ask():
     if _is_dev_bypass_request():
         body["__bypass"] = True
 
-    # If account_id not provided, derive from cookie/bearer session automatically
+    # If account_id not provided, derive from session FIRST, then cookie/bearer
     if not (body.get("account_id") or "").strip():
-        account_id, source = get_account_id_from_request(request)
-        if account_id:
-            body["account_id"] = account_id
+        # First try Flask session
+        session_account_id = _get_account_id_from_session()
+        if session_account_id:
+            body["account_id"] = session_account_id
             body.setdefault("provider", "web")
-            body.setdefault("__auth_source", source)
+            body.setdefault("__auth_source", "session")
+        else:
+            # Fallback to token/cookie auth
+            account_id, source = get_account_id_from_request(request)
+            if account_id:
+                body["account_id"] = account_id
+                body.setdefault("provider", "web")
+                body.setdefault("__auth_source", source)
 
     try:
         resp = ask_guarded(body)
