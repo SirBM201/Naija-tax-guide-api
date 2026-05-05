@@ -18,7 +18,7 @@ def _get_account_id_from_auth_user(auth_user_id: str) -> str | None:
         return None
     
     try:
-        result = supabase().table("accounts")\
+        result = supabase.table("accounts")\
             .select("id")\
             .eq("auth_user_id", auth_user_id)\
             .maybe_single()\
@@ -48,7 +48,7 @@ def get_workspace_limits():
         return jsonify({"ok": False, "error": "account not found"}), 404
     
     try:
-        sub_result = supabase().table("user_subscriptions")\
+        sub_result = supabase.table("user_subscriptions")\
             .select("plan_code, plan_family")\
             .eq("account_id", account_id)\
             .eq("is_active", True)\
@@ -71,7 +71,7 @@ def get_workspace_limits():
                 max_workspace_users = 5
                 max_linked_web_accounts = 5
         
-        members_result = supabase().table("workspace_members")\
+        members_result = supabase.table("workspace_members")\
             .select("id")\
             .eq("owner_account_id", account_id)\
             .execute()
@@ -126,7 +126,7 @@ def list_workspace_members():
         return jsonify({"ok": False, "error": "account not found"}), 404
     
     try:
-        owner_result = supabase().table("accounts")\
+        owner_result = supabase.table("accounts")\
             .select("id, account_id, display_name, email, created_at, updated_at, provider, provider_user_id")\
             .eq("id", account_id)\
             .maybe_single()\
@@ -134,7 +134,7 @@ def list_workspace_members():
         
         owner = owner_result.data if owner_result.data else None
         
-        members_result = supabase().table("workspace_members")\
+        members_result = supabase.table("workspace_members")\
             .select("id, owner_account_id, member_account_id, role, status, created_at, updated_at")\
             .eq("owner_account_id", account_id)\
             .execute()
@@ -142,7 +142,7 @@ def list_workspace_members():
         members = []
         if members_result.data:
             for m in members_result.data:
-                member_acc = supabase().table("accounts")\
+                member_acc = supabase.table("accounts")\
                     .select("display_name, email, provider, provider_user_id, account_id")\
                     .eq("id", m.get("member_account_id"))\
                     .maybe_single()\
@@ -164,7 +164,7 @@ def list_workspace_members():
                     "member_provider_user_id": member_data.get("provider_user_id"),
                 })
         
-        sub_result = supabase().table("user_subscriptions")\
+        sub_result = supabase.table("user_subscriptions")\
             .select("plan_code, plan_family")\
             .eq("account_id", account_id)\
             .eq("is_active", True)\
@@ -227,7 +227,7 @@ def add_workspace_member():
     
     member_account = None
     try:
-        result = supabase().table("accounts")\
+        result = supabase.table("accounts")\
             .select("id, account_id, email")\
             .eq("email", member_email)\
             .maybe_single()\
@@ -245,7 +245,7 @@ def add_workspace_member():
         }), 404
     
     try:
-        existing = supabase().table("workspace_members")\
+        existing = supabase.table("workspace_members")\
             .select("id")\
             .eq("owner_account_id", owner_account_id)\
             .eq("member_account_id", member_account["id"])\
@@ -257,7 +257,7 @@ def add_workspace_member():
     except Exception as e:
         logger.error(f"Failed to check existing membership: {e}")
     
-    sub_result = supabase().table("user_subscriptions")\
+    sub_result = supabase.table("user_subscriptions")\
         .select("plan_family")\
         .eq("account_id", owner_account_id)\
         .eq("is_active", True)\
@@ -272,7 +272,7 @@ def add_workspace_member():
         elif plan_family == "team":
             max_workspace_users = 5
     
-    count_result = supabase().table("workspace_members")\
+    count_result = supabase.table("workspace_members")\
         .select("id", count="exact")\
         .eq("owner_account_id", owner_account_id)\
         .execute()
@@ -293,7 +293,7 @@ def add_workspace_member():
             "status": "active"
         }
         
-        result = supabase().table("workspace_members").insert(insert_data).execute()
+        result = supabase.table("workspace_members").insert(insert_data).execute()
         
         if result.data:
             return jsonify({
@@ -332,7 +332,7 @@ def remove_workspace_member():
         return jsonify({"ok": False, "error": "Cannot remove the workspace owner"}), 403
     
     try:
-        supabase().table("workspace_members")\
+        supabase.table("workspace_members")\
             .delete()\
             .eq("owner_account_id", owner_account_id)\
             .eq("member_account_id", member_account_id)\
