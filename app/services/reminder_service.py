@@ -11,24 +11,28 @@ logger = logging.getLogger(__name__)
 
 
 def subscribe_to_reminders(account_id: str, channel: str, contact: str) -> Dict[str, Any]:
+    """Subscribe a user to tax deadline reminders"""
     try:
-        existing = supabase.table("reminder_subscriptions")\
+        # Check if subscription exists
+        result = supabase.table("reminder_subscriptions")\
             .select("id")\
             .eq("account_id", account_id)\
             .eq("channel", channel)\
-            .maybe_single()\
             .execute()
         
-        if existing.data:
+        if result.data and len(result.data) > 0:
+            # Update existing subscription
             supabase.table("reminder_subscriptions")\
                 .update({
                     "active": True,
+                    "contact": contact,
                     "updated_at": datetime.utcnow().isoformat()
                 })\
-                .eq("id", existing.data["id"])\
+                .eq("id", result.data[0]["id"])\
                 .execute()
             return {"ok": True, "message": "✅ You are already subscribed to reminders!"}
         
+        # Create new subscription
         supabase.table("reminder_subscriptions").insert({
             "account_id": account_id,
             "channel": channel,
@@ -46,17 +50,25 @@ def subscribe_to_reminders(account_id: str, channel: str, contact: str) -> Dict[
 
 
 def unsubscribe_from_reminders(account_id: str, channel: str) -> Dict[str, Any]:
+    """Unsubscribe a user from reminders"""
     try:
-        supabase.table("reminder_subscriptions")\
-            .update({
-                "active": False,
-                "updated_at": datetime.utcnow().isoformat()
-            })\
+        result = supabase.table("reminder_subscriptions")\
+            .select("id")\
             .eq("account_id", account_id)\
             .eq("channel", channel)\
             .execute()
         
-        return {"ok": True, "message": "❌ You have been unsubscribed from reminders."}
+        if result.data and len(result.data) > 0:
+            supabase.table("reminder_subscriptions")\
+                .update({
+                    "active": False,
+                    "updated_at": datetime.utcnow().isoformat()
+                })\
+                .eq("id", result.data[0]["id"])\
+                .execute()
+            return {"ok": True, "message": "❌ You have been unsubscribed from reminders."}
+        
+        return {"ok": True, "message": "You were not subscribed to reminders."}
         
     except Exception as e:
         logger.error(f"Failed to unsubscribe: {e}")
@@ -64,16 +76,16 @@ def unsubscribe_from_reminders(account_id: str, channel: str) -> Dict[str, Any]:
 
 
 def get_user_reminder_status(account_id: str, channel: str) -> Dict[str, Any]:
+    """Check if a user is subscribed to reminders"""
     try:
         result = supabase.table("reminder_subscriptions")\
             .select("active")\
             .eq("account_id", account_id)\
             .eq("channel", channel)\
-            .maybe_single()\
             .execute()
         
-        if result.data:
-            return {"subscribed": result.data.get("active", False)}
+        if result.data and len(result.data) > 0:
+            return {"subscribed": result.data[0].get("active", False)}
         return {"subscribed": False}
         
     except Exception as e:
@@ -82,6 +94,7 @@ def get_user_reminder_status(account_id: str, channel: str) -> Dict[str, Any]:
 
 
 def get_subscribers() -> List[Dict[str, Any]]:
+    """Get all active subscribers"""
     try:
         result = supabase.table("reminder_subscriptions")\
             .select("account_id, channel, contact")\
