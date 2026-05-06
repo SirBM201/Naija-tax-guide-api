@@ -8,8 +8,23 @@ from flask import Blueprint, jsonify, request
 bp = Blueprint("cron", __name__)
 
 
+def _cron_secret() -> str:
+    return (os.getenv("CRON_SECRET") or os.getenv("ADMIN_CRON_SECRET") or "").strip()
+
+
+def _cron_authorized() -> bool:
+    secret = _cron_secret()
+    # If no secret is configured, reject all requests (safe default)
+    if not secret:
+        return False
+    incoming = (request.headers.get("X-Cron-Secret") or request.args.get("cron_secret") or "").strip()
+    return bool(incoming) and incoming == secret
+
+
 @bp.route("/cron/test", methods=["GET", "POST"])
 def cron_test():
+    if not _cron_authorized():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
     return jsonify({
         "ok": True,
         "method": request.method,
@@ -19,7 +34,9 @@ def cron_test():
 
 @bp.route("/cron/send-deadline-reminders", methods=["GET", "POST"])
 def cron_send_deadline_reminders():
-    # NO AUTHENTICATION CHECK - completely open for testing
+    if not _cron_authorized():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    
     return jsonify({
         "ok": True,
         "message": "Reminder endpoint reached",
@@ -30,6 +47,7 @@ def cron_send_deadline_reminders():
 
 @bp.route("/cron/deadlines/upcoming", methods=["GET"])
 def cron_get_upcoming_deadlines():
+    # Public endpoint - no auth needed for reading deadlines
     days_ahead = int(request.args.get("days", 30))
     return jsonify({
         "ok": True,
@@ -52,6 +70,8 @@ def cron_get_upcoming_deadlines():
 
 @bp.route("/cron/referrals/mature", methods=["POST"])
 def cron_referrals_mature():
+    if not _cron_authorized():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
     return jsonify({
         "ok": True,
         "route_version": "cron_v1",
@@ -61,6 +81,8 @@ def cron_referrals_mature():
 
 @bp.route("/cron/referrals/payout-batch", methods=["POST"])
 def cron_referrals_payout_batch():
+    if not _cron_authorized():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
     return jsonify({
         "ok": True,
         "route_version": "cron_v1",
