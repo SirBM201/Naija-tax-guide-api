@@ -34,6 +34,8 @@ from app.services.tax_filing_service import (
     get_user_filings
 )
 from app.services.tax_calculator import calculate_tax
+from app.services.tax_deadline_service import get_upcoming_deadlines, get_deadlines_summary, format_deadline_message
+from app.services.reminder_service import subscribe_to_reminders, unsubscribe_from_reminders, get_user_reminder_status
 
 bp = Blueprint("whatsapp", __name__)
 
@@ -106,7 +108,8 @@ def _send_main_menu(phone: str):
         "# - Save & Menu\n"
         "* - Back\n"
         "0 - Cancel\n"
-        "9 - Resume"
+        "9 - Resume\n\n"
+        "📅 *Reminders:* Reply 'REMIND ME' to get tax deadline alerts!"
     )
     send_whatsapp_text(phone, menu)
 
@@ -120,11 +123,12 @@ def _send_tax_menu(phone: str):
         "C - File CIT (Company tax)\n"
         "H - View my filing history\n"
         "D - View tax deadlines\n"
+        "R - Get deadline reminders\n"
+        "U - Unsubscribe from reminders\n"
         "B - Back to main menu\n\n"
+        "💡 Tip: Reply 'REMIND ME' to get notified about upcoming deadlines!\n\n"
         "Each filing takes 2-3 minutes.\n"
-        "We'll guide you step by step!\n\n"
-        "💡 Global commands:\n"
-        "# - Save & Menu | * - Back | 0 - Cancel | 9 - Resume"
+        "We'll guide you step by step!"
     )
     send_whatsapp_text(phone, menu)
 
@@ -144,6 +148,7 @@ def _send_welcome(phone: str):
         "8️⃣ - Help\n\n"
         "💡 Global commands (anytime):\n"
         "# - Save & Menu | * - Back | 0 - Cancel | 9 - Resume\n\n"
+        "📅 *Get reminders:* Reply 'REMIND ME' for tax deadline alerts!\n\n"
         "Or just type your tax question!"
     )
     send_whatsapp_text(phone, welcome)
@@ -369,7 +374,7 @@ def _handle_submit(phone: str, account_id: str, user_state: dict):
             calc = result.get("calculation", {})
             monthly_tax = calc.get("monthly_tax_payable", 0)
             reference = result.get("reference", "N/A")
-            send_whatsapp_text(phone, f"✅ *PAYE Filing Submitted!*\n\n📋 Reference: {reference}\n💰 Monthly Tax: ₦{monthly_tax:,.2f}\n\nReply 8 for main menu.")
+            send_whatsapp_text(phone, f"✅ *PAYE Filing Submitted!*\n\n📋 Reference: {reference}\n💰 Monthly Tax: ₦{monthly_tax:,.2f}\n\nReply 8 for main menu.\n\n📅 Reply 'REMIND ME' for tax deadline alerts!")
         else:
             send_whatsapp_text(phone, f"❌ Filing failed: {result.get('error', 'Unknown error')}")
     elif sub_context == "vat":
@@ -382,7 +387,7 @@ def _handle_submit(phone: str, account_id: str, user_state: dict):
             calc = result.get("calculation", {})
             vat_payable = calc.get("vat_payable", 0)
             reference = result.get("reference", "N/A")
-            send_whatsapp_text(phone, f"✅ *VAT Filing Submitted!*\n\n📋 Reference: {reference}\n💰 VAT Payable: ₦{vat_payable:,.2f}")
+            send_whatsapp_text(phone, f"✅ *VAT Filing Submitted!*\n\n📋 Reference: {reference}\n💰 VAT Payable: ₦{vat_payable:,.2f}\n\nReply 8 for main menu.\n\n📅 Reply 'REMIND ME' for tax deadline alerts!")
         else:
             send_whatsapp_text(phone, f"❌ Filing failed: {result.get('error', 'Unknown error')}")
     elif sub_context == "cit":
@@ -395,7 +400,7 @@ def _handle_submit(phone: str, account_id: str, user_state: dict):
             calc = result.get("calculation", {})
             cit_payable = calc.get("cit_payable", 0)
             reference = result.get("reference", "N/A")
-            send_whatsapp_text(phone, f"✅ *CIT Filing Submitted!*\n\n📋 Reference: {reference}\n💰 CIT Payable: ₦{cit_payable:,.2f}")
+            send_whatsapp_text(phone, f"✅ *CIT Filing Submitted!*\n\n📋 Reference: {reference}\n💰 CIT Payable: ₦{cit_payable:,.2f}\n\nReply 8 for main menu.\n\n📅 Reply 'REMIND ME' for tax deadline alerts!")
         else:
             send_whatsapp_text(phone, f"❌ Filing failed: {result.get('error', 'Unknown error')}")
     
@@ -413,7 +418,37 @@ def _handle_filing_history(phone: str, account_id: str):
             msg += f"   📅 {f.get('submitted_at', '')[:10]}\n\n"
         send_whatsapp_text(phone, msg)
     else:
-        send_whatsapp_text(phone, "📋 No tax filings found. Reply with P to file PAYE tax, V for VAT, or C for CIT.")
+        send_whatsapp_text(phone, "📋 No tax filings found. Reply with P to file PAYE tax, V for VAT, or C for CIT.\n\n📅 Reply 'REMIND ME' for tax deadline alerts!")
+
+
+def _handle_reminder_commands(phone: str, account_id: str, text: str) -> bool:
+    """Handle reminder-related commands"""
+    text_lower = text.lower().strip()
+    
+    if text_lower == "r" or text_lower == "reminders":
+        status = get_user_reminder_status(account_id, "whatsapp")
+        if status.get("subscribed"):
+            send_whatsapp_text(phone, "✅ *You are subscribed to reminders!*\n\nYou will receive tax deadline alerts.\n\nReply 'UNSUBSCRIBE' or 'U' to stop reminders.\n\nReply 'DEADLINES' to see upcoming deadlines.")
+        else:
+            send_whatsapp_text(phone, "🔔 *You are NOT subscribed to reminders*\n\nReply 'REMIND ME' to receive tax deadline alerts via WhatsApp!\n\nYou'll get reminders for:\n• PAYE (monthly)\n• VAT (monthly)\n• CIT (quarterly & annual)\n• And more!")
+        return True
+    
+    if text_lower == "remind me" or text_lower == "remindme":
+        result = subscribe_to_reminders(account_id, "whatsapp", phone)
+        send_whatsapp_text(phone, result.get("message", "✅ You will now receive tax deadline reminders!"))
+        return True
+    
+    if text_lower == "unsubscribe" or text_lower == "opt out" or text_lower == "u":
+        result = unsubscribe_from_reminders(account_id, "whatsapp")
+        send_whatsapp_text(phone, result.get("message", "❌ You have been unsubscribed from reminders."))
+        return True
+    
+    if text_lower == "deadlines" or text_lower == "d":
+        summary = get_deadlines_summary(30)
+        send_whatsapp_text(phone, summary + "\n\n💡 Reply 'REMIND ME' to get alerts for these deadlines!")
+        return True
+    
+    return False
 
 
 @bp.route("/whatsapp/webhook", methods=["GET", "POST"])
@@ -447,7 +482,9 @@ def wa_webhook():
             _send_welcome(from_phone)
             return jsonify({"ok": True})
         
-        # Handle email collection
+        # ============================================================
+        # 1. Handle email collection for subscription
+        # ============================================================
         if user_state.get("awaiting_email"):
             email = text.strip().lower()
             pending_plan = user_state.get("pending_plan")
@@ -463,10 +500,34 @@ def wa_webhook():
                     send_whatsapp_text(from_phone, f"❌ {result.get('message', 'Please try again.')}")
                 user_states.pop(from_phone, None)
             else:
-                send_whatsapp_text(from_phone, "❌ Invalid email. Send a valid email, 'cancel' to abort, or '#' to save and exit.")
+                send_whatsapp_text(from_phone, "❌ Invalid email. Send a valid email, 'cancel' to abort, or '#' to save and exit.\n\n💡 # - Save & Menu | 0 - Cancel")
             return jsonify({"ok": True})
         
-        # ========== GLOBAL COMMANDS ==========
+        # ============================================================
+        # 2. CRITICAL: Handle confirm/cancel IMMEDIATELY
+        #    These must come BEFORE any other processing to prevent
+        #    "confirm" from being sent to AI
+        # ============================================================
+        
+        if text.lower() == "confirm":
+            if user_state.get("context") == "filing_confirm":
+                _handle_submit(from_phone, account_id, user_state)
+            else:
+                send_whatsapp_text(from_phone, "No filing to confirm. Reply 7 to start a new filing.")
+            return jsonify({"ok": True})
+        
+        if text.lower() == "cancel":
+            if user_state.get("context") == "filing" or user_state.get("context") == "filing_confirm":
+                delete_filing_draft(account_id, user_state.get("sub_context"))
+                user_states.pop(from_phone, None)
+                send_whatsapp_text(from_phone, "❌ Filing cancelled.\n\nReply 8 for main menu.")
+            else:
+                send_whatsapp_text(from_phone, "No active filing to cancel.")
+            return jsonify({"ok": True})
+        
+        # ============================================================
+        # 3. GLOBAL COMMANDS
+        # ============================================================
         
         if text == "#":
             current_context = user_state.get("context")
@@ -486,7 +547,7 @@ def wa_webhook():
             if current_context == "filing" or current_context == "filing_confirm":
                 delete_filing_draft(account_id, user_state.get("sub_context"))
             user_states.pop(from_phone, None)
-            send_whatsapp_text(from_phone, "❌ Cancelled. All progress cleared.\n\nReply 8 for main menu.")
+            send_whatsapp_text(from_phone, "❌ Cancelled. All progress cleared.\n\nReply 8 for main menu.\n\n📅 Reply 'REMIND ME' for tax deadline alerts!")
             return jsonify({"ok": True})
         
         if text == "9":
@@ -500,24 +561,7 @@ def wa_webhook():
                 }
                 _show_filing_step(from_phone, active["filing_type"], active["step"], active["inputs"])
             else:
-                send_whatsapp_text(from_phone, "📭 No saved filing found. Start a new one with P, V, or C.")
-            return jsonify({"ok": True})
-        
-        # Handle confirm/cancel
-        if text.lower() == "confirm":
-            if user_state.get("context") == "filing_confirm":
-                _handle_submit(from_phone, account_id, user_state)
-            else:
-                send_whatsapp_text(from_phone, "No filing to confirm. Reply 7 to start a new filing.")
-            return jsonify({"ok": True})
-        
-        if text.lower() == "cancel":
-            if user_state.get("context") == "filing" or user_state.get("context") == "filing_confirm":
-                delete_filing_draft(account_id, user_state.get("sub_context"))
-                user_states.pop(from_phone, None)
-                send_whatsapp_text(from_phone, "❌ Filing cancelled.\n\nReply 8 for main menu.")
-            else:
-                send_whatsapp_text(from_phone, "No active filing to cancel.")
+                send_whatsapp_text(from_phone, "📭 No saved filing found. Start a new one with P, V, or C.\n\n📅 Reply 'REMIND ME' for tax deadline alerts!")
             return jsonify({"ok": True})
         
         # Handle back command
@@ -533,7 +577,9 @@ def wa_webhook():
                 user_states.pop(from_phone, None)
             return jsonify({"ok": True})
         
-        # ========== CHECK FOR ACTIVE FILING ==========
+        # ============================================================
+        # 4. CHECK FOR ACTIVE FILING
+        # ============================================================
         filing_type = user_state.get("sub_context") if user_state.get("context") == "filing" else None
         step = user_state.get("step")
         inputs = user_state.get("inputs", {})
@@ -560,7 +606,15 @@ def wa_webhook():
                 _handle_cit_filing(from_phone, account_id, step, inputs, text)
             return jsonify({"ok": True})
         
-        # ========== START NEW FILING ==========
+        # ============================================================
+        # 5. HANDLE REMINDER COMMANDS
+        # ============================================================
+        if _handle_reminder_commands(from_phone, account_id, text):
+            return jsonify({"ok": True})
+        
+        # ============================================================
+        # 6. START NEW FILING
+        # ============================================================
         text_lower = text.lower().strip()
         
         if text_lower in ["paye", "p"]:
@@ -590,13 +644,11 @@ def wa_webhook():
             send_whatsapp_text(from_phone, "📋 *CIT Filing - Step 1 of 3*\n\nWhat is your company's total revenue for the period?\n(Example: 50000000 or 50M)\n\n💡 * - Back | # - Save & Menu | 0 - Cancel")
             return jsonify({"ok": True})
         
-        # ========== MENU COMMANDS ==========
+        # ============================================================
+        # 7. MENU COMMANDS
+        # ============================================================
         if text.upper() == "H":
             _handle_filing_history(from_phone, account_id)
-            return jsonify({"ok": True})
-        
-        if text.upper() == "D":
-            send_whatsapp_text(from_phone, "📅 *Tax Deadlines*\n\n• PAYE: Monthly by 10th\n• VAT: Monthly by 21st\n• CIT: 6 months after year end\n• Annual Returns: March 31st")
             return jsonify({"ok": True})
         
         if text.upper() == "B":
@@ -617,7 +669,7 @@ def wa_webhook():
                 send_whatsapp_text(from_phone, "💬 Please type your tax question.\n\n💡 # - Save & Menu | 0 - Cancel")
             elif option == 2:
                 if has_active_subscription(account_id):
-                    send_whatsapp_text(from_phone, "💎 *UNLIMITED AI ACCESS* ✅\n\nYou have an active subscription. No credit limits!")
+                    send_whatsapp_text(from_phone, "💎 *UNLIMITED AI ACCESS* ✅\n\nYou have an active subscription. No credit limits!\n\n📅 Reply 'REMIND ME' for tax deadline alerts!")
                 else:
                     balance = get_credit_balance(account_id)
                     send_whatsapp_text(from_phone, format_balance_message(balance))
@@ -633,14 +685,16 @@ def wa_webhook():
                 user_states[from_phone] = {"context": "linking", "awaiting_code": True}
             elif option == 6:
                 if has_active_subscription(account_id):
-                    send_whatsapp_text(from_phone, "✨ You have an active subscription with UNLIMITED credits!\n\nNo need to buy credits.")
+                    send_whatsapp_text(from_phone, "✨ You have an active subscription with UNLIMITED credits!\n\nNo need to buy credits.\n\n📅 Reply 'REMIND ME' for tax deadline alerts!")
                 else:
                     credit_menu = get_credit_packages_menu()
                     send_whatsapp_text(from_phone, credit_menu + "\n\n💡 Send 1, 2, 3, or 4 to buy, or # to save and exit.")
                     user_states[from_phone] = {"context": "buying_credits"}
             return jsonify({"ok": True})
         
-        # Handle credit package selection
+        # ============================================================
+        # 8. CREDIT PACKAGE SELECTION
+        # ============================================================
         if user_state.get("context") == "buying_credits" and text in ["1", "2", "3", "4"]:
             package_num = int(text)
             package = validate_package_number(package_num)
@@ -655,7 +709,9 @@ def wa_webhook():
             user_states.pop(from_phone, None)
             return jsonify({"ok": True})
         
-        # Handle subscription plan selection
+        # ============================================================
+        # 9. SUBSCRIPTION PLAN SELECTION
+        # ============================================================
         if user_state.get("context") == "subscription" and text.isdigit() and 1 <= int(text) <= 9:
             plan_num = int(text)
             plan = validate_plan_number(plan_num)
@@ -675,7 +731,9 @@ def wa_webhook():
                 send_whatsapp_text(from_phone, "❌ Invalid plan number. Send 4 to see plans.")
             return jsonify({"ok": True})
         
-        # Handle linking code
+        # ============================================================
+        # 10. LINKING CODE
+        # ============================================================
         if user_state.get("context") == "linking" and LINK_CODE_RE.match(text.upper()):
             attempt = _try_consume_link_code(from_phone, text)
             if attempt.get("ok"):
@@ -685,21 +743,25 @@ def wa_webhook():
             user_states.pop(from_phone, None)
             return jsonify({"ok": True})
         
-        # Handle help
+        # ============================================================
+        # 11. HELP
+        # ============================================================
         if text.lower() in ["help", "menu", "start", "?", "/start", "8"]:
             _send_main_menu(from_phone)
             return jsonify({"ok": True})
         
-        # Default: Ask AI
+        # ============================================================
+        # 12. DEFAULT: ASK AI (LAST RESORT)
+        # ============================================================
         result = ask_guarded({"question": text, "account_id": account_id, "lang": "en", "channel": "whatsapp"})
         if result.get("ok"):
             answer = result.get("answer", "")
             if answer:
-                send_whatsapp_text(from_phone, answer + "\n\n💡 Reply 8 for main menu.")
+                send_whatsapp_text(from_phone, answer + "\n\n💡 Reply 8 for main menu.\n📅 Reply 'REMIND ME' for tax deadline alerts!")
             else:
-                send_whatsapp_text(from_phone, "I couldn't find an answer. Reply 8 for menu.")
+                send_whatsapp_text(from_phone, "I couldn't find an answer. Reply 8 for menu.\n\n📅 Reply 'REMIND ME' for tax deadline alerts!")
         else:
-            send_whatsapp_text(from_phone, "Sorry, I encountered an error. Reply 8 for menu.")
+            send_whatsapp_text(from_phone, "Sorry, I encountered an error. Reply 8 for menu.\n\n📅 Reply 'REMIND ME' for tax deadline alerts!")
         
         return jsonify({"ok": True})
         
