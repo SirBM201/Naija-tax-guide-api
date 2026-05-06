@@ -13,15 +13,11 @@ def _cron_secret() -> str:
 
 
 def _cron_authorized() -> bool:
-    # TEMPORARILY DISABLED FOR TESTING - Remove this line after testing
-    return True
-    
     secret = _cron_secret()
     if not secret:
         return True
     incoming = (request.headers.get("X-Cron-Secret") or request.args.get("cron_secret") or "").strip()
     return bool(incoming) and incoming == secret
-
 
 @bp.route("/cron/test", methods=["GET", "POST"])
 def cron_test():
