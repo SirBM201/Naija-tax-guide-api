@@ -25,7 +25,7 @@ from app.services.reminder_service import get_subscribers
 from app.services.outbound_service import send_whatsapp_text
 
 bp = Blueprint("cron", __name__)
-ROUTE_VERSION = "cron_route_v2_user_payout_flow"
+ROUTE_VERSION = "cron_route_v3_final"
 
 
 def _truthy(v: str | None) -> bool:
@@ -57,8 +57,11 @@ def _cron_secret() -> str:
 
 
 def _cron_authorized() -> bool:
-    # TEMPORARILY DISABLED FOR TESTING - REMOVE AFTER CRON WORKS
-    return True
+    """Check if the cron request is authorized"""
+    secret = _cron_secret()
+    if not secret:
+        # If no secret is configured, allow all requests (testing mode)
+        return True
     incoming = (request.headers.get("X-Cron-Secret") or request.args.get("cron_secret") or "").strip()
     return bool(incoming) and incoming == secret
 
@@ -165,14 +168,12 @@ def cron_send_deadline_reminders():
     """
     Cron job to send tax deadline reminders to all subscribers.
     Accepts both GET and POST for cron-job.org compatibility.
-    Call daily at 9 AM.
+    Call daily at 9 AM Nigeria time.
     """
-    # Check authorization
     if not _cron_authorized():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     
     try:
-        # Get all upcoming deadlines in the next 30 days
         deadlines = get_upcoming_deadlines(30)
         
         if not deadlines:
@@ -182,7 +183,6 @@ def cron_send_deadline_reminders():
                 "deadlines_count": 0
             }), 200
         
-        # Get all active subscribers
         subscribers = get_subscribers()
         
         if not subscribers:
@@ -193,7 +193,6 @@ def cron_send_deadline_reminders():
                 "subscribers_count": 0
             }), 200
         
-        # Track reminders sent
         reminders_sent = 0
         reminder_log = []
         
@@ -237,9 +236,7 @@ def cron_send_deadline_reminders():
 
 @bp.route("/cron/deadlines/upcoming", methods=["GET"])
 def cron_get_upcoming_deadlines():
-    """
-    Get upcoming deadlines (public info, no auth required)
-    """
+    """Get upcoming deadlines (public info, no auth required)"""
     days_ahead = _safe_int(request.args.get("days", 30), 30)
     deadlines = get_upcoming_deadlines(days_ahead)
     
@@ -269,7 +266,7 @@ def cron_test():
 
 
 # ============================================================
-# REFERRAL CRON JOBS (Existing)
+# REFERRAL CRON JOBS
 # ============================================================
 
 @bp.post("/cron/referrals/mature")
