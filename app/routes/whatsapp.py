@@ -36,6 +36,7 @@ from app.services.tax_filing_service import (
 from app.services.tax_calculator import calculate_tax
 from app.services.tax_deadline_service import get_upcoming_deadlines, get_deadlines_summary, format_deadline_message
 from app.services.reminder_service import subscribe_to_reminders, unsubscribe_from_reminders, get_user_reminder_status
+from app.services.language_service import t, get_user_language, set_user_language, get_language_menu, LANGUAGES
 
 bp = Blueprint("whatsapp", __name__)
 
@@ -92,65 +93,18 @@ def _try_consume_link_code(provider_user_id: str, raw_text: str) -> dict:
     return {"ok": False, "reason": row.get("reason") or "consume_failed"}
 
 
-def _send_main_menu(phone: str):
-    menu = (
-        "*🤖 Naija Tax Guide*\n\n"
-        "Reply with:\n"
-        "1️⃣ - Ask a tax question\n"
-        "2️⃣ - Check AI credits balance\n"
-        "3️⃣ - Check my subscription plan\n"
-        "4️⃣ - View subscription plans\n"
-        "5️⃣ - Link to website account\n"
-        "6️⃣ - Buy AI credits\n"
-        "7️⃣ - Tax filing & management\n"
-        "8️⃣ - Help / Menu\n\n"
-        "💡 Global commands (anytime):\n"
-        "# - Save & Menu\n"
-        "* - Back\n"
-        "0 - Cancel\n"
-        "9 - Resume\n\n"
-        "📅 *Reminders:* Reply 'REMIND ME' to get tax deadline alerts!"
-    )
+def _send_main_menu(phone: str, lang: str = "en"):
+    menu = f"*🤖 Naija Tax Guide*\n\n{t('main_menu', lang)}\n\n{t('global_commands', lang)}\n\n🌐 Reply LANGUAGE or L to change language"
     send_whatsapp_text(phone, menu)
 
 
-def _send_tax_menu(phone: str):
-    menu = (
-        "*📋 TAX FILING & MANAGEMENT*\n\n"
-        "Reply with:\n"
-        "P - File PAYE Tax (Salary tax)\n"
-        "V - File VAT (Sales tax)\n"
-        "C - File CIT (Company tax)\n"
-        "H - View my filing history\n"
-        "D - View tax deadlines\n"
-        "R - Get deadline reminders\n"
-        "U - Unsubscribe from reminders\n"
-        "B - Back to main menu\n\n"
-        "💡 Tip: Reply 'REMIND ME' to get notified about upcoming deadlines!\n\n"
-        "Each filing takes 2-3 minutes.\n"
-        "We'll guide you step by step!"
-    )
+def _send_tax_menu(phone: str, lang: str = "en"):
+    menu = t('tax_menu', lang) + f"\n\n{t('global_commands', lang)}"
     send_whatsapp_text(phone, menu)
 
 
-def _send_welcome(phone: str):
-    welcome = (
-        "*Welcome to Naija Tax Guide!* ✅\n\n"
-        "I'm your AI tax assistant for Nigerian taxes.\n\n"
-        "Reply with:\n"
-        "1️⃣ - Ask a tax question\n"
-        "2️⃣ - Check AI credits\n"
-        "3️⃣ - View my plan\n"
-        "4️⃣ - View subscription plans\n"
-        "5️⃣ - Link website account\n"
-        "6️⃣ - Buy AI credits\n"
-        "7️⃣ - File taxes\n"
-        "8️⃣ - Help\n\n"
-        "💡 Global commands (anytime):\n"
-        "# - Save & Menu | * - Back | 0 - Cancel | 9 - Resume\n\n"
-        "📅 *Get reminders:* Reply 'REMIND ME' for tax deadline alerts!\n\n"
-        "Or just type your tax question!"
-    )
+def _send_welcome(phone: str, lang: str = "en"):
+    welcome = f"{t('welcome', lang)}\n\n{t('main_menu', lang)}\n\n{t('global_commands', lang)}\n\n🌐 Reply LANGUAGE or L to change language\n\n📅 Reply 'REMIND ME' for tax deadline alerts!"
     send_whatsapp_text(phone, welcome)
 
 
@@ -196,37 +150,37 @@ def _get_active_filing(account_id: str):
     return None
 
 
-def _show_filing_step(phone: str, tax_type: str, step: int, inputs: dict):
+def _show_filing_step(phone: str, tax_type: str, step: int, inputs: dict, lang: str = "en"):
     if tax_type == "paye":
         if step == 1:
-            send_whatsapp_text(phone, "📋 *PAYE Tax Filing - Step 1 of 3*\n\nWhat is your monthly salary?\n(Example: 750000 or 750k)\n\n💡 * - Back | # - Save & Menu | 0 - Cancel")
+            send_whatsapp_text(phone, f"{t('paye_step1', lang)}\n\n{t('global_commands', lang)}")
         elif step == 2:
-            send_whatsapp_text(phone, f"✅ Received: ₦{inputs.get('monthly_gross_income', 0):,.2f}\n\n📋 Step 2 of 3: Pension Contribution\nEnter your monthly pension contribution (0 if none):\n\n💡 * - Back | # - Save & Menu | 0 - Cancel")
+            send_whatsapp_text(phone, f"✅ Received: ₦{inputs.get('monthly_gross_income', 0):,.2f}\n\n{t('paye_step2', lang)}\n\n{t('global_commands', lang)}")
         elif step == 3:
-            send_whatsapp_text(phone, f"✅ Received: ₦{inputs.get('pension_contribution', 0):,.2f}\n\n📋 Step 3 of 3: NHF Contribution\nEnter your NHF contribution (0 if none):\n\n💡 * - Back | # - Save & Menu | 0 - Cancel")
+            send_whatsapp_text(phone, f"✅ Received: ₦{inputs.get('pension_contribution', 0):,.2f}\n\n{t('paye_step3', lang)}\n\n{t('global_commands', lang)}")
     elif tax_type == "vat":
         if step == 1:
-            send_whatsapp_text(phone, "📋 *VAT Filing - Step 1 of 3*\n\nWhat is your total sales for the period?\n(Example: 25000000 or 25M)\n\n💡 * - Back | # - Save & Menu | 0 - Cancel")
+            send_whatsapp_text(phone, f"{t('vat_step1', lang)}\n\n{t('global_commands', lang)}")
         elif step == 2:
-            send_whatsapp_text(phone, f"✅ Received: ₦{inputs.get('sales_amount', 0):,.2f}\n\n📋 Step 2 of 3: Total Purchases\nEnter your total purchases (excluding VAT):\n\n💡 * - Back | # - Save & Menu | 0 - Cancel")
+            send_whatsapp_text(phone, f"✅ Received: ₦{inputs.get('sales_amount', 0):,.2f}\n\n{t('vat_step2', lang)}\n\n{t('global_commands', lang)}")
     elif tax_type == "cit":
         if step == 1:
-            send_whatsapp_text(phone, "📋 *CIT Filing - Step 1 of 3*\n\nWhat is your company's total revenue for the period?\n(Example: 50000000 or 50M)\n\n💡 * - Back | # - Save & Menu | 0 - Cancel")
+            send_whatsapp_text(phone, f"{t('cit_step1', lang)}\n\n{t('global_commands', lang)}")
         elif step == 2:
-            send_whatsapp_text(phone, f"✅ Received: ₦{inputs.get('revenue', 0):,.2f}\n\n📋 Step 2 of 3: Total Expenses\nEnter your total allowable expenses:\n\n💡 * - Back | # - Save & Menu | 0 - Cancel")
+            send_whatsapp_text(phone, f"✅ Received: ₦{inputs.get('revenue', 0):,.2f}\n\n{t('cit_step2', lang)}\n\n{t('global_commands', lang)}")
 
 
-def _handle_paye_filing(phone: str, account_id: str, step: int, inputs: dict, text: str):
+def _handle_paye_filing(phone: str, account_id: str, step: int, inputs: dict, text: str, lang: str = "en"):
     if step == 1:
         try:
             amount = _parse_amount(text)
             inputs["monthly_gross_income"] = amount
             save_filing_draft(account_id, "paye", inputs, [], 2)
-            user_states[phone] = {"context": "filing", "sub_context": "paye", "step": 2, "inputs": inputs}
-            _show_filing_step(phone, "paye", 2, inputs)
+            user_states[phone] = {"context": "filing", "sub_context": "paye", "step": 2, "inputs": inputs, "lang": lang}
+            _show_filing_step(phone, "paye", 2, inputs, lang)
             return True
         except ValueError:
-            send_whatsapp_text(phone, "❌ Please enter a valid amount (e.g., 750000 or 750k)\n\n💡 * - Back | # - Save & Menu | 0 - Cancel")
+            send_whatsapp_text(phone, f"{t('invalid_amount', lang)}\n\n{t('global_commands', lang)}")
             return True
     
     elif step == 2:
@@ -234,11 +188,11 @@ def _handle_paye_filing(phone: str, account_id: str, step: int, inputs: dict, te
             amount = _parse_amount(text)
             inputs["pension_contribution"] = amount
             save_filing_draft(account_id, "paye", inputs, [], 3)
-            user_states[phone] = {"context": "filing", "sub_context": "paye", "step": 3, "inputs": inputs}
-            _show_filing_step(phone, "paye", 3, inputs)
+            user_states[phone] = {"context": "filing", "sub_context": "paye", "step": 3, "inputs": inputs, "lang": lang}
+            _show_filing_step(phone, "paye", 3, inputs, lang)
             return True
         except ValueError:
-            send_whatsapp_text(phone, "❌ Please enter a valid amount\n\n💡 * - Back | # - Save & Menu | 0 - Cancel")
+            send_whatsapp_text(phone, f"{t('invalid_amount', lang)}\n\n{t('global_commands', lang)}")
             return True
     
     elif step == 3:
@@ -255,30 +209,29 @@ def _handle_paye_filing(phone: str, account_id: str, step: int, inputs: dict, te
                        f"• Pension: ₦{inputs.get('pension_contribution', 0):,.2f}\n"
                        f"• NHF: ₦{inputs.get('nhf', 0):,.2f}\n"
                        f"• *Monthly Tax: ₦{monthly_tax:,.2f}*\n\n"
-                       f"Reply with 'confirm' to submit, or 'cancel' to abort\n\n"
-                       f"💡 # - Save & Menu | 0 - Cancel")
+                       f"Reply with 'confirm' to submit, or 'cancel' to abort")
             
-            user_states[phone] = {"context": "filing_confirm", "sub_context": "paye", "step": 4, "inputs": inputs, "calculation": calc}
+            user_states[phone] = {"context": "filing_confirm", "sub_context": "paye", "step": 4, "inputs": inputs, "calculation": calc, "lang": lang}
             send_whatsapp_text(phone, preview)
             return True
         except ValueError:
-            send_whatsapp_text(phone, "❌ Please enter a valid amount\n\n💡 * - Back | # - Save & Menu | 0 - Cancel")
+            send_whatsapp_text(phone, f"{t('invalid_amount', lang)}\n\n{t('global_commands', lang)}")
             return True
     
     return False
 
 
-def _handle_vat_filing(phone: str, account_id: str, step: int, inputs: dict, text: str):
+def _handle_vat_filing(phone: str, account_id: str, step: int, inputs: dict, text: str, lang: str = "en"):
     if step == 1:
         try:
             amount = _parse_amount(text)
             inputs["sales_amount"] = amount
             save_filing_draft(account_id, "vat", inputs, [], 2)
-            user_states[phone] = {"context": "filing", "sub_context": "vat", "step": 2, "inputs": inputs}
-            _show_filing_step(phone, "vat", 2, inputs)
+            user_states[phone] = {"context": "filing", "sub_context": "vat", "step": 2, "inputs": inputs, "lang": lang}
+            _show_filing_step(phone, "vat", 2, inputs, lang)
             return True
         except ValueError:
-            send_whatsapp_text(phone, "❌ Please enter a valid amount (e.g., 25000000 or 25M)\n\n💡 * - Back | # - Save & Menu | 0 - Cancel")
+            send_whatsapp_text(phone, f"{t('invalid_amount', lang)}\n\n{t('global_commands', lang)}")
             return True
     
     elif step == 2:
@@ -298,30 +251,29 @@ def _handle_vat_filing(phone: str, account_id: str, step: int, inputs: dict, tex
                        f"• Total Purchases: ₦{purchases:,.2f}\n"
                        f"• VAT Rate: 7.5%\n"
                        f"• *VAT Payable: ₦{vat_payable:,.2f}*\n\n"
-                       f"Reply with 'confirm' to submit, or 'cancel' to abort\n\n"
-                       f"💡 # - Save & Menu | 0 - Cancel")
+                       f"Reply with 'confirm' to submit, or 'cancel' to abort")
             
-            user_states[phone] = {"context": "filing_confirm", "sub_context": "vat", "step": 3, "inputs": inputs}
+            user_states[phone] = {"context": "filing_confirm", "sub_context": "vat", "step": 3, "inputs": inputs, "lang": lang}
             send_whatsapp_text(phone, preview)
             return True
         except ValueError:
-            send_whatsapp_text(phone, "❌ Please enter a valid amount\n\n💡 * - Back | # - Save & Menu | 0 - Cancel")
+            send_whatsapp_text(phone, f"{t('invalid_amount', lang)}\n\n{t('global_commands', lang)}")
             return True
     
     return False
 
 
-def _handle_cit_filing(phone: str, account_id: str, step: int, inputs: dict, text: str):
+def _handle_cit_filing(phone: str, account_id: str, step: int, inputs: dict, text: str, lang: str = "en"):
     if step == 1:
         try:
             amount = _parse_amount(text)
             inputs["revenue"] = amount
             save_filing_draft(account_id, "cit", inputs, [], 2)
-            user_states[phone] = {"context": "filing", "sub_context": "cit", "step": 2, "inputs": inputs}
-            _show_filing_step(phone, "cit", 2, inputs)
+            user_states[phone] = {"context": "filing", "sub_context": "cit", "step": 2, "inputs": inputs, "lang": lang}
+            _show_filing_step(phone, "cit", 2, inputs, lang)
             return True
         except ValueError:
-            send_whatsapp_text(phone, "❌ Please enter a valid amount (e.g., 25000000 or 25M)\n\n💡 * - Back | # - Save & Menu | 0 - Cancel")
+            send_whatsapp_text(phone, f"{t('invalid_amount', lang)}\n\n{t('global_commands', lang)}")
             return True
     
     elif step == 2:
@@ -351,14 +303,13 @@ def _handle_cit_filing(phone: str, account_id: str, step: int, inputs: dict, tex
                        f"• Company Size: {company_size}\n"
                        f"• Tax Rate: {applicable_rate}%\n"
                        f"• *CIT Payable: ₦{cit_payable:,.2f}*\n\n"
-                       f"Reply with 'confirm' to submit, or 'cancel' to abort\n\n"
-                       f"💡 # - Save & Menu | 0 - Cancel")
+                       f"Reply with 'confirm' to submit, or 'cancel' to abort")
             
-            user_states[phone] = {"context": "filing_confirm", "sub_context": "cit", "step": 3, "inputs": inputs}
+            user_states[phone] = {"context": "filing_confirm", "sub_context": "cit", "step": 3, "inputs": inputs, "lang": lang}
             send_whatsapp_text(phone, preview)
             return True
         except ValueError:
-            send_whatsapp_text(phone, "❌ Please enter a valid amount\n\n💡 * - Back | # - Save & Menu | 0 - Cancel")
+            send_whatsapp_text(phone, f"{t('invalid_amount', lang)}\n\n{t('global_commands', lang)}")
             return True
     
     return False
@@ -367,6 +318,7 @@ def _handle_cit_filing(phone: str, account_id: str, step: int, inputs: dict, tex
 def _handle_submit(phone: str, account_id: str, user_state: dict):
     sub_context = user_state.get("sub_context")
     inputs = user_state.get("inputs", {})
+    lang = user_state.get("lang", "en")
     
     if sub_context == "paye":
         result = submit_tax_filing(account_id, "paye", inputs, [])
@@ -374,7 +326,7 @@ def _handle_submit(phone: str, account_id: str, user_state: dict):
             calc = result.get("calculation", {})
             monthly_tax = calc.get("monthly_tax_payable", 0)
             reference = result.get("reference", "N/A")
-            send_whatsapp_text(phone, f"✅ *PAYE Filing Submitted!*\n\n📋 Reference: {reference}\n💰 Monthly Tax: ₦{monthly_tax:,.2f}\n\nReply 8 for main menu.\n\n📅 Reply 'REMIND ME' for tax deadline alerts!")
+            send_whatsapp_text(phone, t("filing_submitted", lang, tax_type="PAYE", reference=reference, tax_name="Monthly Tax", amount=monthly_tax))
         else:
             send_whatsapp_text(phone, f"❌ Filing failed: {result.get('error', 'Unknown error')}")
     elif sub_context == "vat":
@@ -387,7 +339,7 @@ def _handle_submit(phone: str, account_id: str, user_state: dict):
             calc = result.get("calculation", {})
             vat_payable = calc.get("vat_payable", 0)
             reference = result.get("reference", "N/A")
-            send_whatsapp_text(phone, f"✅ *VAT Filing Submitted!*\n\n📋 Reference: {reference}\n💰 VAT Payable: ₦{vat_payable:,.2f}\n\nReply 8 for main menu.\n\n📅 Reply 'REMIND ME' for tax deadline alerts!")
+            send_whatsapp_text(phone, t("filing_submitted", lang, tax_type="VAT", reference=reference, tax_name="VAT", amount=vat_payable))
         else:
             send_whatsapp_text(phone, f"❌ Filing failed: {result.get('error', 'Unknown error')}")
     elif sub_context == "cit":
@@ -400,7 +352,7 @@ def _handle_submit(phone: str, account_id: str, user_state: dict):
             calc = result.get("calculation", {})
             cit_payable = calc.get("cit_payable", 0)
             reference = result.get("reference", "N/A")
-            send_whatsapp_text(phone, f"✅ *CIT Filing Submitted!*\n\n📋 Reference: {reference}\n💰 CIT Payable: ₦{cit_payable:,.2f}\n\nReply 8 for main menu.\n\n📅 Reply 'REMIND ME' for tax deadline alerts!")
+            send_whatsapp_text(phone, t("filing_submitted", lang, tax_type="CIT", reference=reference, tax_name="CIT", amount=cit_payable))
         else:
             send_whatsapp_text(phone, f"❌ Filing failed: {result.get('error', 'Unknown error')}")
     
@@ -408,7 +360,7 @@ def _handle_submit(phone: str, account_id: str, user_state: dict):
     user_states.pop(phone, None)
 
 
-def _handle_filing_history(phone: str, account_id: str):
+def _handle_filing_history(phone: str, account_id: str, lang: str = "en"):
     filings = get_user_filings(account_id, limit=10)
     if filings:
         msg = "📋 *Your Tax Filings*\n\n"
@@ -418,11 +370,10 @@ def _handle_filing_history(phone: str, account_id: str):
             msg += f"   📅 {f.get('submitted_at', '')[:10]}\n\n"
         send_whatsapp_text(phone, msg)
     else:
-        send_whatsapp_text(phone, "📋 No tax filings found. Reply with P to file PAYE tax, V for VAT, or C for CIT.\n\n📅 Reply 'REMIND ME' for tax deadline alerts!")
+        send_whatsapp_text(phone, "📋 No tax filings found. Reply with P to file PAYE tax, V for VAT, or C for CIT.")
 
 
-def _handle_reminder_commands(phone: str, account_id: str, text: str) -> bool:
-    """Handle reminder-related commands"""
+def _handle_reminder_commands(phone: str, account_id: str, text: str, lang: str = "en") -> bool:
     text_lower = text.lower().strip()
     
     if text_lower == "r" or text_lower == "reminders":
@@ -446,6 +397,19 @@ def _handle_reminder_commands(phone: str, account_id: str, text: str) -> bool:
     if text_lower == "deadlines" or text_lower == "d":
         summary = get_deadlines_summary(30)
         send_whatsapp_text(phone, summary + "\n\n💡 Reply 'REMIND ME' to get alerts for these deadlines!")
+        return True
+    
+    return False
+
+
+def _handle_language_command(phone: str, account_id: str, text: str, current_lang: str) -> bool:
+    text_upper = text.upper().strip()
+    text_lower = text.lower().strip()
+    
+    # Check for language command
+    if text_upper == "L" or text_lower == "language" or text_upper == "LANGUAGE":
+        send_whatsapp_text(phone, get_language_menu())
+        user_states[phone] = {"context": "changing_language", "lang": current_lang}
         return True
     
     return False
@@ -478,8 +442,11 @@ def wa_webhook():
         account_id = lk.get("account_id") or from_phone
         user_state = user_states.get(from_phone, {})
         
+        # Get user's language preference
+        user_lang = get_user_language(account_id)
+        
         if not text:
-            _send_welcome(from_phone)
+            _send_welcome(from_phone, user_lang)
             return jsonify({"ok": True})
         
         # ============================================================
@@ -504,16 +471,28 @@ def wa_webhook():
             return jsonify({"ok": True})
         
         # ============================================================
-        # 2. CRITICAL: Handle confirm/cancel IMMEDIATELY
-        #    These must come BEFORE any other processing to prevent
-        #    "confirm" from being sent to AI
+        # 2. Handle language selection
         # ============================================================
+        if user_state.get("context") == "changing_language":
+            lang_code = text.strip().lower()
+            if lang_code in LANGUAGES:
+                result = set_user_language(account_id, lang_code)
+                send_whatsapp_text(from_phone, result.get("message", f"Language changed to {LANGUAGES[lang_code]['name']}"))
+                user_states.pop(from_phone, None)
+                user_lang = lang_code
+                _send_main_menu(from_phone, user_lang)
+            else:
+                send_whatsapp_text(from_phone, "❌ Invalid language code. Send EN, PCM, YO, IG, or HA.\n\n💡 Reply 8 to cancel")
+            return jsonify({"ok": True})
         
+        # ============================================================
+        # 3. CRITICAL: Handle confirm/cancel IMMEDIATELY
+        # ============================================================
         if text.lower() == "confirm":
             if user_state.get("context") == "filing_confirm":
                 _handle_submit(from_phone, account_id, user_state)
             else:
-                send_whatsapp_text(from_phone, "No filing to confirm. Reply 7 to start a new filing.")
+                send_whatsapp_text(from_phone, t('no_filing', user_lang))
             return jsonify({"ok": True})
         
         if text.lower() == "cancel":
@@ -526,9 +505,14 @@ def wa_webhook():
             return jsonify({"ok": True})
         
         # ============================================================
-        # 3. GLOBAL COMMANDS
+        # 4. Language command
         # ============================================================
+        if _handle_language_command(from_phone, account_id, text, user_lang):
+            return jsonify({"ok": True})
         
+        # ============================================================
+        # 5. GLOBAL COMMANDS
+        # ============================================================
         if text == "#":
             current_context = user_state.get("context")
             if current_context == "filing" or current_context == "filing_confirm":
@@ -538,7 +522,7 @@ def wa_webhook():
                 send_whatsapp_text(from_phone, "✅ Progress saved.")
             else:
                 send_whatsapp_text(from_phone, "ℹ️ Nothing to save.")
-            _send_main_menu(from_phone)
+            _send_main_menu(from_phone, user_lang)
             user_states.pop(from_phone, None)
             return jsonify({"ok": True})
         
@@ -547,7 +531,7 @@ def wa_webhook():
             if current_context == "filing" or current_context == "filing_confirm":
                 delete_filing_draft(account_id, user_state.get("sub_context"))
             user_states.pop(from_phone, None)
-            send_whatsapp_text(from_phone, "❌ Cancelled. All progress cleared.\n\nReply 8 for main menu.\n\n📅 Reply 'REMIND ME' for tax deadline alerts!")
+            send_whatsapp_text(from_phone, "❌ Cancelled. All progress cleared.\n\nReply 8 for main menu.")
             return jsonify({"ok": True})
         
         if text == "9":
@@ -557,11 +541,12 @@ def wa_webhook():
                     "context": "filing",
                     "sub_context": active["filing_type"],
                     "step": active["step"],
-                    "inputs": active["inputs"]
+                    "inputs": active["inputs"],
+                    "lang": user_lang
                 }
-                _show_filing_step(from_phone, active["filing_type"], active["step"], active["inputs"])
+                _show_filing_step(from_phone, active["filing_type"], active["step"], active["inputs"], user_lang)
             else:
-                send_whatsapp_text(from_phone, "📭 No saved filing found. Start a new one with P, V, or C.\n\n📅 Reply 'REMIND ME' for tax deadline alerts!")
+                send_whatsapp_text(from_phone, "📭 No saved filing found. Start a new one with P, V, or C.")
             return jsonify({"ok": True})
         
         # Handle back command
@@ -571,14 +556,14 @@ def wa_webhook():
                 new_step = current_step - 1
                 user_state["step"] = new_step
                 user_states[from_phone] = user_state
-                _show_filing_step(from_phone, user_state.get("sub_context"), new_step, user_state.get("inputs", {}))
+                _show_filing_step(from_phone, user_state.get("sub_context"), new_step, user_state.get("inputs", {}), user_lang)
             else:
-                _send_main_menu(from_phone)
+                _send_main_menu(from_phone, user_lang)
                 user_states.pop(from_phone, None)
             return jsonify({"ok": True})
         
         # ============================================================
-        # 4. CHECK FOR ACTIVE FILING
+        # 6. CHECK FOR ACTIVE FILING
         # ============================================================
         filing_type = user_state.get("sub_context") if user_state.get("context") == "filing" else None
         step = user_state.get("step")
@@ -594,26 +579,27 @@ def wa_webhook():
                     "context": "filing",
                     "sub_context": filing_type,
                     "step": step,
-                    "inputs": inputs
+                    "inputs": inputs,
+                    "lang": user_lang
                 }
         
         if filing_type and step and step < 4:
             if filing_type == "paye":
-                _handle_paye_filing(from_phone, account_id, step, inputs, text)
+                _handle_paye_filing(from_phone, account_id, step, inputs, text, user_lang)
             elif filing_type == "vat":
-                _handle_vat_filing(from_phone, account_id, step, inputs, text)
+                _handle_vat_filing(from_phone, account_id, step, inputs, text, user_lang)
             elif filing_type == "cit":
-                _handle_cit_filing(from_phone, account_id, step, inputs, text)
+                _handle_cit_filing(from_phone, account_id, step, inputs, text, user_lang)
             return jsonify({"ok": True})
         
         # ============================================================
-        # 5. HANDLE REMINDER COMMANDS
+        # 7. HANDLE REMINDER COMMANDS
         # ============================================================
-        if _handle_reminder_commands(from_phone, account_id, text):
+        if _handle_reminder_commands(from_phone, account_id, text, user_lang):
             return jsonify({"ok": True})
         
         # ============================================================
-        # 6. START NEW FILING
+        # 8. START NEW FILING
         # ============================================================
         text_lower = text.lower().strip()
         
@@ -622,8 +608,8 @@ def wa_webhook():
                 supabase.table("tax_filing_drafts").delete().eq("user_id", account_id).eq("tax_type", "paye").eq("status", "in_progress").execute()
             except:
                 pass
-            user_states[from_phone] = {"context": "filing", "sub_context": "paye", "step": 1, "inputs": {}}
-            send_whatsapp_text(from_phone, "📋 *PAYE Tax Filing - Step 1 of 3*\n\nWhat is your monthly salary?\n(Example: 750000 or 750k)\n\n💡 * - Back | # - Save & Menu | 0 - Cancel")
+            user_states[from_phone] = {"context": "filing", "sub_context": "paye", "step": 1, "inputs": {}, "lang": user_lang}
+            send_whatsapp_text(from_phone, f"{t('paye_step1', user_lang)}\n\n{t('global_commands', user_lang)}")
             return jsonify({"ok": True})
         
         if text_lower in ["vat", "v"]:
@@ -631,8 +617,8 @@ def wa_webhook():
                 supabase.table("tax_filing_drafts").delete().eq("user_id", account_id).eq("tax_type", "vat").eq("status", "in_progress").execute()
             except:
                 pass
-            user_states[from_phone] = {"context": "filing", "sub_context": "vat", "step": 1, "inputs": {}}
-            send_whatsapp_text(from_phone, "📋 *VAT Filing - Step 1 of 3*\n\nWhat is your total sales for the period?\n(Example: 25000000 or 25M)\n\n💡 * - Back | # - Save & Menu | 0 - Cancel")
+            user_states[from_phone] = {"context": "filing", "sub_context": "vat", "step": 1, "inputs": {}, "lang": user_lang}
+            send_whatsapp_text(from_phone, f"{t('vat_step1', user_lang)}\n\n{t('global_commands', user_lang)}")
             return jsonify({"ok": True})
         
         if text_lower in ["cit", "c"]:
@@ -640,36 +626,36 @@ def wa_webhook():
                 supabase.table("tax_filing_drafts").delete().eq("user_id", account_id).eq("tax_type", "cit").eq("status", "in_progress").execute()
             except:
                 pass
-            user_states[from_phone] = {"context": "filing", "sub_context": "cit", "step": 1, "inputs": {}}
-            send_whatsapp_text(from_phone, "📋 *CIT Filing - Step 1 of 3*\n\nWhat is your company's total revenue for the period?\n(Example: 50000000 or 50M)\n\n💡 * - Back | # - Save & Menu | 0 - Cancel")
+            user_states[from_phone] = {"context": "filing", "sub_context": "cit", "step": 1, "inputs": {}, "lang": user_lang}
+            send_whatsapp_text(from_phone, f"{t('cit_step1', user_lang)}\n\n{t('global_commands', user_lang)}")
             return jsonify({"ok": True})
         
         # ============================================================
-        # 7. MENU COMMANDS
+        # 9. MENU COMMANDS
         # ============================================================
         if text.upper() == "H":
-            _handle_filing_history(from_phone, account_id)
+            _handle_filing_history(from_phone, account_id, user_lang)
             return jsonify({"ok": True})
         
         if text.upper() == "B":
-            _send_main_menu(from_phone)
+            _send_main_menu(from_phone, user_lang)
             return jsonify({"ok": True})
         
         if text.upper() == "7" or text_lower == "tax":
-            _send_tax_menu(from_phone)
+            _send_tax_menu(from_phone, user_lang)
             return jsonify({"ok": True})
         
         if MENU_NUMBER_RE.match(text):
             option = int(text)
             if option == 7:
-                _send_tax_menu(from_phone)
+                _send_tax_menu(from_phone, user_lang)
             elif option == 8:
-                _send_main_menu(from_phone)
+                _send_main_menu(from_phone, user_lang)
             elif option == 1:
                 send_whatsapp_text(from_phone, "💬 Please type your tax question.\n\n💡 # - Save & Menu | 0 - Cancel")
             elif option == 2:
                 if has_active_subscription(account_id):
-                    send_whatsapp_text(from_phone, "💎 *UNLIMITED AI ACCESS* ✅\n\nYou have an active subscription. No credit limits!\n\n📅 Reply 'REMIND ME' for tax deadline alerts!")
+                    send_whatsapp_text(from_phone, "💎 *UNLIMITED AI ACCESS* ✅\n\nYou have an active subscription. No credit limits!")
                 else:
                     balance = get_credit_balance(account_id)
                     send_whatsapp_text(from_phone, format_balance_message(balance))
@@ -685,7 +671,7 @@ def wa_webhook():
                 user_states[from_phone] = {"context": "linking", "awaiting_code": True}
             elif option == 6:
                 if has_active_subscription(account_id):
-                    send_whatsapp_text(from_phone, "✨ You have an active subscription with UNLIMITED credits!\n\nNo need to buy credits.\n\n📅 Reply 'REMIND ME' for tax deadline alerts!")
+                    send_whatsapp_text(from_phone, "✨ You have an active subscription with UNLIMITED credits!\n\nNo need to buy credits.")
                 else:
                     credit_menu = get_credit_packages_menu()
                     send_whatsapp_text(from_phone, credit_menu + "\n\n💡 Send 1, 2, 3, or 4 to buy, or # to save and exit.")
@@ -693,7 +679,7 @@ def wa_webhook():
             return jsonify({"ok": True})
         
         # ============================================================
-        # 8. CREDIT PACKAGE SELECTION
+        # 10. CREDIT PACKAGE SELECTION
         # ============================================================
         if user_state.get("context") == "buying_credits" and text in ["1", "2", "3", "4"]:
             package_num = int(text)
@@ -710,7 +696,7 @@ def wa_webhook():
             return jsonify({"ok": True})
         
         # ============================================================
-        # 9. SUBSCRIPTION PLAN SELECTION
+        # 11. SUBSCRIPTION PLAN SELECTION
         # ============================================================
         if user_state.get("context") == "subscription" and text.isdigit() and 1 <= int(text) <= 9:
             plan_num = int(text)
@@ -732,7 +718,7 @@ def wa_webhook():
             return jsonify({"ok": True})
         
         # ============================================================
-        # 10. LINKING CODE
+        # 12. LINKING CODE
         # ============================================================
         if user_state.get("context") == "linking" and LINK_CODE_RE.match(text.upper()):
             attempt = _try_consume_link_code(from_phone, text)
@@ -744,24 +730,24 @@ def wa_webhook():
             return jsonify({"ok": True})
         
         # ============================================================
-        # 11. HELP
+        # 13. HELP
         # ============================================================
         if text.lower() in ["help", "menu", "start", "?", "/start", "8"]:
-            _send_main_menu(from_phone)
+            _send_main_menu(from_phone, user_lang)
             return jsonify({"ok": True})
         
         # ============================================================
-        # 12. DEFAULT: ASK AI (LAST RESORT)
+        # 14. DEFAULT: ASK AI (LAST RESORT)
         # ============================================================
-        result = ask_guarded({"question": text, "account_id": account_id, "lang": "en", "channel": "whatsapp"})
+        result = ask_guarded({"question": text, "account_id": account_id, "lang": user_lang, "channel": "whatsapp"})
         if result.get("ok"):
             answer = result.get("answer", "")
             if answer:
-                send_whatsapp_text(from_phone, answer + "\n\n💡 Reply 8 for main menu.\n📅 Reply 'REMIND ME' for tax deadline alerts!")
+                send_whatsapp_text(from_phone, answer + "\n\n💡 Reply 8 for main menu.\n🌐 Reply LANGUAGE to change language")
             else:
-                send_whatsapp_text(from_phone, "I couldn't find an answer. Reply 8 for menu.\n\n📅 Reply 'REMIND ME' for tax deadline alerts!")
+                send_whatsapp_text(from_phone, "I couldn't find an answer. Reply 8 for menu.\n\n🌐 Reply LANGUAGE to change language")
         else:
-            send_whatsapp_text(from_phone, "Sorry, I encountered an error. Reply 8 for menu.\n\n📅 Reply 'REMIND ME' for tax deadline alerts!")
+            send_whatsapp_text(from_phone, "Sorry, I encountered an error. Reply 8 for menu.\n\n🌐 Reply LANGUAGE to change language")
         
         return jsonify({"ok": True})
         
