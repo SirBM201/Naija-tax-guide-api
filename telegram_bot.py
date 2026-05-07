@@ -3,6 +3,7 @@ import re
 import logging
 import json
 import random
+import calendar
 import datetime
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
@@ -50,6 +51,255 @@ else:
 TEST_TELEGRAM_CHAT_ID = os.getenv("TEST_TELEGRAM_CHAT_ID")
 TEST_WHATSAPP_NUMBER = os.getenv("TEST_WHATSAPP_NUMBER")
 
+# ============ TAX CALENDAR DATA ============
+TAX_CALENDAR = {
+    1: {  # January
+        14: {"name": "PAYE Remittance (December)", "type": "paye", "description": "Remit PAYE deducted in December"},
+        21: {"name": "VAT Filing (December)", "type": "vat", "description": "File VAT returns for December"},
+        31: {"name": "Annual PAYE Returns", "type": "paye", "description": "File annual PAYE summary for previous year"},
+    },
+    2: {  # February
+        14: {"name": "PAYE Remittance (January)", "type": "paye", "description": "Remit PAYE deducted in January"},
+        21: {"name": "VAT Filing (January)", "type": "vat", "description": "File VAT returns for January"},
+    },
+    3: {  # March
+        14: {"name": "PAYE Remittance (February)", "type": "paye", "description": "Remit PAYE deducted in February"},
+        21: {"name": "VAT Filing (February)", "type": "vat", "description": "File VAT returns for February"},
+        31: {"name": "Annual CIT Filing", "type": "cit", "description": "Annual Company Income Tax filing deadline"},
+    },
+    4: {  # April
+        14: {"name": "PAYE Remittance (March)", "type": "paye", "description": "Remit PAYE deducted in March"},
+        21: {"name": "VAT Filing (March)", "type": "vat", "description": "File VAT returns for March"},
+        30: {"name": "Q1 CIT Filing", "type": "cit", "description": "First quarter CIT filing deadline"},
+    },
+    5: {  # May
+        14: {"name": "PAYE Remittance (April)", "type": "paye", "description": "Remit PAYE deducted in April"},
+        21: {"name": "VAT Filing (April)", "type": "vat", "description": "File VAT returns for April"},
+    },
+    6: {  # June
+        14: {"name": "PAYE Remittance (May)", "type": "paye", "description": "Remit PAYE deducted in May"},
+        21: {"name": "VAT Filing (May)", "type": "vat", "description": "File VAT returns for May"},
+    },
+    7: {  # July
+        14: {"name": "PAYE Remittance (June)", "type": "paye", "description": "Remit PAYE deducted in June"},
+        21: {"name": "VAT Filing (June)", "type": "vat", "description": "File VAT returns for June"},
+        31: {"name": "Q2 CIT Filing", "type": "cit", "description": "Second quarter CIT filing deadline"},
+    },
+    8: {  # August
+        14: {"name": "PAYE Remittance (July)", "type": "paye", "description": "Remit PAYE deducted in July"},
+        21: {"name": "VAT Filing (July)", "type": "vat", "description": "File VAT returns for July"},
+    },
+    9: {  # September
+        14: {"name": "PAYE Remittance (August)", "type": "paye", "description": "Remit PAYE deducted in August"},
+        21: {"name": "VAT Filing (August)", "type": "vat", "description": "File VAT returns for August"},
+    },
+    10: {  # October
+        14: {"name": "PAYE Remittance (September)", "type": "paye", "description": "Remit PAYE deducted in September"},
+        21: {"name": "VAT Filing (September)", "type": "vat", "description": "File VAT returns for September"},
+        31: {"name": "Q3 CIT Filing", "type": "cit", "description": "Third quarter CIT filing deadline"},
+    },
+    11: {  # November
+        14: {"name": "PAYE Remittance (October)", "type": "paye", "description": "Remit PAYE deducted in October"},
+        21: {"name": "VAT Filing (October)", "type": "vat", "description": "File VAT returns for October"},
+    },
+    12: {  # December
+        14: {"name": "PAYE Remittance (November)", "type": "paye", "description": "Remit PAYE deducted in November"},
+        21: {"name": "VAT Filing (November)", "type": "vat", "description": "File VAT returns for November"},
+        31: {"name": "Year-end Tax Planning", "type": "general", "description": "Review tax position for the year"},
+    },
+}
+
+MONTH_NAMES = {
+    1: "January", 2: "February", 3: "March", 4: "April",
+    5: "May", 6: "June", 7: "July", 8: "August",
+    9: "September", 10: "October", 11: "November", 12: "December"
+}
+
+def get_month_calendar(year, month):
+    """Get calendar view for a specific month with tax deadlines marked"""
+    cal = calendar.monthcalendar(year, month)
+    month_name = MONTH_NAMES[month]
+    deadlines = TAX_CALENDAR.get(month, {})
+    
+    # Build calendar display
+    result = f"📅 *{month_name} {year} - Tax Calendar*\n\n"
+    result += "┌─────┬─────┬─────┬─────┬─────┬─────┬─────┐\n"
+    result += "│ Mon │ Tue │ Wed │ Thu │ Fri │ Sat │ Sun │\n"
+    result += "├─────┼─────┼─────┼─────┼─────┼─────┼─────┤\n"
+    
+    for week in cal:
+        for day in week:
+            if day == 0:
+                result += "│  -  "
+            else:
+                if day in deadlines:
+                    result += f"│ 🔴{day:2d} "
+                else:
+                    result += f"│  {day:2d}  "
+        result += "│\n├─────┼─────┼─────┼─────┼─────┼─────┼─────┤\n"
+    
+    result += "└─────┴─────┴─────┴─────┴─────┴─────┴─────┘\n\n"
+    
+    # List deadlines for the month
+    if deadlines:
+        result += "*📋 Deadlines this month:*\n"
+        for day, info in sorted(deadlines.items()):
+            result += f"🔴 *{day} {month_name}:* {info['name']}\n"
+            result += f"   _{info['description']}_\n\n"
+    else:
+        result += "✅ *No tax deadlines this month*"
+    
+    return result
+
+def get_all_upcoming_deadlines(days_ahead=60):
+    """Get all upcoming deadlines for the next X days"""
+    today = datetime.now()
+    upcoming = []
+    
+    for month in range(today.month, today.month + 3):
+        current_month = ((month - 1) % 12) + 1
+        year = today.year + (month - 1) // 12
+        
+        deadlines = TAX_CALENDAR.get(current_month, {})
+        
+        for day, info in deadlines.items():
+            deadline_date = datetime(year, current_month, day)
+            if deadline_date >= today:
+                days_until = (deadline_date - today).days
+                if days_until <= days_ahead:
+                    upcoming.append({
+                        "date": deadline_date,
+                        "days": days_until,
+                        "name": info["name"],
+                        "type": info["type"],
+                        "description": info["description"]
+                    })
+    
+    return sorted(upcoming, key=lambda x: x["days"])
+
+def format_upcoming_deadlines(upcoming):
+    """Format upcoming deadlines for display"""
+    if not upcoming:
+        return "✅ *No tax deadlines in the next 60 days*"
+    
+    message = "📅 *UPCOMING TAX DEADLINES*\n\n"
+    
+    for deadline in upcoming[:15]:  # Show next 15 deadlines
+        date_str = deadline["date"].strftime("%b %d, %Y")
+        
+        if deadline["days"] == 0:
+            message += f"⚠️ *TODAY:* {deadline['name']}\n"
+        elif deadline["days"] == 1:
+            message += f"🔔 *TOMORROW:* {deadline['name']}\n"
+        else:
+            message += f"📌 *{date_str}:* {deadline['name']} ({deadline['days']} days)\n"
+        message += f"   _{deadline['description']}_\n\n"
+    
+    message += "\n💡 Use /calendar [month] to view full month calendar\n"
+    message += "Example: /calendar 6 for June, /calendar 12 for December"
+    
+    return message
+
+def get_tax_type_summary(tax_type):
+    """Get summary deadlines for a specific tax type"""
+    summary = ""
+    
+    if tax_type == "paye":
+        summary = """
+📊 *PAYE DEADLINES SUMMARY*
+
+*Monthly Remittance:*
+• Due by 14th of each month
+• Remit PAYE deducted from previous month
+• File Schedule 6
+
+*Annual Returns:*
+• Due by January 31st
+• File annual PAYE summary
+• Submit for all employees
+
+*Penalties:*
+• Late remittance: ₦50,000 + interest
+• Late annual returns: ₦50,000 + ₦5,000/day
+"""
+    elif tax_type == "vat":
+        summary = """
+🧾 *VAT DEADLINES SUMMARY*
+
+*Monthly Filing:*
+• Due by 21st of each month
+• File Form 002
+• Pay VAT liability
+
+*Annual Returns:*
+• Due by January 31st
+• File annual VAT summary
+• Reconciliation of monthly filings
+
+*Penalties:*
+• Late filing: ₦50,000/month
+• Late payment: 21% interest + 10% penalty
+"""
+    elif tax_type == "cit":
+        summary = """
+🏢 *CIT DEADLINES SUMMARY*
+
+*Quarterly Filings:*
+• Q1: April 30
+• Q2: July 31
+• Q3: October 31
+
+*Annual Filing:*
+• Due by March 31 (following year)
+• File audited accounts
+• Form A and Form B
+
+*Penalties:*
+• Late filing: ₦500,000 + 10% of tax
+• Underpayment: 21% interest per annum
+"""
+    elif tax_type == "wht":
+        summary = """
+📊 *WHT DEADLINES SUMMARY*
+
+*Monthly Filing:*
+• Due by 21st of each month
+• File Form 1
+• Issue credit notes
+
+*Penalties:*
+• Late filing: ₦50,000/month
+• Late remittance: Interest at CBN rate
+"""
+    
+    return summary
+
+def export_calendar_to_ical(year):
+    """Generate iCal format calendar (placeholder - would be full implementation)"""
+    ical_content = """BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Naija Tax Bot//Tax Calendar//EN
+CALSCALE:GREGORIAN
+METHOD:PUBLISH
+"""
+    
+    for month in range(1, 13):
+        deadlines = TAX_CALENDAR.get(month, {})
+        for day, info in deadlines.items():
+            dtstart = f"{year}{month:02d}{day:02d}"
+            ical_content += f"""
+BEGIN:VEVENT
+UID:{dtstart}@naijataxbot
+DTSTAMP:{datetime.now().strftime('%Y%m%dT%H%M%S')}
+DTSTART;VALUE=DATE:{dtstart}
+SUMMARY:{info['name']}
+DESCRIPTION:{info['description']}
+END:VEVENT
+"""
+    
+    ical_content += "END:VCALENDAR"
+    return ical_content
+
 # ============ WITHHOLDING TAX (WHT) RATES ============
 WHT_RATES = {
     "dividend": {"rate": 10, "description": "Dividend payments to shareholders"},
@@ -65,88 +315,6 @@ WHT_RATES = {
     "management": {"rate": 10, "description": "Management and technical services"},
 }
 
-WHT_CATEGORIES = {
-    "individual": {"resident": 10, "non_resident": 10},
-    "corporate": {"resident": 10, "non_resident": 10},
-}
-
-def calculate_withholding_tax(amount, transaction_type, is_individual=True):
-    """Calculate Withholding Tax based on transaction type"""
-    
-    rate_info = WHT_RATES.get(transaction_type.lower(), WHT_RATES["consultancy"])
-    rate = rate_info["rate"]
-    
-    # Special rates for certain transactions
-    if transaction_type.lower() == "construction" or transaction_type.lower() == "contracts":
-        if amount > 5000000:
-            rate = 10  # Higher rate for large contracts
-    
-    wht_amount = (amount * rate) / 100
-    
-    return {
-        "amount": round(amount, 2),
-        "transaction_type": transaction_type,
-        "rate": rate,
-        "description": rate_info["description"],
-        "wht_amount": round(wht_amount, 2),
-        "payment_after_wht": round(amount - wht_amount, 2),
-        "is_individual": is_individual
-    }
-
-def get_wht_rates_summary():
-    """Get summary of all WHT rates"""
-    message = """
-📊 *WITHHOLDING TAX (WHT) RATES - NIGERIA*
-
-*10% Rate:*
-• Dividend payments
-• Interest payments
-• Rent and lease payments
-• Royalty payments
-• Directors fees
-• Consultancy services
-• Commission and agency fees
-• Management services
-
-*5% Rate:*
-• Construction contracts
-• Supply and service contracts
-
-*3% Rate:*
-• Haulage and transportation
-
-*Exemptions:*
-• Interest on certain government bonds
-• Dividends from companies under pioneer status
-• Payments below ₦2,000 (individuals) / ₦10,000 (corporate)
-
-💡 *File WHT returns by 21st of following month*
-"""
-    return message
-
-def get_wht_calculation_examples():
-    """Provide examples of WHT calculations"""
-    return """
-📝 *WHT CALCULATION EXAMPLES*
-
-*Example 1: Consultancy Fee*
-Company pays ₦500,000 to consultant
-WHT @10% = ₦50,000
-Net payment = ₦450,000
-
-*Example 2: Construction Contract*
-Contract amount ₦8,000,000
-WHT @5% = ₦400,000
-Net payment = ₦7,600,000
-
-*Example 3: Rent Payment*
-Annual rent ₦3,000,000
-WHT @10% = ₦300,000
-Net payment = ₦2,700,000
-
-💡 *Credit WHT against CIT liability at year end*
-"""
-
 # ============ SALARY COMPARISON SESSIONS ============
 user_comparison_sessions = {}
 
@@ -154,7 +322,6 @@ class ComparisonSession:
     def __init__(self, user_id):
         self.user_id = user_id
         self.salaries = []
-        self.current_input_count = 0
         self.max_comparisons = 5
         self.started_at = datetime.now()
     
@@ -165,9 +332,7 @@ class ComparisonSession:
                 "salary": salary,
                 "monthly_tax": tax_data["monthly_tax"],
                 "net_pay": tax_data["net_pay"],
-                "effective_rate": tax_data["effective_rate"],
-                "pension": tax_data["pension"],
-                "nhf": tax_data["nhf"]
+                "effective_rate": tax_data["effective_rate"]
             })
             return True
         return False
@@ -179,34 +344,14 @@ class ComparisonSession:
         if not self.salaries:
             return "No salaries to compare."
         
-        message = """
-📊 *SALARY COMPARISON REPORT*
-
-"""
+        message = "📊 *SALARY COMPARISON*\n\n"
         for i, s in enumerate(self.salaries, 1):
-            message += f"""
-*Option {i}:* ₦{s['salary']:,.0f}
-   • Tax: ₦{s['monthly_tax']:,.0f}
-   • Net: *₦{s['net_pay']:,.0f}*
-   • Rate: {s['effective_rate']}%
-"""
+            message += f"*{i}.* ₦{s['salary']:,.0f} → ₦{s['net_pay']:,.0f} net\n"
+            message += f"   Tax: ₦{s['monthly_tax']:,.0f} ({s['effective_rate']}%)\n\n"
         
         best = max(self.salaries, key=lambda x: x['net_pay'])
-        message += f"""
-💡 *Best net pay:* ₦{best['salary']:,.0f} → ₦{best['net_pay']:,.0f}
-"""
+        message += f"💡 *Best net:* ₦{best['salary']:,.0f}"
         return message
-
-# ============ TAX DEADLINES ============
-TAX_DEADLINES = [
-    {"name": "PAYE Monthly Remittance", "day": 14, "description": "PAYE taxes deducted in previous month must be remitted to FIRS"},
-    {"name": "VAT Filing", "day": 21, "description": "Monthly VAT returns filing deadline"},
-    {"name": "WHT Filing", "day": 21, "description": "Monthly WHT returns filing deadline"},
-    {"name": "Company Income Tax (Q1)", "month": 4, "day": 30, "description": "First quarter CIT filing"},
-    {"name": "Company Income Tax (Q2)", "month": 7, "day": 31, "description": "Second quarter CIT filing"},
-    {"name": "Company Income Tax (Q3)", "month": 10, "day": 31, "description": "Third quarter CIT filing"},
-    {"name": "Annual Tax Filing", "month": 3, "day": 31, "description": "Annual individual tax filing deadline"},
-]
 
 # ============ TAX QUIZ QUESTIONS ============
 TAX_QUIZ_QUESTIONS = [
@@ -219,67 +364,32 @@ TAX_QUIZ_QUESTIONS = [
     },
     {
         "id": 2,
-        "question": "What is the WHT rate for consultancy services?",
-        "options": ["5%", "7.5%", "10%", "12.5%"],
-        "correct": 2,
-        "explanation": "Consultancy services attract 10% Withholding Tax."
-    },
-    {
-        "id": 3,
-        "question": "What percentage of monthly salary goes to Pension?",
-        "options": ["5%", "6%", "7%", "8%"],
-        "correct": 3,
-        "explanation": "Employees contribute 8% of monthly basic salary to pension."
-    },
-    {
-        "id": 4,
-        "question": "What is the CIT rate for large companies?",
-        "options": ["20%", "25%", "30%", "35%"],
-        "correct": 2,
-        "explanation": "Large companies pay 30% CIT + 3% Education Tax + 1% IT Levy."
-    },
-    {
-        "id": 5,
-        "question": "By which date must PAYE be remitted?",
+        "question": "By which date must PAYE be remitted monthly?",
         "options": ["7th", "14th", "21st", "30th"],
         "correct": 1,
         "explanation": "PAYE remittance is due by the 14th of the following month."
     },
     {
-        "id": 6,
-        "question": "What is the WHT rate for construction contracts?",
-        "options": ["3%", "5%", "7.5%", "10%"],
-        "correct": 1,
-        "explanation": "Construction contracts attract 5% WHT (10% for contracts >₦5M)."
-    },
-    {
-        "id": 7,
-        "question": "What is the NHF contribution rate?",
-        "options": ["1.5%", "2.0%", "2.5%", "3.0%"],
-        "correct": 2,
-        "explanation": "NHF contribution is 2.5% of monthly basic salary."
-    },
-    {
-        "id": 8,
-        "question": "What is the penalty for late filing of CIT?",
+        "id": 3,
+        "question": "What is the penalty for late CIT filing?",
         "options": ["₦100,000", "₦250,000", "₦500,000", "₦1,000,000"],
         "correct": 2,
         "explanation": "Late CIT filing penalty is ₦500,000 + 10% of tax due."
     },
     {
-        "id": 9,
-        "question": "What is the WHT rate for dividend payments?",
-        "options": ["5%", "7.5%", "10%", "12.5%"],
+        "id": 4,
+        "question": "When must VAT returns be filed?",
+        "options": ["7th", "14th", "21st", "30th"],
         "correct": 2,
-        "explanation": "Dividend payments attract 10% Withholding Tax."
+        "explanation": "VAT returns are due by the 21st of the following month."
     },
     {
-        "id": 10,
-        "question": "Education Tax is what percentage?",
-        "options": ["2%", "2.5%", "3%", "4%"],
-        "correct": 2,
-        "explanation": "Education Tax is 3% of assessable profit for all companies."
-    }
+        "id": 5,
+        "question": "What is the Q2 CIT filing deadline?",
+        "options": ["April 30", "May 31", "June 30", "July 31"],
+        "correct": 3,
+        "explanation": "Q2 CIT filing is due by July 31 each year."
+    },
 ]
 
 # ============ QUIZ SESSION MANAGEMENT ============
@@ -288,10 +398,9 @@ user_quiz_sessions = {}
 class QuizSession:
     def __init__(self, user_id):
         self.user_id = user_id
-        self.questions = random.sample(TAX_QUIZ_QUESTIONS, min(10, len(TAX_QUIZ_QUESTIONS)))
+        self.questions = random.sample(TAX_QUIZ_QUESTIONS, min(5, len(TAX_QUIZ_QUESTIONS)))
         self.current_index = 0
         self.score = 0
-        self.answers = []
         self.started_at = datetime.now()
     
     def get_current_question(self):
@@ -308,14 +417,6 @@ class QuizSession:
         if is_correct:
             self.score += 1
         
-        self.answers.append({
-            "question": current["question"],
-            "selected": answer_index,
-            "correct": current["correct"],
-            "is_correct": is_correct,
-            "explanation": current["explanation"]
-        })
-        
         self.current_index += 1
         return is_correct
     
@@ -326,246 +427,15 @@ class QuizSession:
         percentage = (self.score / len(self.questions)) * 100
         
         if percentage >= 80:
-            rating = "🌟 Excellent! Tax Expert! 🌟"
+            rating = "🌟 Excellent!"
         elif percentage >= 60:
-            rating = "👍 Good! Almost there! 👍"
-        elif percentage >= 40:
-            rating = "📚 Learning! Study more! 📚"
+            rating = "👍 Good!"
         else:
-            rating = "💪 Keep practicing! Use /learn 💪"
+            rating = "📚 Keep learning!"
         
-        message = f"""
-📊 *TAX QUIZ RESULTS*
+        return f"📊 *QUIZ RESULTS*\n\nScore: {self.score}/{len(self.questions)}\n{rating}"
 
-✅ *Score:* {self.score}/{len(self.questions)}
-📈 *Percentage:* {percentage:.1f}%
-🏆 *Rating:* {rating}
-
-💡 *Try again!* Send /quiz for new questions.
-"""
-        return message
-
-# ============ TAX LEARNING MATERIALS ============
-def get_tax_learning_material(topic):
-    materials = {
-        "paye": """
-📚 *LEARNING: PAYE (Pay-As-You-Earn)*
-
-*What is PAYE?*
-PAYE is tax deducted from employees' salaries.
-
-*Tax Rates (Annual):*
-• ₦0 - ₦300,000: 7%
-• ₦300,001 - ₦600,000: 11%
-• ₦600,001 - ₦1,100,000: 15%
-• ₦1,100,001 - ₦1,600,000: 19%
-• ₦1,600,001 - ₦3,200,000: 21%
-• Above ₦3,200,000: 24%
-
-*Deductions:*
-• Pension (8%)
-• NHF (2.5%)
-• CRA (₦200,000 or 1% + 20% of gross)
-""",
-        "cit": """
-📚 *LEARNING: CIT (Company Income Tax)*
-
-*Tax Rates by Size:*
-• Small (< ₦25M): 0% (Exempt)
-• Medium (₦25M - ₦100M): 20%
-• Large (> ₦100M): 30%
-
-*Additional Taxes:*
-• Education Tax: 3%
-• IT Levy: 1% (large companies)
-• Minimum Tax: 0.5% of turnover
-
-*Deadlines:*
-• Q1: April 30
-• Q2: July 31
-• Q3: October 31
-• Annual: March 31
-""",
-        "vat": """
-📚 *LEARNING: VAT (Value Added Tax)*
-
-*What is VAT?*
-Consumption tax on goods and services at 7.5%.
-
-*How it Works:*
-• Output VAT - Input VAT = Amount to pay
-
-*Zero-Rated (0%):* Exports
-*Exempt:* Medical, food, education
-
-*Deadline:* 21st of following month
-""",
-        "wht": """
-📚 *LEARNING: WHT (Withholding Tax)*
-
-*What is WHT?*
-Tax deducted at source from payments to suppliers, contractors, and service providers.
-
-*Common Rates:*
-• 10%: Consultancy, rent, interest, dividend, royalty
-• 5%: Construction, supply contracts
-• 3%: Transportation, haulage
-
-*Key Points:*
-• File by 21st of following month
-• Can be credited against CIT
-• Exemption for payments below thresholds
-
-*File WHT returns using Form 1*
-"""
-    }
-    return materials.get(topic, materials["paye"])
-
-# ============ DATABASE FUNCTIONS ============
-def get_or_create_user(platform, user_id, name=None):
-    if not supabase:
-        return None
-    
-    try:
-        response = supabase.table("users").select("*").eq("platform", platform).eq("user_id", str(user_id)).execute()
-        
-        if response.data:
-            return response.data[0]
-        else:
-            new_user = {
-                "platform": platform,
-                "user_id": str(user_id),
-                "name": name,
-                "created_at": datetime.now().isoformat(),
-                "total_calculations": 0,
-                "is_active": True
-            }
-            result = supabase.table("users").insert(new_user).execute()
-            logging.info(f"New user created: {platform}/{user_id}")
-            return result.data[0] if result.data else None
-    except Exception as e:
-        logging.error(f"Database user error: {e}")
-        return None
-
-def log_calculation(user_id, calculation_type, input_data, result_data):
-    if not supabase:
-        return False
-    
-    try:
-        record = {
-            "user_id": str(user_id),
-            "calculation_type": calculation_type,
-            "input_data": json.dumps(input_data),
-            "result_data": json.dumps(result_data),
-            "created_at": datetime.now().isoformat()
-        }
-        supabase.table("calculations").insert(record).execute()
-        
-        supabase.table("users").update({
-            "total_calculations": supabase.raw("total_calculations + 1"),
-            "last_active": datetime.now().isoformat()
-        }).eq("user_id", str(user_id)).execute()
-        
-        return True
-    except Exception as e:
-        logging.error(f"Log calculation error: {e}")
-        return False
-
-def log_quiz_result(user_id, score, total_questions, percentage):
-    if not supabase:
-        return False
-    
-    try:
-        record = {
-            "user_id": str(user_id),
-            "calculation_type": "quiz",
-            "input_data": json.dumps({"total": total_questions}),
-            "result_data": json.dumps({"score": score, "percentage": percentage}),
-            "created_at": datetime.now().isoformat()
-        }
-        supabase.table("calculations").insert(record).execute()
-        return True
-    except Exception as e:
-        logging.error(f"Log quiz error: {e}")
-        return False
-
-def get_user_history(user_id, limit=10):
-    if not supabase:
-        return None
-    
-    try:
-        response = supabase.table("calculations").select("*").eq("user_id", str(user_id)).order("created_at", desc=True).limit(limit).execute()
-        return response.data
-    except Exception as e:
-        logging.error(f"Get history error: {e}")
-        return None
-
-def get_user_stats(user_id):
-    if not supabase:
-        return None
-    
-    try:
-        user = supabase.table("users").select("*").eq("user_id", str(user_id)).execute()
-        calculations = supabase.table("calculations").select("calculation_type").eq("user_id", str(user_id)).execute()
-        
-        stats = {
-            "total_calculations": user.data[0].get("total_calculations", 0) if user.data else 0,
-            "joined_at": user.data[0].get("created_at") if user.data else None,
-            "last_active": user.data[0].get("last_active") if user.data else None,
-            "paye_count": 0,
-            "cit_count": 0,
-            "vat_count": 0,
-            "wht_count": 0,
-            "quiz_count": 0,
-            "compare_count": 0
-        }
-        
-        for calc in calculations.data:
-            calc_type = calc.get("calculation_type")
-            if calc_type == "paye":
-                stats["paye_count"] += 1
-            elif calc_type == "cit":
-                stats["cit_count"] += 1
-            elif calc_type == "vat":
-                stats["vat_count"] += 1
-            elif calc_type == "wht":
-                stats["wht_count"] += 1
-            elif calc_type == "quiz":
-                stats["quiz_count"] += 1
-            elif calc_type == "compare":
-                stats["compare_count"] += 1
-        
-        return stats
-    except Exception as e:
-        logging.error(f"Get stats error: {e}")
-        return None
-
-def get_all_active_users(platform=None):
-    if not supabase:
-        return []
-    
-    try:
-        query = supabase.table("users").select("user_id, platform").eq("is_active", True)
-        if platform:
-            query = query.eq("platform", platform)
-        response = query.execute()
-        return response.data
-    except Exception as e:
-        logging.error(f"Get active users error: {e}")
-        return []
-
-def broadcast_message(users, message, platform):
-    sent_count = 0
-    for user in users:
-        if platform == "telegram":
-            if send_telegram_message(user["user_id"], message):
-                sent_count += 1
-        elif platform == "whatsapp":
-            if send_whatsapp_message(user["user_id"], message):
-                sent_count += 1
-    return sent_count
-
-# ============ PAYE TAX CALCULATION ============
+# ============ TAX CALCULATION FUNCTIONS ============
 def calculate_nigerian_paye(monthly_gross):
     annual_gross = monthly_gross * 12
     
@@ -598,28 +468,21 @@ def calculate_nigerian_paye(monthly_gross):
     else:
         annual_tax = 560000 + (chargeable_income - 3200000) * 0.24
     
-    if annual_tax < (annual_gross * 0.01) and annual_gross > 0:
+    if annual_tax < (annual_gross * 0.01):
         annual_tax = annual_gross * 0.01
     
     monthly_tax = annual_tax / 12
-    effective_rate = (annual_tax / annual_gross) * 100 if annual_gross > 0 else 0
+    effective_rate = (annual_tax / annual_gross) * 100
     
     return {
         "monthly_gross": monthly_gross,
-        "annual_gross": annual_gross,
         "pension": round(pension, 2),
         "nhf": round(nhf, 2),
-        "cra": round(cra_total / 12, 2),
-        "total_monthly_deductions": round(pension + nhf, 2),
-        "chargeable_income_monthly": round(chargeable_income / 12, 2),
-        "chargeable_income_annual": round(chargeable_income, 2),
-        "annual_tax": round(annual_tax, 2),
         "monthly_tax": round(monthly_tax, 2),
         "effective_rate": round(effective_rate, 2),
         "net_pay": round(monthly_gross - pension - nhf - monthly_tax, 2)
     }
 
-# ============ COMPANY INCOME TAX (CIT) CALCULATION ============
 def calculate_company_income_tax(annual_turnover, assessable_profit=None):
     if assessable_profit is None:
         assessable_profit = annual_turnover * 0.20
@@ -635,147 +498,45 @@ def calculate_company_income_tax(annual_turnover, assessable_profit=None):
         company_size = "Large"
     
     cit = assessable_profit * tax_rate
-    
-    minimum_tax_turnover = annual_turnover * 0.005
-    minimum_tax_profit = assessable_profit * 0.005
-    minimum_tax = max(minimum_tax_turnover, minimum_tax_profit, 0)
-    
     education_tax = assessable_profit * 0.03
-    
-    it_levy = 0
-    if annual_turnover > 100000000:
-        it_levy = max(assessable_profit * 0.01, 0)
-    
-    total_tax = cit + education_tax + it_levy
-    total_tax = max(total_tax, minimum_tax)
+    total_tax = cit + education_tax
     
     return {
         "annual_turnover": round(annual_turnover, 2),
-        "assessable_profit": round(assessable_profit, 2),
         "company_size": company_size,
-        "tax_rate": tax_rate,
-        "cit": round(cit, 2),
-        "education_tax": round(education_tax, 2),
-        "it_levy": round(it_levy, 2),
-        "minimum_tax": round(minimum_tax, 2),
-        "total_tax": round(total_tax, 2),
-        "effective_rate": round((total_tax / annual_turnover) * 100, 2)
+        "total_tax": round(total_tax, 2)
     }
 
-# ============ VAT CALCULATION ============
 def calculate_vat(amount, is_inclusive=False):
     vat_rate = 0.075
     
     if is_inclusive:
         vat = amount * (vat_rate / (1 + vat_rate))
-        exclusive_amount = amount - vat
     else:
         vat = amount * vat_rate
-        exclusive_amount = amount
-    
-    total_with_vat = exclusive_amount + vat
     
     return {
-        "original_amount": round(amount, 2),
-        "vat_rate": f"{vat_rate * 100}%",
+        "amount": round(amount, 2),
         "vat": round(vat, 2),
-        "exclusive_amount": round(exclusive_amount, 2),
-        "total_with_vat": round(total_with_vat, 2),
-        "is_inclusive": is_inclusive
+        "total": round(amount + (0 if is_inclusive else vat), 2)
     }
 
-def calculate_vat_liability(input_vat, output_vat):
-    liability = output_vat - input_vat
-    status = "Payable to FIRS" if liability > 0 else "Refundable" if liability < 0 else "No liability"
-    
-    return {
-        "input_vat": round(input_vat, 2),
-        "output_vat": round(output_vat, 2),
-        "net_liability": round(liability, 2),
-        "status": status
-    }
-
-# ============ WITHHOLDING TAX (WHT) CALCULATION ============
-def calculate_withholding_tax(amount, transaction_type, is_individual=True):
-    """Calculate Withholding Tax based on transaction type"""
-    
+def calculate_withholding_tax(amount, transaction_type):
     rate_info = WHT_RATES.get(transaction_type.lower(), WHT_RATES["consultancy"])
     rate = rate_info["rate"]
-    
-    # Special rates for certain transactions
-    if transaction_type.lower() in ["construction", "contracts"]:
-        if amount > 5000000:
-            rate = 10  # Higher rate for large contracts
-    
     wht_amount = (amount * rate) / 100
     
     return {
         "amount": round(amount, 2),
-        "transaction_type": transaction_type,
         "rate": rate,
-        "description": rate_info["description"],
         "wht_amount": round(wht_amount, 2),
-        "payment_after_wht": round(amount - wht_amount, 2),
-        "is_individual": is_individual
+        "net_payment": round(amount - wht_amount, 2)
     }
-
-def get_wht_rates_summary():
-    """Get summary of all WHT rates"""
-    return """
-📊 *WITHHOLDING TAX (WHT) RATES*
-
-*10% Rate:*
-• Dividend payments
-• Interest payments
-• Rent and lease
-• Royalty payments
-• Directors fees
-• Consultancy services
-• Commission and agency
-• Management services
-
-*5% Rate:*
-• Construction contracts
-• Supply and service contracts
-
-*3% Rate:*
-• Haulage and transportation
-
-*Exemptions:*
-• Individual payments < ₦2,000
-• Corporate payments < ₦10,000
-• Certain government bonds
-
-💡 *File WHT returns by 21st of following month*
-"""
-
-def get_wht_calculation_examples():
-    """Provide examples of WHT calculations"""
-    return """
-📝 *WHT CALCULATION EXAMPLES*
-
-*Example 1: Consultancy Fee*
-Amount: ₦500,000
-WHT @10%: ₦50,000
-Net payment: ₦450,000
-
-*Example 2: Construction*
-Amount: ₦8,000,000
-WHT @5%: ₦400,000
-Net payment: ₦7,600,000
-
-*Example 3: Rent*
-Amount: ₦3,000,000
-WHT @10%: ₦300,000
-Net payment: ₦2,700,000
-
-💡 *Credit WHT against CIT liability*
-"""
 
 # ============ FORMATTING FUNCTIONS ============
 def format_paye_summary(data):
     return f"""
-🇳🇬 *PAYE TAX SUMMARY*
+🇳🇬 *PAYE SUMMARY*
 
 📊 Gross: ₦{data['monthly_gross']:,.0f}
 📋 Pension: ₦{data['pension']:,.0f}
@@ -786,190 +547,112 @@ def format_paye_summary(data):
 """
 
 def format_cit_summary(data):
-    tax_rate_display = f"{data['tax_rate'] * 100:.0f}%" if data['tax_rate'] > 0 else "Exempt"
-    
     return f"""
 🏢 *CIT SUMMARY*
 
 📊 Turnover: ₦{data['annual_turnover']:,.0f}
 🏷️ Size: {data['company_size']}
-💰 CIT: ₦{data['cit']:,.0f} ({tax_rate_display})
-📚 Education: ₦{data['education_tax']:,.0f}
-🧾 Total: *₦{data['total_tax']:,.0f}*
+🧾 Tax: *₦{data['total_tax']:,.0f}*
 """
 
 def format_vat_summary(data):
-    if data["is_inclusive"]:
-        return f"""
+    return f"""
 🧾 *VAT (7.5%)*
 
-💰 Amount (Incl): ₦{data['original_amount']:,.0f}
+💰 Amount: ₦{data['amount']:,.0f}
 📊 VAT: ₦{data['vat']:,.0f}
-📊 Exclusive: ₦{data['exclusive_amount']:,.0f}
-"""
-    else:
-        return f"""
-🧾 *VAT (7.5%)*
-
-💰 Amount (Excl): ₦{data['original_amount']:,.0f}
-📊 VAT: ₦{data['vat']:,.0f}
-📊 Total: ₦{data['total_with_vat']:,.0f}
+📊 Total: ₦{data['total']:,.0f}
 """
 
 def format_wht_summary(data):
     return f"""
-📊 *WITHHOLDING TAX (WHT)*
+📊 *WITHHOLDING TAX*
 
 💰 Amount: ₦{data['amount']:,.0f}
-📋 Type: {data['transaction_type']}
 📊 Rate: {data['rate']}%
 🧾 WHT: *₦{data['wht_amount']:,.0f}*
-💵 Net Payment: ₦{data['payment_after_wht']:,.0f}
-
-📝 *Note:* Credit this WHT against CIT at year end
+💵 Net: ₦{data['net_payment']:,.0f}
 """
 
-def format_history_summary(history):
-    if not history:
-        return "📋 *No calculation history found.*"
+# ============ DATABASE FUNCTIONS ============
+def get_or_create_user(platform, user_id, name=None):
+    if not supabase:
+        return None
     
-    message = "📋 *YOUR HISTORY*\n\n"
-    for idx, calc in enumerate(history[:8], 1):
-        date = datetime.fromisoformat(calc["created_at"]).strftime("%b %d")
-        calc_type = calc["calculation_type"].upper()
+    try:
+        response = supabase.table("users").select("*").eq("platform", platform).eq("user_id", str(user_id)).execute()
         
-        if calc_type == "COMPARE":
-            message += f"{idx}. {date} - 📊 Salary Comparison\n"
-        elif calc_type == "QUIZ":
-            result = json.loads(calc["result_data"])
-            message += f"{idx}. {date} - 📚 Quiz: {result.get('score', 0)}/10\n"
-        elif calc_type == "WHT":
-            message += f"{idx}. {date} - 📊 WHT Calculation\n"
+        if response.data:
+            return response.data[0]
         else:
-            message += f"{idx}. {date} - {calc_type}\n"
+            new_user = {
+                "platform": platform,
+                "user_id": str(user_id),
+                "name": name,
+                "created_at": datetime.now().isoformat(),
+                "total_calculations": 0,
+                "is_active": True
+            }
+            result = supabase.table("users").insert(new_user).execute()
+            return result.data[0] if result.data else None
+    except Exception as e:
+        logging.error(f"Database error: {e}")
+        return None
+
+def log_calculation(user_id, calc_type, input_data, result_data):
+    if not supabase:
+        return False
     
-    return message
+    try:
+        record = {
+            "user_id": str(user_id),
+            "calculation_type": calc_type,
+            "input_data": json.dumps(input_data),
+            "result_data": json.dumps(result_data),
+            "created_at": datetime.now().isoformat()
+        }
+        supabase.table("calculations").insert(record).execute()
+        
+        supabase.table("users").update({
+            "total_calculations": supabase.raw("total_calculations + 1"),
+            "last_active": datetime.now().isoformat()
+        }).eq("user_id", str(user_id)).execute()
+        
+        return True
+    except Exception as e:
+        logging.error(f"Log error: {e}")
+        return False
 
-def format_stats_summary(stats, user_id):
-    if not stats:
-        return "📊 *No statistics available.*"
+def get_user_history(user_id, limit=10):
+    if not supabase:
+        return None
     
-    joined = datetime.fromisoformat(stats["joined_at"]).strftime("%b %d, %Y") if stats["joined_at"] else "Unknown"
+    try:
+        response = supabase.table("calculations").select("*").eq("user_id", str(user_id)).order("created_at", desc=True).limit(limit).execute()
+        return response.data
+    except Exception as e:
+        return None
+
+def get_all_active_users(platform=None):
+    if not supabase:
+        return []
     
-    return f"""
-📊 *YOUR STATISTICS*
+    try:
+        query = supabase.table("users").select("user_id, platform").eq("is_active", True)
+        if platform:
+            query = query.eq("platform", platform)
+        response = query.execute()
+        return response.data
+    except Exception as e:
+        return []
 
-📅 Joined: {joined}
-📈 Total: {stats['total_calculations']}
-
-*Breakdown:*
-• PAYE: {stats['paye_count']}
-• CIT: {stats['cit_count']}
-• VAT: {stats['vat_count']}
-• WHT: {stats['wht_count']}
-• 📚 Quiz: {stats['quiz_count']}
-• 📊 Compare: {stats['compare_count']}
-"""
-
-# ============ TAX FILING GUIDES ============
-def get_paye_filing_guide():
-    return """
-📋 *PAYE FILING GUIDE*
-
-1. Calculate monthly PAYE per employee
-2. Deduct PAYE, Pension (8%), NHF (2.5%)
-3. File Schedule 6 via FIRS e-PAYE
-4. Remit by 14th of following month
-
-🔗 https://e-paye.firs.gov.ng
-"""
-
-def get_cit_filing_guide():
-    return """
-🏢 *CIT FILING GUIDE*
-
-• Small (< ₦25M): File nil returns
-• Medium (₦25M-₦100M): 20% CIT
-• Large (> ₦100M): 30% CIT
-
-Deadlines: Q1 Apr 30, Q2 Jul 31, Q3 Oct 31, Annual Mar 31
-
-🔗 https://e-filing.firs.gov.ng
-"""
-
-def get_vat_filing_guide():
-    return """
-🧾 *VAT FILING GUIDE*
-
-1. Track Output VAT (sales) and Input VAT (purchases)
-2. Calculate: Output - Input = Amount to pay
-3. File Form 002 by 21st of following month
-
-🔗 https://vat.firs.gov.ng
-"""
-
-def get_wht_filing_guide():
-    return """
-📊 *WHT FILING GUIDE*
-
-1. Deduct WHT from eligible payments
-2. File Form 1 by 21st of following month
-3. Issue credit notes to payees
-4. Credit WHT against CIT at year end
-
-*Due Date:* 21st monthly
-
-🔗 https://e-filing.firs.gov.ng
-"""
-
-def get_filing_checklist(tax_type):
-    checklists = {
-        "paye": ["Payroll register", "Individual computations", "Schedule 6"],
-        "cit": ["Audited accounts", "Form A & B", "Capital allowances"],
-        "vat": ["Sales register", "Purchase register", "Form 002"],
-        "wht": ["Payment schedule", "Form 1", "Credit notes"]
-    }
-    items = checklists.get(tax_type, checklists["paye"])
-    return "📋 *CHECKLIST*\n\n" + "\n".join([f"✓ {item}" for item in items])
-
-def get_filing_deadlines(tax_type):
-    deadlines = {
-        "paye": "📅 PAYE: Due by 14th monthly",
-        "cit": "📅 CIT: Q1 Apr 30, Q2 Jul 31, Q3 Oct 31, Annual Mar 31",
-        "vat": "📅 VAT: Due by 21st monthly",
-        "wht": "📅 WHT: Due by 21st monthly"
-    }
-    return deadlines.get(tax_type, deadlines["paye"])
-
-def get_firs_contacts():
-    return """
-📞 *FIRS CONTACTS*
-
-☎️ 0700-CALL-FIRS
-📧 helpdesk@firs.gov.ng
-🌐 https://www.firs.gov.ng
-"""
-
-def get_taxpayer_tin_guide():
-    return """
-🆔 *GET TIN*
-
-1. Visit nearest FIRS tax office
-2. Complete registration form
-3. Provide valid ID and photo
-
-💡 TIN is FREE!
-"""
-
-def get_penalties_guide():
-    return """
-⚠️ *TAX PENALTIES*
-
-• Late PAYE: ₦50,000 + interest
-• Late CIT: ₦500,000 + 10% of tax
-• Late VAT: ₦50,000/month
-• Late WHT: ₦50,000/month
-"""
+def broadcast_message(users, message, platform_type):
+    sent = 0
+    for user in users:
+        if platform_type == "telegram":
+            if send_telegram_message(user["user_id"], message):
+                sent += 1
+    return sent
 
 # ============ MESSAGE SENDING FUNCTIONS ============
 def send_telegram_message(chat_id, text):
@@ -983,7 +666,7 @@ def send_telegram_message(chat_id, text):
         response.raise_for_status()
         return True
     except Exception as e:
-        logging.error(f"Telegram send failed: {e}")
+        logging.error(f"Send failed: {e}")
         return False
 
 def send_whatsapp_message(to_number, text):
@@ -1003,60 +686,17 @@ def send_whatsapp_message(to_number, text):
         return False
 
 # ============ CRON JOB FUNCTIONS ============
-def get_upcoming_deadlines(days_ahead=7):
-    today = datetime.now()
-    upcoming = []
-    
-    for deadline in TAX_DEADLINES:
-        if 'day' in deadline and 'month' not in deadline:
-            next_date = datetime(today.year, today.month, deadline['day'])
-            if next_date < today:
-                if today.month == 12:
-                    next_date = datetime(today.year + 1, 1, deadline['day'])
-                else:
-                    next_date = datetime(today.year, today.month + 1, deadline['day'])
-            
-            days_until = (next_date - today).days
-            if 0 <= days_until <= days_ahead:
-                upcoming.append({"name": deadline['name'], "days": days_until})
-        
-        elif 'month' in deadline and 'day' in deadline:
-            next_date = datetime(today.year, deadline['month'], deadline['day'])
-            if next_date < today:
-                next_date = datetime(today.year + 1, deadline['month'], deadline['day'])
-            
-            days_until = (next_date - today).days
-            if 0 <= days_until <= days_ahead:
-                upcoming.append({"name": deadline['name'], "days": days_until})
-    
-    return sorted(upcoming, key=lambda x: x['days'])
-
-def format_deadline_message(deadlines):
-    if not deadlines:
-        return "No tax deadlines in the next 7 days. ✅"
-    
-    message = "📅 *TAX DEADLINES*\n\n"
-    for dl in deadlines:
-        if dl['days'] == 0:
-            message += f"⚠️ TODAY: {dl['name']}\n"
-        else:
-            message += f"📌 {dl['name']} - {dl['days']} days left\n"
-    return message
-
 def get_daily_tax_tip():
     tips = [
-        "💡 CRA = ₦200,000 OR 1% of gross + 20% of gross",
-        "💡 Pension contributions (8%) are tax-deductible",
-        "💡 VAT in Nigeria is 7.5%",
-        "💡 File PAYE by 14th of each month",
-        "💡 WHT can be credited against CIT liability",
-        "💡 Medical products are VAT exempt",
-        "💡 Use /wht to calculate Withholding Tax",
-        "💡 Try /compare to compare salaries!",
+        "📅 *Calendar Tip:* PAYE due by 14th monthly. Add to your calendar with /calendar",
+        "📅 *Calendar Tip:* VAT due by 21st monthly. Use /calendar to track deadlines",
+        "📅 *Calendar Tip:* Q1 CIT due April 30. Check /calendar for all quarterly dates",
+        "📅 *Calendar Tip:* Annual CIT due March 31. Never miss a deadline with /deadlines",
+        "📅 *Calendar Tip:* Export tax calendar to Google Calendar with /exportcalendar",
     ]
     return random.choice(tips)
 
-# ============ WHATSAPP WEBHOOK VERIFICATION ============
+# ============ WHATSAPP WEBHOOK ============
 def verify_whatsapp_webhook(mode, token, challenge):
     if mode and token:
         if mode == "subscribe" and token == WHATSAPP_VERIFY_TOKEN:
@@ -1125,25 +765,21 @@ def telegram_webhook():
                     if salary > 0:
                         session.add_salary(salary)
                         if session.is_full():
-                            message = session.get_comparison_message()
-                            send_telegram_message(chat_id, message)
-                            log_calculation(chat_id, "compare", {"salaries": session.salaries}, {"count": len(session.salaries)})
+                            send_telegram_message(chat_id, session.get_comparison_message())
+                            log_calculation(chat_id, "compare", {"salaries": session.salaries}, {})
                             del user_comparison_sessions[chat_id]
                         else:
                             remaining = session.max_comparisons - len(session.salaries)
-                            send_telegram_message(chat_id, f"✅ Added ₦{salary:,.0f}\n\nAdd {remaining} more (or send /done):")
+                            send_telegram_message(chat_id, f"✅ Added. Add {remaining} more or send /done")
                     else:
                         send_telegram_message(chat_id, "Enter positive amount.")
                 elif text.lower() == '/done':
                     if len(session.salaries) >= 2:
-                        message = session.get_comparison_message()
-                        send_telegram_message(chat_id, message)
-                        log_calculation(chat_id, "compare", {"salaries": session.salaries}, {"count": len(session.salaries)})
+                        send_telegram_message(chat_id, session.get_comparison_message())
+                        log_calculation(chat_id, "compare", {"salaries": session.salaries}, {})
                     else:
-                        send_telegram_message(chat_id, "Need at least 2 salaries to compare.")
+                        send_telegram_message(chat_id, "Need at least 2 salaries.")
                     del user_comparison_sessions[chat_id]
-                else:
-                    send_telegram_message(chat_id, f"Send salary amount. Added {len(session.salaries)} so far. Send /done when ready.")
                 return jsonify({"status": "ok"}), 200
         
         # ============ QUIZ HANDLER ============
@@ -1153,239 +789,189 @@ def telegram_webhook():
                 if text in ['1', '2', '3', '4']:
                     answer_idx = int(text) - 1
                     is_correct = session.submit_answer(answer_idx)
-                    current = session.get_current_question()
                     
                     if is_correct:
-                        response = f"✅ Correct!\n\n{current['explanation']}\n\n📊 Progress: {session.score}/{len(session.questions)}"
+                        response = "✅ Correct!\n"
                     else:
-                        correct_option = current['options'][current['correct']]
-                        response = f"❌ Incorrect!\nAnswer: {correct_option}\n\n{current['explanation']}\n\n📊 Progress: {session.score}/{len(session.questions)}"
+                        response = "❌ Incorrect!\n"
                     
                     if session.is_complete():
-                        log_quiz_result(chat_id, session.score, len(session.questions), (session.score/len(session.questions))*100)
-                        response += f"\n\n{session.get_result_message()}"
+                        response += f"\n{session.get_result_message()}"
                         del user_quiz_sessions[chat_id]
                     else:
                         next_q = session.get_current_question()
-                        options_text = "\n".join([f"{i+1}. {opt}" for i, opt in enumerate(next_q['options'])])
-                        response += f"\n\n📋 Next:\n{next_q['question']}\n\n{options_text}\n\nSend answer (1-4):"
+                        opts = "\n".join([f"{i+1}. {opt}" for i, opt in enumerate(next_q['options'])])
+                        response += f"\n\nNext:\n{next_q['question']}\n\n{opts}\n\nAnswer (1-4):"
                     
                     send_telegram_message(chat_id, response)
                     return jsonify({"status": "ok"}), 200
                 else:
                     del user_quiz_sessions[chat_id]
-                    send_telegram_message(chat_id, "❌ Quiz cancelled. Send /quiz to start new quiz!")
+                    send_telegram_message(chat_id, "Quiz cancelled. Send /quiz to start over.")
                     return jsonify({"status": "ok"}), 200
         
-        # /start command
+        # ============ CALENDAR COMMANDS ============
+        if text == '/calendar':
+            today = datetime.now()
+            calendar_view = get_month_calendar(today.year, today.month)
+            calendar_view += f"\n\n📌 *Commands:*\n/calendar [number] - View specific month\n/calendar 6 - View June\n/calendar 12 - View December"
+            send_telegram_message(chat_id, calendar_view)
+            return jsonify({"status": "ok"}), 200
+        
+        if text.startswith('/calendar '):
+            parts = text.split()
+            try:
+                month_num = int(parts[1])
+                if 1 <= month_num <= 12:
+                    today = datetime.now()
+                    year = today.year
+                    if month_num < today.month:
+                        year += 1
+                    calendar_view = get_month_calendar(year, month_num)
+                    send_telegram_message(chat_id, calendar_view)
+                else:
+                    send_telegram_message(chat_id, "Please enter month number 1-12")
+            except ValueError:
+                send_telegram_message(chat_id, "Example: /calendar 6 for June")
+            return jsonify({"status": "ok"}), 200
+        
+        if text == '/deadlines':
+            upcoming = get_all_upcoming_deadlines(60)
+            send_telegram_message(chat_id, format_upcoming_deadlines(upcoming))
+            return jsonify({"status": "ok"}), 200
+        
+        if text == '/exportcalendar':
+            today = datetime.now()
+            ical_data = export_calendar_to_ical(today.year)
+            send_telegram_message(chat_id, f"📅 *Calendar Export*\n\nGenerate iCal file for {today.year}.\n\nNote: Use this URL to subscribe:\n`https://yourbot.com/api/calendar/ical/{today.year}`")
+            return jsonify({"status": "ok"}), 200
+        
+        if text.startswith('/payesummary'):
+            send_telegram_message(chat_id, get_tax_type_summary("paye"))
+            return jsonify({"status": "ok"}), 200
+        
+        if text.startswith('/vatsummary'):
+            send_telegram_message(chat_id, get_tax_type_summary("vat"))
+            return jsonify({"status": "ok"}), 200
+        
+        if text.startswith('/citsummary'):
+            send_telegram_message(chat_id, get_tax_type_summary("cit"))
+            return jsonify({"status": "ok"}), 200
+        
+        if text.startswith('/whtsummary'):
+            send_telegram_message(chat_id, get_tax_type_summary("wht"))
+            return jsonify({"status": "ok"}), 200
+        
+        # ============ START COMMAND ============
         if text == '/start':
             welcome = """
 🇳🇬 *Nigerian Tax Bot*
 
-Complete tax assistant for Nigeria!
+Complete tax assistant with calendar!
 
-*Features:*
+*📅 Calendar Features:* 🆕
+• /calendar - View this month's tax calendar
+• /calendar 6 - View specific month
+• /deadlines - Upcoming deadlines (60 days)
+• /exportcalendar - Export to iCal
+• /payesummary - PAYE deadline summary
+• /vatsummary - VAT deadline summary
+• /citsummary - CIT deadline summary
 
-📊 *Calculate*
-• Send salary - PAYE tax
+*📊 Calculate:*
+• Send salary - PAYE
 • /paye 500000 - PAYE
 • /cit 50000000 - CIT
 • /vat 100000 - VAT
 • /wht 500000 consultancy - WHT
 
-📊 *Compare*
-• /compare - Compare multiple salaries
-
-📚 *Learn*
+*📚 Learn:*
 • /quiz - Tax quiz
-• /learn - Study materials
+• /compare - Compare salaries
 
-📋 *File Taxes*
-• /filepaye - PAYE guide
-• /filewht - WHT guide
-• /deadlines - Due dates
-
-👤 *Account*
-• /history - Your activity
-• /stats - Your stats
-
-💡 *Try /wht to calculate Withholding Tax!*
+💡 *Start with /calendar to see tax deadlines!*
 """
             send_telegram_message(chat_id, welcome)
             return jsonify({"status": "ok"}), 200
         
-        # /help command
+        # ============ HELP COMMAND ============
         if text == '/help':
             help_text = """
 🇳🇬 *Tax Bot Help*
 
-*Calculations*
-• Send number - PAYE
-• /paye 500000 - PAYE
-• /cit 50000000 - CIT
-• /vat 100000 - Add VAT
-• /wht 500000 consultancy - WHT
-• /whtrates - WHT rates
-• /whtexamples - WHT examples
+*📅 Calendar*
+/calendar - View monthly calendar
+/calendar 6 - View June calendar
+/deadlines - Upcoming deadlines
+/exportcalendar - Export to iCal
+/payesummary - PAYE deadlines
+/vatsummary - VAT deadlines
+/citsummary - CIT deadlines
 
-*Compare*
-• /compare - Start salary comparison
+*📊 Calculations*
+Send number - PAYE tax
+/paye 500000 - PAYE
+/cit 50000000 - CIT
+/vat 100000 - Add VAT
+/wht 500000 consultancy - WHT
 
-*Learn*
-• /quiz - Tax quiz
-• /learn - Study materials
+*📚 Learning*
+/quiz - Take quiz
+/compare - Compare salaries
 
-*Filing*
-• /filepaye - PAYE guide
-• /filewht - WHT guide
-• /deadlines - Due dates
-• /contacts - FIRS contacts
-
-*Account*
-• /history - Your history
-• /stats - Your stats
-• /tip - Daily tip
+💡 *Try /calendar to see tax deadlines visually!*
 """
             send_telegram_message(chat_id, help_text)
             return jsonify({"status": "ok"}), 200
         
-        # /compare command
+        # ============ COMPARE COMMAND ============
         if text == '/compare':
             if chat_id in user_comparison_sessions:
                 del user_comparison_sessions[chat_id]
             
             session = ComparisonSession(chat_id)
             user_comparison_sessions[chat_id] = session
-            
-            intro = """
-📊 *SALARY COMPARISON*
-
-Send up to 5 salaries to compare net pay.
-
-Example: `500000`
-
-Send first salary:
-"""
-            send_telegram_message(chat_id, intro)
+            send_telegram_message(chat_id, "📊 *Salary Comparison*\n\nSend first salary amount (e.g., 500000):")
             return jsonify({"status": "ok"}), 200
         
-        # /quiz command
+        # ============ QUIZ COMMAND ============
         if text == '/quiz':
             if chat_id in user_quiz_sessions:
                 del user_quiz_sessions[chat_id]
             
             session = QuizSession(chat_id)
             user_quiz_sessions[chat_id] = session
-            
             first_q = session.get_current_question()
-            options_text = "\n".join([f"{i+1}. {opt}" for i, opt in enumerate(first_q['options'])])
-            
-            send_telegram_message(chat_id, f"📚 *TAX QUIZ*\n\nQ1: {first_q['question']}\n\n{options_text}\n\nSend answer (1-4):")
+            opts = "\n".join([f"{i+1}. {opt}" for i, opt in enumerate(first_q['options'])])
+            send_telegram_message(chat_id, f"📚 *TAX QUIZ*\n\n{first_q['question']}\n\n{opts}\n\nSend answer (1-4):")
             return jsonify({"status": "ok"}), 200
         
-        # /learn command
-        if text == '/learn':
-            send_telegram_message(chat_id, "📚 *LEARNING*\n\n/learnpaye - PAYE\n/learncit - CIT\n/learnvat - VAT\n/learnwht - WHT")
-            return jsonify({"status": "ok"}), 200
-        
-        if text == '/learnpaye':
-            send_telegram_message(chat_id, get_tax_learning_material("paye"))
-            return jsonify({"status": "ok"}), 200
-        if text == '/learncit':
-            send_telegram_message(chat_id, get_tax_learning_material("cit"))
-            return jsonify({"status": "ok"}), 200
-        if text == '/learnvat':
-            send_telegram_message(chat_id, get_tax_learning_material("vat"))
-            return jsonify({"status": "ok"}), 200
-        if text == '/learnwht':
-            send_telegram_message(chat_id, get_tax_learning_material("wht"))
-            return jsonify({"status": "ok"}), 200
-        
-        # ============ WHT COMMANDS ============
+        # ============ WHT COMMAND ============
         if text == '/whtrates':
-            send_telegram_message(chat_id, get_wht_rates_summary())
-            return jsonify({"status": "ok"}), 200
-        
-        if text == '/whtexamples':
-            send_telegram_message(chat_id, get_wht_calculation_examples())
-            return jsonify({"status": "ok"}), 200
-        
-        if text == '/filewht':
-            send_telegram_message(chat_id, get_wht_filing_guide())
+            rates = "📊 *WHT RATES*\n\n10%: Consultancy, Rent, Interest, Dividend\n5%: Construction, Contracts\n3%: Transportation"
+            send_telegram_message(chat_id, rates)
             return jsonify({"status": "ok"}), 200
         
         if text.startswith('/wht '):
             parts = text.split()
             try:
                 amount = float(parts[1].replace(',', ''))
-                transaction_type = parts[2].lower() if len(parts) > 2 else "consultancy"
-                
-                if amount <= 0:
-                    send_telegram_message(chat_id, "Enter positive amount.")
-                else:
-                    data = calculate_withholding_tax(amount, transaction_type)
-                    send_telegram_message(chat_id, format_wht_summary(data))
-                    log_calculation(chat_id, "wht", {"amount": amount, "type": transaction_type}, data)
+                trans_type = parts[2].lower() if len(parts) > 2 else "consultancy"
+                data = calculate_withholding_tax(amount, trans_type)
+                send_telegram_message(chat_id, format_wht_summary(data))
+                log_calculation(chat_id, "wht", {"amount": amount, "type": trans_type}, data)
             except (ValueError, IndexError):
-                send_telegram_message(chat_id, "Example: /wht 500000 consultancy\n\nTypes: consultancy, rent, construction, contracts, dividend, interest, royalty")
+                send_telegram_message(chat_id, "Example: /wht 500000 consultancy")
             return jsonify({"status": "ok"}), 200
         
-        # Filing commands
-        if text == '/filepaye':
-            send_telegram_message(chat_id, get_paye_filing_guide())
-            return jsonify({"status": "ok"}), 200
-        if text == '/filecit':
-            send_telegram_message(chat_id, get_cit_filing_guide())
-            return jsonify({"status": "ok"}), 200
-        if text == '/filevat':
-            send_telegram_message(chat_id, get_vat_filing_guide())
-            return jsonify({"status": "ok"}), 200
-        if text == '/deadlines':
-            upcoming = get_upcoming_deadlines(14)
-            send_telegram_message(chat_id, format_deadline_message(upcoming))
-            return jsonify({"status": "ok"}), 200
-        if text == '/contacts':
-            send_telegram_message(chat_id, get_firs_contacts())
-            return jsonify({"status": "ok"}), 200
-        if text == '/penalties':
-            send_telegram_message(chat_id, get_penalties_guide())
-            return jsonify({"status": "ok"}), 200
-        if text == '/gettin':
-            send_telegram_message(chat_id, get_taxpayer_tin_guide())
-            return jsonify({"status": "ok"}), 200
-        if text == '/checklist':
-            send_telegram_message(chat_id, "Use /filechecklist paye, cit, vat, or wht")
-            return jsonify({"status": "ok"}), 200
-        if text.startswith('/filechecklist '):
-            parts = text.split()
-            tax_type = parts[1].lower() if len(parts) > 1 else "paye"
-            send_telegram_message(chat_id, get_filing_checklist(tax_type))
-            return jsonify({"status": "ok"}), 200
-        
-        # Account commands
-        if text == '/history':
-            history = get_user_history(chat_id)
-            send_telegram_message(chat_id, format_history_summary(history))
-            return jsonify({"status": "ok"}), 200
-        if text == '/stats':
-            stats = get_user_stats(chat_id)
-            send_telegram_message(chat_id, format_stats_summary(stats, chat_id))
-            return jsonify({"status": "ok"}), 200
-        if text == '/tip':
-            send_telegram_message(chat_id, get_daily_tax_tip())
-            return jsonify({"status": "ok"}), 200
-        
-        # Calculation commands
+        # ============ CALCULATION COMMANDS ============
         if text.startswith('/paye '):
             parts = text.split()
             try:
                 salary = float(parts[1].replace(',', ''))
-                if salary <= 0:
-                    send_telegram_message(chat_id, "Enter positive amount.")
-                else:
-                    data = calculate_nigerian_paye(salary)
-                    send_telegram_message(chat_id, format_paye_summary(data))
-                    log_calculation(chat_id, "paye", {"salary": salary}, data)
+                data = calculate_nigerian_paye(salary)
+                send_telegram_message(chat_id, format_paye_summary(data))
+                log_calculation(chat_id, "paye", {"salary": salary}, data)
             except ValueError:
                 send_telegram_message(chat_id, "Example: /paye 500000")
             return jsonify({"status": "ok"}), 200
@@ -1394,13 +980,9 @@ Send first salary:
             parts = text.split()
             try:
                 turnover = float(parts[1].replace(',', ''))
-                profit = float(parts[2].replace(',', '')) if len(parts) > 2 else None
-                if turnover <= 0:
-                    send_telegram_message(chat_id, "Enter positive turnover.")
-                else:
-                    data = calculate_company_income_tax(turnover, profit)
-                    send_telegram_message(chat_id, format_cit_summary(data))
-                    log_calculation(chat_id, "cit", {"turnover": turnover}, data)
+                data = calculate_company_income_tax(turnover)
+                send_telegram_message(chat_id, format_cit_summary(data))
+                log_calculation(chat_id, "cit", {"turnover": turnover}, data)
             except ValueError:
                 send_telegram_message(chat_id, "Example: /cit 50000000")
             return jsonify({"status": "ok"}), 200
@@ -1409,12 +991,9 @@ Send first salary:
             parts = text.split()
             try:
                 amount = float(parts[1].replace(',', ''))
-                if amount <= 0:
-                    send_telegram_message(chat_id, "Enter positive amount.")
-                else:
-                    data = calculate_vat(amount, is_inclusive=False)
-                    send_telegram_message(chat_id, format_vat_summary(data))
-                    log_calculation(chat_id, "vat", {"amount": amount}, data)
+                data = calculate_vat(amount, is_inclusive=False)
+                send_telegram_message(chat_id, format_vat_summary(data))
+                log_calculation(chat_id, "vat", {"amount": amount}, data)
             except ValueError:
                 send_telegram_message(chat_id, "Example: /vat 100000")
             return jsonify({"status": "ok"}), 200
@@ -1423,41 +1002,24 @@ Send first salary:
             parts = text.split()
             try:
                 amount = float(parts[1].replace(',', ''))
-                if amount <= 0:
-                    send_telegram_message(chat_id, "Enter positive amount.")
-                else:
-                    data = calculate_vat(amount, is_inclusive=True)
-                    send_telegram_message(chat_id, format_vat_summary(data))
-                    log_calculation(chat_id, "vat", {"amount": amount}, data)
+                data = calculate_vat(amount, is_inclusive=True)
+                send_telegram_message(chat_id, format_vat_summary(data))
+                log_calculation(chat_id, "vat", {"amount": amount}, data)
             except ValueError:
                 send_telegram_message(chat_id, "Example: /vatin 107500")
             return jsonify({"status": "ok"}), 200
         
-        if text.startswith('/vatliability '):
-            parts = text.split()
-            try:
-                input_vat = float(parts[1].replace(',', ''))
-                output_vat = float(parts[2].replace(',', '')) if len(parts) > 2 else 0
-                data = calculate_vat_liability(input_vat, output_vat)
-                send_telegram_message(chat_id, f"📥 Input: ₦{data['input_vat']:,.0f}\n📤 Output: ₦{data['output_vat']:,.0f}\n📊 Net: ₦{abs(data['net_liability']):,.0f} ({data['status']})")
-                log_calculation(chat_id, "vat", {"input": input_vat, "output": output_vat}, data)
-            except (ValueError, IndexError):
-                send_telegram_message(chat_id, "Example: /vatliability 500000 750000")
-            return jsonify({"status": "ok"}), 200
-        
-        # Default: parse salary number
+        # ============ DEFAULT: SALARY NUMBER ============
         salary_match = re.search(r'[\d,]+', text.replace(',', ''))
         
         if salary_match:
             monthly_salary = float(salary_match.group())
-            if monthly_salary <= 0:
-                send_telegram_message(chat_id, "Enter positive amount.")
-            else:
+            if monthly_salary > 0:
                 tax_data = calculate_nigerian_paye(monthly_salary)
                 send_telegram_message(chat_id, format_paye_summary(tax_data))
                 log_calculation(chat_id, "paye", {"salary": monthly_salary}, tax_data)
         else:
-            send_telegram_message(chat_id, "Send salary or use /help\n\n💡 Try /wht 500000 consultancy")
+            send_telegram_message(chat_id, "Send salary or use /help\n\n📅 *Try /calendar to see tax deadlines*")
         
         return jsonify({"status": "ok"}), 200
         
@@ -1472,4 +1034,74 @@ def whatsapp_webhook():
         token = request.args.get('hub.verify_token')
         challenge = request.args.get('hub.challenge')
         
-        result = verify_whatsapp_webhook(mode
+        result = verify_whatsapp_webhook(mode, token, challenge)
+        if result:
+            return result, 200
+        return "Verification failed", 403
+    
+    elif request.method == 'POST':
+        try:
+            body = request.get_json()
+            from_number, message_text = process_whatsapp_message(body)
+            
+            if from_number and message_text:
+                get_or_create_user("whatsapp", from_number)
+                
+                salary_match = re.search(r'[\d,]+', message_text.replace(',', ''))
+                
+                if salary_match:
+                    salary = float(salary_match.group())
+                    if salary > 0:
+                        data = calculate_nigerian_paye(salary)
+                        send_whatsapp_message(from_number, format_paye_summary(data))
+                        log_calculation(from_number, "paye", {"salary": salary}, data)
+                elif message_text.lower() in ['/start', 'start', 'help']:
+                    response = "🇳🇬 Tax Bot\n\n/calendar - View deadlines\n/paye [amount] - Calculate\n/quiz - Test knowledge"
+                    send_whatsapp_message(from_number, response)
+            
+            return jsonify({"status": "ok"}), 200
+        except Exception as e:
+            logging.error(f"WhatsApp error: {e}")
+            return jsonify({"status": "error"}), 500
+
+# ============ CRON JOB ENDPOINTS ============
+
+@app.route('/api/cron/send-deadline-reminders', methods=['POST', 'GET'])
+def send_deadline_reminders():
+    try:
+        upcoming = get_all_upcoming_deadlines(7)
+        message = format_upcoming_deadlines(upcoming)
+        
+        if TEST_TELEGRAM_CHAT_ID:
+            send_telegram_message(TEST_TELEGRAM_CHAT_ID, message)
+        
+        all_users = get_all_active_users("telegram")
+        broadcast_message(all_users, message, "telegram")
+        
+        return jsonify({"status": "success", "deadlines": len(upcoming)}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+@app.route('/api/cron/daily-tax-tip', methods=['POST', 'GET'])
+def send_daily_tax_tip():
+    try:
+        tip = get_daily_tax_tip()
+        message = f"{tip}\n\n📅 Use /calendar to never miss tax deadlines!"
+        
+        if TEST_TELEGRAM_CHAT_ID:
+            send_telegram_message(TEST_TELEGRAM_CHAT_ID, message)
+        
+        return jsonify({"status": "success"}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+@app.route('/api/calendar/ical/<int:year>', methods=['GET'])
+def get_ical_calendar(year):
+    """Serve iCal calendar file for external calendar apps"""
+    ical_content = export_calendar_to_ical(year)
+    response = jsonify({"ical_url": f"/api/calendar/ical/{year}/download"})
+    return response
+
+if __name__ == '__main__':
+    port = int(os.getenv('PORT', 8000))
+    app.run(host='0.0.0.0', port=port)
