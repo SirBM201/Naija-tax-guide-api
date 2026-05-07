@@ -24,17 +24,10 @@ supabase: Client = None
 if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
     logging.info("✅ Supabase connected successfully")
-else:
-    logging.warning("⚠️ Supabase not configured")
 
 # ============ TELEGRAM CONFIGURATION ============
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
-
-if TELEGRAM_TOKEN:
-    logging.info(f"✅ TELEGRAM_TOKEN loaded")
-else:
-    logging.error("❌ TELEGRAM_TOKEN NOT FOUND!")
 
 # ============ WHATSAPP CONFIGURATION ============
 WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "your_verify_token_here")
@@ -46,359 +39,258 @@ WHATSAPP_API_URL = "https://graph.facebook.com/v18.0"
 TEST_TELEGRAM_CHAT_ID = os.getenv("TEST_TELEGRAM_CHAT_ID")
 TEST_WHATSAPP_NUMBER = os.getenv("TEST_WHATSAPP_NUMBER")
 
-# ============ FILING SESSIONS ============
-user_filing_sessions = {}
-
-class FilingSession:
-    def __init__(self, user_id, tax_type):
-        self.user_id = user_id
-        self.tax_type = tax_type
-        self.step = 1
-        self.data = {}
-        self.documents = []
-        self.started_at = datetime.now()
-    
-    def get_current_step_question(self):
-        steps = {
-            "paye": {
-                1: "What is your company's TIN?",
-                2: "How many employees are you filing for?",
-                3: "What is the filing month? (e.g., January 2024)",
-                4: "Do you have the PAYE computation file ready? (Yes/No)",
-                5: "Have you remitted the PAYE amount? (Yes/No)",
-            },
-            "cit": {
-                1: "What is your company's TIN?",
-                2: "What is your company's turnover for the year?",
-                3: "What is your assessable profit?",
-                4: "Do you have audited financial statements? (Yes/No)",
-                5: "Have you filed all quarterly returns? (Yes/No)",
-            },
-            "vat": {
-                1: "What is your company's TIN?",
-                2: "What is your monthly output VAT (collected from customers)?",
-                3: "What is your monthly input VAT (paid to suppliers)?",
-                4: "Do you have all sales invoices? (Yes/No)",
-                5: "Do you have all purchase invoices? (Yes/No)",
-            },
-            "wht": {
-                1: "What is your company's TIN?",
-                2: "How many payments did you make this month?",
-                3: "What was the total amount subject to WHT?",
-                4: "Do you have credit notes for all deductions? (Yes/No)",
-                5: "Have you issued WHT certificates to vendors? (Yes/No)",
-            }
-        }
-        return steps.get(self.tax_type, steps["paye"]).get(self.step, "Processing your filing...")
-    
-    def process_answer(self, answer):
-        step_fields = {
-            "paye": {
-                1: "tin",
-                2: "employee_count",
-                3: "filing_month",
-                4: "has_computation",
-                5: "has_remitted"
-            },
-            "cit": {
-                1: "tin",
-                2: "turnover",
-                3: "profit",
-                4: "has_audited",
-                5: "has_quarterly_filed"
-            },
-            "vat": {
-                1: "tin",
-                2: "output_vat",
-                3: "input_vat",
-                4: "has_sales_invoices",
-                5: "has_purchase_invoices"
-            },
-            "wht": {
-                1: "tin",
-                2: "payment_count",
-                3: "total_amount",
-                4: "has_credit_notes",
-                5: "has_certificates"
-            }
-        }
-        
-        field_name = step_fields.get(self.tax_type, step_fields["paye"]).get(self.step)
-        self.data[field_name] = answer
-        self.step += 1
-        
-        return self.is_complete()
-    
-    def is_complete(self):
-        return self.step > 5
-    
-    def get_final_summary(self):
-        if self.tax_type == "paye":
-            return f"""
-📋 *PAYE FILING CHECKLIST COMPLETE*
-
-✅ TIN: {self.data.get('tin', 'N/A')}
-✅ Employees: {self.data.get('employee_count', 'N/A')}
-✅ Month: {self.data.get('filing_month', 'N/A')}
-✅ Computation: {self.data.get('has_computation', 'N/A')}
-✅ Remittance: {self.data.get('has_remitted', 'N/A')}
-
-*Next Steps:*
-1. Log into FIRS e-PAYE portal
-2. Upload Schedule 6 form
-3. Make payment if not already done
-4. Keep payment receipt
-
-🔗 https://e-paye.firs.gov.ng
-"""
-        elif self.tax_type == "cit":
-            return f"""
-🏢 *CIT FILING CHECKLIST COMPLETE*
-
-✅ TIN: {self.data.get('tin', 'N/A')}
-✅ Turnover: ₦{self.data.get('turnover', 'N/A'):,.0f}
-✅ Profit: ₦{self.data.get('profit', 'N/A'):,.0f}
-✅ Audited Statements: {self.data.get('has_audited', 'N/A')}
-✅ Quarterly Filed: {self.data.get('has_quarterly_filed', 'N/A')}
-
-*Next Steps:*
-1. Prepare audited financial statements
-2. Complete Form A and Form B
-3. File via FIRS e-Filing portal
-4. Pay assessed tax by March 31
-
-🔗 https://e-filing.firs.gov.ng
-"""
-        elif self.tax_type == "vat":
-            liability = float(self.data.get('output_vat', 0)) - float(self.data.get('input_vat', 0))
-            return f"""
-🧾 *VAT FILING CHECKLIST COMPLETE*
-
-✅ TIN: {self.data.get('tin', 'N/A')}
-✅ Output VAT: ₦{self.data.get('output_vat', 'N/A'):,.0f}
-✅ Input VAT: ₦{self.data.get('input_vat', 'N/A'):,.0f}
-✅ Net Payable: *₦{max(0, liability):,.0f}*
-✅ Sales Invoices: {self.data.get('has_sales_invoices', 'N/A')}
-✅ Purchase Invoices: {self.data.get('has_purchase_invoices', 'N/A')}
-
-*Next Steps:*
-1. Complete Form 002
-2. File via FIRS VAT portal
-3. Pay by 21st of next month
-4. File monthly returns
-
-🔗 https://vat.firs.gov.ng
-"""
-        else:
-            return f"""
-📊 *WHT FILING CHECKLIST COMPLETE*
-
-✅ TIN: {self.data.get('tin', 'N/A')}
-✅ Payments: {self.data.get('payment_count', 'N/A')}
-✅ Total Amount: ₦{self.data.get('total_amount', 'N/A'):,.0f}
-✅ Credit Notes: {self.data.get('has_credit_notes', 'N/A')}
-✅ Certificates: {self.data.get('has_certificates', 'N/A')}
-
-*Next Steps:*
-1. Complete Form 1
-2. File via FIRS e-Filing portal
-3. Issue credit notes to vendors
-4. File by 21st of next month
-
-🔗 https://e-filing.firs.gov.ng
-"""
-
-# ============ DOCUMENT CHECKLIST ============
-DOCUMENT_CHECKLISTS = {
-    "paye": [
-        "Employee payroll register for the month",
-        "Individual PAYE computations for each employee",
-        "Schedule 6 (PAYE remittance form)",
-        "Bank teller/payment confirmation for remittance",
-        "Employee biodata (Name, TIN, Basic salary, Allowances)",
-        "Previous month's filing reference number"
-    ],
-    "cit": [
-        "Audited financial statements for the year",
-        "Form A (Annual returns)",
-        "Form B (Tax computation)",
-        "Schedule 3 (Capital allowances calculation)",
-        "Withholding tax schedule for the year",
-        "PAYE remittance summary for the year",
-        "Auditor's report and opinion",
-        "Company TIN certificate and registration documents",
-        "Minutes of Directors meeting approving accounts"
-    ],
-    "vat": [
-        "Sales invoice register for the month",
-        "Purchase invoice register for the month",
-        "Form 002 (VAT returns)",
-        "Input VAT supporting invoices (must be original)",
-        "Output VAT supporting invoices",
-        "Bank payment confirmation and teller",
-        "VAT certificate of registration",
-        "Credit notes issued and received"
-    ],
-    "wht": [
-        "Payment schedule for the month",
-        "Form 1 (WHT returns)",
-        "Credit notes issued to each vendor",
-        "WHT certificate for each deduction",
-        "Vendor TIN list and verification",
-        "Bank payment confirmation",
-        "WHT schedule for CIT credit"
-    ]
+# ============ LANGUAGE SUPPORT ============
+LANGUAGES = {
+    "en": "English",
+    "pidgin": "Pidgin English",
+    "yoruba": "Yorùbá",
+    "hausa": "Hausa",
+    "igbo": "Igbo"
 }
 
-FILING_CHECKLISTS = {
-    "paye": {
-        "title": "📋 PAYE FILING CHECKLIST",
-        "steps": [
-            "Step 1: Calculate PAYE for each employee",
-            "Step 2: Deduct PAYE, Pension (8%), NHF (2.5%)",
-            "Step 3: Prepare Schedule 6 form",
-            "Step 4: Log into FIRS e-PAYE portal",
-            "Step 5: Upload Schedule 6 and pay",
-            "Step 6: Download payment receipt",
-            "Step 7: Update employee records"
-        ]
+user_language = {}
+
+# ============ TRANSLATIONS ============
+TRANSLATIONS = {
+    "en": {
+        "welcome": "🇳🇬 *Nigerian Tax Bot*\n\nYour complete tax assistant!\n\n*Commands:*\n/paye [amount] - Calculate PAYE\n/cit [turnover] - Company tax\n/vat [amount] - VAT calculation\n/wht [amount] [type] - Withholding tax\n/calculate [salary] - Tax calculation\n/calendar - Tax deadlines\n/help - Show all commands\n/language - Change language",
+        "paye_summary": "🇳🇬 *PAYE SUMMARY*\n\nGross: ₦{gross}\nPension: ₦{pension}\nNHF: ₦{nhf}\nTax: ₦{tax}\nNet: *₦{net}*\nRate: {rate}%",
+        "enter_amount": "Please enter a valid amount",
+        "enter_salary": "Send your monthly salary (e.g., 500000):",
+        "calculation_saved": "✅ Calculation saved to your history",
+        "loading": "⏳ Calculating...",
+        "deadlines": "📅 *UPCOMING TAX DEADLINES*\n\n",
+        "today": "⚠️ *TODAY:* ",
+        "tomorrow": "🔔 *TOMORROW:* ",
+        "days_left": "📌 {name} - {days} days left",
+        "no_deadlines": "✅ No tax deadlines in the next 30 days",
+        "wht_rates": "📊 *WHT RATES*\n\n10%: Consultancy, Rent, Interest, Dividend\n5%: Construction, Contracts\n3%: Transportation",
+        "help": """📚 *TAX BOT HELP*
+
+*🇳🇬 Language Support*
+/language - Change language (English, Pidgin, Yoruba, Hausa, Igbo)
+
+*📊 Calculations*
+• Send amount - Calculate PAYE tax
+• /paye 500000 - PAYE for ₦500,000
+• /cit 50000000 - Company tax
+• /vat 100000 - Add 7.5% VAT
+• /vatin 107500 - Extract VAT
+• /wht 500000 consultancy - Withholding tax
+
+*📅 Calendar*
+• /calendar - Monthly tax calendar
+• /deadlines - Upcoming deadlines
+
+*📋 Filing*
+• /filepaye - PAYE filing guide
+• /filecit - CIT filing guide
+• /filevat - VAT filing guide
+• /checklist - Document checklist
+
+*👤 Account*
+• /history - Your calculation history
+• /stats - Your usage statistics""",
+        "language_changed": "✅ Language changed to English!",
+        "select_language": "🌍 *Select your language:*\n\nSend the number:\n1. English\n2. Pidgin English\n3. Yorùbá\n4. Hausa\n5. Igbo",
+        "paye_guide": """📋 *PAYE FILING GUIDE*
+
+1. Calculate PAYE per employee
+2. Deduct PAYE, Pension (8%), NHF (2.5%)
+3. File Schedule 6 via FIRS e-PAYE
+4. Remit by 14th of following month
+
+🔗 https://e-paye.firs.gov.ng""",
+        "cit_guide": """🏢 *CIT FILING GUIDE*
+
+• Small (< ₦25M): File nil returns
+• Medium (₦25M-₦100M): 20% CIT
+• Large (> ₦100M): 30% CIT
+
+Deadlines: Q1 Apr 30, Q2 Jul 31, Q3 Oct 31, Annual Mar 31""",
+        "vat_guide": """🧾 *VAT FILING GUIDE*
+
+1. Track Output VAT and Input VAT
+2. Calculate: Output - Input = Payable
+3. File Form 002 by 21st of following month""",
+        "wht_guide": """📊 *WHT FILING GUIDE*
+
+1. Deduct WHT from eligible payments
+2. File Form 1 by 21st of following month
+3. Issue credit notes to vendors"""
     },
-    "cit": {
-        "title": "🏢 CIT FILING CHECKLIST",
-        "steps": [
-            "Step 1: Prepare audited financial statements",
-            "Step 2: Calculate CIT (20% or 30% of profit)",
-            "Step 3: Calculate Education Tax (3%)",
-            "Step 4: Complete Form A and Form B",
-            "Step 5: File via FIRS e-Filing portal",
-            "Step 6: Make payment by March 31",
-            "Step 7: Keep all documents for 6 years"
-        ]
+    "pidgin": {
+        "welcome": "🇳🇬 *Nigerian Tax Bot (Pidgin)*\n\nYour complete tax assistant for Nigeria!\n\n*Commands:*\n/paye [amount] - Calculate PAYE tax\n/cit [turnover] - Company tax\n/vat [amount] - VAT calculation\n/calendar - Tax deadlines\n/help - Show all commands\n/language - Change language",
+        "paye_summary": "🇳🇬 *PAYE SUMMARY (Pidgin)*\n\nMoney wey you collect: ₦{gross}\nPension: ₦{pension}\nNHF: ₦{nhf}\nTax wey you go pay: ₦{tax}\nYour take home: *₦{net}*\nTax rate: {rate}%",
+        "enter_amount": "Abeg send correct amount",
+        "enter_salary": "Send your monthly salary (e.g., 500000):",
+        "calculation_saved": "✅ We don save your calculation",
+        "loading": "⏳ Small time...",
+        "deadlines": "📅 *TAX DEADLINES WEY DEY COME*\n\n",
+        "today": "⚠️ *TODAY:* ",
+        "tomorrow": "🔔 *TOMORROW:* ",
+        "days_left": "📌 {name} - {days} days left",
+        "no_deadlines": "✅ No tax deadlines for next 30 days",
+        "wht_rates": "📊 *WHT RATES (Pidgin)*\n\n10%: Consultancy, Rent, Interest, Dividend\n5%: Construction, Contracts\n3%: Transportation",
+        "help": """📚 *TAX BOT HELP (Pidgin)*
+
+*🇳🇬 Language Support*
+/language - Change language (English, Pidgin, Yoruba, Hausa, Igbo)
+
+*📊 Calculations*
+• Send amount - Calculate PAYE tax
+• /paye 500000 - PAYE for ₦500,000
+• /cit 50000000 - Company tax
+• /vat 100000 - Add 7.5% VAT
+• /vatin 107500 - Extract VAT
+
+*📅 Calendar*
+• /calendar - Monthly tax calendar
+• /deadlines - Upcoming deadlines
+
+*📋 Filing*
+• /filepaye - PAYE filing guide
+• /filecit - CIT filing guide
+
+*👤 Account*
+• /history - Your calculation history""",
+        "language_changed": "✅ We don change language to Pidgin English!",
+        "select_language": "🌍 *Select your language:*\n\nSend the number:\n1. English\n2. Pidgin English\n3. Yorùbá\n4. Hausa\n5. Igbo",
+        "paye_guide": """📋 *PAYE FILING GUIDE (Pidgin)*
+
+1. Calculate PAYE for each worker
+2. Remove PAYE, Pension (8%), NHF (2.5%)
+3. File Schedule 6 for FIRS
+4. Pay by 14th of next month
+
+🔗 https://e-paye.firs.gov.ng""",
+        "cit_guide": """🏢 *CIT FILING GUIDE (Pidgin)*
+
+• Small (< ₦25M): Just file zero
+• Medium (₦25M-₦100M): 20% CIT
+• Large (> ₦100M): 30% CIT
+
+Deadlines: Q1 Apr 30, Q2 Jul 31, Q3 Oct 31, Annual Mar 31""",
+        "vat_guide": """🧾 *VAT FILING GUIDE (Pidgin)*
+
+1. Track VAT wey you collect and pay
+2. Calculate money to pay
+3. File Form 002 by 21st of next month""",
+        "wht_guide": """📊 *WHT FILING GUIDE (Pidgin)*
+
+1. Remove WHT from payments
+2. File Form 1 by 21st of next month
+3. Give credit notes to vendors"""
     },
-    "vat": {
-        "title": "🧾 VAT FILING CHECKLIST",
-        "steps": [
-            "Step 1: Calculate Output VAT (7.5% of sales)",
-            "Step 2: Calculate Input VAT (7.5% of purchases)",
-            "Step 3: Net VAT = Output - Input",
-            "Step 4: Complete Form 002",
-            "Step 5: File by 21st of next month",
-            "Step 6: Make payment if net is positive",
-            "Step 7: Keep all invoices for verification"
-        ]
+    "yoruba": {
+        "welcome": "🇳🇬 *Nigerian Tax Bot (Yorùbá)*\n\nOluṣe iranlọwọ orí-ori rẹ!\n\n*Awọn aṣẹ:*\n/paye [owó] - Ṣiṣiro owo-ori PAYE\n/cit [owo-iye] - Owo-ori ile-iṣẹ\n/vat [owo] - Ṣiṣiro VAT\n/calendar - Awọn ọjọ-ipari\n/help - Gbogbo aṣẹ\n/language - Yipada ede",
+        "paye_summary": "🇳🇬 *PAYE SUMMARY (Yorùbá)*\n\nOwo-oṣooṣu: ₦{gross}\nPension: ₦{pension}\nNHF: ₦{nhf}\nOwo-ori: ₦{tax}\nOwo ti o gba: *₦{net}*\nOṣuwọn: {rate}%",
+        "enter_amount": "Jọwọ tẹ iye to pe",
+        "enter_salary": "Fi owo-oṣooṣu rẹ ranṣẹ (fun apẹẹrẹ, 500000):",
+        "calculation_saved": "✅ A ti fi iṣiro rẹ pamọ",
+        "loading": "⏳ Nṣiṣiro...",
+        "deadlines": "📅 *AWỌN ỌJỌ-IPARI OWO-ORI TI NMỌ SỌDỌ*\n\n",
+        "today": "⚠️ *ÒNÍ:* ",
+        "tomorrow": "🔔 *ỌLA:* ",
+        "days_left": "📌 {name} - ọjọ {days} le",
+        "no_deadlines": "✅ Ko si ọjọ-ipari owo-ori ninu ọjọ 30 to nbọ",
+        "wht_rates": "📊 *WHT RATES (Yorùbá)*\n\n10%: Consultancy, Rent, Interest, Dividend\n5%: Construction, Contracts\n3%: Transportation",
+        "help": "📚 *IRANLỌWỌ BOT OWO-ORI*\n\n/language - Yipada ede\n/paye [owó] - Owo-ori PAYE\n/cit [owo-iye] - Owo-ori ile-iṣẹ\n/vat [owo] - VAT\n/calendar - Awọn ọjọ-ipari\n/filepaye - Itọsọna filing\n/history - Itan iṣiro rẹ",
+        "language_changed": "✅ A ti yipada ede si Yorùbá!",
+        "select_language": "🌍 *Yan ede rẹ:*\n\nFi nọ́ńbà ranṣẹ:\n1. English\n2. Pidgin English\n3. Yorùbá\n4. Hausa\n5. Igbo",
+        "paye_guide": "📋 *ITỌSỌNA PAYE FILING*\n\n1. Ṣe iṣiro owo-ori fun oṣiṣẹ kọọkan\n2. Yọkuro owo-ori, Pension (8%), NHF (2.5%)\n3. Fọọmu Schedule 6 si cyberspace FIRS\n4. San ni ọjọ 14th oṣu to nbọ",
+        "cit_guide": "🏢 *ITỌSỌNA CIT FILING*\n\n• Kekere (< ₦25M): Fi iwe-ofo ranṣẹ\n• Alabọde (₦25M-₦100M): 20% CIT\n• Nla (> ₦100M): 30% CIT",
+        "vat_guide": "🧾 *ITỌSỌNA VAT FILING*\n\n1. Tọju akọsilẹ Output VAT ati Input VAT\n2. Ṣe iṣiro: Output - Input = Owo lati san\n3. Fi Fọọmu 002 silẹ ni ọjọ 21st oṣu to nbọ",
+        "wht_guide": "📊 *ITỌSỌNA WHT FILING*\n\n1. Yọkuro WHT lati awọn isanwo\n2. Fi Fọọmu 1 silẹ ni ọjọ 21st oṣu to nbọ\n3. Fun awọn iwe-ẹri credit si awọn olutaja"
     },
-    "wht": {
-        "title": "📊 WHT FILING CHECKLIST",
-        "steps": [
-            "Step 1: Identify eligible payments (consultancy, rent, etc.)",
-            "Step 2: Deduct WHT at applicable rate (10%, 5%, or 3%)",
-            "Step 3: Prepare Form 1",
-            "Step 4: File by 21st of next month",
-            "Step 5: Issue credit notes to vendors",
-            "Step 6: Remit deducted amount to FIRS",
-            "Step 7: Keep WHT schedule for CIT credit"
-        ]
+    "hausa": {
+        "welcome": "🇳🇬 *Nigerian Tax Bot (Hausa)*\n\nCikakken mataimakin haraji!\n\n*Umarni:*\n/paye [adadin] - Lissafin harajin PAYE\n/cit [juyawa] - Harajin kamfani\n/vat [adadin] - Lissafin VAT\n/calendar - Kwanakin ƙarshe\n/help - Duk umarni\n/language - Canza yare",
+        "paye_summary": "🇳🇬 *PAYE SUMMARY (Hausa)*\n\nAlbashin wata: ₦{gross}\nPension: ₦{pension}\nNHF: ₦{nhf}\nHaraji: ₦{tax}\nAbin da zaka karba: *₦{net}*\nAdadin haraji: {rate}%",
+        "enter_amount": "Don Allah shigar da adadi mai inganci",
+        "enter_salary": "Aika albashin watanka (misali, 500000):",
+        "calculation_saved": "✅ An ajiye lissafin ka",
+        "loading": "⏳ Ana lissafin...",
+        "deadlines": "📅 *KUNAKIN ƘARSHE HARAJI MASU ZUWA*\n\n",
+        "today": "⚠️ *YAU:* ",
+        "tomorrow": "🔔 *GOBE:* ",
+        "days_left": "📌 {name} - {days} days left",
+        "no_deadlines": "✅ Babu kwanakin ƙarshe na haraji a cikin kwanaki 30 masu zuwa",
+        "wht_rates": "📊 *RATES NA WHT*\n\n10%: Consultancy, Rent, Interest, Dividend\n5%: Construction, Contracts\n3%: Transportation",
+        "help": "📚 *TAIMAKON BOT HARAJI*\n\n/language - Canza yare\n/paye [adadin] - Harajin PAYE\n/cit [juyawa] - Harajin kamfani\n/vat [adadin] - VAT\n/calendar - Kwanakin ƙarshe\n/filepaye - Jagororin shigar da haraji\n/history - Tarihin lissafinka",
+        "language_changed": "✅ An canza yare zuwa Hausa!",
+        "select_language": "🌍 *Zaɓi yarenka:*\n\nAika lambar:\n1. English\n2. Pidgin English\n3. Yorùbá\n4. Hausa\n5. Igbo",
+        "paye_guide": "📋 *JAGORORIN SHIGAR DA PAYE*\n\n1. Lissafi harajin kowane ma'aikaci\n2. Cire haraji, Pension (8%), NHF (2.5%)\n3. Aika Schedule 6 zuwa FIRS\n4. Biya kafin ranar 14th ga wata mai zuwa",
+        "cit_guide": "🏢 *JAGORORIN SHIGAR DA CIT*\n\n• Karami (< ₦25M): Aika sifili\n• Matsakaici (₦25M-₦100M): 20% CIT\n• Babba (> ₦100M): 30% CIT",
+        "vat_guide": "🧾 *JAGORORIN SHIGAR DA VAT*\n\n1. Rike Output VAT da Input VAT\n2. Lissafi: Output - Input = Abin da za'a biya\n3. Aika Form 002 kafin ranar 21st ga wata mai zuwa",
+        "wht_guide": "📊 *JAGORORIN SHIGAR DA WHT*\n\n1. Cire WHT daga biyan kuɗi\n2. Aika Form 1 kafin ranar 21st ga wata mai zuwa\n3. Ba da takardun shaidar kiredit ga dillalai"
+    },
+    "igbo": {
+        "welcome": "🇳🇬 *Nigerian Tax Bot (Igbo)*\n\nOnye na-enyere gị aka n'ụtụ isi!\n\n*Iwu:*\n/paye [ego] - Gbakọọ ụtụ PAYE\n/cit [ntughari] - Ụtụ ụlọ ọrụ\n/vat [ego] - Gbakọọ VAT\n/calendar - Ụbọchị njedebe\n/help - Iwu niile\n/language - Gbanwee asụsụ",
+        "paye_summary": "🇳🇬 *PAYE SUMMARY (Igbo)*\n\nEgo ọnwa: ₦{gross}\nPension: ₦{pension}\nNHF: ₦{nhf}\nỤtụ: ₦{tax}\nEgo ị ga-enweta: *₦{net}*\nỌnụ ego: {rate}%",
+        "enter_amount": "Biko tinye ego ziri ezi",
+        "enter_salary": "Ziga ọnwa ọnwa gị (dịka, 500000):",
+        "calculation_saved": "✅ Echekwabara ngụkọ gị",
+        "loading": "⏳ Na-agbakọ...",
+        "deadlines": "📅 *ỤBỌCHỊ NJEDEBE ỤTỤ ISI NA-ABỊA*\n\n",
+        "today": "⚠️ *TAA:* ",
+        "tomorrow": "🔔 *ECHI:* ",
+        "days_left": "📌 {name} - ụbọchị {days} fọdụrụ",
+        "no_deadlines": "✅ Ọ nweghị ụbọchị njedebe ụtụ n'ime ụbọchị 30 na-abịa",
+        "wht_rates": "📊 *ỌNỤ EGO WHT*\n\n10%: Consultancy, Rent, Interest, Dividend\n5%: Construction, Contracts\n3%: Transportation",
+        "help": "📚 *ENYEMAKA BOT ỤTỤ*\n\n/language - Gbanwee asụsụ\n/paye [ego] - Ụtụ PAYE\n/cit [ntughari] - Ụtụ ụlọ ọrụ\n/vat [ego] - VAT\n/calendar - Ụbọchị njedebe\n/filepaye - Ntuzi maka ịgbanye ụtụ\n/history - Akụkọ ngụkọ gị",
+        "language_changed": "✅ Agbanweela asụsụ gaa na Igbo!",
+        "select_language": "🌍 *Họrọ asụsụ gị:*\n\nZiga nọmba:\n1. English\n2. Pidgin English\n3. Yorùbá\n4. Hausa\n5. Igbo",
+        "paye_guide": "📋 *NTUZI ỊGBANYE PAYE*\n\n1. Gbakọọ ụtụ maka onye ọrụ nke ọ bụla\n2. Wepụ ụtụ, Pension (8%), NHF (2.5%)\n3. Debe Schedule 6 na FIRS portal\n4. Kwụọ ụgwọ tupu ụbọchị 14th nke ọnwa na-abịa",
+        "cit_guide": "🏢 *NTUZI ỊGBANYE CIT*\n\n• Obere (< ₦25M): Debe efu\n• Ọkara (₦25M-₦100M): 20% CIT\n• Nnukwu (> ₦100M): 30% CIT",
+        "vat_guide": "🧾 *NTUZI ỊGBANYE VAT*\n\n1. Chekọta Output VAT na Input VAT\n2. Gbakọọ: Output - Input = Ego a ga-akwụ\n3. Debe Form 002 tupu ụbọchị 21st nke ọnwa na-abịa",
+        "wht_guide": "📊 *NTUZI ỊGBANYE WHT*\n\n1. Wepụ WHT site na ịkwụ ụgwọ\n2. Debe Form 1 tupu ụbọchị 21st nke ọnwa na-abịa\n3. Nye asambodo kredit ndị na-ere ahịa"
     }
 }
 
-def get_filing_checklist(tax_type):
-    checklist = FILING_CHECKLISTS.get(tax_type, FILING_CHECKLISTS["paye"])
-    steps = "\n".join(checklist["steps"])
-    return f"""
-{checklist['title']}
+def get_translation(lang, key, **kwargs):
+    """Get translated text for a given key"""
+    translation = TRANSLATIONS.get(lang, TRANSLATIONS["en"]).get(key, TRANSLATIONS["en"][key])
+    if kwargs:
+        return translation.format(**kwargs)
+    return translation
 
-{steps}
-
-💡 *Tip:* Use /file{tax_type} to start guided filing
-"""
-
-def get_document_checklist(tax_type):
-    docs = DOCUMENT_CHECKLISTS.get(tax_type, DOCUMENT_CHECKLISTS["paye"])
-    doc_list = "\n".join([f"✅ {doc}" for doc in docs])
-    return f"""
-📄 *REQUIRED DOCUMENTS FOR {tax_type.upper()} FILING*
-
-{doc_list}
-
-⚠️ *Keep all documents for at least 6 years!*
-"""
-
-# ============ TAX CALENDAR DATA ============
-TAX_CALENDAR = {
-    1: {14: {"name": "PAYE Remittance (Dec)", "type": "paye"}, 21: {"name": "VAT Filing (Dec)", "type": "vat"}},
-    2: {14: {"name": "PAYE Remittance (Jan)", "type": "paye"}, 21: {"name": "VAT Filing (Jan)", "type": "vat"}},
-    3: {14: {"name": "PAYE Remittance (Feb)", "type": "paye"}, 21: {"name": "VAT Filing (Feb)", "type": "vat"}, 31: {"name": "Annual CIT Filing", "type": "cit"}},
-    4: {14: {"name": "PAYE Remittance (Mar)", "type": "paye"}, 21: {"name": "VAT Filing (Mar)", "type": "vat"}, 30: {"name": "Q1 CIT Filing", "type": "cit"}},
-    5: {14: {"name": "PAYE Remittance (Apr)", "type": "paye"}, 21: {"name": "VAT Filing (Apr)", "type": "vat"}},
-    6: {14: {"name": "PAYE Remittance (May)", "type": "paye"}, 21: {"name": "VAT Filing (May)", "type": "vat"}},
-    7: {14: {"name": "PAYE Remittance (Jun)", "type": "paye"}, 21: {"name": "VAT Filing (Jun)", "type": "vat"}, 31: {"name": "Q2 CIT Filing", "type": "cit"}},
-    8: {14: {"name": "PAYE Remittance (Jul)", "type": "paye"}, 21: {"name": "VAT Filing (Jul)", "type": "vat"}},
-    9: {14: {"name": "PAYE Remittance (Aug)", "type": "paye"}, 21: {"name": "VAT Filing (Aug)", "type": "vat"}},
-    10: {14: {"name": "PAYE Remittance (Sep)", "type": "paye"}, 21: {"name": "VAT Filing (Sep)", "type": "vat"}, 31: {"name": "Q3 CIT Filing", "type": "cit"}},
-    11: {14: {"name": "PAYE Remittance (Oct)", "type": "paye"}, 21: {"name": "VAT Filing (Oct)", "type": "vat"}},
-    12: {14: {"name": "PAYE Remittance (Nov)", "type": "paye"}, 21: {"name": "VAT Filing (Nov)", "type": "vat"}, 31: {"name": "Year-end Planning", "type": "general"}},
-}
-
-MONTH_NAMES = {
-    1: "January", 2: "February", 3: "March", 4: "April",
-    5: "May", 6: "June", 7: "July", 8: "August",
-    9: "September", 10: "October", 11: "November", 12: "December"
-}
-
-def get_month_calendar(year, month):
-    cal = calendar.monthcalendar(year, month)
-    month_name = MONTH_NAMES[month]
-    deadlines = TAX_CALENDAR.get(month, {})
+def get_user_language(user_id):
+    """Get user's preferred language preference"""
+    if user_id in user_language:
+        return user_language[user_id]
     
-    result = f"📅 *{month_name} {year} - Tax Calendar*\n\n"
-    result += "┌─────┬─────┬─────┬─────┬─────┬─────┬─────┐\n"
-    result += "│ Mon │ Tue │ Wed │ Thu │ Fri │ Sat │ Sun │\n"
-    result += "├─────┼─────┼─────┼─────┼─────┼─────┼─────┤\n"
+    # Check database for saved preference
+    if supabase:
+        try:
+            response = supabase.table("user_preferences").select("preference_value").eq("user_id", str(user_id)).eq("preference_key", "language").execute()
+            if response.data:
+                lang = response.data[0]["preference_value"]
+                user_language[user_id] = lang
+                return lang
+        except:
+            pass
     
-    for week in cal:
-        for day in week:
-            if day == 0:
-                result += "│  -  "
-            else:
-                if day in deadlines:
-                    result += f"│ 🔴{day:2d} "
-                else:
-                    result += f"│  {day:2d}  "
-        result += "│\n├─────┼─────┼─────┼─────┼─────┼─────┼─────┤\n"
-    
-    result += "└─────┴─────┴─────┴─────┴─────┴─────┴─────┘\n"
-    return result
+    return "en"
 
-def get_upcoming_deadlines(days_ahead=30):
-    today = datetime.now()
-    upcoming = []
-    
-    for month in range(today.month, today.month + 2):
-        current_month = ((month - 1) % 12) + 1
-        year = today.year + (month - 1) // 12
+def set_user_language(user_id, lang):
+    """Set user's language preference"""
+    if lang in LANGUAGES:
+        user_language[user_id] = lang
         
-        deadlines = TAX_CALENDAR.get(current_month, {})
-        for day, info in deadlines.items():
-            deadline_date = datetime(year, current_month, day)
-            if deadline_date >= today:
-                days = (deadline_date - today).days
-                if days <= days_ahead:
-                    upcoming.append({
-                        "date": deadline_date,
-                        "days": days,
-                        "name": info["name"],
-                        "type": info["type"]
-                    })
-    
-    return sorted(upcoming, key=lambda x: x["days"])[:10]
+        # Save to database
+        if supabase:
+            try:
+                existing = supabase.table("user_preferences").select("*").eq("user_id", str(user_id)).eq("preference_key", "language").execute()
+                if existing.data:
+                    supabase.table("user_preferences").update({"preference_value": lang}).eq("id", existing.data[0]["id"]).execute()
+                else:
+                    supabase.table("user_preferences").insert({"user_id": str(user_id), "preference_key": "language", "preference_value": lang}).execute()
+            except:
+                pass
+        return True
+    return False
 
-# ============ WHT RATES ============
-WHT_RATES = {
-    "consultancy": 10, "rent": 10, "interest": 10, "dividend": 10,
-    "construction": 5, "contracts": 5, "transport": 3
-}
-
-# ============ CALCULATION FUNCTIONS ============
+# ============ TAX CALCULATION FUNCTIONS ============
 def calculate_nigerian_paye(monthly_gross):
     annual_gross = monthly_gross * 12
     pension = monthly_gross * 0.08
@@ -411,27 +303,26 @@ def calculate_nigerian_paye(monthly_gross):
     cra_total = cra_base + cra_percentage
     
     total_deductions = (pension * 12) + (nhf * 12) + cra_total
-    chargeable = annual_gross - total_deductions
-    chargeable = max(0, chargeable)
+    chargeable = max(0, annual_gross - total_deductions)
     
     if chargeable <= 300000:
-        tax = chargeable * 0.07
+        annual_tax = chargeable * 0.07
     elif chargeable <= 600000:
-        tax = 21000 + (chargeable - 300000) * 0.11
+        annual_tax = 21000 + (chargeable - 300000) * 0.11
     elif chargeable <= 1100000:
-        tax = 54000 + (chargeable - 600000) * 0.15
+        annual_tax = 54000 + (chargeable - 600000) * 0.15
     elif chargeable <= 1600000:
-        tax = 129000 + (chargeable - 1100000) * 0.19
+        annual_tax = 129000 + (chargeable - 1100000) * 0.19
     elif chargeable <= 3200000:
-        tax = 224000 + (chargeable - 1600000) * 0.21
+        annual_tax = 224000 + (chargeable - 1600000) * 0.21
     else:
-        tax = 560000 + (chargeable - 3200000) * 0.24
+        annual_tax = 560000 + (chargeable - 3200000) * 0.24
     
-    if tax < annual_gross * 0.01:
-        tax = annual_gross * 0.01
+    if annual_tax < annual_gross * 0.01:
+        annual_tax = annual_gross * 0.01
     
-    monthly_tax = tax / 12
-    effective_rate = (tax / annual_gross) * 100
+    monthly_tax = annual_tax / 12
+    effective_rate = (annual_tax / annual_gross) * 100 if annual_gross > 0 else 0
     
     return {
         "gross": monthly_gross,
@@ -446,85 +337,69 @@ def calculate_cit(turnover, profit=None):
     if profit is None:
         profit = turnover * 0.20
     if turnover < 25000000:
-        rate = 0
         size = "Small (Exempt)"
+        rate = 0
     elif turnover <= 100000000:
-        rate = 0.20
         size = "Medium"
+        rate = 0.20
     else:
-        rate = 0.30
         size = "Large"
+        rate = 0.30
     
     cit = profit * rate
     education = profit * 0.03
     total = cit + education
     
-    return {"turnover": turnover, "profit": profit, "size": size, "total": round(total, 2), "rate": rate}
+    return {"turnover": turnover, "profit": profit, "size": size, "total": round(total, 2)}
 
 def calculate_vat(amount, inclusive=False):
     if inclusive:
         vat = amount * 0.075 / 1.075
         exclusive = amount - vat
+        total = amount
     else:
         vat = amount * 0.075
         exclusive = amount
-    return {"amount": amount, "vat": round(vat, 2), "exclusive": round(exclusive, 2), "total": round(amount + vat, 2) if not inclusive else amount}
+        total = amount + vat
+    return {"amount": amount, "vat": round(vat, 2), "exclusive": round(exclusive, 2), "total": round(total, 2)}
+
+WHT_RATES = {"consultancy": 10, "rent": 10, "interest": 10, "dividend": 10, "construction": 5, "contracts": 5, "transport": 3}
 
 def calculate_wht(amount, trans_type):
     rate = WHT_RATES.get(trans_type, 10)
     wht = amount * rate / 100
     return {"amount": amount, "rate": rate, "wht": round(wht, 2), "net": round(amount - wht, 2)}
 
-# ============ FORMATTING ============
-def format_paye(data):
-    return f"""
-🇳🇬 *PAYE SUMMARY*
+# ============ TAX CALENDAR ============
+TAX_CALENDAR = {
+    1: {14: "PAYE Remittance (Dec)", 21: "VAT Filing (Dec)"},
+    2: {14: "PAYE Remittance (Jan)", 21: "VAT Filing (Jan)"},
+    3: {14: "PAYE Remittance (Feb)", 21: "VAT Filing (Feb)", 31: "Annual CIT Filing"},
+    4: {14: "PAYE Remittance (Mar)", 21: "VAT Filing (Mar)", 30: "Q1 CIT Filing"},
+    5: {14: "PAYE Remittance (Apr)", 21: "VAT Filing (Apr)"},
+    6: {14: "PAYE Remittance (May)", 21: "VAT Filing (May)"},
+    7: {14: "PAYE Remittance (Jun)", 21: "VAT Filing (Jun)", 31: "Q2 CIT Filing"},
+    8: {14: "PAYE Remittance (Jul)", 21: "VAT Filing (Jul)"},
+    9: {14: "PAYE Remittance (Aug)", 21: "VAT Filing (Aug)"},
+    10: {14: "PAYE Remittance (Sep)", 21: "VAT Filing (Sep)", 31: "Q3 CIT Filing"},
+    11: {14: "PAYE Remittance (Oct)", 21: "VAT Filing (Oct)"},
+    12: {14: "PAYE Remittance (Nov)", 21: "VAT Filing (Nov)", 31: "Year-end Planning"},
+}
 
-Gross: ₦{data['gross']:,.0f}
-Pension: ₦{data['pension']:,.0f}
-NHF: ₦{data['nhf']:,.0f}
-Tax: ₦{data['tax']:,.0f}
-Net: *₦{data['net']:,.0f}*
-Rate: {data['rate']}%
-"""
-
-def format_cit(data):
-    return f"""
-🏢 *CIT SUMMARY*
-
-Turnover: ₦{data['turnover']:,.0f}
-Profit: ₦{data['profit']:,.0f}
-Size: {data['size']}
-Total Tax: *₦{data['total']:,.0f}*
-"""
-
-def format_vat(data):
-    if 'exclusive' in data and data['exclusive'] != data['amount']:
-        return f"""
-🧾 *VAT (7.5%)*
-
-Amount (incl): ₦{data['amount']:,.0f}
-VAT: ₦{data['vat']:,.0f}
-Exclusive: ₦{data['exclusive']:,.0f}
-"""
-    else:
-        return f"""
-🧾 *VAT (7.5%)*
-
-Amount (excl): ₦{data['amount']:,.0f}
-VAT: ₦{data['vat']:,.0f}
-Total: ₦{data['total']:,.0f}
-"""
-
-def format_wht(data):
-    return f"""
-📊 *WITHHOLDING TAX*
-
-Amount: ₦{data['amount']:,.0f}
-Rate: {data['rate']}%
-WHT: *₦{data['wht']:,.0f}*
-Net Payment: ₦{data['net']:,.0f}
-"""
+def get_upcoming_deadlines(days_ahead=30):
+    today = datetime.now()
+    upcoming = []
+    for month in range(today.month, today.month + 2):
+        current_month = ((month - 1) % 12) + 1
+        year = today.year + (month - 1) // 12
+        deadlines = TAX_CALENDAR.get(current_month, {})
+        for day, name in deadlines.items():
+            deadline_date = datetime(year, current_month, day)
+            if deadline_date >= today:
+                days = (deadline_date - today).days
+                if days <= days_ahead:
+                    upcoming.append({"name": name, "days": days, "date": deadline_date})
+    return sorted(upcoming, key=lambda x: x["days"])
 
 # ============ DATABASE FUNCTIONS ============
 def get_or_create_user(platform, user_id, name=None):
@@ -538,17 +413,21 @@ def get_or_create_user(platform, user_id, name=None):
             new_user = {"platform": platform, "user_id": str(user_id), "name": name, "created_at": datetime.now().isoformat(), "total_calculations": 0, "is_active": True}
             result = supabase.table("users").insert(new_user).execute()
             return result.data[0] if result.data else None
-    except Exception as e:
+    except:
         return None
 
 def log_calculation(user_id, calc_type, input_data, result_data):
     if not supabase:
         return False
     try:
-        supabase.table("calculations").insert({"user_id": str(user_id), "calculation_type": calc_type, "input_data": json.dumps(input_data), "result_data": json.dumps(result_data), "created_at": datetime.now().isoformat()}).execute()
+        supabase.table("calculations").insert({
+            "user_id": str(user_id), "calculation_type": calc_type,
+            "input_data": json.dumps(input_data), "result_data": json.dumps(result_data),
+            "created_at": datetime.now().isoformat()
+        }).execute()
         supabase.table("users").update({"total_calculations": supabase.raw("total_calculations + 1"), "last_active": datetime.now().isoformat()}).eq("user_id", str(user_id)).execute()
         return True
-    except Exception as e:
+    except:
         return False
 
 def get_user_history(user_id):
@@ -557,7 +436,7 @@ def get_user_history(user_id):
     try:
         response = supabase.table("calculations").select("*").eq("user_id", str(user_id)).order("created_at", desc=True).limit(10).execute()
         return response.data
-    except Exception as e:
+    except:
         return []
 
 # ============ MESSAGE SENDING ============
@@ -568,50 +447,14 @@ def send_telegram_message(chat_id, text):
         url = f"{TELEGRAM_API_URL}/sendMessage"
         requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}, timeout=10)
         return True
-    except Exception as e:
+    except:
         return False
-
-def send_whatsapp_message(to_number, text):
-    if not WHATSAPP_ACCESS_TOKEN or not PHONE_NUMBER_ID:
-        return False
-    try:
-        url = f"{WHATSAPP_API_URL}/{PHONE_NUMBER_ID}/messages"
-        headers = {"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}", "Content-Type": "application/json"}
-        payload = {"messaging_product": "whatsapp", "recipient_type": "individual", "to": to_number, "type": "text", "text": {"body": text}}
-        requests.post(url, json=payload, headers=headers, timeout=10)
-        return True
-    except Exception as e:
-        return False
-
-# ============ WHATSAPP WEBHOOK ============
-def verify_whatsapp_webhook(mode, token, challenge):
-    if mode and token and mode == "subscribe" and token == WHATSAPP_VERIFY_TOKEN:
-        return challenge
-    return None
-
-def process_whatsapp_message(message_data):
-    try:
-        entry = message_data.get('entry', [{}])[0]
-        changes = entry.get('changes', [{}])[0]
-        value = changes.get('value', {})
-        messages = value.get('messages', [])
-        if not messages:
-            return None, None
-        message = messages[0]
-        from_number = message.get('from')
-        msg_type = message.get('type')
-        if msg_type == 'text':
-            text = message.get('text', {}).get('body', '').strip()
-            return from_number, text
-        return from_number, None
-    except Exception as e:
-        return None, None
 
 # ============ FLASK ENDPOINTS ============
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({"status": "healthy", "telegram": bool(TELEGRAM_TOKEN), "timestamp": datetime.now().isoformat()})
+    return jsonify({"status": "healthy", "telegram": bool(TELEGRAM_TOKEN)})
 
 @app.route('/webhook', methods=['POST'])
 def telegram_webhook():
@@ -628,250 +471,158 @@ def telegram_webhook():
         logging.info(f"Telegram from {chat_id}: {text}")
         get_or_create_user("telegram", chat_id, user_name)
         
-        # ============ FILING SESSION HANDLER ============
-        if chat_id in user_filing_sessions:
-            session = user_filing_sessions[chat_id]
-            if not session.is_complete():
-                session.process_answer(text)
-                if session.is_complete():
-                    send_telegram_message(chat_id, session.get_final_summary())
-                    del user_filing_sessions[chat_id]
-                else:
-                    send_telegram_message(chat_id, session.get_current_step_question())
-                return jsonify({"status": "ok"}), 200
+        lang = get_user_language(chat_id)
         
-        # ============ FILING COMMANDS ============
-        if text == '/filepaye':
-            session = FilingSession(chat_id, "paye")
-            user_filing_sessions[chat_id] = session
-            send_telegram_message(chat_id, f"📋 *PAYE Filing Assistant*\n\n{session.get_current_step_question()}")
+        # Language selection menu
+        if text == '/language':
+            send_telegram_message(chat_id, get_translation(lang, "select_language"))
             return jsonify({"status": "ok"}), 200
         
-        if text == '/filecit':
-            session = FilingSession(chat_id, "cit")
-            user_filing_sessions[chat_id] = session
-            send_telegram_message(chat_id, f"🏢 *CIT Filing Assistant*\n\n{session.get_current_step_question()}")
+        # Language selection handler
+        if text in ['1', '2', '3', '4', '5']:
+            lang_map = {"1": "en", "2": "pidgin", "3": "yoruba", "4": "hausa", "5": "igbo"}
+            set_user_language(chat_id, lang_map[text])
+            send_telegram_message(chat_id, get_translation(lang_map[text], "language_changed"))
+            send_telegram_message(chat_id, get_translation(lang_map[text], "welcome"))
             return jsonify({"status": "ok"}), 200
         
-        if text == '/filevat':
-            session = FilingSession(chat_id, "vat")
-            user_filing_sessions[chat_id] = session
-            send_telegram_message(chat_id, f"🧾 *VAT Filing Assistant*\n\n{session.get_current_step_question()}")
+        # Help command
+        if text == '/help':
+            send_telegram_message(chat_id, get_translation(lang, "help"))
             return jsonify({"status": "ok"}), 200
         
-        if text == '/filewht':
-            session = FilingSession(chat_id, "wht")
-            user_filing_sessions[chat_id] = session
-            send_telegram_message(chat_id, f"📊 *WHT Filing Assistant*\n\n{session.get_current_step_question()}")
+        # Start command
+        if text == '/start':
+            send_telegram_message(chat_id, get_translation(lang, "welcome"))
             return jsonify({"status": "ok"}), 200
         
-        # ============ CHECKLIST COMMANDS ============
-        if text == '/checklist':
-            menu = """
-📋 *FILING CHECKLISTS*
-
-/payelist - PAYE filing steps
-/citlist - CIT filing steps
-/vatlist - VAT filing steps
-/whtlist - WHT filing steps
-
-/docs - Required documents
-"""
-            send_telegram_message(chat_id, menu)
-            return jsonify({"status": "ok"}), 200
-        
-        if text == '/payelist':
-            send_telegram_message(chat_id, get_filing_checklist("paye"))
-            return jsonify({"status": "ok"}), 200
-        if text == '/citlist':
-            send_telegram_message(chat_id, get_filing_checklist("cit"))
-            return jsonify({"status": "ok"}), 200
-        if text == '/vatlist':
-            send_telegram_message(chat_id, get_filing_checklist("vat"))
-            return jsonify({"status": "ok"}), 200
-        if text == '/whtlist':
-            send_telegram_message(chat_id, get_filing_checklist("wht"))
-            return jsonify({"status": "ok"}), 200
-        
-        if text == '/docs':
-            menu = """
-📄 *REQUIRED DOCUMENTS*
-
-/docs paye - PAYE documents
-/docs cit - CIT documents
-/docs vat - VAT documents
-/docs wht - WHT documents
-"""
-            send_telegram_message(chat_id, menu)
-            return jsonify({"status": "ok"}), 200
-        
-        if text.startswith('/docs '):
-            parts = text.split()
-            tax_type = parts[1].lower() if len(parts) > 1 else "paye"
-            send_telegram_message(chat_id, get_document_checklist(tax_type))
-            return jsonify({"status": "ok"}), 200
-        
-        # ============ CALENDAR COMMANDS ============
-        if text == '/calendar':
-            today = datetime.now()
-            send_telegram_message(chat_id, get_month_calendar(today.year, today.month))
-            return jsonify({"status": "ok"}), 200
-        
-        if text.startswith('/calendar '):
+        # PAYE calculation command
+        if text.startswith('/paye '):
             parts = text.split()
             try:
-                month = int(parts[1])
-                if 1 <= month <= 12:
-                    year = datetime.now().year
-                    if month < datetime.now().month:
-                        year += 1
-                    send_telegram_message(chat_id, get_month_calendar(year, month))
+                salary = float(parts[1].replace(',', ''))
+                if salary > 0:
+                    data = calculate_nigerian_paye(salary)
+                    result = get_translation(lang, "paye_summary", gross=f"{data['gross']:,.0f}", pension=f"{data['pension']:,.0f}", nhf=f"{data['nhf']:,.0f}", tax=f"{data['tax']:,.0f}", net=f"{data['net']:,.0f}", rate=data['rate'])
+                    send_telegram_message(chat_id, result)
+                    log_calculation(chat_id, "paye", {"salary": salary}, data)
                 else:
-                    send_telegram_message(chat_id, "Month must be 1-12")
+                    send_telegram_message(chat_id, get_translation(lang, "enter_amount"))
             except:
-                send_telegram_message(chat_id, "Example: /calendar 6")
+                send_telegram_message(chat_id, get_translation(lang, "enter_amount"))
             return jsonify({"status": "ok"}), 200
         
-        if text == '/deadlines':
-            upcoming = get_upcoming_deadlines(30)
-            if not upcoming:
-                send_telegram_message(chat_id, "✅ No deadlines in next 30 days")
-            else:
-                msg = "📅 *UPCOMING DEADLINES*\n\n"
-                for d in upcoming:
-                    if d['days'] == 0:
-                        msg += f"⚠️ *TODAY:* {d['name']}\n"
-                    elif d['days'] == 1:
-                        msg += f"🔔 *TOMORROW:* {d['name']}\n"
-                    else:
-                        msg += f"📌 *{d['date'].strftime('%b %d')}:* {d['name']} ({d['days']} days)\n"
-                send_telegram_message(chat_id, msg)
-            return jsonify({"status": "ok"}), 200
-        
-        # ============ START COMMAND ============
-        if text == '/start':
-            welcome = """
-🇳🇬 *Nigerian Tax Bot Pro*
-
-Complete tax assistant with filing wizard!
-
-*📋 Filing Assistant (New!)*
-/filepaye - Guided PAYE filing
-/filecit - Guided CIT filing
-/filevat - Guided VAT filing
-/filewht - Guided WHT filing
-
-*📋 Checklists*
-/payelist - PAYE steps
-/citlist - CIT steps
-/vatlist - VAT steps
-/whtlist - WHT steps
-/docs - Required documents
-
-*📅 Calendar*
-/calendar - View this month
-/calendar 6 - View specific month
-/deadlines - Upcoming deadlines
-
-*📊 Calculations*
-Send salary - PAYE
-/cit 50000000 - CIT
-/vat 100000 - VAT
-/wht 500000 consultancy - WHT
-
-💡 *Try /filepaye to start guided filing!*
-"""
-            send_telegram_message(chat_id, welcome)
-            return jsonify({"status": "ok"}), 200
-        
-        # ============ HELP ============
-        if text == '/help':
-            help_text = """
-🇳🇬 *Tax Bot Help*
-
-*Filing Assistant*
-/filepaye - Guided PAYE filing
-/filecit - Guided CIT filing
-/filevat - Guided VAT filing
-/filewht - Guided WHT filing
-
-*Checklists*
-/payelist - PAYE filing steps
-/citlist - CIT filing steps
-/vatlist - VAT filing steps
-/whtlist - WHT filing steps
-/docs - Required documents
-
-*Calendar*
-/calendar - Monthly calendar
-/deadlines - Upcoming deadlines
-
-*Calculations*
-Send number - PAYE tax
-/cit 50000000 - CIT
-/vat 100000 - VAT
-/wht 500000 consultancy - WHT
-"""
-            send_telegram_message(chat_id, help_text)
-            return jsonify({"status": "ok"}), 200
-        
-        # ============ CALCULATIONS ============
+        # CIT calculation
         if text.startswith('/cit '):
             parts = text.split()
             try:
                 turnover = float(parts[1].replace(',', ''))
-                profit = float(parts[2].replace(',', '')) if len(parts) > 2 else None
-                data = calculate_cit(turnover, profit)
-                send_telegram_message(chat_id, format_cit(data))
+                data = calculate_cit(turnover)
+                msg = f"🏢 *CIT SUMMARY*\n\nTurnover: ₦{data['turnover']:,.0f}\nProfit: ₦{data['profit']:,.0f}\nSize: {data['size']}\nTotal Tax: *₦{data['total']:,.0f}*"
+                send_telegram_message(chat_id, msg)
                 log_calculation(chat_id, "cit", {"turnover": turnover}, data)
             except:
                 send_telegram_message(chat_id, "Example: /cit 50000000")
             return jsonify({"status": "ok"}), 200
         
+        # VAT calculation
         if text.startswith('/vat '):
             parts = text.split()
             try:
                 amount = float(parts[1].replace(',', ''))
                 data = calculate_vat(amount, False)
-                send_telegram_message(chat_id, format_vat(data))
+                msg = f"🧾 *VAT (7.5%)*\n\nAmount (excl): ₦{data['amount']:,.0f}\nVAT: ₦{data['vat']:,.0f}\nTotal: ₦{data['total']:,.0f}"
+                send_telegram_message(chat_id, msg)
                 log_calculation(chat_id, "vat", {"amount": amount}, data)
             except:
                 send_telegram_message(chat_id, "Example: /vat 100000")
             return jsonify({"status": "ok"}), 200
         
+        # VAT inclusive calculation
         if text.startswith('/vatin '):
             parts = text.split()
             try:
                 amount = float(parts[1].replace(',', ''))
                 data = calculate_vat(amount, True)
-                send_telegram_message(chat_id, format_vat(data))
+                msg = f"🧾 *VAT (7.5%)*\n\nAmount (incl): ₦{data['amount']:,.0f}\nVAT: ₦{data['vat']:,.0f}\nExclusive: ₦{data['exclusive']:,.0f}"
+                send_telegram_message(chat_id, msg)
                 log_calculation(chat_id, "vat", {"amount": amount}, data)
             except:
                 send_telegram_message(chat_id, "Example: /vatin 107500")
             return jsonify({"status": "ok"}), 200
         
+        # WHT calculation
         if text.startswith('/wht '):
             parts = text.split()
             try:
                 amount = float(parts[1].replace(',', ''))
                 trans_type = parts[2].lower() if len(parts) > 2 else "consultancy"
                 data = calculate_wht(amount, trans_type)
-                send_telegram_message(chat_id, format_wht(data))
+                msg = f"📊 *WITHHOLDING TAX*\n\nAmount: ₦{data['amount']:,.0f}\nRate: {data['rate']}%\nWHT: *₦{data['wht']:,.0f}*\nNet Payment: ₦{data['net']:,.0f}"
+                send_telegram_message(chat_id, msg)
                 log_calculation(chat_id, "wht", {"amount": amount, "type": trans_type}, data)
             except:
-                send_telegram_message(chat_id, "Example: /wht 500000 consultancy\nTypes: consultancy, rent, construction, transport")
+                send_telegram_message(chat_id, "Example: /wht 500000 consultancy")
             return jsonify({"status": "ok"}), 200
         
+        # WHT rates
         if text == '/whtrates':
-            rates = "📊 *WHT RATES*\n\n10%: Consultancy, Rent, Interest, Dividend\n5%: Construction, Contracts\n3%: Transportation"
-            send_telegram_message(chat_id, rates)
+            send_telegram_message(chat_id, get_translation(lang, "wht_rates"))
             return jsonify({"status": "ok"}), 200
         
-        # ============ HISTORY ============
+        # Calendar
+        if text == '/calendar':
+            today = datetime.now()
+            cal = calendar.monthcalendar(today.year, today.month)
+            month_name = today.strftime("%B")
+            msg = f"📅 *{month_name} {today.year} - Tax Calendar*\n\n"
+            msg += "Mon Tue Wed Thu Fri Sat Sun\n"
+            for week in cal:
+                for day in week:
+                    if day == 0:
+                        msg += "    "
+                    else:
+                        msg += f"{day:3d} "
+                msg += "\n"
+            send_telegram_message(chat_id, msg)
+            return jsonify({"status": "ok"}), 200
+        
+        # Deadlines
+        if text == '/deadlines':
+            upcoming = get_upcoming_deadlines(30)
+            if not upcoming:
+                send_telegram_message(chat_id, get_translation(lang, "no_deadlines"))
+            else:
+                msg = get_translation(lang, "deadlines")
+                for d in upcoming:
+                    if d['days'] == 0:
+                        msg += f"{get_translation(lang, 'today')}{d['name']}\n"
+                    elif d['days'] == 1:
+                        msg += f"{get_translation(lang, 'tomorrow')}{d['name']}\n"
+                    else:
+                        msg += f"{get_translation(lang, 'days_left', name=d['name'], days=d['days'])}\n"
+                send_telegram_message(chat_id, msg)
+            return jsonify({"status": "ok"}), 200
+        
+        # Filing guides
+        if text == '/filepaye':
+            send_telegram_message(chat_id, get_translation(lang, "paye_guide"))
+            return jsonify({"status": "ok"}), 200
+        if text == '/filecit':
+            send_telegram_message(chat_id, get_translation(lang, "cit_guide"))
+            return jsonify({"status": "ok"}), 200
+        if text == '/filevat':
+            send_telegram_message(chat_id, get_translation(lang, "vat_guide"))
+            return jsonify({"status": "ok"}), 200
+        if text == '/filewht':
+            send_telegram_message(chat_id, get_translation(lang, "wht_guide"))
+            return jsonify({"status": "ok"}), 200
+        
+        # History
         if text == '/history':
             history = get_user_history(chat_id)
             if not history:
-                send_telegram_message(chat_id, "No history yet. Make some calculations!")
+                send_telegram_message(chat_id, "📋 No history yet. Make some calculations!")
             else:
                 msg = "📋 *YOUR HISTORY*\n\n"
                 for h in history[:5]:
@@ -880,86 +631,22 @@ Send number - PAYE tax
                 send_telegram_message(chat_id, msg)
             return jsonify({"status": "ok"}), 200
         
-        # ============ DEFAULT: SALARY ============
+        # Default: salary calculation
         salary_match = re.search(r'[\d,]+', text.replace(',', ''))
         if salary_match:
             salary = float(salary_match.group())
             if salary > 0:
                 data = calculate_nigerian_paye(salary)
-                send_telegram_message(chat_id, format_paye(data))
+                result = get_translation(lang, "paye_summary", gross=f"{data['gross']:,.0f}", pension=f"{data['pension']:,.0f}", nhf=f"{data['nhf']:,.0f}", tax=f"{data['tax']:,.0f}", net=f"{data['net']:,.0f}", rate=data['rate'])
+                send_telegram_message(chat_id, result)
                 log_calculation(chat_id, "paye", {"salary": salary}, data)
         else:
-            send_telegram_message(chat_id, "Send salary or use /help\n\n📋 *Try /filepaye for guided filing*")
+            send_telegram_message(chat_id, get_translation(lang, "enter_salary"))
         
         return jsonify({"status": "ok"}), 200
         
     except Exception as e:
         logging.error(f"Error: {e}")
-        return jsonify({"status": "error"}), 500
-
-@app.route('/api/whatsapp/webhook', methods=['GET', 'POST'])
-def whatsapp_webhook():
-    if request.method == 'GET':
-        mode = request.args.get('hub.mode')
-        token = request.args.get('hub.verify_token')
-        challenge = request.args.get('hub.challenge')
-        result = verify_whatsapp_webhook(mode, token, challenge)
-        if result:
-            return result, 200
-        return "Verification failed", 403
-    
-    elif request.method == 'POST':
-        try:
-            body = request.get_json()
-            from_number, message_text = process_whatsapp_message(body)
-            if from_number and message_text:
-                salary_match = re.search(r'[\d,]+', message_text.replace(',', ''))
-                if salary_match:
-                    salary = float(salary_match.group())
-                    if salary > 0:
-                        data = calculate_nigerian_paye(salary)
-                        send_whatsapp_message(from_number, format_paye(data))
-                elif message_text.lower() in ['/start', 'start', 'help']:
-                    send_whatsapp_message(from_number, "🇳🇬 Tax Bot Pro\n\n/filepaye - Guided filing\n/calendar - Tax deadlines\nSend salary - PAYE calculation")
-            return jsonify({"status": "ok"}), 200
-        except Exception as e:
-            return jsonify({"status": "error"}), 500
-
-# ============ CRON JOB ENDPOINTS ============
-@app.route('/api/cron/send-deadline-reminders', methods=['POST', 'GET'])
-def send_deadline_reminders():
-    try:
-        upcoming = get_upcoming_deadlines(7)
-        if upcoming:
-            msg = "📅 *TAX DEADLINE ALERTS*\n\n"
-            for d in upcoming[:5]:
-                if d['days'] == 0:
-                    msg += f"⚠️ *TODAY:* {d['name']}\n"
-                elif d['days'] == 1:
-                    msg += f"🔔 *TOMORROW:* {d['name']}\n"
-                else:
-                    msg += f"📌 {d['name']} - {d['days']} days\n"
-            if TEST_TELEGRAM_CHAT_ID:
-                send_telegram_message(TEST_TELEGRAM_CHAT_ID, msg)
-        return jsonify({"status": "success"}), 200
-    except Exception as e:
-        return jsonify({"status": "error"}), 500
-
-@app.route('/api/cron/daily-tip', methods=['POST', 'GET'])
-def send_daily_tip():
-    try:
-        tips = [
-            "💡 Use /filepaye for guided PAYE filing",
-            "💡 Keep tax documents for 6 years",
-            "💡 VAT returns due by 21st monthly",
-            "💡 WHT can be credited against CIT",
-            "💡 Use /calendar to track deadlines",
-        ]
-        tip = random.choice(tips)
-        if TEST_TELEGRAM_CHAT_ID:
-            send_telegram_message(TEST_TELEGRAM_CHAT_ID, f"{tip}\n\nNeed help? Send /help")
-        return jsonify({"status": "success"}), 200
-    except Exception as e:
         return jsonify({"status": "error"}), 500
 
 if __name__ == '__main__':
