@@ -50,6 +50,103 @@ else:
 TEST_TELEGRAM_CHAT_ID = os.getenv("TEST_TELEGRAM_CHAT_ID")
 TEST_WHATSAPP_NUMBER = os.getenv("TEST_WHATSAPP_NUMBER")
 
+# ============ WITHHOLDING TAX (WHT) RATES ============
+WHT_RATES = {
+    "dividend": {"rate": 10, "description": "Dividend payments to shareholders"},
+    "interest": {"rate": 10, "description": "Interest payments on loans, bonds, treasury bills"},
+    "rent": {"rate": 10, "description": "Rent on land, buildings, and structures"},
+    "royalty": {"rate": 10, "description": "Royalty payments for intellectual property"},
+    "directors_fees": {"rate": 10, "description": "Directors fees and sitting allowances"},
+    "consultancy": {"rate": 10, "description": "Professional, management, and technical services"},
+    "construction": {"rate": 5, "description": "Construction and building contracts"},
+    "contracts": {"rate": 5, "description": "Supply and service contracts"},
+    "commission": {"rate": 10, "description": "Commission and agency fees"},
+    "transport": {"rate": 3, "description": "Haulage and transportation services"},
+    "management": {"rate": 10, "description": "Management and technical services"},
+}
+
+WHT_CATEGORIES = {
+    "individual": {"resident": 10, "non_resident": 10},
+    "corporate": {"resident": 10, "non_resident": 10},
+}
+
+def calculate_withholding_tax(amount, transaction_type, is_individual=True):
+    """Calculate Withholding Tax based on transaction type"""
+    
+    rate_info = WHT_RATES.get(transaction_type.lower(), WHT_RATES["consultancy"])
+    rate = rate_info["rate"]
+    
+    # Special rates for certain transactions
+    if transaction_type.lower() == "construction" or transaction_type.lower() == "contracts":
+        if amount > 5000000:
+            rate = 10  # Higher rate for large contracts
+    
+    wht_amount = (amount * rate) / 100
+    
+    return {
+        "amount": round(amount, 2),
+        "transaction_type": transaction_type,
+        "rate": rate,
+        "description": rate_info["description"],
+        "wht_amount": round(wht_amount, 2),
+        "payment_after_wht": round(amount - wht_amount, 2),
+        "is_individual": is_individual
+    }
+
+def get_wht_rates_summary():
+    """Get summary of all WHT rates"""
+    message = """
+📊 *WITHHOLDING TAX (WHT) RATES - NIGERIA*
+
+*10% Rate:*
+• Dividend payments
+• Interest payments
+• Rent and lease payments
+• Royalty payments
+• Directors fees
+• Consultancy services
+• Commission and agency fees
+• Management services
+
+*5% Rate:*
+• Construction contracts
+• Supply and service contracts
+
+*3% Rate:*
+• Haulage and transportation
+
+*Exemptions:*
+• Interest on certain government bonds
+• Dividends from companies under pioneer status
+• Payments below ₦2,000 (individuals) / ₦10,000 (corporate)
+
+💡 *File WHT returns by 21st of following month*
+"""
+    return message
+
+def get_wht_calculation_examples():
+    """Provide examples of WHT calculations"""
+    return """
+📝 *WHT CALCULATION EXAMPLES*
+
+*Example 1: Consultancy Fee*
+Company pays ₦500,000 to consultant
+WHT @10% = ₦50,000
+Net payment = ₦450,000
+
+*Example 2: Construction Contract*
+Contract amount ₦8,000,000
+WHT @5% = ₦400,000
+Net payment = ₦7,600,000
+
+*Example 3: Rent Payment*
+Annual rent ₦3,000,000
+WHT @10% = ₦300,000
+Net payment = ₦2,700,000
+
+💡 *Credit WHT against CIT liability at year end*
+"""
+
 # ============ SALARY COMPARISON SESSIONS ============
 user_comparison_sessions = {}
 
@@ -85,40 +182,26 @@ class ComparisonSession:
         message = """
 📊 *SALARY COMPARISON REPORT*
 
-Compare net pay, taxes, and deductions across different salary levels:
-
 """
         for i, s in enumerate(self.salaries, 1):
             message += f"""
-*Option {i}:* ₦{s['salary']:,.0f} monthly
-   • Monthly Tax: ₦{s['monthly_tax']:,.0f}
-   • Pension (8%): ₦{s['pension']:,.0f}
-   • NHF (2.5%): ₦{s['nhf']:,.0f}
-   • Net Pay: *₦{s['net_pay']:,.0f}*
-   • Effective Rate: {s['effective_rate']}%
+*Option {i}:* ₦{s['salary']:,.0f}
+   • Tax: ₦{s['monthly_tax']:,.0f}
+   • Net: *₦{s['net_pay']:,.0f}*
+   • Rate: {s['effective_rate']}%
 """
         
-        # Best net pay
         best = max(self.salaries, key=lambda x: x['net_pay'])
-        # Lowest tax rate
-        lowest_tax = min(self.salaries, key=lambda x: x['effective_rate'])
-        
         message += f"""
-📈 *Insights:*
-• Best net pay: ₦{best['salary']:,.0f} → ₦{best['net_pay']:,.0f} take-home
-• Lowest tax rate: {lowest_tax['effective_rate']}% at ₦{lowest_tax['salary']:,.0f}
-
-💡 *Tip:* For every ₦100 increase in salary, you lose about {((best['effective_rate'] + lowest_tax['effective_rate'])/2):.0f}% to taxes.
+💡 *Best net pay:* ₦{best['salary']:,.0f} → ₦{best['net_pay']:,.0f}
 """
         return message
-    
-    def get_summary(self):
-        return f"Comparing {len(self.salaries)} salary scenarios"
 
 # ============ TAX DEADLINES ============
 TAX_DEADLINES = [
     {"name": "PAYE Monthly Remittance", "day": 14, "description": "PAYE taxes deducted in previous month must be remitted to FIRS"},
     {"name": "VAT Filing", "day": 21, "description": "Monthly VAT returns filing deadline"},
+    {"name": "WHT Filing", "day": 21, "description": "Monthly WHT returns filing deadline"},
     {"name": "Company Income Tax (Q1)", "month": 4, "day": 30, "description": "First quarter CIT filing"},
     {"name": "Company Income Tax (Q2)", "month": 7, "day": 31, "description": "Second quarter CIT filing"},
     {"name": "Company Income Tax (Q3)", "month": 10, "day": 31, "description": "Third quarter CIT filing"},
@@ -136,45 +219,45 @@ TAX_QUIZ_QUESTIONS = [
     },
     {
         "id": 2,
-        "question": "What is the Consolidated Relief Allowance (CRA) minimum amount?",
-        "options": ["₦100,000", "₦150,000", "₦200,000", "₦250,000"],
+        "question": "What is the WHT rate for consultancy services?",
+        "options": ["5%", "7.5%", "10%", "12.5%"],
         "correct": 2,
-        "explanation": "CRA minimum is ₦200,000 OR 1% of gross income - whichever is higher."
+        "explanation": "Consultancy services attract 10% Withholding Tax."
     },
     {
         "id": 3,
-        "question": "What percentage of monthly salary goes to Pension (employee contribution)?",
+        "question": "What percentage of monthly salary goes to Pension?",
         "options": ["5%", "6%", "7%", "8%"],
         "correct": 3,
         "explanation": "Employees contribute 8% of monthly basic salary to pension."
     },
     {
         "id": 4,
-        "question": "What is the CIT rate for large companies (turnover > ₦100M)?",
+        "question": "What is the CIT rate for large companies?",
         "options": ["20%", "25%", "30%", "35%"],
         "correct": 2,
         "explanation": "Large companies pay 30% CIT + 3% Education Tax + 1% IT Levy."
     },
     {
         "id": 5,
-        "question": "By which date must PAYE be remitted to FIRS monthly?",
+        "question": "By which date must PAYE be remitted?",
         "options": ["7th", "14th", "21st", "30th"],
         "correct": 1,
         "explanation": "PAYE remittance is due by the 14th of the following month."
     },
     {
         "id": 6,
-        "question": "What is the NHF (National Housing Fund) contribution rate?",
-        "options": ["1.5%", "2.0%", "2.5%", "3.0%"],
-        "correct": 2,
-        "explanation": "NHF contribution is 2.5% of monthly basic salary."
+        "question": "What is the WHT rate for construction contracts?",
+        "options": ["3%", "5%", "7.5%", "10%"],
+        "correct": 1,
+        "explanation": "Construction contracts attract 5% WHT (10% for contracts >₦5M)."
     },
     {
         "id": 7,
-        "question": "Which of these items is VAT EXEMPT in Nigeria?",
-        "options": ["Electronics", "Cars", "Medical products", "Furniture"],
+        "question": "What is the NHF contribution rate?",
+        "options": ["1.5%", "2.0%", "2.5%", "3.0%"],
         "correct": 2,
-        "explanation": "Medical and pharmaceutical products are VAT exempt."
+        "explanation": "NHF contribution is 2.5% of monthly basic salary."
     },
     {
         "id": 8,
@@ -185,14 +268,14 @@ TAX_QUIZ_QUESTIONS = [
     },
     {
         "id": 9,
-        "question": "Small companies (turnover < ₦25M) are exempt from which tax?",
-        "options": ["PAYE", "VAT", "CIT", "NHF"],
+        "question": "What is the WHT rate for dividend payments?",
+        "options": ["5%", "7.5%", "10%", "12.5%"],
         "correct": 2,
-        "explanation": "Small companies are exempt from CIT but must file nil returns."
+        "explanation": "Dividend payments attract 10% Withholding Tax."
     },
     {
         "id": 10,
-        "question": "Education Tax is what percentage of assessable profit?",
+        "question": "Education Tax is what percentage?",
         "options": ["2%", "2.5%", "3%", "4%"],
         "correct": 2,
         "explanation": "Education Tax is 3% of assessable profit for all companies."
@@ -269,7 +352,7 @@ def get_tax_learning_material(topic):
 📚 *LEARNING: PAYE (Pay-As-You-Earn)*
 
 *What is PAYE?*
-PAYE is tax deducted from employees' salaries by employers.
+PAYE is tax deducted from employees' salaries.
 
 *Tax Rates (Annual):*
 • ₦0 - ₦300,000: 7%
@@ -280,8 +363,8 @@ PAYE is tax deducted from employees' salaries by employers.
 • Above ₦3,200,000: 24%
 
 *Deductions:*
-• Pension (8% of basic)
-• NHF (2.5% of basic)
+• Pension (8%)
+• NHF (2.5%)
 • CRA (₦200,000 or 1% + 20% of gross)
 """,
         "cit": """
@@ -316,6 +399,24 @@ Consumption tax on goods and services at 7.5%.
 *Exempt:* Medical, food, education
 
 *Deadline:* 21st of following month
+""",
+        "wht": """
+📚 *LEARNING: WHT (Withholding Tax)*
+
+*What is WHT?*
+Tax deducted at source from payments to suppliers, contractors, and service providers.
+
+*Common Rates:*
+• 10%: Consultancy, rent, interest, dividend, royalty
+• 5%: Construction, supply contracts
+• 3%: Transportation, haulage
+
+*Key Points:*
+• File by 21st of following month
+• Can be credited against CIT
+• Exemption for payments below thresholds
+
+*File WHT returns using Form 1*
 """
     }
     return materials.get(topic, materials["paye"])
@@ -414,6 +515,7 @@ def get_user_stats(user_id):
             "paye_count": 0,
             "cit_count": 0,
             "vat_count": 0,
+            "wht_count": 0,
             "quiz_count": 0,
             "compare_count": 0
         }
@@ -426,6 +528,8 @@ def get_user_stats(user_id):
                 stats["cit_count"] += 1
             elif calc_type == "vat":
                 stats["vat_count"] += 1
+            elif calc_type == "wht":
+                stats["wht_count"] += 1
             elif calc_type == "quiz":
                 stats["quiz_count"] += 1
             elif calc_type == "compare":
@@ -591,62 +695,138 @@ def calculate_vat_liability(input_vat, output_vat):
         "status": status
     }
 
+# ============ WITHHOLDING TAX (WHT) CALCULATION ============
+def calculate_withholding_tax(amount, transaction_type, is_individual=True):
+    """Calculate Withholding Tax based on transaction type"""
+    
+    rate_info = WHT_RATES.get(transaction_type.lower(), WHT_RATES["consultancy"])
+    rate = rate_info["rate"]
+    
+    # Special rates for certain transactions
+    if transaction_type.lower() in ["construction", "contracts"]:
+        if amount > 5000000:
+            rate = 10  # Higher rate for large contracts
+    
+    wht_amount = (amount * rate) / 100
+    
+    return {
+        "amount": round(amount, 2),
+        "transaction_type": transaction_type,
+        "rate": rate,
+        "description": rate_info["description"],
+        "wht_amount": round(wht_amount, 2),
+        "payment_after_wht": round(amount - wht_amount, 2),
+        "is_individual": is_individual
+    }
+
+def get_wht_rates_summary():
+    """Get summary of all WHT rates"""
+    return """
+📊 *WITHHOLDING TAX (WHT) RATES*
+
+*10% Rate:*
+• Dividend payments
+• Interest payments
+• Rent and lease
+• Royalty payments
+• Directors fees
+• Consultancy services
+• Commission and agency
+• Management services
+
+*5% Rate:*
+• Construction contracts
+• Supply and service contracts
+
+*3% Rate:*
+• Haulage and transportation
+
+*Exemptions:*
+• Individual payments < ₦2,000
+• Corporate payments < ₦10,000
+• Certain government bonds
+
+💡 *File WHT returns by 21st of following month*
+"""
+
+def get_wht_calculation_examples():
+    """Provide examples of WHT calculations"""
+    return """
+📝 *WHT CALCULATION EXAMPLES*
+
+*Example 1: Consultancy Fee*
+Amount: ₦500,000
+WHT @10%: ₦50,000
+Net payment: ₦450,000
+
+*Example 2: Construction*
+Amount: ₦8,000,000
+WHT @5%: ₦400,000
+Net payment: ₦7,600,000
+
+*Example 3: Rent*
+Amount: ₦3,000,000
+WHT @10%: ₦300,000
+Net payment: ₦2,700,000
+
+💡 *Credit WHT against CIT liability*
+"""
+
 # ============ FORMATTING FUNCTIONS ============
 def format_paye_summary(data):
     return f"""
-🇳🇬 *NIGERIA PAYE TAX SUMMARY*
+🇳🇬 *PAYE TAX SUMMARY*
 
-📊 *Monthly Gross:* ₦{data['monthly_gross']:,.2f}
-📈 *Annual Gross:* ₦{data['annual_gross']:,.2f}
-
-📋 *Monthly Deductions:*
-• Pension (8%): ₦{data['pension']:,.2f}
-• NHF (2.5%): ₦{data['nhf']:,.2f}
-• CRA Relief: ₦{data['cra']:,.2f}
-
-🎯 *Chargeable Income:* ₦{data['chargeable_income_monthly']:,.2f}
-
-🧾 *Tax Due:*
-• Monthly Tax: ₦{data['monthly_tax']:,.2f}
-• Effective Rate: {data['effective_rate']}%
-
-💵 *Net Monthly Take-home:* ₦{data['net_pay']:,.2f}
+📊 Gross: ₦{data['monthly_gross']:,.0f}
+📋 Pension: ₦{data['pension']:,.0f}
+📋 NHF: ₦{data['nhf']:,.0f}
+🧾 Tax: ₦{data['monthly_tax']:,.0f}
+💵 Net: *₦{data['net_pay']:,.0f}*
+📊 Rate: {data['effective_rate']}%
 """
 
 def format_cit_summary(data):
-    tax_rate_display = f"{data['tax_rate'] * 100:.0f}%" if data['tax_rate'] > 0 else "Exempt (0%)"
+    tax_rate_display = f"{data['tax_rate'] * 100:.0f}%" if data['tax_rate'] > 0 else "Exempt"
     
     return f"""
-🏢 *NIGERIA COMPANY INCOME TAX (CIT)*
+🏢 *CIT SUMMARY*
 
-📊 *Annual Turnover:* ₦{data['annual_turnover']:,.2f}
-📈 *Assessable Profit:* ₦{data['assessable_profit']:,.2f}
-🏷️ *Company Size:* {data['company_size']}
-
-💰 *Tax Breakdown:*
-• CIT Due: ₦{data['cit']:,.2f} ({tax_rate_display})
-• Education Tax: ₦{data['education_tax']:,.2f}
-• IT Levy: ₦{data['it_levy']:,.2f}
-
-🧾 *Total Tax Payable:* ₦{data['total_tax']:,.2f}
+📊 Turnover: ₦{data['annual_turnover']:,.0f}
+🏷️ Size: {data['company_size']}
+💰 CIT: ₦{data['cit']:,.0f} ({tax_rate_display})
+📚 Education: ₦{data['education_tax']:,.0f}
+🧾 Total: *₦{data['total_tax']:,.0f}*
 """
 
 def format_vat_summary(data):
     if data["is_inclusive"]:
         return f"""
-🧾 *NIGERIA VAT (7.5%)*
+🧾 *VAT (7.5%)*
 
-💰 Amount (VAT Inclusive): ₦{data['original_amount']:,.2f}
-📊 VAT Amount: ₦{data['vat']:,.2f}
-📊 Amount (Exclusive): ₦{data['exclusive_amount']:,.2f}
+💰 Amount (Incl): ₦{data['original_amount']:,.0f}
+📊 VAT: ₦{data['vat']:,.0f}
+📊 Exclusive: ₦{data['exclusive_amount']:,.0f}
 """
     else:
         return f"""
-🧾 *NIGERIA VAT (7.5%)*
+🧾 *VAT (7.5%)*
 
-💰 Amount (Exclusive): ₦{data['original_amount']:,.2f}
-📊 VAT Amount: ₦{data['vat']:,.2f}
-📊 Total (Inclusive): ₦{data['total_with_vat']:,.2f}
+💰 Amount (Excl): ₦{data['original_amount']:,.0f}
+📊 VAT: ₦{data['vat']:,.0f}
+📊 Total: ₦{data['total_with_vat']:,.0f}
+"""
+
+def format_wht_summary(data):
+    return f"""
+📊 *WITHHOLDING TAX (WHT)*
+
+💰 Amount: ₦{data['amount']:,.0f}
+📋 Type: {data['transaction_type']}
+📊 Rate: {data['rate']}%
+🧾 WHT: *₦{data['wht_amount']:,.0f}*
+💵 Net Payment: ₦{data['payment_after_wht']:,.0f}
+
+📝 *Note:* Credit this WHT against CIT at year end
 """
 
 def format_history_summary(history):
@@ -663,6 +843,8 @@ def format_history_summary(history):
         elif calc_type == "QUIZ":
             result = json.loads(calc["result_data"])
             message += f"{idx}. {date} - 📚 Quiz: {result.get('score', 0)}/10\n"
+        elif calc_type == "WHT":
+            message += f"{idx}. {date} - 📊 WHT Calculation\n"
         else:
             message += f"{idx}. {date} - {calc_type}\n"
     
@@ -678,16 +860,15 @@ def format_stats_summary(stats, user_id):
 📊 *YOUR STATISTICS*
 
 📅 Joined: {joined}
-📈 Total: {stats['total_calculations']} calculations
+📈 Total: {stats['total_calculations']}
 
 *Breakdown:*
 • PAYE: {stats['paye_count']}
 • CIT: {stats['cit_count']}
 • VAT: {stats['vat_count']}
+• WHT: {stats['wht_count']}
 • 📚 Quiz: {stats['quiz_count']}
 • 📊 Compare: {stats['compare_count']}
-
-💡 Try /compare to compare salaries!
 """
 
 # ============ TAX FILING GUIDES ============
@@ -727,11 +908,26 @@ def get_vat_filing_guide():
 🔗 https://vat.firs.gov.ng
 """
 
+def get_wht_filing_guide():
+    return """
+📊 *WHT FILING GUIDE*
+
+1. Deduct WHT from eligible payments
+2. File Form 1 by 21st of following month
+3. Issue credit notes to payees
+4. Credit WHT against CIT at year end
+
+*Due Date:* 21st monthly
+
+🔗 https://e-filing.firs.gov.ng
+"""
+
 def get_filing_checklist(tax_type):
     checklists = {
         "paye": ["Payroll register", "Individual computations", "Schedule 6"],
         "cit": ["Audited accounts", "Form A & B", "Capital allowances"],
-        "vat": ["Sales register", "Purchase register", "Form 002"]
+        "vat": ["Sales register", "Purchase register", "Form 002"],
+        "wht": ["Payment schedule", "Form 1", "Credit notes"]
     }
     items = checklists.get(tax_type, checklists["paye"])
     return "📋 *CHECKLIST*\n\n" + "\n".join([f"✓ {item}" for item in items])
@@ -740,7 +936,8 @@ def get_filing_deadlines(tax_type):
     deadlines = {
         "paye": "📅 PAYE: Due by 14th monthly",
         "cit": "📅 CIT: Q1 Apr 30, Q2 Jul 31, Q3 Oct 31, Annual Mar 31",
-        "vat": "📅 VAT: Due by 21st monthly"
+        "vat": "📅 VAT: Due by 21st monthly",
+        "wht": "📅 WHT: Due by 21st monthly"
     }
     return deadlines.get(tax_type, deadlines["paye"])
 
@@ -771,6 +968,7 @@ def get_penalties_guide():
 • Late PAYE: ₦50,000 + interest
 • Late CIT: ₦500,000 + 10% of tax
 • Late VAT: ₦50,000/month
+• Late WHT: ₦50,000/month
 """
 
 # ============ MESSAGE SENDING FUNCTIONS ============
@@ -851,9 +1049,10 @@ def get_daily_tax_tip():
         "💡 Pension contributions (8%) are tax-deductible",
         "💡 VAT in Nigeria is 7.5%",
         "💡 File PAYE by 14th of each month",
+        "💡 WHT can be credited against CIT liability",
         "💡 Medical products are VAT exempt",
+        "💡 Use /wht to calculate Withholding Tax",
         "💡 Try /compare to compare salaries!",
-        "💡 Try /quiz to test your knowledge!",
     ]
     return random.choice(tips)
 
@@ -920,7 +1119,6 @@ def telegram_webhook():
         if chat_id in user_comparison_sessions:
             session = user_comparison_sessions[chat_id]
             if not session.is_full():
-                # Check if input is a number for salary addition
                 salary_match = re.search(r'[\d,]+', text.replace(',', ''))
                 if salary_match:
                     salary = float(salary_match.group())
@@ -933,19 +1131,19 @@ def telegram_webhook():
                             del user_comparison_sessions[chat_id]
                         else:
                             remaining = session.max_comparisons - len(session.salaries)
-                            send_telegram_message(chat_id, f"✅ Added ₦{salary:,.0f}\n\nAdd {remaining} more salary (or send /done to finish):")
+                            send_telegram_message(chat_id, f"✅ Added ₦{salary:,.0f}\n\nAdd {remaining} more (or send /done):")
                     else:
-                        send_telegram_message(chat_id, "Please enter a positive salary amount.")
+                        send_telegram_message(chat_id, "Enter positive amount.")
                 elif text.lower() == '/done':
                     if len(session.salaries) >= 2:
                         message = session.get_comparison_message()
                         send_telegram_message(chat_id, message)
                         log_calculation(chat_id, "compare", {"salaries": session.salaries}, {"count": len(session.salaries)})
                     else:
-                        send_telegram_message(chat_id, "Need at least 2 salaries to compare. Send more salaries!")
+                        send_telegram_message(chat_id, "Need at least 2 salaries to compare.")
                     del user_comparison_sessions[chat_id]
                 else:
-                    send_telegram_message(chat_id, f"Send a salary amount (e.g., 500000).\nAdded {len(session.salaries)} so far. Send /done when ready.")
+                    send_telegram_message(chat_id, f"Send salary amount. Added {len(session.salaries)} so far. Send /done when ready.")
                 return jsonify({"status": "ok"}), 200
         
         # ============ QUIZ HANDLER ============
@@ -984,7 +1182,7 @@ def telegram_webhook():
             welcome = """
 🇳🇬 *Nigerian Tax Bot*
 
-Your complete tax assistant!
+Complete tax assistant for Nigeria!
 
 *Features:*
 
@@ -993,24 +1191,25 @@ Your complete tax assistant!
 • /paye 500000 - PAYE
 • /cit 50000000 - CIT
 • /vat 100000 - VAT
+• /wht 500000 consultancy - WHT
 
-📊 *Compare* 🆕
+📊 *Compare*
 • /compare - Compare multiple salaries
-• See net pay side-by-side
 
 📚 *Learn*
-• /quiz - Test your knowledge
+• /quiz - Tax quiz
 • /learn - Study materials
 
 📋 *File Taxes*
 • /filepaye - PAYE guide
+• /filewht - WHT guide
 • /deadlines - Due dates
 
 👤 *Account*
 • /history - Your activity
 • /stats - Your stats
 
-💡 *Try /compare to compare salaries!*
+💡 *Try /wht to calculate Withholding Tax!*
 """
             send_telegram_message(chat_id, welcome)
             return jsonify({"status": "ok"}), 200
@@ -1025,11 +1224,12 @@ Your complete tax assistant!
 • /paye 500000 - PAYE
 • /cit 50000000 - CIT
 • /vat 100000 - Add VAT
+• /wht 500000 consultancy - WHT
+• /whtrates - WHT rates
+• /whtexamples - WHT examples
 
-*Compare* 🆕
+*Compare*
 • /compare - Start salary comparison
-• Add up to 5 salaries
-• Send /done when ready
 
 *Learn*
 • /quiz - Tax quiz
@@ -1037,6 +1237,7 @@ Your complete tax assistant!
 
 *Filing*
 • /filepaye - PAYE guide
+• /filewht - WHT guide
 • /deadlines - Due dates
 • /contacts - FIRS contacts
 
@@ -1044,8 +1245,6 @@ Your complete tax assistant!
 • /history - Your history
 • /stats - Your stats
 • /tip - Daily tip
-
-💡 *Try /compare now!*
 """
             send_telegram_message(chat_id, help_text)
             return jsonify({"status": "ok"}), 200
@@ -1059,16 +1258,13 @@ Your complete tax assistant!
             user_comparison_sessions[chat_id] = session
             
             intro = """
-📊 *SALARY COMPARISON TOOL*
+📊 *SALARY COMPARISON*
 
-Compare net pay across different salary levels!
-
-Send up to 5 salary amounts.
-I'll show you which gives the best take-home pay.
+Send up to 5 salaries to compare net pay.
 
 Example: `500000`
 
-Send your first salary amount:
+Send first salary:
 """
             send_telegram_message(chat_id, intro)
             return jsonify({"status": "ok"}), 200
@@ -1084,34 +1280,14 @@ Send your first salary amount:
             first_q = session.get_current_question()
             options_text = "\n".join([f"{i+1}. {opt}" for i, opt in enumerate(first_q['options'])])
             
-            quiz_intro = f"""
-📚 *TAX QUIZ*
-
-Question 1 of {len(session.questions)}:
-{first_q['question']}
-
-{options_text}
-
-Send answer (1-4):
-"""
-            send_telegram_message(chat_id, quiz_intro)
+            send_telegram_message(chat_id, f"📚 *TAX QUIZ*\n\nQ1: {first_q['question']}\n\n{options_text}\n\nSend answer (1-4):")
             return jsonify({"status": "ok"}), 200
         
         # /learn command
         if text == '/learn':
-            learn_menu = """
-📚 *LEARNING CENTER*
-
-/learnpaye - PAYE (Personal Tax)
-/learncit - Company Income Tax
-/learnvat - VAT
-
-💡 Study at your own pace!
-"""
-            send_telegram_message(chat_id, learn_menu)
+            send_telegram_message(chat_id, "📚 *LEARNING*\n\n/learnpaye - PAYE\n/learncit - CIT\n/learnvat - VAT\n/learnwht - WHT")
             return jsonify({"status": "ok"}), 200
         
-        # Learning commands
         if text == '/learnpaye':
             send_telegram_message(chat_id, get_tax_learning_material("paye"))
             return jsonify({"status": "ok"}), 200
@@ -1120,6 +1296,38 @@ Send answer (1-4):
             return jsonify({"status": "ok"}), 200
         if text == '/learnvat':
             send_telegram_message(chat_id, get_tax_learning_material("vat"))
+            return jsonify({"status": "ok"}), 200
+        if text == '/learnwht':
+            send_telegram_message(chat_id, get_tax_learning_material("wht"))
+            return jsonify({"status": "ok"}), 200
+        
+        # ============ WHT COMMANDS ============
+        if text == '/whtrates':
+            send_telegram_message(chat_id, get_wht_rates_summary())
+            return jsonify({"status": "ok"}), 200
+        
+        if text == '/whtexamples':
+            send_telegram_message(chat_id, get_wht_calculation_examples())
+            return jsonify({"status": "ok"}), 200
+        
+        if text == '/filewht':
+            send_telegram_message(chat_id, get_wht_filing_guide())
+            return jsonify({"status": "ok"}), 200
+        
+        if text.startswith('/wht '):
+            parts = text.split()
+            try:
+                amount = float(parts[1].replace(',', ''))
+                transaction_type = parts[2].lower() if len(parts) > 2 else "consultancy"
+                
+                if amount <= 0:
+                    send_telegram_message(chat_id, "Enter positive amount.")
+                else:
+                    data = calculate_withholding_tax(amount, transaction_type)
+                    send_telegram_message(chat_id, format_wht_summary(data))
+                    log_calculation(chat_id, "wht", {"amount": amount, "type": transaction_type}, data)
+            except (ValueError, IndexError):
+                send_telegram_message(chat_id, "Example: /wht 500000 consultancy\n\nTypes: consultancy, rent, construction, contracts, dividend, interest, royalty")
             return jsonify({"status": "ok"}), 200
         
         # Filing commands
@@ -1134,8 +1342,7 @@ Send answer (1-4):
             return jsonify({"status": "ok"}), 200
         if text == '/deadlines':
             upcoming = get_upcoming_deadlines(14)
-            msg = format_deadline_message(upcoming)
-            send_telegram_message(chat_id, msg)
+            send_telegram_message(chat_id, format_deadline_message(upcoming))
             return jsonify({"status": "ok"}), 200
         if text == '/contacts':
             send_telegram_message(chat_id, get_firs_contacts())
@@ -1147,7 +1354,7 @@ Send answer (1-4):
             send_telegram_message(chat_id, get_taxpayer_tin_guide())
             return jsonify({"status": "ok"}), 200
         if text == '/checklist':
-            send_telegram_message(chat_id, "Use /filechecklist paye, /filechecklist cit, or /filechecklist vat")
+            send_telegram_message(chat_id, "Use /filechecklist paye, cit, vat, or wht")
             return jsonify({"status": "ok"}), 200
         if text.startswith('/filechecklist '):
             parts = text.split()
@@ -1232,7 +1439,7 @@ Send answer (1-4):
                 input_vat = float(parts[1].replace(',', ''))
                 output_vat = float(parts[2].replace(',', '')) if len(parts) > 2 else 0
                 data = calculate_vat_liability(input_vat, output_vat)
-                send_telegram_message(chat_id, f"📥 Input VAT: ₦{data['input_vat']:,.2f}\n📤 Output VAT: ₦{data['output_vat']:,.2f}\n📊 Net: ₦{abs(data['net_liability']):,.2f} ({data['status']})")
+                send_telegram_message(chat_id, f"📥 Input: ₦{data['input_vat']:,.0f}\n📤 Output: ₦{data['output_vat']:,.0f}\n📊 Net: ₦{abs(data['net_liability']):,.0f} ({data['status']})")
                 log_calculation(chat_id, "vat", {"input": input_vat, "output": output_vat}, data)
             except (ValueError, IndexError):
                 send_telegram_message(chat_id, "Example: /vatliability 500000 750000")
@@ -1250,7 +1457,7 @@ Send answer (1-4):
                 send_telegram_message(chat_id, format_paye_summary(tax_data))
                 log_calculation(chat_id, "paye", {"salary": monthly_salary}, tax_data)
         else:
-            send_telegram_message(chat_id, "Send a salary amount or use /help for commands.\n\n💡 *Try /compare to compare salaries!*")
+            send_telegram_message(chat_id, "Send salary or use /help\n\n💡 Try /wht 500000 consultancy")
         
         return jsonify({"status": "ok"}), 200
         
@@ -1265,122 +1472,4 @@ def whatsapp_webhook():
         token = request.args.get('hub.verify_token')
         challenge = request.args.get('hub.challenge')
         
-        result = verify_whatsapp_webhook(mode, token, challenge)
-        if result:
-            return result, 200
-        return "Verification failed", 403
-    
-    elif request.method == 'POST':
-        try:
-            body = request.get_json()
-            from_number, message_text = process_whatsapp_message(body)
-            
-            if from_number and message_text:
-                get_or_create_user("whatsapp", from_number)
-                
-                salary_match = re.search(r'[\d,]+', message_text.replace(',', ''))
-                
-                if salary_match:
-                    salary = float(salary_match.group())
-                    if salary > 0:
-                        data = calculate_nigerian_paye(salary)
-                        send_whatsapp_message(from_number, format_paye_summary(data))
-                        log_calculation(from_number, "paye", {"salary": salary}, data)
-                elif message_text.lower() in ['/start', 'start', 'help']:
-                    response = """🇳🇬 Tax Bot
-
-Commands:
-/paye [amount] - PAYE
-/compare - Compare salaries
-/quiz - Tax quiz
-/history - Your history
-
-Try /compare!"""
-                    send_whatsapp_message(from_number, response)
-            
-            return jsonify({"status": "ok"}), 200
-        except Exception as e:
-            logging.error(f"WhatsApp error: {e}")
-            return jsonify({"status": "error"}), 500
-
-# ============ ADMIN BROADCAST ENDPOINT ============
-@app.route('/api/admin/broadcast', methods=['POST'])
-def admin_broadcast():
-    try:
-        data = request.get_json()
-        admin_key = data.get('admin_key')
-        message = data.get('message')
-        platform = data.get('platform')
-        
-        ADMIN_KEY = os.getenv("ADMIN_KEY")
-        if not ADMIN_KEY or admin_key != ADMIN_KEY:
-            return jsonify({"error": "Unauthorized"}), 401
-        
-        if not message:
-            return jsonify({"error": "Message required"}), 400
-        
-        users = []
-        if platform == 'all' or platform == 'telegram':
-            users.extend(get_all_active_users('telegram'))
-        if platform == 'all' or platform == 'whatsapp':
-            users.extend(get_all_active_users('whatsapp'))
-        
-        sent = 0
-        for user in users:
-            if user['platform'] == 'telegram':
-                if send_telegram_message(user['user_id'], message):
-                    sent += 1
-            elif user['platform'] == 'whatsapp':
-                if send_whatsapp_message(user['user_id'], message):
-                    sent += 1
-        
-        return jsonify({"status": "success", "sent": sent, "total": len(users)}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-# ============ CRON JOB ENDPOINTS ============
-
-@app.route('/api/cron/send-deadline-reminders', methods=['POST', 'GET'])
-def send_deadline_reminders():
-    try:
-        deadlines = get_upcoming_deadlines(7)
-        message = format_deadline_message(deadlines)
-        
-        if TEST_TELEGRAM_CHAT_ID and TELEGRAM_TOKEN:
-            send_telegram_message(TEST_TELEGRAM_CHAT_ID, message)
-        if TEST_WHATSAPP_NUMBER and WHATSAPP_ACCESS_TOKEN:
-            send_whatsapp_message(TEST_WHATSAPP_NUMBER, message)
-        
-        all_users = get_all_active_users()
-        broadcast_message(all_users, message, 'all')
-        
-        return jsonify({"status": "success"}), 200
-    except Exception as e:
-        return jsonify({"status": "error", "error": str(e)}), 500
-
-@app.route('/api/cron/daily-tax-tip', methods=['POST', 'GET'])
-def send_daily_tax_tip():
-    try:
-        tip = get_daily_tax_tip()
-        message = f"{tip}\n\n💡 Try /compare to compare salaries!"
-        
-        if TEST_TELEGRAM_CHAT_ID and TELEGRAM_TOKEN:
-            send_telegram_message(TEST_TELEGRAM_CHAT_ID, message)
-        if TEST_WHATSAPP_NUMBER and WHATSAPP_ACCESS_TOKEN:
-            send_whatsapp_message(TEST_WHATSAPP_NUMBER, message)
-        
-        all_users = get_all_active_users()
-        broadcast_message(all_users, message, 'all')
-        
-        return jsonify({"status": "success"}), 200
-    except Exception as e:
-        return jsonify({"status": "error", "error": str(e)}), 500
-
-@app.route('/api/cron/check-deadlines', methods=['GET'])
-def check_deadlines():
-    deadlines = get_upcoming_deadlines(30)
-    return jsonify({"deadlines": deadlines}), 200
-
-if __name__ == '__main__':
-    port = int(os.getenv('PORT', 8000))
-    app.run(host='0.0.0.0', port=port)
+        result = verify_whatsapp_webhook(mode
