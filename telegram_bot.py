@@ -50,6 +50,326 @@ else:
 TEST_TELEGRAM_CHAT_ID = os.getenv("TEST_TELEGRAM_CHAT_ID")
 TEST_WHATSAPP_NUMBER = os.getenv("TEST_WHATSAPP_NUMBER")
 
+# ============ TAX DEADLINES ============
+TAX_DEADLINES = [
+    {"name": "PAYE Monthly Remittance", "day": 14, "description": "PAYE taxes deducted in previous month must be remitted to FIRS"},
+    {"name": "VAT Filing", "day": 21, "description": "Monthly VAT returns filing deadline"},
+    {"name": "Company Income Tax (Q1)", "month": 4, "day": 30, "description": "First quarter CIT filing"},
+    {"name": "Company Income Tax (Q2)", "month": 7, "day": 31, "description": "Second quarter CIT filing"},
+    {"name": "Company Income Tax (Q3)", "month": 10, "day": 31, "description": "Third quarter CIT filing"},
+    {"name": "Annual Tax Filing", "month": 3, "day": 31, "description": "Annual individual tax filing deadline"},
+]
+
+# ============ FISCAL YEARS ============
+def get_current_fiscal_year():
+    """Get current Nigerian fiscal year (January - December)"""
+    today = datetime.now()
+    return today.year
+
+def get_tax_filing_status():
+    """Get current tax filing status for the year"""
+    today = datetime.now()
+    fiscal_year = get_current_fiscal_year()
+    
+    # Key filing dates
+    annual_due_date = datetime(fiscal_year, 3, 31)  # March 31st
+    q1_due_date = datetime(fiscal_year, 4, 30)
+    q2_due_date = datetime(fiscal_year, 7, 31)
+    q3_due_date = datetime(fiscal_year, 10, 31)
+    
+    if today > annual_due_date:
+        return f"Annual filing for {fiscal_year} is PAST DUE"
+    elif today > q3_due_date:
+        days_left = (annual_due_date - today).days
+        return f"Annual filing due in {days_left} days (March 31)"
+    elif today > q2_due_date:
+        return f"Q3 filing due {q3_due_date.strftime('%B %d')}"
+    elif today > q1_due_date:
+        return f"Q2 filing due {q2_due_date.strftime('%B %d')}"
+    else:
+        return f"Q1 filing due {q1_due_date.strftime('%B %d')}"
+
+# ============ TAX FILING ASSISTANT ============
+def get_paye_filing_guide():
+    """Step-by-step guide for PAYE filing"""
+    return """
+📋 *PAYE FILING GUIDE (Employers)*
+
+*Step 1: Calculate PAYE*
+• Compute monthly PAYE for each employee
+• Use our calculator: Send salary amount
+
+*Step 2: Deduct from Salary*
+• Deduct calculated PAYE from employee's salary
+• Also deduct Pension (8%), NHF (2.5%)
+
+*Step 3: Remit to FIRS*
+• File Schedule 6 (Monthly returns)
+• Due date: 14th of following month
+• Use FIRS e-PAYE platform
+
+*Step 4: Generate Receipt*
+• Keep payment confirmation
+• Provide employees with tax receipt
+
+*Required Documents:*
+✓ Employee payroll register
+✓ Individual tax computations
+✓ Remittance schedule
+✓ Previous month's filing
+
+🔗 *FIRS e-PAYE Portal:* https://e-paye.firs.gov.ng
+"""
+
+def get_cit_filing_guide(company_size="general"):
+    """Step-by-step guide for CIT filing"""
+    
+    if company_size == "small":
+        size_note = "Small companies (< ₦25M turnover) are exempt from CIT but must file nil returns."
+    elif company_size == "medium":
+        size_note = "Medium companies (₦25M - ₦100M) pay 20% CIT + 3% Education Tax."
+    else:
+        size_note = "Large companies (> ₦100M) pay 30% CIT + 3% Education Tax + 1% IT Levy."
+    
+    return f"""
+🏢 *CIT FILING GUIDE*
+
+{size_note}
+
+*Step 1: Calculate Taxable Profit*
+• Adjust accounting profit for tax purposes
+• Add back disallowed expenses
+• Deduct capital allowances
+
+*Step 2: Calculate CIT*
+• Apply appropriate rate (20% or 30%)
+• Add Education Tax (3%)
+• Add IT Levy if applicable
+
+*Step 3: File Returns*
+• Form A (Audited accounts)
+• Form B (Tax computation)
+• Schedule 3 (Capital allowances)
+
+*Deadlines:*
+• Q1: April 30
+• Q2: July 31
+• Q3: October 31
+• Annual: March 31 (following year)
+
+*Required Documents:*
+✓ Audited financial statements
+✓ Tax computations
+✓ Capital allowance schedule
+✓ Withholding tax schedule
+✓ PAYE remittance summary
+
+🔗 *FIRS e-Filing Portal:* https://e-filing.firs.gov.ng
+"""
+
+def get_vat_filing_guide():
+    """Step-by-step guide for VAT filing"""
+    return """
+🧾 *VAT FILING GUIDE*
+
+*Step 1: Track Sales & Purchases*
+• Record all taxable sales (Output VAT)
+• Record all taxable purchases (Input VAT)
+
+*Step 2: Calculate VAT Liability*
+• Output VAT - Input VAT = Amount to pay
+• Use /vatliability command to calculate
+
+*Step 3: File Monthly Returns*
+• Form 002 (VAT returns)
+• Due by 21st of following month
+
+*Step 4: Make Payment*
+• Pay calculated amount to FIRS
+• Generate payment receipt
+
+*VAT Rates:*
+• Standard rate: 7.5%
+• Zero-rated: 0% (Exports)
+• Exempt goods: Food, medical, education
+
+*Required Documents:*
+✓ Sales invoice register
+✓ Purchase invoice register
+✓ VAT computation sheet
+✓ Bank payment confirmation
+
+🔗 *FIRS VAT Portal:* https://vat.firs.gov.ng
+"""
+
+def get_filing_checklist(tax_type):
+    """Get document checklist for filing"""
+    checklists = {
+        "paye": [
+            "Employee payroll register for the month",
+            "Individual PAYE computations for each employee",
+            "Schedule 6 (PAYE remittance form)",
+            "Bank teller/payment confirmation",
+            "Previous month's filing reference",
+            "Employee biodata (Name, TIN, Basic salary)"
+        ],
+        "cit": [
+            "Audited financial statements",
+            "Form A (Annual returns)",
+            "Form B (Tax computation)",
+            "Schedule 3 (Capital allowances)",
+            "Withholding tax schedule for year",
+            "PAYE remittance summary for year",
+            "Auditor's report and opinion",
+            "Company TIN certificate"
+        ],
+        "vat": [
+            "Sales invoice register for the month",
+            "Purchase invoice register for the month",
+            "Form 002 (VAT returns)",
+            "Input VAT supporting invoices",
+            "Output VAT supporting invoices",
+            "Bank payment confirmation"
+        ]
+    }
+    
+    checklist = checklists.get(tax_type, checklists["paye"])
+    items = "\n".join([f"✓ {item}" for item in checklist])
+    
+    return f"""
+📋 *{tax_type.upper()} FILING CHECKLIST*
+
+{items}
+
+💡 *Tip:* Gather all documents before starting your filing to avoid delays.
+"""
+
+def get_filing_deadlines(tax_type):
+    """Get specific filing deadlines for tax type"""
+    deadlines = {
+        "paye": """
+📅 *PAYE Filing Deadlines*
+
+• *Monthly Remittance:* Due by 14th of following month
+• *Annual Returns:* Due by January 31st following tax year
+
+*Penalties for Late Filing:*
+• ₦50,000 for individuals
+• ₦500,000 for companies
+• plus interest at 21% per annum
+""",
+        "cit": """
+📅 *Company Income Tax Deadlines*
+
+• *Q1 Filing:* April 30
+• *Q2 Filing:* July 31  
+• *Q3 Filing:* October 31
+• *Annual Filing:* March 31 (following year)
+
+*Penalties for Late Filing:*
+• ₦500,000 + 10% of tax due
+• Interest at 21% per annum
+""",
+        "vat": """
+📅 *VAT Filing Deadlines*
+
+• *Monthly Filing:* Due by 21st of following month
+• *Annual Returns:* Due by January 31st
+
+*Penalties for Late Filing:*
+• ₦50,000 for each month of default
+• plus 21% interest on unpaid tax
+"""
+    }
+    
+    return deadlines.get(tax_type, deadlines["paye"])
+
+def get_firs_contacts():
+    """Get FIRS contact information"""
+    return """
+📞 *FIRS CONTACT INFORMATION*
+
+*Head Office:*
+FIRS Headquarters
+Abuja, Nigeria
+
+*Helpdesk:*
+☎️ Phone: 0700-CALL-FIRS (0700-2255-3477)
+📧 Email: helpdesk@firs.gov.ng
+
+*Regional Offices:*
+• Lagos: 01-271-4777
+• Port Harcourt: 084-461-786
+• Kano: 064-871-880
+• Enugu: 042-256-256
+
+*Online Platforms:*
+🌐 Website: https://www.firs.gov.ng
+📱 e-FIRS Portal: https://e-filing.firs.gov.ng
+💬 Twitter: @FIRSNigeria
+
+*Working Hours:*
+Monday-Friday: 8:00 AM - 4:00 PM
+"""
+
+def get_taxpayer_tin_guide():
+    """Guide for getting TIN"""
+    return """
+🆔 *HOW TO GET YOUR TIN (Tax Identification Number)*
+
+*For Individuals:*
+1. Visit nearest FIRS tax office or State IRS
+2. Complete TIN registration form
+3. Provide valid ID (National ID, Driver's License, Passport)
+4. Provide passport photograph (2 copies)
+5. Provide proof of address (Utility bill)
+
+*For Businesses:*
+1. Register business with CAC first
+2. Submit CAC registration documents
+3. Complete company TIN application
+4. Provide director's ID documents
+5. Provide business address proof
+
+*Required Documents:*
+✓ Completed application form
+✓ Valid identification
+✓ Passport photograph
+✓ Proof of address
+
+*Processing Time:* 2-5 business days
+
+💡 *TIN is FREE!* Beware of scams demanding payment.
+"""
+
+def get_penalties_guide():
+    """Guide for tax penalties"""
+    return """
+⚠️ *NIGERIAN TAX PENALTIES*
+
+*PAYE Penalties:*
+• Late remittance: ₦50,000 (individual) / ₦500,000 (company)
+• Interest: 21% per annum on unpaid amount
+• Plus 10% of tax due (default penalty)
+
+*CIT Penalties:*
+• Late filing: ₦500,000 + 10% of tax due
+• Underpayment: 21% interest per annum
+• Failure to file: ₦25,000 per month
+
+*VAT Penalties:*
+• Late filing: ₦50,000 per month
+• Late payment: 21% interest + 10% penalty
+• Non-registration: ₦50,000 + ₦5,000/day
+
+*Other Offenses:*
+• Failure to keep records: ₦50,000
+• Incorrect information: ₦100,000 - ₦500,000
+• Fraudulent returns: 100% of tax + imprisonment
+
+💡 *Avoid penalties by filing and paying on time!*
+"""
+
 # ============ DATABASE FUNCTIONS ============
 def get_or_create_user(platform, user_id, name=None):
     """Get existing user or create new one in database"""
@@ -57,13 +377,11 @@ def get_or_create_user(platform, user_id, name=None):
         return None
     
     try:
-        # Check if user exists
         response = supabase.table("users").select("*").eq("platform", platform).eq("user_id", str(user_id)).execute()
         
         if response.data:
             return response.data[0]
         else:
-            # Create new user
             new_user = {
                 "platform": platform,
                 "user_id": str(user_id),
@@ -80,7 +398,7 @@ def get_or_create_user(platform, user_id, name=None):
         return None
 
 def log_calculation(user_id, calculation_type, input_data, result_data):
-    """Log calculation to database for history and analytics"""
+    """Log calculation to database"""
     if not supabase:
         return False
     
@@ -94,7 +412,6 @@ def log_calculation(user_id, calculation_type, input_data, result_data):
         }
         supabase.table("calculations").insert(record).execute()
         
-        # Update user's total calculations count
         supabase.table("users").update({
             "total_calculations": supabase.raw("total_calculations + 1"),
             "last_active": datetime.now().isoformat()
@@ -123,10 +440,7 @@ def get_user_stats(user_id):
         return None
     
     try:
-        # Get user info
         user = supabase.table("users").select("*").eq("user_id", str(user_id)).execute()
-        
-        # Get calculation counts by type
         calculations = supabase.table("calculations").select("calculation_type").eq("user_id", str(user_id)).execute()
         
         stats = {
@@ -150,40 +464,6 @@ def get_user_stats(user_id):
         return stats
     except Exception as e:
         logging.error(f"Get stats error: {e}")
-        return None
-
-def save_user_preference(user_id, preference_key, preference_value):
-    """Save user preference (e.g., favorite salary, notification settings)"""
-    if not supabase:
-        return False
-    
-    try:
-        # Check if preference exists
-        existing = supabase.table("user_preferences").select("*").eq("user_id", str(user_id)).eq("preference_key", preference_key).execute()
-        
-        if existing.data:
-            supabase.table("user_preferences").update({"preference_value": preference_value}).eq("id", existing.data[0]["id"]).execute()
-        else:
-            supabase.table("user_preferences").insert({
-                "user_id": str(user_id),
-                "preference_key": preference_key,
-                "preference_value": preference_value
-            }).execute()
-        return True
-    except Exception as e:
-        logging.error(f"Save preference error: {e}")
-        return False
-
-def get_user_preference(user_id, preference_key):
-    """Get user preference"""
-    if not supabase:
-        return None
-    
-    try:
-        response = supabase.table("user_preferences").select("*").eq("user_id", str(user_id)).eq("preference_key", preference_key).execute()
-        return response.data[0]["preference_value"] if response.data else None
-    except Exception as e:
-        logging.error(f"Get preference error: {e}")
         return None
 
 def get_all_active_users(platform=None):
@@ -212,16 +492,6 @@ def broadcast_message(users, message, platform):
             if send_whatsapp_message(user["user_id"], message):
                 sent_count += 1
     return sent_count
-
-# ============ TAX DEADLINES ============
-TAX_DEADLINES = [
-    {"name": "PAYE Monthly Remittance", "day": 14, "description": "PAYE taxes deducted in previous month must be remitted to FIRS"},
-    {"name": "VAT Filing", "day": 21, "description": "Monthly VAT returns filing deadline"},
-    {"name": "Company Income Tax (Q1)", "month": 4, "day": 30, "description": "First quarter CIT filing"},
-    {"name": "Company Income Tax (Q2)", "month": 7, "day": 31, "description": "Second quarter CIT filing"},
-    {"name": "Company Income Tax (Q3)", "month": 10, "day": 31, "description": "Third quarter CIT filing"},
-    {"name": "Annual Tax Filing", "month": 3, "day": 31, "description": "Annual individual tax filing deadline"},
-]
 
 # ============ PAYE TAX CALCULATION ============
 def calculate_nigerian_paye(monthly_gross):
@@ -557,8 +827,9 @@ def get_daily_tax_tip():
         "💡 *Tax Tip:* Late filing penalties: ₦50,000 for individuals, ₦500,000 for companies.",
         "💡 *Tax Tip:* Small companies (turnover < ₦25M) are exempt from CIT.",
         "💡 *Tax Tip:* Education Tax is 3% of assessable profit for all companies.",
-        "💡 *Tax Tip:* Input VAT can be deducted from Output VAT - only pay the difference!",
-        "💡 *Tax Tip:* VAT returns are due by the 21st of every month.",
+        "💡 *Tax Tip:* File PAYE by 14th of each month to avoid penalties.",
+        "💡 *Tax Tip:* Keep all tax receipts for at least 6 years - FIRS can audit up to 6 years back.",
+        "💡 *Tax Tip:* You can get your TIN online at https://e-filing.firs.gov.ng",
     ]
     return random.choice(tips)
 
@@ -627,22 +898,35 @@ def telegram_webhook():
             welcome = """
 🇳🇬 *Nigerian Tax Bot*
 
-Calculate taxes for individuals, companies, and VAT.
+Calculate taxes, get filing guides, and stay compliant!
 
 *Commands:*
+
+*Calculate Taxes*
 • Send any number - Calculate PAYE tax
 • /paye 500000 - Calculate PAYE
 • /cit 50000000 - Company Income Tax
 • /vat 100000 - Calculate VAT
-• /vatin 100000 - VAT inclusive
-• /vatliability 500000 750000 - VAT liability
+
+*Filing Assistant (NEW!)*
+• /filepaye - PAYE filing guide
+• /filecit - CIT filing guide
+• /filevat - VAT filing guide
+• /checklist - Document checklist
+• /deadlines - Filing deadlines
+• /contacts - FIRS contact info
+• /gettin - How to get TIN
+• /penalties - Penalty information
+
+*Account*
 • /history - Your calculation history
 • /stats - Your usage statistics
-• /deadlines - Tax deadlines
+
+*General*
 • /tip - Daily tax tip
 • /help - Full menu
 
-Your calculations are saved to track your history!
+📋 *Tax filing season is here! Use /filepaye to start.*
 """
             send_telegram_message(chat_id, welcome)
             return jsonify({"status": "ok"}), 200
@@ -650,31 +934,105 @@ Your calculations are saved to track your history!
         # /help command
         if text == '/help':
             help_text = """
-🇳🇬 *Nigerian Tax Bot Commands*
+🇳🇬 *Nigerian Tax Bot - Full Help*
 
-*PAYE Tax (Individual)*
+*📊 Tax Calculations*
 • Send any number - Calculate PAYE
 • /paye 500000 - PAYE for ₦500,000
-
-*Company Tax (CIT)*
-• /cit 50000000 - CIT for ₦50M turnover
-
-*VAT Calculator*
+• /cit 50000000 - CIT for ₦50M
 • /vat 100000 - Add 7.5% VAT
-• /vatin 100000 - Extract VAT from total
-• /vatliability 500000 750000 - Input vs Output VAT
+• /vatin 107500 - Extract VAT
+• /vatliability 500000 750000 - VAT to pay
 
-*Account*
+*📋 Filing Assistant*
+• /filepaye - PAYE filing step-by-step
+• /filecit - CIT filing guide
+• /filevat - VAT filing guide
+• /checklist - Document checklist
+• /deadlines - Filing deadlines
+• /contacts - FIRS contact info
+• /gettin - How to get TIN
+• /penalties - Tax penalties
+
+*👤 Account*
 • /history - Your calculation history
 • /stats - Your usage statistics
 
-*General*
-• /deadlines - Tax deadlines
+*ℹ️ General*
 • /tip - Daily tax tip
+• /start - Welcome message
 
-💾 All your calculations are saved!
+💡 *New to filing? Try /filepaye first!*
 """
             send_telegram_message(chat_id, help_text)
+            return jsonify({"status": "ok"}), 200
+        
+        # ============ TAX FILING ASSISTANT COMMANDS ============
+        
+        # /filepaye command
+        if text == '/filepaye':
+            filing_status = get_tax_filing_status()
+            guide = get_paye_filing_guide()
+            send_telegram_message(chat_id, f"{guide}\n\n📊 *Current Status:* {filing_status}")
+            return jsonify({"status": "ok"}), 200
+        
+        # /filecit command
+        if text == '/filecit':
+            guide = get_cit_filing_guide()
+            send_telegram_message(chat_id, guide)
+            return jsonify({"status": "ok"}), 200
+        
+        # /filevat command
+        if text == '/filevat':
+            guide = get_vat_filing_guide()
+            send_telegram_message(chat_id, guide)
+            return jsonify({"status": "ok"}), 200
+        
+        # /checklist command
+        if text == '/checklist':
+            keyboard = """
+📋 *Select Tax Type for Checklist*
+
+/filechecklist paye - PAYE Checklist
+/filechecklist cit - CIT Checklist
+/filechecklist vat - VAT Checklist
+"""
+            send_telegram_message(chat_id, keyboard)
+            return jsonify({"status": "ok"}), 200
+        
+        # /filechecklist command
+        if text.startswith('/filechecklist '):
+            parts = text.split()
+            tax_type = parts[1].lower() if len(parts) > 1 else "paye"
+            checklist = get_filing_checklist(tax_type)
+            send_telegram_message(chat_id, checklist)
+            return jsonify({"status": "ok"}), 200
+        
+        # /deadlines command
+        if text == '/deadlines':
+            upcoming = get_upcoming_deadlines(30)
+            paye_deadlines = get_filing_deadlines("paye")
+            cit_deadlines = get_filing_deadlines("cit")
+            vat_deadlines = get_filing_deadlines("vat")
+            send_telegram_message(chat_id, f"{paye_deadlines}\n\n{cit_deadlines}\n\n{vat_deadlines}")
+            return jsonify({"status": "ok"}), 200
+        
+        # /contacts command
+        if text == '/contacts':
+            contacts = get_firs_contacts()
+            send_telegram_message(chat_id, contacts)
+            return jsonify({"status": "ok"}), 200
+        
+        # /gettin command
+        if text == '/gettin':
+            tin_guide = get_taxpayer_tin_guide()
+            send_telegram_message(chat_id, tin_guide)
+            return jsonify({"status": "ok"}), 200
+        
+        # /penalties command
+        if text == '/penalties':
+            penalties = get_penalties_guide()
+            send_telegram_message(chat_id, penalties)
             return jsonify({"status": "ok"}), 200
         
         # /history command
@@ -771,12 +1129,6 @@ Your calculations are saved to track your history!
                 send_telegram_message(chat_id, "Example: `/vatliability 500000 750000`")
             return jsonify({"status": "ok"}), 200
         
-        # /deadlines command
-        if text == '/deadlines':
-            deadlines = get_upcoming_deadlines(30)
-            send_telegram_message(chat_id, format_deadline_message(deadlines))
-            return jsonify({"status": "ok"}), 200
-        
         # /tip command
         if text == '/tip':
             send_telegram_message(chat_id, get_daily_tax_tip())
@@ -794,7 +1146,7 @@ Your calculations are saved to track your history!
                 send_telegram_message(chat_id, format_paye_summary(tax_data))
                 log_calculation(chat_id, "paye", {"salary": monthly_salary}, tax_data)
         else:
-            send_telegram_message(chat_id, "Send a salary amount or use /help for commands.")
+            send_telegram_message(chat_id, "Send a salary amount or use /help for commands.\n\n📋 *Try /filepaye for tax filing assistance!*")
         
         return jsonify({"status": "ok"}), 200
         
@@ -834,17 +1186,18 @@ def whatsapp_webhook():
                 elif message_text.lower() in ['/start', 'start', 'help']:
                     response = """🇳🇬 Nigerian Tax Bot
 
-Send your monthly salary to calculate PAYE tax.
+Calculate taxes and get filing guides!
 
 Commands:
 /paye [amount] - Calculate PAYE
 /cit [turnover] - Company tax
 /vat [amount] - Add VAT
+/filepaye - PAYE filing guide
+/filecit - CIT filing guide
+/filevat - VAT filing guide
+/deadlines - Filing deadlines
 /history - Your calculation history
-/deadlines - Tax deadlines
-/tip - Tax tips
-
-Your calculations are saved!"""
+/tip - Tax tips"""
                     send_whatsapp_message(from_number, response)
             
             return jsonify({"status": "ok"}), 200
@@ -855,14 +1208,12 @@ Your calculations are saved!"""
 # ============ ADMIN BROADCAST ENDPOINT ============
 @app.route('/api/admin/broadcast', methods=['POST'])
 def admin_broadcast():
-    """Admin endpoint to broadcast messages to all users (Protected by secret key)"""
     try:
         data = request.get_json()
         admin_key = data.get('admin_key')
         message = data.get('message')
-        platform = data.get('platform')  # 'telegram', 'whatsapp', or 'all'
+        platform = data.get('platform')
         
-        # Verify admin key from environment
         ADMIN_KEY = os.getenv("ADMIN_KEY")
         if not ADMIN_KEY or admin_key != ADMIN_KEY:
             return jsonify({"error": "Unauthorized"}), 401
@@ -900,14 +1251,12 @@ def send_deadline_reminders():
         deadlines = get_upcoming_deadlines(7)
         message = format_deadline_message(deadlines)
         
-        # Send to test users
         if TEST_TELEGRAM_CHAT_ID and TELEGRAM_TOKEN:
             send_telegram_message(TEST_TELEGRAM_CHAT_ID, message)
         
         if TEST_WHATSAPP_NUMBER and WHATSAPP_ACCESS_TOKEN:
             send_whatsapp_message(TEST_WHATSAPP_NUMBER, message)
         
-        # Broadcast to all active users
         all_users = get_all_active_users()
         broadcast_message(all_users, message, 'all')
         
@@ -919,16 +1268,14 @@ def send_deadline_reminders():
 def send_daily_tax_tip():
     try:
         tip = get_daily_tax_tip()
-        message = f"{tip}\n\nSend your salary to calculate PAYE tax!"
+        message = f"{tip}\n\nSend your salary to calculate PAYE tax!\n\n📋 Use /filepaye for filing assistance."
         
-        # Send to test users
         if TEST_TELEGRAM_CHAT_ID and TELEGRAM_TOKEN:
             send_telegram_message(TEST_TELEGRAM_CHAT_ID, message)
         
         if TEST_WHATSAPP_NUMBER and WHATSAPP_ACCESS_TOKEN:
             send_whatsapp_message(TEST_WHATSAPP_NUMBER, message)
         
-        # Broadcast to all active users
         all_users = get_all_active_users()
         broadcast_message(all_users, message, 'all')
         
@@ -939,7 +1286,7 @@ def send_daily_tax_tip():
 @app.route('/api/cron/check-deadlines', methods=['GET'])
 def check_deadlines():
     deadlines = get_upcoming_deadlines(30)
-    return jsonify({"deadlines": deadlines}), 200
+    return jsonify({"deadlines": deadlines}), 500
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 8000))
