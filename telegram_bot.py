@@ -8,11 +8,23 @@ from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 import requests
 from dotenv import load_dotenv
+from supabase import create_client, Client
 
 load_dotenv()
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
+
+# ============ SUPABASE CONFIGURATION ============
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+supabase: Client = None
+
+if SUPABASE_URL and SUPABASE_KEY:
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    logging.info("✅ Supabase connected successfully")
+else:
+    logging.warning("⚠️ Supabase not configured - database features disabled")
 
 # ============ TELEGRAM CONFIGURATION ============
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -37,6 +49,169 @@ else:
 # ============ CRON JOB TEST USERS ============
 TEST_TELEGRAM_CHAT_ID = os.getenv("TEST_TELEGRAM_CHAT_ID")
 TEST_WHATSAPP_NUMBER = os.getenv("TEST_WHATSAPP_NUMBER")
+
+# ============ DATABASE FUNCTIONS ============
+def get_or_create_user(platform, user_id, name=None):
+    """Get existing user or create new one in database"""
+    if not supabase:
+        return None
+    
+    try:
+        # Check if user exists
+        response = supabase.table("users").select("*").eq("platform", platform).eq("user_id", str(user_id)).execute()
+        
+        if response.data:
+            return response.data[0]
+        else:
+            # Create new user
+            new_user = {
+                "platform": platform,
+                "user_id": str(user_id),
+                "name": name,
+                "created_at": datetime.now().isoformat(),
+                "total_calculations": 0,
+                "is_active": True
+            }
+            result = supabase.table("users").insert(new_user).execute()
+            logging.info(f"New user created: {platform}/{user_id}")
+            return result.data[0] if result.data else None
+    except Exception as e:
+        logging.error(f"Database user error: {e}")
+        return None
+
+def log_calculation(user_id, calculation_type, input_data, result_data):
+    """Log calculation to database for history and analytics"""
+    if not supabase:
+        return False
+    
+    try:
+        record = {
+            "user_id": str(user_id),
+            "calculation_type": calculation_type,
+            "input_data": json.dumps(input_data),
+            "result_data": json.dumps(result_data),
+            "created_at": datetime.now().isoformat()
+        }
+        supabase.table("calculations").insert(record).execute()
+        
+        # Update user's total calculations count
+        supabase.table("users").update({
+            "total_calculations": supabase.raw("total_calculations + 1"),
+            "last_active": datetime.now().isoformat()
+        }).eq("user_id", str(user_id)).execute()
+        
+        return True
+    except Exception as e:
+        logging.error(f"Log calculation error: {e}")
+        return False
+
+def get_user_history(user_id, limit=10):
+    """Get user's calculation history"""
+    if not supabase:
+        return None
+    
+    try:
+        response = supabase.table("calculations").select("*").eq("user_id", str(user_id)).order("created_at", desc=True).limit(limit).execute()
+        return response.data
+    except Exception as e:
+        logging.error(f"Get history error: {e}")
+        return None
+
+def get_user_stats(user_id):
+    """Get user statistics"""
+    if not supabase:
+        return None
+    
+    try:
+        # Get user info
+        user = supabase.table("users").select("*").eq("user_id", str(user_id)).execute()
+        
+        # Get calculation counts by type
+        calculations = supabase.table("calculations").select("calculation_type").eq("user_id", str(user_id)).execute()
+        
+        stats = {
+            "total_calculations": user.data[0].get("total_calculations", 0) if user.data else 0,
+            "joined_at": user.data[0].get("created_at") if user.data else None,
+            "last_active": user.data[0].get("last_active") if user.data else None,
+            "paye_count": 0,
+            "cit_count": 0,
+            "vat_count": 0
+        }
+        
+        for calc in calculations.data:
+            calc_type = calc.get("calculation_type")
+            if calc_type == "paye":
+                stats["paye_count"] += 1
+            elif calc_type == "cit":
+                stats["cit_count"] += 1
+            elif calc_type == "vat":
+                stats["vat_count"] += 1
+        
+        return stats
+    except Exception as e:
+        logging.error(f"Get stats error: {e}")
+        return None
+
+def save_user_preference(user_id, preference_key, preference_value):
+    """Save user preference (e.g., favorite salary, notification settings)"""
+    if not supabase:
+        return False
+    
+    try:
+        # Check if preference exists
+        existing = supabase.table("user_preferences").select("*").eq("user_id", str(user_id)).eq("preference_key", preference_key).execute()
+        
+        if existing.data:
+            supabase.table("user_preferences").update({"preference_value": preference_value}).eq("id", existing.data[0]["id"]).execute()
+        else:
+            supabase.table("user_preferences").insert({
+                "user_id": str(user_id),
+                "preference_key": preference_key,
+                "preference_value": preference_value
+            }).execute()
+        return True
+    except Exception as e:
+        logging.error(f"Save preference error: {e}")
+        return False
+
+def get_user_preference(user_id, preference_key):
+    """Get user preference"""
+    if not supabase:
+        return None
+    
+    try:
+        response = supabase.table("user_preferences").select("*").eq("user_id", str(user_id)).eq("preference_key", preference_key).execute()
+        return response.data[0]["preference_value"] if response.data else None
+    except Exception as e:
+        logging.error(f"Get preference error: {e}")
+        return None
+
+def get_all_active_users(platform=None):
+    """Get all active users for broadcasting"""
+    if not supabase:
+        return []
+    
+    try:
+        query = supabase.table("users").select("user_id, platform").eq("is_active", True)
+        if platform:
+            query = query.eq("platform", platform)
+        response = query.execute()
+        return response.data
+    except Exception as e:
+        logging.error(f"Get active users error: {e}")
+        return []
+
+def broadcast_message(users, message, platform):
+    """Broadcast message to multiple users"""
+    sent_count = 0
+    for user in users:
+        if platform == "telegram":
+            if send_telegram_message(user["user_id"], message):
+                sent_count += 1
+        elif platform == "whatsapp":
+            if send_whatsapp_message(user["user_id"], message):
+                sent_count += 1
+    return sent_count
 
 # ============ TAX DEADLINES ============
 TAX_DEADLINES = [
@@ -150,21 +325,13 @@ def calculate_company_income_tax(annual_turnover, assessable_profit=None):
 
 # ============ VAT CALCULATION ============
 def calculate_vat(amount, is_inclusive=False):
-    """
-    Calculate Nigerian VAT (7.5%)
-    
-    Parameters:
-    - amount: The transaction amount
-    - is_inclusive: If True, amount already includes VAT. If False, VAT is added.
-    """
+    """Calculate Nigerian VAT (7.5%)"""
     vat_rate = 0.075
     
     if is_inclusive:
-        # Amount includes VAT, calculate VAT portion
         vat = amount * (vat_rate / (1 + vat_rate))
         exclusive_amount = amount - vat
     else:
-        # Amount excludes VAT, calculate VAT to add
         vat = amount * vat_rate
         exclusive_amount = amount
     
@@ -180,12 +347,8 @@ def calculate_vat(amount, is_inclusive=False):
     }
 
 def calculate_vat_liability(input_vat, output_vat):
-    """
-    Calculate VAT payable/refundable for businesses
-    Output VAT (collected from customers) - Input VAT (paid to suppliers)
-    """
+    """Calculate VAT payable/refundable for businesses"""
     liability = output_vat - input_vat
-    
     status = "Payable to FIRS" if liability > 0 else "Refundable" if liability < 0 else "No liability"
     
     return {
@@ -194,70 +357,6 @@ def calculate_vat_liability(input_vat, output_vat):
         "net_liability": round(liability, 2),
         "status": status
     }
-
-def format_vat_summary(data):
-    """Format VAT calculation for display"""
-    if data["is_inclusive"]:
-        return f"""
-🧾 *NIGERIA VAT CALCULATOR (7.5%)*
-
-💰 *Amount (VAT Inclusive):* ₦{data['original_amount']:,.2f}
-
-📊 *Breakdown:*
-• VAT (7.5%): ₦{data['vat']:,.2f}
-• Amount (Exclusive): ₦{data['exclusive_amount']:,.2f}
-• Total (Inclusive): ₦{data['total_with_vat']:,.2f}
-
-💡 *This amount already includes VAT.*
-"""
-    else:
-        return f"""
-🧾 *NIGERIA VAT CALCULATOR (7.5%)*
-
-💰 *Amount (VAT Exclusive):* ₦{data['original_amount']:,.2f}
-
-📊 *Breakdown:*
-• VAT (7.5%): ₦{data['vat']:,.2f}
-• Total (Inclusive): ₦{data['total_with_vat']:,.2f}
-
-💡 *Add 7.5% VAT to this amount.*
-"""
-
-def format_vat_liability_summary(data):
-    return f"""
-🏢 *VAT LIABILITY CALCULATION*
-
-📥 *Input VAT (Paid):* ₦{data['input_vat']:,.2f}
-📤 *Output VAT (Collected):* ₦{data['output_vat']:,.2f}
-
-📊 *Net {data['status']}:* ₦{abs(data['net_liability']):,.2f}
-
-💡 *{'Pay to FIRS by 21st of next month' if data['net_liability'] > 0 else 'Can claim refund or carry forward' if data['net_liability'] < 0 else 'No payment needed'}*
-"""
-
-# ============ VAT EXEMPT ITEMS ============
-VAT_EXEMPT_ITEMS = [
-    "Medical and pharmaceutical products",
-    "Basic food items (rice, beans, garri, yam, etc.)",
-    "Educational materials and books",
-    "Farming equipment and machinery",
-    "Medical services",
-    "Export services",
-    "Plant and machinery for manufacturing"
-]
-
-def get_vat_exempt_items():
-    """Return list of VAT exempt items in Nigeria"""
-    exempt_list = "\n".join([f"• {item}" for item in VAT_EXEMPT_ITEMS])
-    return f"""
-📋 *VAT EXEMPT ITEMS IN NIGERIA*
-
-The following items are Zero-Rated or Exempt from VAT:
-
-{exempt_list}
-
-⚠️ *Note:* Zero-rated supplies (exports) allow VAT recovery on inputs. Exempt supplies do not.
-"""
 
 # ============ FORMATTING FUNCTIONS ============
 def format_paye_summary(data):
@@ -306,6 +405,72 @@ def format_cit_summary(data):
 📊 *Effective Rate:* {data['effective_rate']}% of turnover
 """
 
+def format_vat_summary(data):
+    if data["is_inclusive"]:
+        return f"""
+🧾 *NIGERIA VAT CALCULATOR (7.5%)*
+
+💰 *Amount (VAT Inclusive):* ₦{data['original_amount']:,.2f}
+
+📊 *Breakdown:*
+• VAT (7.5%): ₦{data['vat']:,.2f}
+• Amount (Exclusive): ₦{data['exclusive_amount']:,.2f}
+• Total (Inclusive): ₦{data['total_with_vat']:,.2f}
+"""
+    else:
+        return f"""
+🧾 *NIGERIA VAT CALCULATOR (7.5%)*
+
+💰 *Amount (VAT Exclusive):* ₦{data['original_amount']:,.2f}
+
+📊 *Breakdown:*
+• VAT (7.5%): ₦{data['vat']:,.2f}
+• Total (Inclusive): ₦{data['total_with_vat']:,.2f}
+"""
+
+def format_history_summary(history):
+    if not history:
+        return "📋 *No calculation history found.*\n\nStart calculating taxes to see your history here!"
+    
+    message = "📋 *YOUR CALCULATION HISTORY*\n\n"
+    for idx, calc in enumerate(history[:10], 1):
+        date = datetime.fromisoformat(calc["created_at"]).strftime("%b %d, %H:%M")
+        calc_type = calc["calculation_type"].upper()
+        input_data = json.loads(calc["input_data"])
+        
+        if calc_type == "PAYE":
+            message += f"{idx}. *{calc_type}* - ₦{input_data.get('salary', 0):,.0f} → ₦{json.loads(calc['result_data']).get('monthly_tax', 0):,.0f} tax\n"
+        elif calc_type == "CIT":
+            message += f"{idx}. *{calc_type}* - ₦{input_data.get('turnover', 0):,.0f} → ₦{json.loads(calc['result_data']).get('total_tax', 0):,.0f} tax\n"
+        elif calc_type == "VAT":
+            message += f"{idx}. *{calc_type}* - ₦{input_data.get('amount', 0):,.0f} → VAT ₦{json.loads(calc['result_data']).get('vat', 0):,.0f}\n"
+    
+    message += "\n📊 Use `/stats` to see your usage statistics."
+    return message
+
+def format_stats_summary(stats, user_id):
+    if not stats:
+        return "📊 *No statistics available.*\n\nMake some calculations to see your stats!"
+    
+    joined = datetime.fromisoformat(stats["joined_at"]).strftime("%b %d, %Y") if stats["joined_at"] else "Unknown"
+    
+    return f"""
+📊 *YOUR TAX BOT STATISTICS*
+
+👤 *User ID:* `{user_id[:16]}...`
+📅 *Joined:* {joined}
+🔄 *Last Active:* {stats.get('last_active', 'N/A')[:10] if stats.get('last_active') else 'N/A'}
+
+📈 *Total Calculations:* {stats['total_calculations']}
+
+*Breakdown:*
+• PAYE Calculations: {stats['paye_count']}
+• CIT Calculations: {stats['cit_count']}
+• VAT Calculations: {stats['vat_count']}
+
+💡 You're helping make Nigerian taxes easier to understand!
+"""
+
 # ============ MESSAGE SENDING FUNCTIONS ============
 def send_telegram_message(chat_id, text):
     if not TELEGRAM_TOKEN:
@@ -323,7 +488,6 @@ def send_telegram_message(chat_id, text):
 
 def send_whatsapp_message(to_number, text):
     if not WHATSAPP_ACCESS_TOKEN or not PHONE_NUMBER_ID:
-        logging.error("WhatsApp not configured")
         return False
     
     url = f"{WHATSAPP_API_URL}/{PHONE_NUMBER_ID}/messages"
@@ -333,7 +497,6 @@ def send_whatsapp_message(to_number, text):
     try:
         response = requests.post(url, json=payload, headers=headers, timeout=10)
         response.raise_for_status()
-        logging.info(f"WhatsApp sent to {to_number}")
         return True
     except Exception as e:
         logging.error(f"WhatsApp send failed: {e}")
@@ -392,13 +555,10 @@ def get_daily_tax_tip():
         "💡 *Tax Tip:* NHF contributions of 2.5% are mandatory but tax-deductible.",
         "💡 *Tax Tip:* VAT in Nigeria is 7.5% - always add to taxable goods and services.",
         "💡 *Tax Tip:* Late filing penalties: ₦50,000 for individuals, ₦500,000 for companies.",
-        "💡 *Tax Tip:* Minimum tax rule applies when chargeable income is low - you still pay 1% of gross.",
-        "💡 *Tax Tip:* Basic food items, medical products, and educational materials are VAT exempt.",
         "💡 *Tax Tip:* Small companies (turnover < ₦25M) are exempt from CIT.",
         "💡 *Tax Tip:* Education Tax is 3% of assessable profit for all companies.",
         "💡 *Tax Tip:* Input VAT can be deducted from Output VAT - only pay the difference!",
         "💡 *Tax Tip:* VAT returns are due by the 21st of every month.",
-        "💡 *Tax Tip:* Zero-rated exports allow VAT recovery - exempt supplies do not.",
     ]
     return random.choice(tips)
 
@@ -440,6 +600,7 @@ def health():
         "status": "healthy",
         "telegram": bool(TELEGRAM_TOKEN),
         "whatsapp": bool(WHATSAPP_ACCESS_TOKEN),
+        "supabase": bool(supabase),
         "timestamp": datetime.now().isoformat()
     }), 200
 
@@ -452,10 +613,14 @@ def telegram_webhook():
             return jsonify({"status": "ok"}), 200
         
         message = update['message']
-        chat_id = message['chat']['id']
+        chat_id = str(message['chat']['id'])
+        user_name = message.get('from', {}).get('first_name', 'User')
         text = message.get('text', '').strip()
         
         logging.info(f"Telegram from {chat_id}: {text}")
+        
+        # Get or create user in database
+        get_or_create_user("telegram", chat_id, user_name)
         
         # /start command
         if text == '/start':
@@ -468,15 +633,16 @@ Calculate taxes for individuals, companies, and VAT.
 • Send any number - Calculate PAYE tax
 • /paye 500000 - Calculate PAYE
 • /cit 50000000 - Company Income Tax
-• /vat 100000 - Calculate VAT (adds 7.5%)
-• /vatin 100000 - VAT inclusive (extracts VAT)
-• /vatliability 500000 750000 - Input vs Output VAT
-• /vatexempt - List VAT exempt items
+• /vat 100000 - Calculate VAT
+• /vatin 100000 - VAT inclusive
+• /vatliability 500000 750000 - VAT liability
+• /history - Your calculation history
+• /stats - Your usage statistics
 • /deadlines - Tax deadlines
 • /tip - Daily tax tip
 • /help - Full menu
 
-Try it now! Send your monthly salary.
+Your calculations are saved to track your history!
 """
             send_telegram_message(chat_id, welcome)
             return jsonify({"status": "ok"}), 200
@@ -492,26 +658,35 @@ Try it now! Send your monthly salary.
 
 *Company Tax (CIT)*
 • /cit 50000000 - CIT for ₦50M turnover
-• /cit 50000000 15000000 - With custom profit
 
 *VAT Calculator*
 • /vat 100000 - Add 7.5% VAT
 • /vatin 100000 - Extract VAT from total
 • /vatliability 500000 750000 - Input vs Output VAT
-• /vatexempt - List VAT exempt items
+
+*Account*
+• /history - Your calculation history
+• /stats - Your usage statistics
 
 *General*
-• /start - Welcome message
-• /help - This menu
 • /deadlines - Tax deadlines
 • /tip - Daily tax tip
 
-*Examples:*
-• `500000` - PAYE for ₦500,000
-• `/cit 75000000` - CIT for ₦75M
-• `/vat 250000` - VAT on ₦250,000
+💾 All your calculations are saved!
 """
             send_telegram_message(chat_id, help_text)
+            return jsonify({"status": "ok"}), 200
+        
+        # /history command
+        if text == '/history':
+            history = get_user_history(chat_id)
+            send_telegram_message(chat_id, format_history_summary(history))
+            return jsonify({"status": "ok"}), 200
+        
+        # /stats command
+        if text == '/stats':
+            stats = get_user_stats(chat_id)
+            send_telegram_message(chat_id, format_stats_summary(stats, chat_id))
             return jsonify({"status": "ok"}), 200
         
         # /paye command
@@ -524,6 +699,7 @@ Try it now! Send your monthly salary.
                 else:
                     data = calculate_nigerian_paye(salary)
                     send_telegram_message(chat_id, format_paye_summary(data))
+                    log_calculation(chat_id, "paye", {"salary": salary}, data)
             except ValueError:
                 send_telegram_message(chat_id, "Example: `/paye 500000`")
             return jsonify({"status": "ok"}), 200
@@ -540,11 +716,12 @@ Try it now! Send your monthly salary.
                 else:
                     data = calculate_company_income_tax(turnover, profit)
                     send_telegram_message(chat_id, format_cit_summary(data))
+                    log_calculation(chat_id, "cit", {"turnover": turnover, "profit": profit}, data)
             except ValueError:
-                send_telegram_message(chat_id, "Example: `/cit 50000000` or `/cit 50000000 15000000`")
+                send_telegram_message(chat_id, "Example: `/cit 50000000`")
             return jsonify({"status": "ok"}), 200
         
-        # /vat command (add VAT)
+        # /vat command
         if text.startswith('/vat '):
             parts = text.split()
             try:
@@ -554,11 +731,12 @@ Try it now! Send your monthly salary.
                 else:
                     data = calculate_vat(amount, is_inclusive=False)
                     send_telegram_message(chat_id, format_vat_summary(data))
+                    log_calculation(chat_id, "vat", {"amount": amount, "type": "exclusive"}, data)
             except ValueError:
                 send_telegram_message(chat_id, "Example: `/vat 100000`")
             return jsonify({"status": "ok"}), 200
         
-        # /vatin command (extract VAT from inclusive amount)
+        # /vatin command
         if text.startswith('/vatin '):
             parts = text.split()
             try:
@@ -568,6 +746,7 @@ Try it now! Send your monthly salary.
                 else:
                     data = calculate_vat(amount, is_inclusive=True)
                     send_telegram_message(chat_id, format_vat_summary(data))
+                    log_calculation(chat_id, "vat", {"amount": amount, "type": "inclusive"}, data)
             except ValueError:
                 send_telegram_message(chat_id, "Example: `/vatin 107500`")
             return jsonify({"status": "ok"}), 200
@@ -579,14 +758,17 @@ Try it now! Send your monthly salary.
                 input_vat = float(parts[1].replace(',', ''))
                 output_vat = float(parts[2].replace(',', '')) if len(parts) > 2 else 0
                 data = calculate_vat_liability(input_vat, output_vat)
-                send_telegram_message(chat_id, format_vat_liability_summary(data))
+                send_telegram_message(chat_id, f"""
+🏢 *VAT LIABILITY CALCULATION*
+
+📥 *Input VAT (Paid):* ₦{data['input_vat']:,.2f}
+📤 *Output VAT (Collected):* ₦{data['output_vat']:,.2f}
+
+📊 *Net {data['status']}:* ₦{abs(data['net_liability']):,.2f}
+""")
+                log_calculation(chat_id, "vat_liability", {"input_vat": input_vat, "output_vat": output_vat}, data)
             except (ValueError, IndexError):
-                send_telegram_message(chat_id, "Example: `/vatliability 500000 750000`\n(Input VAT paid, Output VAT collected)")
-            return jsonify({"status": "ok"}), 200
-        
-        # /vatexempt command
-        if text == '/vatexempt':
-            send_telegram_message(chat_id, get_vat_exempt_items())
+                send_telegram_message(chat_id, "Example: `/vatliability 500000 750000`")
             return jsonify({"status": "ok"}), 200
         
         # /deadlines command
@@ -610,6 +792,7 @@ Try it now! Send your monthly salary.
             else:
                 tax_data = calculate_nigerian_paye(monthly_salary)
                 send_telegram_message(chat_id, format_paye_summary(tax_data))
+                log_calculation(chat_id, "paye", {"salary": monthly_salary}, tax_data)
         else:
             send_telegram_message(chat_id, "Send a salary amount or use /help for commands.")
         
@@ -637,6 +820,8 @@ def whatsapp_webhook():
             from_number, message_text = process_whatsapp_message(body)
             
             if from_number and message_text:
+                get_or_create_user("whatsapp", from_number)
+                
                 salary_match = re.search(r'[\d,]+', message_text.replace(',', ''))
                 
                 if salary_match:
@@ -645,23 +830,67 @@ def whatsapp_webhook():
                         data = calculate_nigerian_paye(salary)
                         response = format_paye_summary(data)
                         send_whatsapp_message(from_number, response)
+                        log_calculation(from_number, "paye", {"salary": salary}, data)
                 elif message_text.lower() in ['/start', 'start', 'help']:
                     response = """🇳🇬 Nigerian Tax Bot
+
+Send your monthly salary to calculate PAYE tax.
 
 Commands:
 /paye [amount] - Calculate PAYE
 /cit [turnover] - Company tax
 /vat [amount] - Add VAT
-/vatin [amount] - Extract VAT
+/history - Your calculation history
 /deadlines - Tax deadlines
 /tip - Tax tips
-/vatexempt - VAT exempt items"""
+
+Your calculations are saved!"""
                     send_whatsapp_message(from_number, response)
             
             return jsonify({"status": "ok"}), 200
         except Exception as e:
             logging.error(f"WhatsApp error: {e}")
             return jsonify({"status": "error"}), 500
+
+# ============ ADMIN BROADCAST ENDPOINT ============
+@app.route('/api/admin/broadcast', methods=['POST'])
+def admin_broadcast():
+    """Admin endpoint to broadcast messages to all users (Protected by secret key)"""
+    try:
+        data = request.get_json()
+        admin_key = data.get('admin_key')
+        message = data.get('message')
+        platform = data.get('platform')  # 'telegram', 'whatsapp', or 'all'
+        
+        # Verify admin key from environment
+        ADMIN_KEY = os.getenv("ADMIN_KEY")
+        if not ADMIN_KEY or admin_key != ADMIN_KEY:
+            return jsonify({"error": "Unauthorized"}), 401
+        
+        if not message:
+            return jsonify({"error": "Message required"}), 400
+        
+        users = []
+        if platform == 'all' or platform == 'telegram':
+            telegram_users = get_all_active_users('telegram')
+            users.extend(telegram_users)
+        
+        if platform == 'all' or platform == 'whatsapp':
+            whatsapp_users = get_all_active_users('whatsapp')
+            users.extend(whatsapp_users)
+        
+        sent = 0
+        for user in users:
+            if user['platform'] == 'telegram':
+                if send_telegram_message(user['user_id'], message):
+                    sent += 1
+            elif user['platform'] == 'whatsapp':
+                if send_whatsapp_message(user['user_id'], message):
+                    sent += 1
+        
+        return jsonify({"status": "success", "sent": sent, "total": len(users)}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # ============ CRON JOB ENDPOINTS ============
 
@@ -671,11 +900,16 @@ def send_deadline_reminders():
         deadlines = get_upcoming_deadlines(7)
         message = format_deadline_message(deadlines)
         
+        # Send to test users
         if TEST_TELEGRAM_CHAT_ID and TELEGRAM_TOKEN:
             send_telegram_message(TEST_TELEGRAM_CHAT_ID, message)
         
         if TEST_WHATSAPP_NUMBER and WHATSAPP_ACCESS_TOKEN:
             send_whatsapp_message(TEST_WHATSAPP_NUMBER, message)
+        
+        # Broadcast to all active users
+        all_users = get_all_active_users()
+        broadcast_message(all_users, message, 'all')
         
         return jsonify({"status": "success", "deadlines_sent": len(deadlines)}), 200
     except Exception as e:
@@ -687,11 +921,16 @@ def send_daily_tax_tip():
         tip = get_daily_tax_tip()
         message = f"{tip}\n\nSend your salary to calculate PAYE tax!"
         
+        # Send to test users
         if TEST_TELEGRAM_CHAT_ID and TELEGRAM_TOKEN:
             send_telegram_message(TEST_TELEGRAM_CHAT_ID, message)
         
         if TEST_WHATSAPP_NUMBER and WHATSAPP_ACCESS_TOKEN:
             send_whatsapp_message(TEST_WHATSAPP_NUMBER, message)
+        
+        # Broadcast to all active users
+        all_users = get_all_active_users()
+        broadcast_message(all_users, message, 'all')
         
         return jsonify({"status": "success", "tip": tip}), 200
     except Exception as e:
