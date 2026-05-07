@@ -11,6 +11,15 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+
+# Debug logging
+if TELEGRAM_TOKEN:
+    logging.info(f"✅ TELEGRAM_TOKEN loaded. Length: {len(TELEGRAM_TOKEN)}")
+    logging.info(f"Token starts with: {TELEGRAM_TOKEN[:10]}...")
+else:
+    logging.error("❌ TELEGRAM_TOKEN NOT FOUND in environment variables!")
+    logging.error("Available env vars: " + str([k for k in os.environ.keys() if 'TOKEN' in k or 'BOT' in k]))
+
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 def calculate_nigerian_paye(monthly_gross):
@@ -103,6 +112,10 @@ def format_tax_summary(data):
 
 def send_telegram_message(chat_id, text):
     """Send message via Telegram API"""
+    if not TELEGRAM_TOKEN:
+        logging.error("Cannot send message: TELEGRAM_TOKEN is missing")
+        return False
+    
     url = f"{TELEGRAM_API_URL}/sendMessage"
     payload = {
         "chat_id": chat_id,
@@ -112,6 +125,7 @@ def send_telegram_message(chat_id, text):
     try:
         response = requests.post(url, json=payload, timeout=10)
         response.raise_for_status()
+        logging.info(f"Message sent successfully to chat_id: {chat_id}")
         return True
     except Exception as e:
         logging.error(f"Failed to send message: {e}")
@@ -129,6 +143,8 @@ def webhook():
         message = update['message']
         chat_id = message['chat']['id']
         text = message.get('text', '').strip()
+        
+        logging.info(f"Received message from chat_id {chat_id}: {text}")
         
         if text == '/start':
             welcome = """
