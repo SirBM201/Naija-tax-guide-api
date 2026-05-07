@@ -162,3 +162,5 @@ Example: 500000 or 250,000"""
         except Exception as e:
             logging.error(f"WhatsApp webhook error: {e}")
             return jsonify({"status": "error"}), 500
+
+
