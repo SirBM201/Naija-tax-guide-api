@@ -148,6 +148,117 @@ def calculate_company_income_tax(annual_turnover, assessable_profit=None):
         "effective_rate": round((total_tax / annual_turnover) * 100, 2)
     }
 
+# ============ VAT CALCULATION ============
+def calculate_vat(amount, is_inclusive=False):
+    """
+    Calculate Nigerian VAT (7.5%)
+    
+    Parameters:
+    - amount: The transaction amount
+    - is_inclusive: If True, amount already includes VAT. If False, VAT is added.
+    """
+    vat_rate = 0.075
+    
+    if is_inclusive:
+        # Amount includes VAT, calculate VAT portion
+        vat = amount * (vat_rate / (1 + vat_rate))
+        exclusive_amount = amount - vat
+    else:
+        # Amount excludes VAT, calculate VAT to add
+        vat = amount * vat_rate
+        exclusive_amount = amount
+    
+    total_with_vat = exclusive_amount + vat
+    
+    return {
+        "original_amount": round(amount, 2),
+        "vat_rate": f"{vat_rate * 100}%",
+        "vat": round(vat, 2),
+        "exclusive_amount": round(exclusive_amount, 2),
+        "total_with_vat": round(total_with_vat, 2),
+        "is_inclusive": is_inclusive
+    }
+
+def calculate_vat_liability(input_vat, output_vat):
+    """
+    Calculate VAT payable/refundable for businesses
+    Output VAT (collected from customers) - Input VAT (paid to suppliers)
+    """
+    liability = output_vat - input_vat
+    
+    status = "Payable to FIRS" if liability > 0 else "Refundable" if liability < 0 else "No liability"
+    
+    return {
+        "input_vat": round(input_vat, 2),
+        "output_vat": round(output_vat, 2),
+        "net_liability": round(liability, 2),
+        "status": status
+    }
+
+def format_vat_summary(data):
+    """Format VAT calculation for display"""
+    if data["is_inclusive"]:
+        return f"""
+🧾 *NIGERIA VAT CALCULATOR (7.5%)*
+
+💰 *Amount (VAT Inclusive):* ₦{data['original_amount']:,.2f}
+
+📊 *Breakdown:*
+• VAT (7.5%): ₦{data['vat']:,.2f}
+• Amount (Exclusive): ₦{data['exclusive_amount']:,.2f}
+• Total (Inclusive): ₦{data['total_with_vat']:,.2f}
+
+💡 *This amount already includes VAT.*
+"""
+    else:
+        return f"""
+🧾 *NIGERIA VAT CALCULATOR (7.5%)*
+
+💰 *Amount (VAT Exclusive):* ₦{data['original_amount']:,.2f}
+
+📊 *Breakdown:*
+• VAT (7.5%): ₦{data['vat']:,.2f}
+• Total (Inclusive): ₦{data['total_with_vat']:,.2f}
+
+💡 *Add 7.5% VAT to this amount.*
+"""
+
+def format_vat_liability_summary(data):
+    return f"""
+🏢 *VAT LIABILITY CALCULATION*
+
+📥 *Input VAT (Paid):* ₦{data['input_vat']:,.2f}
+📤 *Output VAT (Collected):* ₦{data['output_vat']:,.2f}
+
+📊 *Net {data['status']}:* ₦{abs(data['net_liability']):,.2f}
+
+💡 *{'Pay to FIRS by 21st of next month' if data['net_liability'] > 0 else 'Can claim refund or carry forward' if data['net_liability'] < 0 else 'No payment needed'}*
+"""
+
+# ============ VAT EXEMPT ITEMS ============
+VAT_EXEMPT_ITEMS = [
+    "Medical and pharmaceutical products",
+    "Basic food items (rice, beans, garri, yam, etc.)",
+    "Educational materials and books",
+    "Farming equipment and machinery",
+    "Medical services",
+    "Export services",
+    "Plant and machinery for manufacturing"
+]
+
+def get_vat_exempt_items():
+    """Return list of VAT exempt items in Nigeria"""
+    exempt_list = "\n".join([f"• {item}" for item in VAT_EXEMPT_ITEMS])
+    return f"""
+📋 *VAT EXEMPT ITEMS IN NIGERIA*
+
+The following items are Zero-Rated or Exempt from VAT:
+
+{exempt_list}
+
+⚠️ *Note:* Zero-rated supplies (exports) allow VAT recovery on inputs. Exempt supplies do not.
+"""
+
 # ============ FORMATTING FUNCTIONS ============
 def format_paye_summary(data):
     return f"""
@@ -279,13 +390,15 @@ def get_daily_tax_tip():
         "💡 *Tax Tip:* Consolidated Relief Allowance (CRA) = ₦200,000 OR 1% of gross + 20% of gross - whichever is higher.",
         "💡 *Tax Tip:* Pension contributions (8%) are tax-deductible. Ensure your employer remits correctly.",
         "💡 *Tax Tip:* NHF contributions of 2.5% are mandatory but tax-deductible.",
+        "💡 *Tax Tip:* VAT in Nigeria is 7.5% - always add to taxable goods and services.",
         "💡 *Tax Tip:* Late filing penalties: ₦50,000 for individuals, ₦500,000 for companies.",
         "💡 *Tax Tip:* Minimum tax rule applies when chargeable income is low - you still pay 1% of gross.",
-        "💡 *Tax Tip:* Keep receipts for donations - charitable contributions are tax-deductible in Nigeria.",
-        "💡 *Tax Tip:* Multiple income sources? You must declare all for accurate PAYE calculation.",
+        "💡 *Tax Tip:* Basic food items, medical products, and educational materials are VAT exempt.",
         "💡 *Tax Tip:* Small companies (turnover < ₦25M) are exempt from CIT.",
         "💡 *Tax Tip:* Education Tax is 3% of assessable profit for all companies.",
-        "💡 *Tax Tip:* IT Levy (1%) applies only to companies with turnover > ₦100M.",
+        "💡 *Tax Tip:* Input VAT can be deducted from Output VAT - only pay the difference!",
+        "💡 *Tax Tip:* VAT returns are due by the 21st of every month.",
+        "💡 *Tax Tip:* Zero-rated exports allow VAT recovery - exempt supplies do not.",
     ]
     return random.choice(tips)
 
@@ -349,15 +462,19 @@ def telegram_webhook():
             welcome = """
 🇳🇬 *Nigerian Tax Bot*
 
-Calculate taxes for individuals and companies.
+Calculate taxes for individuals, companies, and VAT.
 
 *Commands:*
 • Send any number - Calculate PAYE tax
-• /paye 500000 - Calculate PAYE for ₦500,000
-• /cit 50000000 - Calculate Company Income Tax
-• /deadlines - Upcoming tax deadlines
+• /paye 500000 - Calculate PAYE
+• /cit 50000000 - Company Income Tax
+• /vat 100000 - Calculate VAT (adds 7.5%)
+• /vatin 100000 - VAT inclusive (extracts VAT)
+• /vatliability 500000 750000 - Input vs Output VAT
+• /vatexempt - List VAT exempt items
+• /deadlines - Tax deadlines
 • /tip - Daily tax tip
-• /help - Full help menu
+• /help - Full menu
 
 Try it now! Send your monthly salary.
 """
@@ -377,6 +494,12 @@ Try it now! Send your monthly salary.
 • /cit 50000000 - CIT for ₦50M turnover
 • /cit 50000000 15000000 - With custom profit
 
+*VAT Calculator*
+• /vat 100000 - Add 7.5% VAT
+• /vatin 100000 - Extract VAT from total
+• /vatliability 500000 750000 - Input vs Output VAT
+• /vatexempt - List VAT exempt items
+
 *General*
 • /start - Welcome message
 • /help - This menu
@@ -386,6 +509,7 @@ Try it now! Send your monthly salary.
 *Examples:*
 • `500000` - PAYE for ₦500,000
 • `/cit 75000000` - CIT for ₦75M
+• `/vat 250000` - VAT on ₦250,000
 """
             send_telegram_message(chat_id, help_text)
             return jsonify({"status": "ok"}), 200
@@ -418,6 +542,51 @@ Try it now! Send your monthly salary.
                     send_telegram_message(chat_id, format_cit_summary(data))
             except ValueError:
                 send_telegram_message(chat_id, "Example: `/cit 50000000` or `/cit 50000000 15000000`")
+            return jsonify({"status": "ok"}), 200
+        
+        # /vat command (add VAT)
+        if text.startswith('/vat '):
+            parts = text.split()
+            try:
+                amount = float(parts[1].replace(',', ''))
+                if amount <= 0:
+                    send_telegram_message(chat_id, "Please enter a positive amount.")
+                else:
+                    data = calculate_vat(amount, is_inclusive=False)
+                    send_telegram_message(chat_id, format_vat_summary(data))
+            except ValueError:
+                send_telegram_message(chat_id, "Example: `/vat 100000`")
+            return jsonify({"status": "ok"}), 200
+        
+        # /vatin command (extract VAT from inclusive amount)
+        if text.startswith('/vatin '):
+            parts = text.split()
+            try:
+                amount = float(parts[1].replace(',', ''))
+                if amount <= 0:
+                    send_telegram_message(chat_id, "Please enter a positive amount.")
+                else:
+                    data = calculate_vat(amount, is_inclusive=True)
+                    send_telegram_message(chat_id, format_vat_summary(data))
+            except ValueError:
+                send_telegram_message(chat_id, "Example: `/vatin 107500`")
+            return jsonify({"status": "ok"}), 200
+        
+        # /vatliability command
+        if text.startswith('/vatliability '):
+            parts = text.split()
+            try:
+                input_vat = float(parts[1].replace(',', ''))
+                output_vat = float(parts[2].replace(',', '')) if len(parts) > 2 else 0
+                data = calculate_vat_liability(input_vat, output_vat)
+                send_telegram_message(chat_id, format_vat_liability_summary(data))
+            except (ValueError, IndexError):
+                send_telegram_message(chat_id, "Example: `/vatliability 500000 750000`\n(Input VAT paid, Output VAT collected)")
+            return jsonify({"status": "ok"}), 200
+        
+        # /vatexempt command
+        if text == '/vatexempt':
+            send_telegram_message(chat_id, get_vat_exempt_items())
             return jsonify({"status": "ok"}), 200
         
         # /deadlines command
@@ -479,13 +648,14 @@ def whatsapp_webhook():
                 elif message_text.lower() in ['/start', 'start', 'help']:
                     response = """🇳🇬 Nigerian Tax Bot
 
-Send your monthly salary to calculate PAYE tax.
-
 Commands:
 /paye [amount] - Calculate PAYE
 /cit [turnover] - Company tax
+/vat [amount] - Add VAT
+/vatin [amount] - Extract VAT
 /deadlines - Tax deadlines
-/tip - Tax tips"""
+/tip - Tax tips
+/vatexempt - VAT exempt items"""
                     send_whatsapp_message(from_number, response)
             
             return jsonify({"status": "ok"}), 200
