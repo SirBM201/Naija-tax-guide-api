@@ -11,6 +11,9 @@ import requests
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
+# Import subscription service for plans
+from app.services.channel_subscription_service import get_plans_list_menu
+
 load_dotenv()
 
 app = Flask(__name__)
@@ -42,9 +45,9 @@ TEST_TELEGRAM_CHAT_ID = os.getenv("TEST_TELEGRAM_CHAT_ID")
 TEST_WHATSAPP_NUMBER = os.getenv("TEST_WHATSAPP_NUMBER")
 
 # ============ USER SESSIONS ============
-user_sessions = {}  # Track user's current menu position
-user_calc_sessions = {}  # For calculator inputs
-user_ai_sessions = {}  # For AI question asking
+user_sessions = {}
+user_calc_sessions = {}
+user_ai_sessions = {}
 
 # ============ WHT RATES ============
 WHT_RATES = {
@@ -368,32 +371,6 @@ Each tax question consumes 1 credit.
 Buy more with Option 6 from main menu.
 """
 
-SUBSCRIPTION_PLANS = """
-📋 *Subscription Plans*
-
-*Free Plan* - ₦0/month
-• 5 AI questions per month
-• Basic tax calculator
-• Standard support
-
-*Pro Plan* - ₦5,000/month
-• 50 AI questions per month
-• Advanced calculator
-• Priority support
-• Export reports
-
-*Business Plan* - ₦15,000/month
-• Unlimited AI questions
-• All features
-• API access
-• Dedicated support
-
-Reply with:
-1️⃣ - Upgrade to Pro
-2️⃣ - Upgrade to Business
-3️⃣ - Back to menu
-"""
-
 LINK_ACCOUNT_MSG = """
 🔗 *Link Website Account*
 
@@ -405,17 +382,6 @@ To link your website account:
 4. Click Link Account
 
 Your bot and web account will be synced!
-"""
-
-LINK_SUCCESS_MSG = """
-✅ *Account Linked Successfully!*
-
-Your bot is now linked to your website account.
-
-You can now:
-• Use AI credits from your web account
-• Access your subscription benefits
-• Get personalized tax guidance
 """
 
 BUY_CREDITS_MSG = """
@@ -472,7 +438,6 @@ def send_message(platform, recipient, text):
 
 # ============ COMMAND PROCESSING ============
 def process_command(platform, user_id, text, user_name="User"):
-    # Get or create user
     get_or_create_user(platform, user_id, user_name)
     
     # Check for # - Save and return to main menu
@@ -528,7 +493,6 @@ def process_command(platform, user_id, text, user_name="User"):
     
     # Check for LANGUAGE command
     if text.upper() == 'LANGUAGE' or text.upper() == 'L':
-        # Language selection would go here
         send_message(platform, user_id, "🌍 Language options coming soon!")
         return True
     
@@ -594,8 +558,6 @@ Net: ₦{data['net']:,.0f}"""
     
     # Handle user in AI question mode
     if user_id in user_ai_sessions and user_ai_sessions[user_id].get('active'):
-        # This would call your AI API
-        # For now, simulate response
         send_message(platform, user_id, "🤖 *AI Response*\n\nThank you for your question. Our AI is processing it.\n\n(This will integrate with your website's AI endpoint)")
         del user_ai_sessions[user_id]
         send_message(platform, user_id, MAIN_MENU)
@@ -664,15 +626,16 @@ Tax: *₦{data['total']:,.0f}*"""
             send_message(platform, user_id, AI_QUESTION_PROMPT)
             return True
         elif text == '2':
-            # Get credits from database
-            credits = 0  # Fetch from DB
+            credits = 0
             send_message(platform, user_id, CREDITS_BALANCE_MSG.format(credits=credits))
             return True
         elif text == '3':
             send_message(platform, user_id, "📋 *Current Plan*\n\nYou are on the Free Plan.\n\nReply 4 to view upgrade options.")
             return True
         elif text == '4':
-            send_message(platform, user_id, SUBSCRIPTION_PLANS)
+            # Get subscription plans from database
+            plans_menu = get_plans_list_menu()
+            send_message(platform, user_id, plans_menu)
             return True
         elif text == '5':
             import random
@@ -709,12 +672,10 @@ Tax: *₦{data['total']:,.0f}*"""
             send_message(platform, user_id, CALCULATOR_MENU)
             return True
         elif text == '5':
-            # Salary Comparison
             send_message(platform, user_id, "*Salary Comparison*\n\nSend up to 5 salaries. Send 'done' when finished.\n\nSend salary 1:")
             user_calc_sessions[user_id] = {'type': 'compare', 'salaries': []}
             return True
         elif text == '6':
-            # Tax Quiz
             questions = [
                 {"q": "What is the current VAT rate in Nigeria?", "opt": ["5%", "7.5%", "10%", "12.5%"], "correct": 1},
                 {"q": "By which date must PAYE be remitted?", "opt": ["7th", "14th", "21st", "30th"], "correct": 1},
@@ -726,7 +687,6 @@ Tax: *₦{data['total']:,.0f}*"""
             user_calc_sessions[user_id] = {'type': 'quiz', 'correct': q['correct'], 'total': 1}
             return True
         elif text == '7':
-            # Tax Calendar
             today = datetime.now()
             cal = calendar.monthcalendar(today.year, today.month)
             month = today.strftime("%B")
@@ -745,7 +705,6 @@ Tax: *₦{data['total']:,.0f}*"""
             send_message(platform, user_id, msg)
             return True
         elif text == '8':
-            # Filing Guides
             guides = """
 📋 *Filing Guides*
 
@@ -816,7 +775,6 @@ Tax: *₦{data['total']:,.0f}*"""
             user_sessions[user_id] = {'menu': 'calculator'}
             return True
         
-        # Handle VAT amount input
         if user_id in user_calc_sessions and user_calc_sessions[user_id].get('type') in ['vat_exclusive', 'vat_inclusive']:
             try:
                 amount = float(text.replace(',', ''))
@@ -848,7 +806,6 @@ Total: ₦{data['total']:,.0f}"""
     
     # WHT CALC MENU
     elif current_menu == 'wht_calc':
-        # Handle WHT input
         if user_id not in user_calc_sessions:
             user_calc_sessions[user_id] = {'type': 'wht', 'step': 'amount'}
             send_message(platform, user_id, "Enter amount:")
@@ -914,7 +871,7 @@ Net: ₦{data['net']:,.0f}"""
                     user_calc_sessions[user_id]['salaries'] = salaries
                     total = len(salaries)
                     if total >= 5:
-                        msg = "✅ Added ₦{salary:,.0f}\n\nYou have {total}/5 salaries.\n\nType 'done' to see comparison."
+                        msg = f"✅ Added ₦{salary:,.0f}\n\nYou have {total}/5 salaries.\n\nType 'done' to see comparison."
                         send_message(platform, user_id, msg)
                     else:
                         msg = f"✅ Added ₦{salary:,.0f}\n\nSend next salary (or type 'done'):"
@@ -942,7 +899,6 @@ Net: ₦{data['net']:,.0f}"""
             send_message(platform, user_id, "Please reply with 1, 2, 3, or 4.")
         return True
     
-    # Default: Show main menu for any unrecognized input
     send_message(platform, user_id, MAIN_MENU)
     return True
 
