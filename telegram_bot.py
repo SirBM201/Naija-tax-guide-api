@@ -11,9 +11,6 @@ import requests
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
-# Import subscription service for plans
-from app.services.channel_subscription_service import get_plans_list_menu
-
 load_dotenv()
 
 app = Flask(__name__)
@@ -630,12 +627,10 @@ Tax: *₦{data['total']:,.0f}*"""
             send_message(platform, user_id, CREDITS_BALANCE_MSG.format(credits=credits))
             return True
         elif text == '3':
-            send_message(platform, user_id, "📋 *Current Plan*\n\nYou are on the Free Plan.\n\nReply 4 to view upgrade options.")
+            send_message(platform, user_id, "📋 *Current Plan*\n\nYou are on the Free Plan.\n\nUse WhatsApp bot to view upgrade options, or visit www.naijataxguides.com/plans")
             return True
         elif text == '4':
-            # Get subscription plans from database
-            plans_menu = get_plans_list_menu()
-            send_message(platform, user_id, plans_menu)
+            send_message(platform, user_id, "📋 *Subscription Plans*\n\nPlease use the WhatsApp bot to view subscription plans, or visit www.naijataxguides.com/plans\n\nSend 4 again on WhatsApp for full plan details!")
             return True
         elif text == '5':
             import random
