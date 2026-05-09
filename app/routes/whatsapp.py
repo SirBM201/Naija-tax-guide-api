@@ -168,6 +168,7 @@ QUIZ_QUESTIONS = [
     {"q": "What is the WHT rate for consultancy services?", "opt": ["5%", "7.5%", "10%", "12.5%"], "correct": 2, "exp": "Consultancy services attract 10% Withholding Tax"},
 ]
 
+<<<<<<< HEAD
 # ============ MENU FUNCTIONS ============
 
 def _send_main_menu(phone: str):
@@ -208,6 +209,10 @@ def _send_tax_menu(phone: str):
 
 def _send_tax_calculator_menu(phone: str):
     menu = (
+=======
+def get_tax_calculator_menu():
+    return (
+>>>>>>> 5aa809ef2bfe2c6d95bde08c459f82d9b0747ce1
         "*🧮 TAX CALCULATOR*\n\n"
         "Reply with:\n"
         "1️⃣ - PAYE Tax Calculator\n"
@@ -221,6 +226,7 @@ def _send_tax_calculator_menu(phone: str):
         "💡 Global commands:\n"
         "# - Save & Menu | * - Back | 0 - Cancel | 9 - Resume"
     )
+<<<<<<< HEAD
     send_whatsapp_text(phone, menu)
 
 def _send_welcome(phone: str):
@@ -243,6 +249,25 @@ def _send_welcome(phone: str):
     send_whatsapp_text(phone, welcome)
 
 # ============ HELPER FUNCTIONS ============
+=======
+
+def get_tax_menu():
+    return (
+        "*📋 TAX FILING & MANAGEMENT*\n\n"
+        "Reply with:\n"
+        "1️⃣ - Tax Calculator (PAYE, CIT, VAT, WHT)\n"
+        "2️⃣ - File PAYE Tax\n"
+        "3️⃣ - File VAT\n"
+        "4️⃣ - File CIT\n"
+        "5️⃣ - View Filing History\n"
+        "6️⃣ - View Tax Deadlines\n"
+        "7️⃣ - Back to Main Menu\n\n"
+        "💡 Global commands:\n"
+        "# - Save & Menu | * - Back | 0 - Cancel | 9 - Resume"
+    )
+
+# ============ EXISTING FUNCTIONS (kept as is) ============
+>>>>>>> 5aa809ef2bfe2c6d95bde08c459f82d9b0747ce1
 
 def _extract_message(body: dict) -> tuple[str, str]:
     entry = (body.get("entry") or [None])[0] or {}
@@ -305,6 +330,70 @@ def _try_consume_link_code(provider_user_id: str, raw_text: str) -> dict:
 
     return {"ok": False, "reason": row.get("reason") or "consume_failed"}
 
+<<<<<<< HEAD
+=======
+
+def _send_main_menu(phone: str):
+    menu = (
+        "*🤖 Naija Tax Guide*\n\n"
+        "Reply with:\n"
+        "1️⃣ - Ask a tax question\n"
+        "2️⃣ - Check AI credits balance\n"
+        "3️⃣ - Check my subscription plan\n"
+        "4️⃣ - View subscription plans\n"
+        "5️⃣ - Link to website account\n"
+        "6️⃣ - Buy AI credits\n"
+        "7️⃣ - Tax filing & management\n"
+        "8️⃣ - Help / Menu\n\n"
+        "💡 Global commands (anytime):\n"
+        "# - Save & Menu\n"
+        "* - Back\n"
+        "0 - Cancel\n"
+        "9 - Resume"
+    )
+    send_whatsapp_text(phone, menu)
+
+
+def _send_welcome(phone: str):
+    welcome = (
+        "*Welcome to Naija Tax Guide!* ✅\n\n"
+        "I'm your AI tax assistant for Nigerian taxes.\n\n"
+        "Reply with:\n"
+        "1️⃣ - Ask a tax question\n"
+        "2️⃣ - Check AI credits\n"
+        "3️⃣ - View my plan\n"
+        "4️⃣ - View subscription plans\n"
+        "5️⃣ - Link website account\n"
+        "6️⃣ - Buy AI credits\n"
+        "7️⃣ - File taxes\n"
+        "8️⃣ - Help\n\n"
+        "💡 Global commands (anytime):\n"
+        "# - Save & Menu | * - Back | 0 - Cancel | 9 - Resume\n\n"
+        "Or just type your tax question!"
+    )
+    send_whatsapp_text(phone, welcome)
+
+
+def _parse_amount(text: str) -> float:
+    """Parse amount - handles decimals, N, ₦, commas, k, M suffix"""
+    clean = text.replace(",", "").replace("₦", "").replace("N", "").replace("n", "").replace("naira", "").strip().lower()
+    
+    if clean.endswith("k"):
+        clean = clean[:-1]
+        return float(clean) * 1000
+    
+    if clean.endswith("m"):
+        clean = clean[:-1]
+        return float(clean) * 1000000
+    
+    if "million" in clean:
+        clean = clean.replace("million", "").strip()
+        return float(clean) * 1000000
+    
+    return float(clean)
+
+
+>>>>>>> 5aa809ef2bfe2c6d95bde08c459f82d9b0747ce1
 def _get_active_filing(account_id: str):
     """Check database for any active filing"""
     try:
@@ -327,6 +416,10 @@ def _get_active_filing(account_id: str):
     
     return None
 
+<<<<<<< HEAD
+=======
+
+>>>>>>> 5aa809ef2bfe2c6d95bde08c459f82d9b0747ce1
 def _show_filing_step(phone: str, tax_type: str, step: int, inputs: dict):
     if tax_type == "paye":
         if step == 1:
@@ -358,6 +451,7 @@ def _handle_filing_history(phone: str, account_id: str):
     else:
         send_whatsapp_text(phone, "📋 No tax filings found. Reply with 2 to file PAYE tax, 3 for VAT, or 4 for CIT under Tax menu.")
 
+<<<<<<< HEAD
 def _handle_tax_calendar(phone: str):
     """Show tax calendar"""
     today = datetime.now()
@@ -611,6 +705,8 @@ def _handle_tax_calculator_menu_selection(phone: str, account_id: str, text: str
 
 # ============ FILING HANDLERS ============
 
+=======
+>>>>>>> 5aa809ef2bfe2c6d95bde08c459f82d9b0747ce1
 def _handle_paye_filing(phone: str, account_id: str, step: int, inputs: dict, text: str):
     if step == 1:
         try:
@@ -662,6 +758,10 @@ def _handle_paye_filing(phone: str, account_id: str, step: int, inputs: dict, te
     
     return False
 
+<<<<<<< HEAD
+=======
+
+>>>>>>> 5aa809ef2bfe2c6d95bde08c459f82d9b0747ce1
 def _handle_vat_filing(phone: str, account_id: str, step: int, inputs: dict, text: str):
     if step == 1:
         try:
@@ -704,6 +804,10 @@ def _handle_vat_filing(phone: str, account_id: str, step: int, inputs: dict, tex
     
     return False
 
+<<<<<<< HEAD
+=======
+
+>>>>>>> 5aa809ef2bfe2c6d95bde08c459f82d9b0747ce1
 def _handle_cit_filing(phone: str, account_id: str, step: int, inputs: dict, text: str):
     if step == 1:
         try:
@@ -799,6 +903,268 @@ def _handle_submit(phone: str, account_id: str, user_state: dict):
     delete_filing_draft(account_id, sub_context)
     user_states.pop(phone, None)
 
+<<<<<<< HEAD
+=======
+
+def _handle_filing_history(phone: str, account_id: str):
+    filings = get_user_filings(account_id, limit=10)
+    if filings:
+        msg = "📋 *Your Tax Filings*\n\n"
+        for f in filings[:5]:
+            status_emoji = "✅" if f.get('status') == 'submitted' else "⏳"
+            msg += f"{status_emoji} *{f.get('tax_type', '').upper()}*: {f.get('reference', 'N/A')}\n"
+            msg += f"   📅 {f.get('submitted_at', '')[:10]}\n\n"
+        send_whatsapp_text(phone, msg)
+    else:
+        send_whatsapp_text(phone, "📋 No tax filings found. Reply with 2 to file PAYE tax, 3 for VAT, or 4 for CIT under Tax menu.")
+
+# ============ TAX CALCULATOR HANDLERS ============
+
+def _send_tax_calculator_menu(phone: str):
+    send_whatsapp_text(phone, get_tax_calculator_menu())
+
+def _send_tax_menu(phone: str):
+    send_whatsapp_text(phone, get_tax_menu())
+
+def _handle_paye_calculator(phone: str, account_id: str, text: str, step: int = 1):
+    """Handle PAYE calculator flow"""
+    if step == 1:
+        user_states[phone] = {"context": "paye_calc", "step": 1}
+        send_whatsapp_text(phone, "💰 *PAYE Calculator*\n\nEnter your monthly salary:\n(Example: 500000 or 500k)\n\n💡 * - Back | # - Save & Menu | 0 - Cancel")
+        return True
+    else:
+        try:
+            amount = _parse_amount(text)
+            result = calculate_paye(amount)
+            msg = (f"*📊 PAYE CALCULATION RESULT*\n\n"
+                   f"💰 Monthly Gross: ₦{result['gross']:,.0f}\n"
+                   f"📈 Annual Gross: ₦{result['annual_gross']:,.0f}\n"
+                   f"📋 Pension (8%): ₦{result['pension']:,.0f}\n"
+                   f"📋 NHF (2.5%): ₦{result['nhf']:,.0f}\n"
+                   f"🧾 Monthly Tax: *₦{result['tax']:,.0f}*\n"
+                   f"🧾 Annual Tax: ₦{result['annual_tax']:,.0f}\n"
+                   f"💵 Net Pay: *₦{result['net']:,.0f}*\n"
+                   f"📊 Effective Rate: {result['rate']}%\n\n"
+                   f"Reply with another amount to calculate again,\n"
+                   f"or send * to go back to calculator menu.")
+            send_whatsapp_text(phone, msg)
+            # Stay in calculator mode for another calculation
+            return True
+        except ValueError:
+            send_whatsapp_text(phone, "❌ Invalid amount. Please enter a valid number (e.g., 500000 or 500k)")
+            return True
+
+def _handle_cit_calculator(phone: str, account_id: str, text: str, step: int = 1):
+    """Handle CIT calculator flow"""
+    if step == 1:
+        user_states[phone] = {"context": "cit_calc", "step": 1}
+        send_whatsapp_text(phone, "🏢 *CIT Calculator*\n\nEnter your company's annual turnover:\n(Example: 50000000 or 50M)\n\n💡 * - Back | # - Save & Menu | 0 - Cancel")
+        return True
+    else:
+        try:
+            amount = _parse_amount(text)
+            result = calculate_cit(amount)
+            msg = (f"*📊 CIT CALCULATION RESULT*\n\n"
+                   f"📊 Annual Turnover: ₦{result['turnover']:,.0f}\n"
+                   f"📈 Taxable Profit: ₦{result['profit']:,.0f}\n"
+                   f"🏷️ Company Size: {result['size']}\n"
+                   f"📊 Tax Rate: {result['rate']}%\n"
+                   f"🧾 CIT Payable: *₦{result['total']:,.0f}*\n\n"
+                   f"Reply with another turnover to calculate again,\n"
+                   f"or send * to go back to calculator menu.")
+            send_whatsapp_text(phone, msg)
+            return True
+        except ValueError:
+            send_whatsapp_text(phone, "❌ Invalid amount. Please enter a valid number (e.g., 50000000 or 50M)")
+            return True
+
+def _handle_vat_calculator(phone: str, account_id: str, text: str, step: int = 1):
+    """Handle VAT calculator flow"""
+    if step == 1:
+        user_states[phone] = {"context": "vat_calc", "step": 1, "substep": 1}
+        send_whatsapp_text(phone, "🧾 *VAT Calculator*\n\n1️⃣ - Add VAT (exclusive amount)\n2️⃣ - Extract VAT (inclusive amount)\n\n💡 * - Back | # - Save & Menu | 0 - Cancel")
+        return True
+    elif step == 2:
+        # User selected inclusive vs exclusive
+        if text in ["1", "2"]:
+            user_states[phone] = {"context": "vat_calc", "step": 2, "mode": "exclusive" if text == "1" else "inclusive"}
+            mode_text = "exclusive (without VAT)" if text == "1" else "inclusive (with VAT)"
+            send_whatsapp_text(phone, f"🧾 *VAT Calculator*\n\nEnter amount ({mode_text}):\n(Example: 100000)\n\n💡 * - Back | # - Save & Menu | 0 - Cancel")
+            return True
+        else:
+            send_whatsapp_text(phone, "❌ Please reply with 1 or 2")
+            return True
+    else:
+        try:
+            amount = _parse_amount(text)
+            mode = user_states[phone].get("mode", "exclusive")
+            result = calculate_vat(amount, inclusive=(mode == "inclusive"))
+            
+            if mode == "exclusive":
+                msg = (f"*📊 VAT CALCULATION RESULT*\n\n"
+                       f"💰 Amount (excl. VAT): ₦{result['amount']:,.0f}\n"
+                       f"📊 VAT (7.5%): ₦{result['vat']:,.0f}\n"
+                       f"💰 Total (incl. VAT): *₦{result['total']:,.0f}*")
+            else:
+                msg = (f"*📊 VAT CALCULATION RESULT*\n\n"
+                       f"💰 Amount (incl. VAT): ₦{result['amount']:,.0f}\n"
+                       f"📊 VAT (7.5%): ₦{result['vat']:,.0f}\n"
+                       f"💰 Amount (excl. VAT): *₦{result['exclusive']:,.0f}*")
+            
+            send_whatsapp_text(phone, msg + "\n\nReply with another amount to calculate again,\nor send * to go back to calculator menu.")
+            return True
+        except ValueError:
+            send_whatsapp_text(phone, "❌ Invalid amount. Please enter a valid number (e.g., 100000)")
+            return True
+
+def _handle_wht_calculator(phone: str, account_id: str, text: str, step: int = 1):
+    """Handle WHT calculator flow"""
+    if step == 1:
+        user_states[phone] = {"context": "wht_calc", "step": 1}
+        send_whatsapp_text(phone, "📊 *WHT Calculator*\n\nEnter the payment amount:\n(Example: 500000)\n\n💡 * - Back | # - Save & Menu | 0 - Cancel")
+        return True
+    elif step == 2:
+        # We have the amount, now ask for transaction type
+        user_states[phone] = {"context": "wht_calc", "step": 2, "amount": text}
+        send_whatsapp_text(phone, "📊 *WHT Calculator*\n\nEnter transaction type:\n\n• consultancy\n• rent\n• interest\n• dividend\n• construction\n• contracts\n• transport\n\n💡 * - Back | # - Save & Menu | 0 - Cancel")
+        return True
+    else:
+        try:
+            trans_type = text.lower()
+            if trans_type not in WHT_RATES:
+                send_whatsapp_text(phone, "❌ Invalid type. Please choose: consultancy, rent, interest, dividend, construction, contracts, transport")
+                return True
+            
+            amount = float(user_states[phone].get("amount", "0"))
+            result = calculate_wht(amount, trans_type)
+            msg = (f"*📊 WHT CALCULATION RESULT*\n\n"
+                   f"💰 Payment Amount: ₦{result['amount']:,.0f}\n"
+                   f"📋 Transaction: {trans_type}\n"
+                   f"📊 WHT Rate: {result['rate']}%\n"
+                   f"🧾 *WHT to Deduct: ₦{result['wht']:,.0f}*\n"
+                   f"💵 Net Payment: ₦{result['net']:,.0f}\n\n"
+                   f"Reply with another amount to calculate again,\n"
+                   f"or send * to go back to calculator menu.")
+            send_whatsapp_text(phone, msg)
+            # Reset to allow new calculation
+            user_states[phone] = {"context": "wht_calc", "step": 1}
+            return True
+        except:
+            send_whatsapp_text(phone, "❌ Error. Please try again.")
+            return True
+
+def _handle_salary_comparison(phone: str, account_id: str, text: str):
+    """Handle salary comparison flow"""
+    state = user_states.get(phone, {})
+    if state.get("context") != "salary_compare":
+        user_states[phone] = {"context": "salary_compare", "salaries": [], "step": 1}
+        send_whatsapp_text(phone, "📊 *Salary Comparison*\n\nSend up to 5 salaries. Send 'done' when finished.\n\nSend salary 1 (e.g., 500000):\n\n💡 * - Back | # - Save & Menu | 0 - Cancel")
+        return True
+    
+    if text.lower() == "done":
+        salaries = state.get("salaries", [])
+        if len(salaries) < 2:
+            send_whatsapp_text(phone, "❌ Need at least 2 salaries to compare. Send another salary or type 'cancel'.")
+            return True
+        result = get_comparison_result(salaries)
+        send_whatsapp_text(phone, result)
+        user_states.pop(phone, None)
+        return True
+    
+    try:
+        amount = _parse_amount(text)
+        salaries = state.get("salaries", [])
+        result = calculate_paye(amount)
+        salaries.append(result)
+        user_states[phone] = {"context": "salary_compare", "salaries": salaries, "step": len(salaries) + 1}
+        
+        if len(salaries) >= 5:
+            msg = f"✅ Added ₦{amount:,.0f}\n\nYou have 5 salaries. Type 'done' to see comparison."
+        else:
+            msg = f"✅ Added ₦{amount:,.0f}\n\nSend salary {len(salaries) + 1} (or type 'done'):"
+        send_whatsapp_text(phone, msg)
+        return True
+    except:
+        send_whatsapp_text(phone, "❌ Invalid amount. Please enter a valid number (e.g., 500000)")
+        return True
+
+def _handle_tax_quiz(phone: str, account_id: str, text: str):
+    """Handle tax quiz flow"""
+    state = user_states.get(phone, {})
+    if state.get("context") != "tax_quiz":
+        q = random.choice(QUIZ_QUESTIONS)
+        opts = "\n".join([f"{i+1}. {opt}" for i, opt in enumerate(q['opt'])])
+        user_states[phone] = {"context": "tax_quiz", "question": q, "step": 1}
+        send_whatsapp_text(phone, f"📚 *TAX QUIZ*\n\n{q['q']}\n\n{opts}\n\nReply with number (1-4):\n\n💡 * - Back | # - Save & Menu | 0 - Cancel")
+        return True
+    
+    if text in ["1", "2", "3", "4"]:
+        q = state.get("question")
+        selected = int(text) - 1
+        if selected == q['correct']:
+            send_whatsapp_text(phone, f"✅ *Correct!* {q.get('exp', 'Well done!')}\n\nSend 7 again for another quiz question!")
+        else:
+            correct_opt = q['opt'][q['correct']]
+            send_whatsapp_text(phone, f"❌ *Incorrect!* The correct answer is {correct_opt}.\n\n{q.get('exp', '')}\n\nSend 7 again for another quiz question!")
+        user_states.pop(phone, None)
+        return True
+    else:
+        send_whatsapp_text(phone, "❌ Please reply with 1, 2, 3, or 4")
+        return True
+
+def _handle_tax_calendar(phone: str):
+    """Show tax calendar"""
+    today = datetime.now()
+    month = today.month
+    year = today.year
+    month_name = ["January", "February", "March", "April", "May", "June", 
+                  "July", "August", "September", "October", "November", "December"][month - 1]
+    
+    deadlines = TAX_CALENDAR.get(month, {})
+    
+    msg = f"*📅 {month_name} {year} - Tax Calendar*\n\n"
+    
+    if deadlines:
+        for day, name in sorted(deadlines.items()):
+            msg += f"🔴 *{day} {month_name}:* {name}\n"
+        msg += "\n📌 *Upcoming Deadlines:*\n"
+        
+        # Show next 30 days deadlines
+        today_dt = datetime.now()
+        for i in range(1, 31):
+            check_date = today_dt + timedelta(days=i)
+            check_month = check_date.month
+            check_day = check_date.day
+            month_deadlines = TAX_CALENDAR.get(check_month, {})
+            if check_day in month_deadlines:
+                msg += f"📅 {check_date.strftime('%b %d')}: {month_deadlines[check_day]}\n"
+    else:
+        msg += "✅ No tax deadlines this month\n"
+    
+    send_whatsapp_text(phone, msg)
+
+def _handle_tax_calculator_menu_selection(phone: str, account_id: str, text: str):
+    """Handle selections from tax calculator menu (Options 1-8)"""
+    if text == "1":
+        _handle_paye_calculator(phone, account_id, "", step=1)
+    elif text == "2":
+        _handle_cit_calculator(phone, account_id, "", step=1)
+    elif text == "3":
+        _handle_vat_calculator(phone, account_id, "", step=1)
+    elif text == "4":
+        _handle_wht_calculator(phone, account_id, "", step=1)
+    elif text == "5":
+        _handle_salary_comparison(phone, account_id, "")
+    elif text == "6":
+        _handle_tax_quiz(phone, account_id, "")
+    elif text == "7":
+        _handle_tax_calendar(phone)
+    elif text == "8":
+        _send_tax_menu(phone)
+    else:
+        send_whatsapp_text(phone, "❌ Invalid option. Please reply with 1-8.")
+
+>>>>>>> 5aa809ef2bfe2c6d95bde08c459f82d9b0747ce1
 # ============ MAIN WEBHOOK ============
 
 @bp.route("/whatsapp/webhook", methods=["GET", "POST"])
@@ -835,7 +1201,11 @@ def wa_webhook():
             _send_welcome(from_phone)
             return jsonify({"ok": True})
         
+<<<<<<< HEAD
         # Handle email collection
+=======
+        # Handle email collection (existing)
+>>>>>>> 5aa809ef2bfe2c6d95bde08c459f82d9b0747ce1
         if user_state.get("awaiting_email"):
             email = text.strip().lower()
             pending_plan = user_state.get("pending_plan")
@@ -854,15 +1224,33 @@ def wa_webhook():
                 send_whatsapp_text(from_phone, "❌ Invalid email. Send a valid email, 'cancel' to abort, or '#' to save and exit.")
             return jsonify({"ok": True})
         
+<<<<<<< HEAD
         # Global commands
         if text == "#":
             send_whatsapp_text(from_phone, "✅ Progress saved.\n\nReturning to main menu...")
+=======
+        # ========== GLOBAL COMMANDS ==========
+        
+        if text == "#":
+            current_context = user_state.get("context")
+            if current_context in ["filing", "filing_confirm", "paye_calc", "cit_calc", "vat_calc", "wht_calc", "salary_compare", "tax_quiz"]:
+                send_whatsapp_text(from_phone, "✅ Progress saved.")
+            elif current_context:
+                send_whatsapp_text(from_phone, "✅ Progress saved.")
+            else:
+                send_whatsapp_text(from_phone, "ℹ️ Nothing to save.")
+>>>>>>> 5aa809ef2bfe2c6d95bde08c459f82d9b0747ce1
             _send_main_menu(from_phone)
             user_states.pop(from_phone, None)
             return jsonify({"ok": True})
         
         if text == "0":
+<<<<<<< HEAD
             if user_state.get("context") in ["filing", "filing_confirm"]:
+=======
+            current_context = user_state.get("context")
+            if current_context in ["filing", "filing_confirm"]:
+>>>>>>> 5aa809ef2bfe2c6d95bde08c459f82d9b0747ce1
                 delete_filing_draft(account_id, user_state.get("sub_context"))
             user_states.pop(from_phone, None)
             send_whatsapp_text(from_phone, "❌ Cancelled. All progress cleared.\n\nReply 8 for main menu.")
@@ -879,6 +1267,7 @@ def wa_webhook():
                 }
                 _show_filing_step(from_phone, active["filing_type"], active["step"], active["inputs"])
             else:
+<<<<<<< HEAD
                 send_whatsapp_text(from_phone, "📭 No saved filing found. Reply 7 then 1 to start Tax menu.")
             return jsonify({"ok": True})
         
@@ -913,11 +1302,55 @@ def wa_webhook():
                     _send_tax_menu(from_phone)
                     user_states.pop(from_phone, None)
             else:
+=======
+                send_whatsapp_text(from_phone, "📭 No saved filing found. Start a new one with 2, 3, or 4 under Tax menu.")
+            return jsonify({"ok": True})
+        
+        # Handle confirm/cancel for filing
+        if text.lower() == "confirm":
+            if user_state.get("context") == "filing_confirm":
+                _handle_submit(from_phone, account_id, user_state)
+            else:
+                send_whatsapp_text(from_phone, "No filing to confirm. Reply 7 then 1 to start Tax menu.")
+            return jsonify({"ok": True})
+        
+        if text.lower() == "cancel":
+            if user_state.get("context") in ["filing", "filing_confirm"]:
+                delete_filing_draft(account_id, user_state.get("sub_context"))
+                user_states.pop(from_phone, None)
+                send_whatsapp_text(from_phone, "❌ Filing cancelled.\n\nReply 8 for main menu.")
+            else:
+                send_whatsapp_text(from_phone, "No active filing to cancel.")
+            return jsonify({"ok": True})
+        
+        # Handle back command
+        if text == "*":
+            current_context = user_state.get("context")
+            if current_context in ["paye_calc", "cit_calc", "vat_calc", "wht_calc", "salary_compare", "tax_quiz"]:
+                _send_tax_calculator_menu(from_phone)
+                user_states.pop(from_phone, None)
+            elif current_context == "filing":
+                if user_state.get("step") and user_state.get("step") > 1:
+                    new_step = user_state.get("step") - 1
+                    user_state["step"] = new_step
+                    user_states[from_phone] = user_state
+                    _show_filing_step(from_phone, user_state.get("sub_context"), new_step, user_state.get("inputs", {}))
+                else:
+                    _send_tax_menu(from_phone)
+                    user_states.pop(from_phone, None)
+            elif current_context == "filing_confirm":
+                send_whatsapp_text(from_phone, "Type 'cancel' to abort filing.")
+            else:
+>>>>>>> 5aa809ef2bfe2c6d95bde08c459f82d9b0747ce1
                 _send_main_menu(from_phone)
                 user_states.pop(from_phone, None)
             return jsonify({"ok": True})
         
+<<<<<<< HEAD
         # Check for active filing
+=======
+        # ========== CHECK FOR ACTIVE FILING ==========
+>>>>>>> 5aa809ef2bfe2c6d95bde08c459f82d9b0747ce1
         filing_type = user_state.get("sub_context") if user_state.get("context") == "filing" else None
         step = user_state.get("step")
         inputs = user_state.get("inputs", {})
@@ -944,6 +1377,7 @@ def wa_webhook():
                 _handle_cit_filing(from_phone, account_id, step, inputs, text)
             return jsonify({"ok": True})
         
+<<<<<<< HEAD
         # Handle calculator states
         calc_context = user_state.get("context")
         
@@ -953,22 +1387,47 @@ def wa_webhook():
         
         if calc_context == "cit_calc":
             _handle_cit_calculator(from_phone, account_id, text, step=2)
+=======
+        # ========== HANDLE TAX CALCULATOR STATES ==========
+        calc_context = user_state.get("context")
+        
+        if calc_context == "paye_calc":
+            _handle_paye_calculator(from_phone, account_id, text, step=user_state.get("step", 2))
+            return jsonify({"ok": True})
+        
+        if calc_context == "cit_calc":
+            _handle_cit_calculator(from_phone, account_id, text, step=user_state.get("step", 2))
+>>>>>>> 5aa809ef2bfe2c6d95bde08c459f82d9b0747ce1
             return jsonify({"ok": True})
         
         if calc_context == "vat_calc":
             current_step = user_state.get("step", 1)
             if current_step == 1:
                 _handle_vat_calculator(from_phone, account_id, text, step=1)
+<<<<<<< HEAD
             else:
                 _handle_vat_calculator(from_phone, account_id, text, step=2)
+=======
+            elif current_step == 2:
+                _handle_vat_calculator(from_phone, account_id, text, step=2)
+            else:
+                _handle_vat_calculator(from_phone, account_id, text, step=3)
+>>>>>>> 5aa809ef2bfe2c6d95bde08c459f82d9b0747ce1
             return jsonify({"ok": True})
         
         if calc_context == "wht_calc":
             current_step = user_state.get("step", 1)
             if current_step == 1:
                 _handle_wht_calculator(from_phone, account_id, text, step=1)
+<<<<<<< HEAD
             else:
                 _handle_wht_calculator(from_phone, account_id, text, step=2)
+=======
+            elif current_step == 2:
+                _handle_wht_calculator(from_phone, account_id, text, step=2)
+            else:
+                _handle_wht_calculator(from_phone, account_id, text, step=3)
+>>>>>>> 5aa809ef2bfe2c6d95bde08c459f82d9b0747ce1
             return jsonify({"ok": True})
         
         if calc_context == "salary_compare":
@@ -979,12 +1438,23 @@ def wa_webhook():
             _handle_tax_quiz(from_phone, account_id, text)
             return jsonify({"ok": True})
         
+<<<<<<< HEAD
         # Menu navigation
         if text == "7" or text.lower() == "tax":
+=======
+        # ========== MENU NAVIGATION ==========
+        
+        # Tax Filing & Management Menu (from Option 7)
+        if text.upper() == "7" or text.lower() == "tax":
+>>>>>>> 5aa809ef2bfe2c6d95bde08c459f82d9b0747ce1
             _send_tax_menu(from_phone)
             user_states.pop(from_phone, None)
             return jsonify({"ok": True})
         
+<<<<<<< HEAD
+=======
+        # Handle Tax Menu selections (1-7)
+>>>>>>> 5aa809ef2bfe2c6d95bde08c459f82d9b0747ce1
         if user_state.get("context") == "tax_menu":
             if text in ["1", "2", "3", "4", "5", "6", "7"]:
                 if text == "1":
@@ -1010,6 +1480,10 @@ def wa_webhook():
                 send_whatsapp_text(from_phone, "❌ Invalid option. Please reply with 1-7.")
             return jsonify({"ok": True})
         
+<<<<<<< HEAD
+=======
+        # Tax Calculator Menu selections (1-8)
+>>>>>>> 5aa809ef2bfe2c6d95bde08c459f82d9b0747ce1
         if user_state.get("context") == "tax_calculator_menu":
             if text in ["1", "2", "3", "4", "5", "6", "7", "8"]:
                 _handle_tax_calculator_menu_selection(from_phone, account_id, text)
@@ -1119,5 +1593,10 @@ def wa_webhook():
         
     except Exception as e:
         logging.exception(f"WA webhook error: {e}")
+<<<<<<< HEAD
         send_whatsapp_text(from_phone if 'from_phone' in locals() else "Unknown", f"❌ Error: {str(e)[:100]}")
         return jsonify({"ok": True})
+=======
+        return jsonify({"ok": True})
+
+>>>>>>> 5aa809ef2bfe2c6d95bde08c459f82d9b0747ce1
