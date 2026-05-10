@@ -25,15 +25,6 @@ supabase: Client = None
 if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
     logging.info("✅ Supabase connected")
-    
-    # Try to disable RLS on critical tables (optional - may need admin)
-    try:
-        # Note: This might require service_role key, not anon key
-        # If you have RLS issues, run SQL in Supabase dashboard instead
-        logging.info("⚠️ RLS should be disabled manually in Supabase SQL editor")
-        logging.info("Run: ALTER TABLE ai_credit_balances DISABLE ROW LEVEL SECURITY;")
-    except Exception as e:
-        logging.warning(f"Could not disable RLS via API: {e}")
 
 # ============ WHATSAPP ============
 WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "naija-tax-guide-verify")
@@ -57,7 +48,7 @@ CREDIT_PACKAGES = {
 user_state = {}
 user_cooldown = defaultdict(float)
 
-# ============ IMPROVED CREDIT FUNCTIONS ============
+# ============ FIXED CREDIT FUNCTIONS ============
 def get_or_create_account_id(phone_number):
     """Get or create account_id for a WhatsApp user"""
     try:
@@ -93,27 +84,7 @@ def get_or_create_account_id(phone_number):
         return auth_user_id
     except Exception as e:
         logging.error(f"Error creating account: {e}")
-        # Try one more time with a different approach
-        try:
-            auth_user_id = str(uuid.uuid4())
-            supabase.table("bot_users").insert({
-                "platform": "whatsapp",
-                "user_id": str(phone_number),
-                "auth_user_id": auth_user_id,
-                "created_at": datetime.now().isoformat(),
-                "total_calculations": 0,
-                "is_active": True
-            }).execute()
-            
-            supabase.table("ai_credit_balances").insert({
-                "account_id": auth_user_id,
-                "balance": 0,
-                "updated_at": datetime.now().isoformat()
-            }).execute()
-            return auth_user_id
-        except Exception as e2:
-            logging.error(f"Second attempt failed: {e2}")
-            return None
+        return None
 
 def get_credit_balance(account_id):
     """Get current credit balance"""
@@ -127,12 +98,12 @@ def get_credit_balance(account_id):
         return 0
 
 def add_credits_topup(account_id, credits, reference):
-    """ADD credits to existing balance (TOP-UP, not replace) - With retry logic"""
+    """ADD credits to existing balance (TOP-UP, not replace) - FIXED without 'id' column"""
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            # First, check if balance record exists
-            existing = supabase.table("ai_credit_balances").select("balance, id").eq("account_id", account_id).execute()
+            # First, check if balance record exists - WITHOUT selecting 'id'
+            existing = supabase.table("ai_credit_balances").select("balance").eq("account_id", account_id).execute()
             
             if existing.data:
                 current_balance = existing.data[0].get("balance", 0)
@@ -674,7 +645,7 @@ def payment_success():
 
 @app.route('/api/billing/webhook', methods=['POST'])
 def billing_webhook():
-    """Handle Paystack webhook - IMPROVED with better error handling and notifications"""
+    """Handle Paystack webhook - FIXED with better error handling"""
     try:
         payload = request.get_json()
         if not payload:
@@ -707,6 +678,7 @@ def billing_webhook():
                         # Get updated balance
                         time.sleep(1)  # Give database time to update
                         new_balance = get_credit_balance(account_id)
+                        old_balance = new_balance - credits
                         
                         # Send detailed WhatsApp confirmation
                         confirmation_msg = f"""✅ *CREDITS ADDED SUCCESSFULLY!*
@@ -715,7 +687,7 @@ def billing_webhook():
 
 💰 Amount paid: ₦{amount:,.2f}
 🆔 Reference: {reference}
-📊 Previous balance: {new_balance - credits} credits
+📊 Previous balance: {old_balance} credits
 ✨ New balance: *{new_balance} credits*
 
 💡 Each credit = 1 AI tax question
