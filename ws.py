@@ -139,7 +139,7 @@ def add_credits_topup(account_id, credits, reference):
 def get_credit_packages_menu():
     return """💎 *Buy AI Credits*
 
-Reply with the package code:
+Reply with the package code AFTER pressing 6:
 
 T10 - 10 credits - ₦500
 T50 - 50 credits - ₦2,000
@@ -1026,9 +1026,9 @@ After successful payment, you will be redirected back to WhatsApp.
                 elif text == '2':
                     balance = get_credit_balance(account_id)
                     if balance == 0:
-                        send_whatsapp(from_number, f"💎 *AI Credits Balance*\n\nYou have *0 credits* remaining.\n\nEach credit = 1 AI tax question.\n\nTo buy credits, reply with 6.")
+                        send_whatsapp(from_number, f"💎 *AI Credits Balance*\n\nYou have *0 credits* remaining.\n\nEach credit = 1 AI tax question.\n\nTo buy credits:\n1. Press 6 to see packages\n2. Then reply with T10, T50, T100, or T500")
                     else:
-                        send_whatsapp(from_number, f"💎 *AI Credits Balance*\n\nYou have *{balance} credits* remaining.\n\nEach credit = 1 AI tax question.\n\nTo buy more credits, reply with 6.")
+                        send_whatsapp(from_number, f"💎 *AI Credits Balance*\n\nYou have *{balance} credits* remaining.\n\nEach credit = 1 AI tax question.\n\nTo buy more credits:\n1. Press 6 to see packages\n2. Then reply with T10, T50, T100, or T500")
                 elif text == '7':
                     send_whatsapp(from_number, """*📋 TAX FILING & MANAGEMENT*
 
@@ -1049,6 +1049,11 @@ Rate: {data['rate']}%"""
                     except:
                         send_whatsapp(from_number, "Send a valid number (e.g., 500000)")
                 else:
+                    # Check if user typed a T code without pressing 6 first
+                    if text.upper().strip() in ["T10", "T50", "T100", "T500"]:
+                        send_whatsapp(from_number, "💡 *To buy credits:* Press 6 first to see packages, then reply with T10, T50, T100, or T500.\n\nReply 8 for main menu.")
+                        continue
+                    
                     plans = get_all_plans()
                     result = find_plan_by_input(plans, text)
                     
