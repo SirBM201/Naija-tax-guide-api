@@ -1,7 +1,6 @@
 import os
 import re
 import logging
-import random
 from datetime import datetime
 from flask import Flask, request, jsonify
 import requests
@@ -71,40 +70,6 @@ def calculate_paye(monthly_gross):
         "rate": round(rate, 1)
     }
 
-def calculate_cit(turnover):
-    profit = turnover * 0.20
-    if turnover < 25000000:
-        rate = 0
-        size = "Small (Exempt)"
-    elif turnover <= 100000000:
-        rate = 20
-        size = "Medium"
-    else:
-        rate = 30
-        size = "Large"
-    cit = profit * rate / 100
-    education = profit * 0.03
-    total = cit + education
-    return {"turnover": turnover, "profit": profit, "size": size, "total": round(total)}
-
-def calculate_vat(amount, inclusive=False):
-    if inclusive:
-        vat = amount * 0.075 / 1.075
-        exclusive = amount - vat
-        total = amount
-    else:
-        vat = amount * 0.075
-        exclusive = amount
-        total = amount + vat
-    return {"amount": amount, "vat": round(vat), "exclusive": round(exclusive), "total": round(total)}
-
-WHT_RATES = {"consultancy": 10, "rent": 10, "interest": 10, "dividend": 10, "construction": 5, "contracts": 5, "transport": 3}
-
-def calculate_wht(amount, trans_type):
-    rate = WHT_RATES.get(trans_type, 10)
-    wht = amount * rate / 100
-    return {"amount": amount, "rate": rate, "wht": round(wht), "net": round(amount - wht)}
-
 # ============ SUBSCRIPTION PLANS ============
 def get_plans_list_menu():
     try:
@@ -114,36 +79,28 @@ def get_plans_list_menu():
         if not plans:
             return "📋 *Subscription Plans*\n\nNo plans available at the moment. Please check back later."
         
-        menu_lines = ["📋 *Subscription Plans*\n"]
+        menu_lines = ["📋 *AVAILABLE SUBSCRIPTION PLANS*\n"]
         
-        # Add Free Plan
-        menu_lines.append("*Free Plan* - ₦0/month")
-        menu_lines.append("• 5 AI questions per month")
-        menu_lines.append("• Basic tax calculator")
-        menu_lines.append("• Standard support\n")
+        # Sort by price
+        plans.sort(key=lambda x: x.get("price", 0))
         
-        # Add Starter/Pro plans (price around 5000)
-        pro_plans = [p for p in plans if p.get("price", 0) <= 6000]
-        if pro_plans:
-            menu_lines.append("*Pro Plan* - ₦5,000/month")
-            menu_lines.append("• 50 AI questions per month")
-            menu_lines.append("• Advanced calculator")
-            menu_lines.append("• Priority support")
-            menu_lines.append("• Export reports\n")
+        for idx, plan in enumerate(plans, 1):
+            name = plan.get("name", "Unknown")
+            price = plan.get("price", 0)
+            credits = plan.get("ai_credits_total", 0)
+            
+            plan_code = plan.get("plan_code", "")
+            if "yearly" in plan_code:
+                billing = "year"
+            elif "quarterly" in plan_code:
+                billing = "quarter"
+            else:
+                billing = "month"
+            
+            menu_lines.append(f"{idx}. *{name}* - ₦{price:,}/{billing} - {credits} AI credits")
         
-        # Add Business plans (price around 25000)
-        business_plans = [p for p in plans if p.get("price", 0) >= 20000]
-        if business_plans:
-            menu_lines.append("*Business Plan* - ₦15,000/month")
-            menu_lines.append("• Unlimited AI questions")
-            menu_lines.append("• All features")
-            menu_lines.append("• API access")
-            menu_lines.append("• Dedicated support\n")
-        
-        menu_lines.append("Reply with:")
-        menu_lines.append("1️⃣ - Upgrade to Pro")
-        menu_lines.append("2️⃣ - Upgrade to Business")
-        menu_lines.append("3️⃣ - Back to menu")
+        menu_lines.append("\n💡 Send plan number to subscribe")
+        menu_lines.append("0 - Cancel | # - Main Menu")
         
         return "\n".join(menu_lines)
     except Exception as e:
@@ -175,64 +132,6 @@ Type 'calc paye 500000' to calculate tax
 ---
 Reply LANGUAGE or L to change language"""
 
-def get_tax_menu():
-    return """*📋 TAX FILING & MANAGEMENT*
-
-Select an option:
-
-1️⃣ - PAYE Tax Calculator
-2️⃣ - Company Income Tax (CIT)
-3️⃣ - VAT Calculator
-4️⃣ - Withholding Tax (WHT)
-5️⃣ - Salary Comparison
-6️⃣ - Tax Quiz
-7️⃣ - Tax Calendar & Deadlines
-8️⃣ - Filing Guides & Checklists
-9️⃣ - Back to Main Menu
-
----
-Send # to save and return to main menu"""
-
-def get_calculator_menu():
-    return """*🧮 TAX CALCULATOR*
-
-Enter your calculation:
-
-*PAYE:* `calc paye 500000`
-*CIT:* `calc cit 50000000`
-*VAT:* `calc vat 100000`
-*VAT inclusive:* `calc vatin 107500`
-*WHT:* `calc wht 500000 consultancy`
-
-Or select a calculator:
-1️⃣ - PAYE
-2️⃣ - CIT
-3️⃣ - VAT
-4️⃣ - WHT
-5️⃣ - Back"""
-
-def get_help_menu():
-    return """*❓ Help - How to Use This Bot*
-
-*Main Menu:*
-• Send 1-8 to navigate the menu
-• Send # to save and return to main menu
-• Send * to go back
-• Send 0 to cancel
-• Send 9 to resume
-
-*Quick Commands:*
-• `calc paye 500000` - Calculate PAYE
-• `calc cit 50000000` - Calculate CIT
-• `calc vat 100000` - Calculate VAT
-• `calc wht 500000 consultancy` - Calculate WHT
-• `LANGUAGE` - Change language
-
-*Support:*
-• Send a question directly for AI tax assistance
-• Or select Option 1 from main menu"""
-
-# ============ SEND MESSAGE ============
 def send_whatsapp(to_phone, text):
     try:
         url = f"{WHATSAPP_API_URL}/{PHONE_NUMBER_ID}/messages"
@@ -280,91 +179,16 @@ def webhook():
                 text = msg.get('text', {}).get('body', '').strip()
                 logging.info(f"Message from {from_number}: {text}")
                 
-                # Handle quick calc command
-                calc_match = re.match(r'^calc\s+(paye|cit|vat|vatin|wht)\s+([\d,]+)(?:\s+(\w+))?', text.lower())
-                if calc_match:
-                    calc_type = calc_match.group(1)
-                    amount = float(calc_match.group(2).replace(',', ''))
-                    
-                    if calc_type == 'paye':
-                        data = calculate_paye(amount)
-                        result = f"""*PAYE SUMMARY*
-
-Gross: ₦{data['gross']:,.0f}
-Pension: ₦{data['pension']:,.0f}
-NHF: ₦{data['nhf']:,.0f}
-Tax: ₦{data['tax']:,.0f}
-Net: *₦{data['net']:,.0f}*
-Rate: {data['rate']}%"""
-                        send_whatsapp(from_number, result)
-                    elif calc_type == 'cit':
-                        data = calculate_cit(amount)
-                        result = f"""*CIT SUMMARY*
-
-Turnover: ₦{data['turnover']:,.0f}
-Profit: ₦{data['profit']:,.0f}
-Size: {data['size']}
-Tax: *₦{data['total']:,.0f}*"""
-                        send_whatsapp(from_number, result)
-                    elif calc_type == 'vat':
-                        data = calculate_vat(amount, False)
-                        result = f"""*VAT (7.5%)*
-
-Amount (excl): ₦{data['amount']:,.0f}
-VAT: ₦{data['vat']:,.0f}
-Total: ₦{data['total']:,.0f}"""
-                        send_whatsapp(from_number, result)
-                    elif calc_type == 'vatin':
-                        data = calculate_vat(amount, True)
-                        result = f"""*VAT (7.5%)*
-
-Amount (incl): ₦{data['amount']:,.0f}
-VAT: ₦{data['vat']:,.0f}
-Exclusive: ₦{data['exclusive']:,.0f}"""
-                        send_whatsapp(from_number, result)
-                    elif calc_type == 'wht':
-                        trans_type = calc_match.group(3) if calc_match.group(3) else "consultancy"
-                        data = calculate_wht(amount, trans_type)
-                        result = f"""*WITHHOLDING TAX*
-
-Amount: ₦{data['amount']:,.0f}
-Rate: {data['rate']}%
-WHT: *₦{data['wht']:,.0f}*
-Net: ₦{data['net']:,.0f}"""
-                        send_whatsapp(from_number, result)
-                    continue
-                
-                # Menu navigation
-                if text == '1':
-                    send_whatsapp(from_number, "💬 Please type your tax question.\n\n💡 # - Save & Menu | 0 - Cancel")
-                elif text == '2':
-                    send_whatsapp(from_number, "💳 *AI Credits Balance*\n\nYou have 10 credits remaining.\n\nBuy more with Option 6.")
-                elif text == '3':
-                    send_whatsapp(from_number, "📋 *Current Plan*\n\nYou are on the Free Plan.\n\nReply 4 to view upgrade options.")
-                elif text == '4':
+                if text == '4':
                     plans = get_plans_list_menu()
                     send_whatsapp(from_number, plans)
-                elif text == '5':
-                    send_whatsapp(from_number, "🔗 *Link Website Account*\n\nVisit www.naijataxguides.com/settings to link your account.")
-                elif text == '6':
-                    send_whatsapp(from_number, "💰 *Buy AI Credits*\n\nVisit www.naijataxguides.com/credits to purchase.")
-                elif text == '7':
-                    send_whatsapp(from_number, get_tax_menu())
                 elif text == '8':
-                    send_whatsapp(from_number, get_help_menu())
-                elif text == '#':
                     send_whatsapp(from_number, get_main_menu())
-                elif text == '9':
-                    send_whatsapp(from_number, get_main_menu())
-                elif text == '*':
-                    send_whatsapp(from_number, get_main_menu())
-                elif text == '0':
-                    send_whatsapp(from_number, "❌ Cancelled. Send # for main menu.")
                 elif text.isdigit() and len(text) >= 5:
                     try:
                         salary = float(text.replace(',', ''))
                         data = calculate_paye(salary)
-                        result = f"""*PAYE SUMMARY*
+                        result = f"""*PAYE RESULT*
 
 Gross: ₦{data['gross']:,.0f}
 Pension: ₦{data['pension']:,.0f}
@@ -374,7 +198,7 @@ Net: *₦{data['net']:,.0f}*
 Rate: {data['rate']}%"""
                         send_whatsapp(from_number, result)
                     except:
-                        send_whatsapp(from_number, "Please enter a valid number (e.g., 500000)")
+                        send_whatsapp(from_number, "Send a valid number")
                 else:
                     send_whatsapp(from_number, get_main_menu())
         
