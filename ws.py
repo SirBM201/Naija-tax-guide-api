@@ -86,6 +86,58 @@ def get_all_plans():
         logging.error(f"Error fetching plans: {e}")
         return []
 
+def get_user_subscription(phone_number):
+    """Get user's active subscription"""
+    try:
+        user_result = supabase.table("bot_users").select("*").eq("platform", "whatsapp").eq("user_id", str(phone_number)).execute()
+        if not user_result.data:
+            return None
+        
+        account_id = user_result.data[0].get("id")
+        
+        sub_result = supabase.table("subscriptions").select("*").eq("user_id", account_id).eq("status", "active").order("created_at", desc=True).limit(1).execute()
+        
+        if sub_result.data:
+            return sub_result.data[0]
+        return None
+    except Exception as e:
+        logging.error(f"Error getting subscription: {e}")
+        return None
+
+def format_subscription_message(subscription, plan):
+    """Format subscription details message"""
+    if not subscription:
+        return """📋 *NO ACTIVE SUBSCRIPTION*
+
+You are on the Free Plan.
+
+💰 Free plan: ₦0
+🎯 0 AI credits (Unlimited database answers)
+
+Reply with 4 to view available plans and upgrade."""
+    
+    plan_name = subscription.get("plan_name", "Unknown")
+    amount = subscription.get("amount", 0)
+    created_at = subscription.get("created_at", "")
+    status = subscription.get("status", "active")
+    
+    plan_credits = plan.get("ai_credits_total", 0) if plan else 0
+    
+    created_date = created_at[:10] if created_at else "Unknown"
+    
+    return f"""📋 *YOUR SUBSCRIPTION*
+
+✅ Plan: {plan_name}
+💰 Amount: ₦{amount:,.2f}
+🎯 Credits: {plan_credits} AI credits
+📅 Activated: {created_date}
+📊 Status: {status.upper()}
+
+✨ You have {plan_credits} AI credits available.
+🔄 Your subscription auto-renews.
+
+To cancel or upgrade, contact support."""
+
 def extract_number(text):
     """Extract digits from text, handling ₦ and commas"""
     cleaned = text.replace('₦', '').replace(',', '').replace(' ', '').strip()
@@ -130,27 +182,22 @@ def find_plan_by_name(plans, name):
 def find_plan_by_input(plans, user_input):
     user_input = user_input.strip()
     
-    # 1. Check by Plan Code
     plan = find_plan_by_code(plans, user_input)
     if plan:
         return {"found": True, "plan": plan, "ambiguous": False}
     
-    # 2. Check by Plan Name
     plan = find_plan_by_name(plans, user_input)
     if plan:
         return {"found": True, "plan": plan, "ambiguous": False}
     
-    # Extract number for price/credits search
     number = extract_number(user_input)
     if number is not None:
-        # 3. Check by Price
         price_matches = find_plans_by_price(plans, number)
         if len(price_matches) == 1:
             return {"found": True, "plan": price_matches[0], "ambiguous": False}
         elif len(price_matches) > 1:
             return {"found": True, "ambiguous": True, "matches": price_matches, "type": "price"}
         
-        # 4. Check by Credits
         credits_matches = find_plans_by_credits(plans, number)
         if len(credits_matches) == 1:
             return {"found": True, "plan": credits_matches[0], "ambiguous": False}
@@ -162,11 +209,10 @@ def find_plan_by_input(plans, user_input):
 def create_paystack_payment(plan, email, phone_number, reference):
     """Create Paystack payment link"""
     try:
-        amount = plan.get("price", 0) * 100  # Convert to kobo
+        amount = plan.get("price", 0) * 100
         plan_name = plan.get("name", "Subscription")
         plan_code = plan.get("plan_code", "")
         
-        # Callback URL with phone number for redirect
         base_url = os.getenv("PUBLIC_BACKEND_BASE_URL", "https://incredible-nonie-bmsconcept-37359733.koyeb.app")
         callback_url = f"{base_url}/payment/success?phone={phone_number}&plan={plan_name}"
         
@@ -455,8 +501,11 @@ def payment_success():
     phone = request.args.get('phone', '')
     plan_name = request.args.get('plan', 'Subscription')
     
-    # Build WhatsApp deep link
-    whatsapp_url = f"https://wa.me/{phone}?text=Payment%20successful!%20My%20{plan_name.replace(' ', '%20')}%20subscription%20is%20now%20active."
+    clean_phone = re.sub(r'\D', '', phone)
+    if len(clean_phone) == 13 and clean_phone.startswith('234'):
+        clean_phone = clean_phone[3:]
+    
+    whatsapp_url = f"https://wa.me/{clean_phone}?text=Payment%20successful!%20My%20{plan_name.replace(' ', '%20')}%20subscription%20is%20now%20active."
     
     return render_template_string(SUCCESS_PAGE, plan_name=plan_name, whatsapp_url=whatsapp_url)
 
@@ -482,7 +531,6 @@ def billing_webhook():
             plan_code = metadata.get('plan_code')
             
             if phone_number:
-                # Send confirmation message to WhatsApp
                 confirmation_msg = f"""✅ *PAYMENT SUCCESSFUL!*
 
 🎉 Thank you for your subscription!
@@ -497,7 +545,6 @@ Reply 8 for main menu."""
                 
                 send_whatsapp(phone_number, confirmation_msg)
                 
-                # Update subscription in database
                 try:
                     user_result = supabase.table("bot_users").select("*").eq("platform", "whatsapp").eq("user_id", str(phone_number)).execute()
                     if user_result.data:
@@ -548,7 +595,7 @@ def webhook():
                 text = msg.get('text', {}).get('body', '').strip()
                 logging.info(f"Message from {from_number}: {text}")
                 
-                # Handle global commands
+                # Global commands
                 if text == '#':
                     user_state.pop(from_number, None)
                     send_whatsapp(from_number, get_main_menu())
@@ -643,6 +690,18 @@ After successful payment, you will be redirected back to WhatsApp.
                     send_whatsapp(from_number, plans)
                 elif text == '8':
                     send_whatsapp(from_number, get_main_menu())
+                elif text == '3':
+                    subscription = get_user_subscription(from_number)
+                    plan = None
+                    if subscription:
+                        plan_code = subscription.get("plan_code")
+                        plans = get_all_plans()
+                        for p in plans:
+                            if p.get("plan_code") == plan_code:
+                                plan = p
+                                break
+                    message = format_subscription_message(subscription, plan)
+                    send_whatsapp(from_number, message)
                 elif text.isdigit() and len(text) >= 5:
                     try:
                         salary = float(text.replace(',', ''))
