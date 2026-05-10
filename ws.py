@@ -95,7 +95,6 @@ def get_user_subscription(phone_number):
         
         auth_user_id = user_result.data[0].get("auth_user_id")
         if not auth_user_id:
-            logging.warning(f"No auth_user_id found for {phone_number}")
             return None
         
         sub_result = supabase.table("subscriptions").select("*").eq("account_id", auth_user_id).eq("status", "active").order("created_at", desc=True).limit(1).execute()
@@ -545,12 +544,12 @@ Reply 8 for main menu."""
                 
                 send_whatsapp(phone_number, confirmation_msg)
                 
-                # FIXED: Use auth_user_id (UUID) instead of id (INTEGER)
                 try:
                     user_result = supabase.table("bot_users").select("auth_user_id").eq("platform", "whatsapp").eq("user_id", str(phone_number)).execute()
                     if user_result.data:
                         auth_user_id = user_result.data[0].get("auth_user_id")
                         if auth_user_id:
+                            # Fixed: Correct data types for each column
                             supabase.table("subscriptions").insert({
                                 "account_id": auth_user_id,
                                 "user_id": auth_user_id,
@@ -558,13 +557,13 @@ Reply 8 for main menu."""
                                 "plan": plan_name,
                                 "status": "active",
                                 "paystack_ref": reference,
-                                "amount": amount,
-                                "amount_kobo": amount * 100,
+                                "amount": float(amount),
+                                "amount_kobo": int(amount * 100),
                                 "currency": "NGN",
                                 "created_at": datetime.now().isoformat(),
                                 "updated_at": datetime.now().isoformat()
                             }).execute()
-                            logging.info(f"✅ Subscription activated for {phone_number}: {plan_name} (UUID: {auth_user_id})")
+                            logging.info(f"✅ Subscription activated for {phone_number}: {plan_name}")
                         else:
                             logging.error(f"No auth_user_id found for {phone_number}")
                     else:
