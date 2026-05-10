@@ -3,7 +3,7 @@ import re
 import logging
 import uuid
 from datetime import datetime
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template_string
 import requests
 from dotenv import load_dotenv
 from supabase import create_client, Client
@@ -30,7 +30,6 @@ WHATSAPP_API_URL = "https://graph.facebook.com/v18.0"
 
 # ============ PAYSTACK ============
 PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY")
-PAYSTACK_PUBLIC_KEY = os.getenv("PAYSTACK_PUBLIC_KEY")
 PAYSTACK_API_URL = "https://api.paystack.co"
 
 # Track user state for subscription flow
@@ -165,10 +164,11 @@ def create_paystack_payment(plan, email, phone_number, reference):
     try:
         amount = plan.get("price", 0) * 100  # Convert to kobo
         plan_name = plan.get("name", "Subscription")
+        plan_code = plan.get("plan_code", "")
         
-        # Get callback URL from environment or use default
+        # Callback URL with phone number for redirect
         base_url = os.getenv("PUBLIC_BACKEND_BASE_URL", "https://incredible-nonie-bmsconcept-37359733.koyeb.app")
-        callback_url = f"{base_url}/api/paystack/callback"
+        callback_url = f"{base_url}/payment/success?phone={phone_number}&plan={plan_name}"
         
         payload = {
             "amount": amount,
@@ -176,7 +176,7 @@ def create_paystack_payment(plan, email, phone_number, reference):
             "reference": reference,
             "currency": "NGN",
             "metadata": {
-                "plan_code": plan.get("plan_code"),
+                "plan_code": plan_code,
                 "plan_name": plan_name,
                 "phone": phone_number,
                 "channel": "whatsapp"
@@ -329,9 +329,196 @@ def send_whatsapp(to_phone, text):
         logging.error(f"Send error: {e}")
         return False
 
+# ============ CALLBACK PAGE HTML ============
+SUCCESS_PAGE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Payment Successful - Naija Tax Guide</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+        .container {
+            text-align: center;
+            background: white;
+            padding: 40px;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            max-width: 90%;
+            width: 400px;
+        }
+        .success-icon {
+            width: 80px;
+            height: 80px;
+            background: #4CAF50;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 20px;
+        }
+        .success-icon svg {
+            width: 50px;
+            height: 50px;
+            fill: white;
+        }
+        h1 {
+            color: #333;
+            margin-bottom: 10px;
+        }
+        p {
+            color: #666;
+            margin-bottom: 20px;
+        }
+        .plan-name {
+            background: #f0f0f0;
+            padding: 10px;
+            border-radius: 10px;
+            margin: 20px 0;
+            font-weight: bold;
+        }
+        .redirect-timer {
+            color: #999;
+            font-size: 14px;
+            margin-top: 20px;
+        }
+        .manual-link {
+            margin-top: 15px;
+        }
+        .manual-link a {
+            color: #667eea;
+            text-decoration: none;
+        }
+        .whatsapp-button {
+            display: inline-block;
+            background: #25D366;
+            color: white;
+            padding: 12px 24px;
+            border-radius: 30px;
+            text-decoration: none;
+            margin-top: 20px;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="success-icon">
+            <svg viewBox="0 0 24 24">
+                <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41L9 16.17z"/>
+            </svg>
+        </div>
+        <h1>✅ Payment Successful!</h1>
+        <p>Your subscription is now active.</p>
+        <div class="plan-name">🎯 {{ plan_name }}</div>
+        <div class="redirect-timer">Redirecting to WhatsApp in <span id="countdown">3</span> seconds...</div>
+        <div class="manual-link">
+            <a href="{{ whatsapp_url }}" class="whatsapp-button">💬 Return to WhatsApp Now</a>
+        </div>
+    </div>
+    <script>
+        let seconds = 3;
+        const countdownElement = document.getElementById('countdown');
+        const whatsappUrl = "{{ whatsapp_url }}";
+        
+        const timer = setInterval(function() {
+            seconds--;
+            countdownElement.textContent = seconds;
+            if (seconds <= 0) {
+                clearInterval(timer);
+                window.location.href = whatsappUrl;
+            }
+        }, 1000);
+    </script>
+</body>
+</html>
+"""
+
+# ============ FLASK ENDPOINTS ============
+
 @app.route('/health', methods=['GET'])
 def health():
     return "OK"
+
+@app.route('/payment/success', methods=['GET'])
+def payment_success():
+    """Callback page after successful Paystack payment"""
+    phone = request.args.get('phone', '')
+    plan_name = request.args.get('plan', 'Subscription')
+    
+    # Build WhatsApp deep link
+    whatsapp_url = f"https://wa.me/{phone}?text=Payment%20successful!%20My%20{plan_name.replace(' ', '%20')}%20subscription%20is%20now%20active."
+    
+    return render_template_string(SUCCESS_PAGE, plan_name=plan_name, whatsapp_url=whatsapp_url)
+
+@app.route('/api/billing/webhook', methods=['POST'])
+def billing_webhook():
+    """Handle Paystack webhook for payment confirmation"""
+    try:
+        payload = request.get_json()
+        if not payload:
+            return "No payload", 400
+        
+        event = payload.get('event')
+        data = payload.get('data', {})
+        
+        logging.info(f"Billing webhook received: {event}")
+        
+        if event == 'charge.success':
+            metadata = data.get('metadata', {})
+            phone_number = metadata.get('phone')
+            plan_name = metadata.get('plan_name', 'Subscription')
+            reference = data.get('reference')
+            amount = data.get('amount', 0) / 100
+            plan_code = metadata.get('plan_code')
+            
+            if phone_number:
+                # Send confirmation message to WhatsApp
+                confirmation_msg = f"""✅ *PAYMENT SUCCESSFUL!*
+
+🎉 Thank you for your subscription!
+
+📋 Plan: {plan_name}
+💰 Amount: ₦{amount:,.2f}
+🆔 Reference: {reference}
+
+Your subscription is now ACTIVE.
+
+Reply 8 for main menu."""
+                
+                send_whatsapp(phone_number, confirmation_msg)
+                
+                # Update subscription in database
+                try:
+                    user_result = supabase.table("bot_users").select("*").eq("platform", "whatsapp").eq("user_id", str(phone_number)).execute()
+                    if user_result.data:
+                        account_id = user_result.data[0].get("id")
+                        supabase.table("subscriptions").insert({
+                            "user_id": account_id,
+                            "plan_code": plan_code,
+                            "plan_name": plan_name,
+                            "status": "active",
+                            "reference": reference,
+                            "amount": amount,
+                            "created_at": datetime.now().isoformat()
+                        }).execute()
+                        logging.info(f"Subscription activated for {phone_number}: {plan_name}")
+                except Exception as e:
+                    logging.error(f"Failed to update subscription: {e}")
+        
+        return "OK", 200
+    except Exception as e:
+        logging.error(f"Webhook error: {e}")
+        return "Error", 500
 
 @app.route('/api/whatsapp/webhook', methods=['GET', 'POST'])
 def webhook():
@@ -373,11 +560,10 @@ def webhook():
                     continue
                 
                 if text == '*':
-                    # Go back one step
                     if from_number in user_state:
                         state = user_state[from_number]
                         step = state.get("step", 0)
-                        if step == 2:  # Going back from email entry to plan selection
+                        if step == 2:
                             user_state.pop(from_number, None)
                             send_whatsapp(from_number, get_plans_list_menu())
                         else:
@@ -396,7 +582,6 @@ def webhook():
                         idx = int(text) - 1
                         if idx < len(matches):
                             plan = matches[idx]
-                            # Store selected plan and move to email collection
                             user_state[from_number] = {"step": 2, "plan": plan}
                             welcome_msg = f"""✅ *Plan Selected:* {plan.get('name')}
 
@@ -423,18 +608,12 @@ Email example: name@example.com
                     plan = user_state[from_number].get("plan")
                     email = text.strip().lower()
                     
-                    # Validate email
                     if "@" in email and "." in email and len(email) > 5:
-                        # Generate unique reference
                         reference = f"SUB_{plan.get('plan_code')}_{uuid.uuid4().hex[:8]}"
-                        
-                        # Create Paystack payment
                         payment = create_paystack_payment(plan, email, from_number, reference)
                         
                         if payment.get("success"):
                             payment_link = payment.get("payment_link")
-                            
-                            # Store payment reference in user state
                             user_state[from_number] = {"step": 3, "plan": plan, "reference": reference}
                             
                             response = f"""✅ *Payment Link Generated!*
@@ -445,7 +624,7 @@ Amount: ₦{plan.get('price', 0):,}
 🔗 *Click here to complete payment:*
 {payment_link}
 
-After successful payment, your subscription will be activated automatically.
+After successful payment, you will be redirected back to WhatsApp.
 
 💡 Payment reference: {reference}
 
@@ -480,7 +659,6 @@ Rate: {data['rate']}%"""
                     except:
                         send_whatsapp(from_number, "Send a valid number (e.g., 500000)")
                 else:
-                    # Try to find plan by input
                     plans = get_all_plans()
                     result = find_plan_by_input(plans, text)
                     
@@ -510,7 +688,6 @@ Rate: {data['rate']}%"""
                             user_state[from_number] = {"ambiguous": True, "matches": matches}
                         else:
                             plan = result.get("plan")
-                            # Store selected plan and move to email collection
                             user_state[from_number] = {"step": 2, "plan": plan}
                             
                             welcome_msg = f"""✅ *Plan Selected:* {plan.get('name')}
