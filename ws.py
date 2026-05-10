@@ -35,12 +35,12 @@ WHATSAPP_API_URL = "https://graph.facebook.com/v18.0"
 PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY")
 PAYSTACK_API_URL = "https://api.paystack.co"
 
-# Credit packages
+# Credit packages with LETTER CODES (to avoid menu number conflicts)
 CREDIT_PACKAGES = {
-    1: {"credits": 10, "amount_ngn": 500, "amount_kobo": 50000, "description": "10 AI Credits"},
-    2: {"credits": 50, "amount_ngn": 2000, "amount_kobo": 200000, "description": "50 AI Credits"},
-    3: {"credits": 100, "amount_ngn": 3500, "amount_kobo": 350000, "description": "100 AI Credits"},
-    4: {"credits": 500, "amount_ngn": 15000, "amount_kobo": 1500000, "description": "500 AI Credits"},
+    "T10": {"credits": 10, "amount_ngn": 500, "amount_kobo": 50000, "code": "T10", "description": "10 AI Credits"},
+    "T50": {"credits": 50, "amount_ngn": 2000, "amount_kobo": 200000, "code": "T50", "description": "50 AI Credits"},
+    "T100": {"credits": 100, "amount_ngn": 3500, "amount_kobo": 350000, "code": "T100", "description": "100 AI Credits"},
+    "T500": {"credits": 500, "amount_ngn": 15000, "amount_kobo": 1500000, "code": "T500", "description": "500 AI Credits"},
 }
 
 # Track user state
@@ -89,25 +89,27 @@ def get_credit_balance(account_id):
         logging.error(f"Error getting balance: {e}")
         return 0
 
-def add_credits(account_id, credits, reference):
-    """Add credits to user's balance"""
+def add_credits_topup(account_id, credits, reference):
+    """ADD credits to existing balance (TOP-UP, not replace)"""
     try:
         existing = supabase.table("ai_credit_balances").select("balance").eq("account_id", account_id).execute()
         
         if existing.data:
-            new_balance = existing.data[0].get("balance", 0) + credits
+            current_balance = existing.data[0].get("balance", 0)
+            new_balance = current_balance + credits  # ADD to existing
             supabase.table("ai_credit_balances").update({
                 "balance": new_balance,
                 "updated_at": datetime.now().isoformat()
             }).eq("account_id", account_id).execute()
+            logging.info(f"Top-up: Added {credits} credits to {account_id}. Old: {current_balance}, New: {new_balance}")
         else:
             supabase.table("ai_credit_balances").insert({
                 "account_id": account_id,
                 "balance": credits,
                 "updated_at": datetime.now().isoformat()
             }).execute()
+            logging.info(f"Top-up: Created new balance with {credits} credits for {account_id}")
         
-        logging.info(f"Added {credits} credits to {account_id}. Reference: {reference}")
         return True
     except Exception as e:
         logging.error(f"Error adding credits: {e}")
@@ -116,18 +118,18 @@ def add_credits(account_id, credits, reference):
 def get_credit_packages_menu():
     return """💎 *Buy AI Credits*
 
-Reply with the package number:
+Reply with the package code:
 
-1️⃣ - 10 credits - ₦500
-2️⃣ - 50 credits - ₦2,000
-3️⃣ - 100 credits - ₦3,500
-4️⃣ - 500 credits - ₦15,000
+T10 - 10 credits - ₦500
+T50 - 50 credits - ₦2,000
+T100 - 100 credits - ₦3,500
+T500 - 500 credits - ₦15,000
 
 0 - Cancel | # - Main Menu"""
 
-def create_credit_payment(account_id, package_num, phone_number):
+def create_credit_payment(account_id, package_code, phone_number):
     """Create Paystack payment for credit purchase"""
-    package = CREDIT_PACKAGES.get(package_num)
+    package = CREDIT_PACKAGES.get(package_code.upper())
     if not package:
         return None
     
@@ -146,7 +148,7 @@ def create_credit_payment(account_id, package_num, phone_number):
         "metadata": {
             "account_id": account_id,
             "credits": credits,
-            "package": package_num,
+            "package_code": package_code,
             "type": "credit_purchase",
             "channel_type": "whatsapp",
             "provider_user_id": phone_number,
@@ -642,21 +644,21 @@ def billing_webhook():
                 amount = data.get('amount', 0) / 100
                 
                 if account_id and credits:
-                    success = add_credits(account_id, credits, reference)
+                    success = add_credits_topup(account_id, credits, reference)
                     
                     if success and phone_number:
                         balance = get_credit_balance(account_id)
                         confirmation_msg = f"""✅ *CREDITS ADDED SUCCESSFULLY!*
 
-🎉 {credits} AI credits have been added to your account.
+🎉 {credits} AI credits have been ADDED to your account.
 💰 Amount paid: ₦{amount:,.2f}
 🆔 Reference: {reference}
 
-You now have {balance} credits available.
+Your new balance: {balance} credits
 
 Reply 8 for main menu."""
                         send_whatsapp(phone_number, confirmation_msg)
-                        logging.info(f"Added {credits} credits to {account_id}")
+                        logging.info(f"Top-up: Added {credits} credits to {account_id}")
             
             elif transaction_type == 'subscription':
                 phone_number = metadata.get('phone')
@@ -797,14 +799,15 @@ Reply 8 for main menu.""")
                     send_whatsapp(from_number, get_credit_packages_menu())
                     continue
                 
-                # Handle credit package selection
+                # Handle credit package selection (using LETTER CODES: T10, T50, T100, T500)
                 if from_number in user_state and user_state[from_number].get("step") == "buy_credits":
-                    if text in ["1", "2", "3", "4"]:
-                        package_num = int(text)
-                        package = CREDIT_PACKAGES.get(package_num)
+                    package_code = text.upper().strip()
+                    
+                    if package_code in ["T10", "T50", "T100", "T500"]:
+                        package = CREDIT_PACKAGES.get(package_code)
                         
                         if package:
-                            payment = create_credit_payment(account_id, package_num, from_number)
+                            payment = create_credit_payment(account_id, package_code, from_number)
                             if payment and payment.get("success"):
                                 send_whatsapp(from_number, f"""💎 *Payment Link Generated!*
 
@@ -814,7 +817,7 @@ Amount: ₦{package['amount_ngn']:,}
 🔗 *Click here to complete payment:*
 {payment['payment_link']}
 
-After successful payment, your credits will be added automatically.
+After successful payment, your credits will be ADDED to your existing balance.
 
 💡 Reference: {payment['reference']}
 
@@ -824,12 +827,12 @@ After successful payment, your credits will be added automatically.
                                 send_whatsapp(from_number, "❌ Failed to generate payment link. Please try again later.\n\nReply 8 for main menu.")
                                 user_state.pop(from_number, None)
                         else:
-                            send_whatsapp(from_number, "❌ Invalid package. Please reply with 1, 2, 3, or 4.")
+                            send_whatsapp(from_number, "❌ Invalid package. Please reply with T10, T50, T100, or T500.")
                     elif text == '0':
                         user_state.pop(from_number, None)
                         send_whatsapp(from_number, "❌ Cancelled.\n\nReply 8 for main menu.")
                     else:
-                        send_whatsapp(from_number, "Please reply with 1, 2, 3, or 4 to select a package, or 0 to cancel.")
+                        send_whatsapp(from_number, "Please reply with T10, T50, T100, or T500 to select a package, or 0 to cancel.")
                     continue
                 
                 # Handle ambiguous selection response
