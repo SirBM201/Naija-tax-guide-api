@@ -2,11 +2,12 @@ import os
 import re
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, render_template_string
 import requests
 from dotenv import load_dotenv
 from supabase import create_client, Client
+from collections import defaultdict
 
 load_dotenv()
 
@@ -34,6 +35,7 @@ PAYSTACK_API_URL = "https://api.paystack.co"
 
 # Track user state for subscription flow
 user_state = {}
+user_cooldown = defaultdict(float)
 
 # ============ TAX CALCULATION ============
 def calculate_paye(monthly_gross):
@@ -549,12 +551,11 @@ Reply 8 for main menu."""
                     if user_result.data:
                         auth_user_id = user_result.data[0].get("auth_user_id")
                         if auth_user_id:
-                            # Fixed: Correct data types for each column
                             supabase.table("subscriptions").insert({
                                 "account_id": auth_user_id,
                                 "user_id": auth_user_id,
                                 "plan_code": plan_code,
-                                "plan": plan_name,
+                                "plan": plan_code,
                                 "status": "active",
                                 "paystack_ref": reference,
                                 "amount": float(amount),
@@ -602,8 +603,25 @@ def webhook():
             
             if msg_type == 'text':
                 text = msg.get('text', {}).get('body', '').strip()
+                
+                # Check for duplicate message (2 second cooldown)
+                current_time = datetime.now().timestamp()
+                cooldown_key = f"{from_number}:{text}"
+                if user_cooldown[cooldown_key] > current_time - 2:
+                    logging.info(f"Skipping duplicate message: {text}")
+                    continue
+                user_cooldown[cooldown_key] = current_time
+                
+                # Auto-clear stale state (5 minutes inactivity)
+                if from_number in user_state:
+                    state_time = user_state[from_number].get("timestamp", 0)
+                    if current_time - state_time > 300:
+                        user_state.pop(from_number, None)
+                        logging.info(f"Cleared stale state for {from_number}")
+                
                 logging.info(f"Message from {from_number}: {text}")
                 
+                # Global commands
                 if text == '#':
                     user_state.pop(from_number, None)
                     send_whatsapp(from_number, get_main_menu())
@@ -611,7 +629,7 @@ def webhook():
                 
                 if text == '0':
                     user_state.pop(from_number, None)
-                    send_whatsapp(from_number, "❌ Subscription cancelled.\n\nReply 8 for main menu.")
+                    send_whatsapp(from_number, "❌ Cancelled.\n\nReply 8 for main menu.")
                     continue
                 
                 if text == '*':
@@ -628,6 +646,7 @@ def webhook():
                         send_whatsapp(from_number, get_main_menu())
                     continue
                 
+                # Handle ambiguous selection response
                 if from_number in user_state and user_state[from_number].get("ambiguous"):
                     state = user_state[from_number]
                     matches = state.get("matches", [])
@@ -636,7 +655,7 @@ def webhook():
                         idx = int(text) - 1
                         if idx < len(matches):
                             plan = matches[idx]
-                            user_state[from_number] = {"step": 2, "plan": plan}
+                            user_state[from_number] = {"step": 2, "plan": plan, "timestamp": datetime.now().timestamp()}
                             welcome_msg = f"""✅ *Plan Selected:* {plan.get('name')}
 
 💰 Price: ₦{plan.get('price', 0):,}
@@ -652,22 +671,26 @@ Email example: name@example.com
                             send_whatsapp(from_number, "Invalid selection. Please reply with 1 or 2, or 0 to cancel.")
                     elif text == '0':
                         user_state.pop(from_number, None)
-                        send_whatsapp(from_number, "❌ Subscription cancelled.\n\nReply 8 for main menu.")
+                        send_whatsapp(from_number, "❌ Cancelled.\n\nReply 8 for main menu.")
                     else:
                         send_whatsapp(from_number, "Please reply with 1 or 2 to select your plan, or 0 to cancel.")
                     continue
                 
+                # Handle email collection (step 2)
                 if from_number in user_state and user_state[from_number].get("step") == 2:
                     plan = user_state[from_number].get("plan")
                     email = text.strip().lower()
                     
-                    if "@" in email and "." in email and len(email) > 5:
+                    # Email validation pattern
+                    email_pattern = re.compile(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
+                    
+                    if email_pattern.match(email):
                         reference = f"SUB_{plan.get('plan_code')}_{uuid.uuid4().hex[:8]}"
                         payment = create_paystack_payment(plan, email, from_number, reference)
                         
                         if payment.get("success"):
                             payment_link = payment.get("payment_link")
-                            user_state[from_number] = {"step": 3, "plan": plan, "reference": reference}
+                            user_state[from_number] = {"step": 3, "plan": plan, "reference": reference, "timestamp": datetime.now().timestamp()}
                             
                             response = f"""✅ *Payment Link Generated!*
 
@@ -686,10 +709,17 @@ After successful payment, you will be redirected back to WhatsApp.
                         else:
                             send_whatsapp(from_number, f"❌ Failed to generate payment link. Please try again later.\n\nReply 4 to view plans again.")
                             user_state.pop(from_number, None)
+                    elif text == '0' or text == '#':
+                        user_state.pop(from_number, None)
+                        if text == '#':
+                            send_whatsapp(from_number, get_main_menu())
+                        else:
+                            send_whatsapp(from_number, "❌ Cancelled.\n\nReply 8 for main menu.")
                     else:
                         send_whatsapp(from_number, "❌ *Invalid email address.*\n\nPlease send a valid email address (e.g., name@example.com).\n\n* - Back | 0 - Cancel | # - Main Menu")
                     continue
                 
+                # Main menu navigation
                 if text == '4':
                     plans = get_plans_list_menu()
                     send_whatsapp(from_number, plans)
@@ -707,6 +737,18 @@ After successful payment, you will be redirected back to WhatsApp.
                                 break
                     message = format_subscription_message(subscription, plan)
                     send_whatsapp(from_number, message)
+                elif text == '1':
+                    send_whatsapp(from_number, "💬 Please type your tax question.\n\n💡 # - Save & Menu | 0 - Cancel")
+                elif text == '2':
+                    send_whatsapp(from_number, "💳 *AI Credits Balance*\n\nYou have 10 credits remaining.\n\nBuy more with Option 6.")
+                elif text == '5':
+                    send_whatsapp(from_number, "🔗 *Link Website Account*\n\nVisit www.naijataxguides.com/settings to link your account.")
+                elif text == '6':
+                    send_whatsapp(from_number, "💰 *Buy AI Credits*\n\nVisit www.naijataxguides.com/credits to purchase.")
+                elif text == '7':
+                    send_whatsapp(from_number, """*📋 TAX FILING & MANAGEMENT*
+
+This feature is coming soon. Stay tuned!""")
                 elif text.isdigit() and len(text) >= 5:
                     try:
                         salary = float(text.replace(',', ''))
@@ -749,10 +791,10 @@ Rate: {data['rate']}%"""
                             selection_msg += "\nPlease reply with the number (1 or 2) to select your plan.\n0 - Cancel | # - Main Menu"
                             
                             send_whatsapp(from_number, selection_msg)
-                            user_state[from_number] = {"ambiguous": True, "matches": matches}
+                            user_state[from_number] = {"ambiguous": True, "matches": matches, "timestamp": datetime.now().timestamp()}
                         else:
                             plan = result.get("plan")
-                            user_state[from_number] = {"step": 2, "plan": plan}
+                            user_state[from_number] = {"step": 2, "plan": plan, "timestamp": datetime.now().timestamp()}
                             
                             welcome_msg = f"""✅ *Plan Selected:* {plan.get('name')}
 
