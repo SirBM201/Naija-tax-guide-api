@@ -2,6 +2,8 @@ import os
 import re
 import logging
 import uuid
+import random
+import string
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, render_template_string
 import requests
@@ -33,9 +35,150 @@ WHATSAPP_API_URL = "https://graph.facebook.com/v18.0"
 PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY")
 PAYSTACK_API_URL = "https://api.paystack.co"
 
-# Track user state for subscription flow
+# Credit packages
+CREDIT_PACKAGES = {
+    1: {"credits": 10, "amount_ngn": 500, "amount_kobo": 50000, "description": "10 AI Credits"},
+    2: {"credits": 50, "amount_ngn": 2000, "amount_kobo": 200000, "description": "50 AI Credits"},
+    3: {"credits": 100, "amount_ngn": 3500, "amount_kobo": 350000, "description": "100 AI Credits"},
+    4: {"credits": 500, "amount_ngn": 15000, "amount_kobo": 1500000, "description": "500 AI Credits"},
+}
+
+# Track user state
 user_state = {}
 user_cooldown = defaultdict(float)
+
+# ============ HELPER FUNCTIONS ============
+def get_or_create_account_id(phone_number):
+    """Get or create account_id for a WhatsApp user"""
+    try:
+        user_result = supabase.table("bot_users").select("auth_user_id").eq("platform", "whatsapp").eq("user_id", str(phone_number)).execute()
+        
+        if user_result.data and user_result.data[0].get("auth_user_id"):
+            return user_result.data[0].get("auth_user_id")
+        
+        auth_user_id = str(uuid.uuid4())
+        
+        supabase.table("bot_users").insert({
+            "platform": "whatsapp",
+            "user_id": str(phone_number),
+            "auth_user_id": auth_user_id,
+            "created_at": datetime.now().isoformat(),
+            "total_calculations": 0,
+            "is_active": True
+        }).execute()
+        
+        supabase.table("ai_credit_balances").insert({
+            "account_id": auth_user_id,
+            "balance": 0,
+            "updated_at": datetime.now().isoformat()
+        }).execute()
+        
+        return auth_user_id
+    except Exception as e:
+        logging.error(f"Error creating account: {e}")
+        return None
+
+def get_credit_balance(account_id):
+    """Get current credit balance"""
+    try:
+        result = supabase.table("ai_credit_balances").select("balance").eq("account_id", account_id).limit(1).execute()
+        if result.data:
+            return result.data[0].get("balance", 0)
+        return 0
+    except Exception as e:
+        logging.error(f"Error getting balance: {e}")
+        return 0
+
+def add_credits(account_id, credits, reference):
+    """Add credits to user's balance"""
+    try:
+        existing = supabase.table("ai_credit_balances").select("balance").eq("account_id", account_id).execute()
+        
+        if existing.data:
+            new_balance = existing.data[0].get("balance", 0) + credits
+            supabase.table("ai_credit_balances").update({
+                "balance": new_balance,
+                "updated_at": datetime.now().isoformat()
+            }).eq("account_id", account_id).execute()
+        else:
+            supabase.table("ai_credit_balances").insert({
+                "account_id": account_id,
+                "balance": credits,
+                "updated_at": datetime.now().isoformat()
+            }).execute()
+        
+        logging.info(f"Added {credits} credits to {account_id}. Reference: {reference}")
+        return True
+    except Exception as e:
+        logging.error(f"Error adding credits: {e}")
+        return False
+
+def get_credit_packages_menu():
+    return """💎 *Buy AI Credits*
+
+Reply with the package number:
+
+1️⃣ - 10 credits - ₦500
+2️⃣ - 50 credits - ₦2,000
+3️⃣ - 100 credits - ₦3,500
+4️⃣ - 500 credits - ₦15,000
+
+0 - Cancel | # - Main Menu"""
+
+def create_credit_payment(account_id, package_num, phone_number):
+    """Create Paystack payment for credit purchase"""
+    package = CREDIT_PACKAGES.get(package_num)
+    if not package:
+        return None
+    
+    reference = f"CREDIT_{package['credits']}_{uuid.uuid4().hex[:8]}"
+    amount_kobo = package["amount_kobo"]
+    credits = package["credits"]
+    
+    base_url = os.getenv("PUBLIC_BACKEND_BASE_URL", "https://incredible-nonie-bmsconcept-37359733.koyeb.app")
+    callback_url = f"{base_url}/payment/success?phone={phone_number}&type=credits&credits={credits}"
+    
+    payload = {
+        "amount": amount_kobo,
+        "email": f"wa_{phone_number}@temp.ng",
+        "reference": reference,
+        "currency": "NGN",
+        "metadata": {
+            "account_id": account_id,
+            "credits": credits,
+            "package": package_num,
+            "type": "credit_purchase",
+            "channel_type": "whatsapp",
+            "provider_user_id": phone_number,
+            "amount_ngn": package["amount_ngn"]
+        },
+        "callback_url": callback_url
+    }
+    
+    headers = {
+        "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",
+        "Content-Type": "application/json"
+    }
+    
+    try:
+        response = requests.post(f"{PAYSTACK_API_URL}/transaction/initialize", json=payload, headers=headers, timeout=30)
+        
+        if response.status_code == 200:
+            data = response.json()
+            if data.get("status"):
+                return {
+                    "success": True,
+                    "payment_link": data["data"]["authorization_url"],
+                    "reference": reference,
+                    "credits": credits,
+                    "amount": package["amount_ngn"]
+                }
+        
+        logging.error(f"Paystack error: {response.text}")
+        return None
+    except Exception as e:
+        logging.error(f"Payment error: {e}")
+        return None
 
 # ============ TAX CALCULATION ============
 def calculate_paye(monthly_gross):
@@ -89,7 +232,6 @@ def get_all_plans():
         return []
 
 def get_user_subscription(phone_number):
-    """Get user's active subscription using auth_user_id (UUID)"""
     try:
         user_result = supabase.table("bot_users").select("auth_user_id").eq("platform", "whatsapp").eq("user_id", str(phone_number)).execute()
         if not user_result.data:
@@ -109,7 +251,6 @@ def get_user_subscription(phone_number):
         return None
 
 def format_subscription_message(subscription, plan):
-    """Format subscription details message"""
     if not subscription:
         return """📋 *NO ACTIVE SUBSCRIPTION*
 
@@ -209,47 +350,6 @@ def find_plan_by_input(plans, user_input):
             return {"found": True, "ambiguous": True, "matches": credits_matches, "type": "credits"}
     
     return {"found": False}
-
-def create_paystack_payment(plan, email, phone_number, reference):
-    try:
-        amount = plan.get("price", 0) * 100
-        plan_name = plan.get("name", "Subscription")
-        plan_code = plan.get("plan_code", "")
-        
-        base_url = os.getenv("PUBLIC_BACKEND_BASE_URL", "https://incredible-nonie-bmsconcept-37359733.koyeb.app")
-        callback_url = f"{base_url}/payment/success?phone={phone_number}&plan={plan_name}"
-        
-        payload = {
-            "amount": amount,
-            "email": email,
-            "reference": reference,
-            "currency": "NGN",
-            "metadata": {
-                "plan_code": plan_code,
-                "plan_name": plan_name,
-                "phone": phone_number,
-                "channel": "whatsapp"
-            },
-            "callback_url": callback_url
-        }
-        
-        headers = {
-            "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",
-            "Content-Type": "application/json"
-        }
-        
-        response = requests.post(f"{PAYSTACK_API_URL}/transaction/initialize", json=payload, headers=headers, timeout=30)
-        
-        if response.status_code == 200:
-            data = response.json()
-            if data.get("status"):
-                return {"success": True, "payment_link": data["data"]["authorization_url"], "reference": reference}
-        
-        logging.error(f"Paystack error: {response.text}")
-        return {"success": False, "error": "Payment initialization failed"}
-    except Exception as e:
-        logging.error(f"Paystack error: {e}")
-        return {"success": False, "error": str(e)}
 
 def get_plans_list_menu():
     try:
@@ -352,9 +452,9 @@ Reply with:
 2️⃣ - Check AI credits balance
 3️⃣ - Check my subscription plan
 4️⃣ - View subscription plans
-5️⃣ - Link to website account
+5️⃣ - Link to website account (coming soon)
 6️⃣ - Buy AI credits
-7️⃣ - Tax filing & management
+7️⃣ - Tax filing & management (coming soon)
 8️⃣ - Help / Menu
 
 ---
@@ -467,8 +567,8 @@ SUCCESS_PAGE = """
             </svg>
         </div>
         <h1>✅ Payment Successful!</h1>
-        <p>Your subscription is now active.</p>
-        <div class="plan-name">🎯 {{ plan_name }}</div>
+        <p>Your {{ type }} has been processed successfully.</p>
+        <div class="plan-name">🎯 {{ amount_info }}</div>
         <div class="redirect-timer">Redirecting to WhatsApp in <span id="countdown">3</span> seconds...</div>
         <div class="manual-link">
             <a href="{{ whatsapp_url }}" class="whatsapp-button">💬 Return to WhatsApp Now</a>
@@ -501,15 +601,22 @@ def health():
 @app.route('/payment/success', methods=['GET'])
 def payment_success():
     phone = request.args.get('phone', '')
-    plan_name = request.args.get('plan', 'Subscription')
+    payment_type = request.args.get('type', 'subscription')
+    plan_name = request.args.get('plan', '')
+    credits = request.args.get('credits', '')
     
     clean_phone = re.sub(r'\D', '', phone)
     if len(clean_phone) == 13 and clean_phone.startswith('234'):
         clean_phone = clean_phone[3:]
     
-    whatsapp_url = f"https://wa.me/{clean_phone}?text=Payment%20successful!%20My%20{plan_name.replace(' ', '%20')}%20subscription%20is%20now%20active."
+    whatsapp_url = f"https://wa.me/{clean_phone}"
     
-    return render_template_string(SUCCESS_PAGE, plan_name=plan_name, whatsapp_url=whatsapp_url)
+    if payment_type == 'credits':
+        amount_info = f"{credits} AI Credits added!"
+    else:
+        amount_info = plan_name
+    
+    return render_template_string(SUCCESS_PAGE, type=payment_type, amount_info=amount_info, whatsapp_url=whatsapp_url)
 
 @app.route('/api/billing/webhook', methods=['POST'])
 def billing_webhook():
@@ -525,14 +632,41 @@ def billing_webhook():
         
         if event == 'charge.success':
             metadata = data.get('metadata', {})
-            phone_number = metadata.get('phone')
-            plan_name = metadata.get('plan_name', 'Subscription')
-            reference = data.get('reference')
-            amount = data.get('amount', 0) / 100
-            plan_code = metadata.get('plan_code')
+            transaction_type = metadata.get('type', 'subscription')
             
-            if phone_number:
-                confirmation_msg = f"""✅ *PAYMENT SUCCESSFUL!*
+            if transaction_type == 'credit_purchase':
+                account_id = metadata.get('account_id')
+                credits = metadata.get('credits', 0)
+                reference = data.get('reference')
+                phone_number = metadata.get('provider_user_id')
+                amount = data.get('amount', 0) / 100
+                
+                if account_id and credits:
+                    success = add_credits(account_id, credits, reference)
+                    
+                    if success and phone_number:
+                        balance = get_credit_balance(account_id)
+                        confirmation_msg = f"""✅ *CREDITS ADDED SUCCESSFULLY!*
+
+🎉 {credits} AI credits have been added to your account.
+💰 Amount paid: ₦{amount:,.2f}
+🆔 Reference: {reference}
+
+You now have {balance} credits available.
+
+Reply 8 for main menu."""
+                        send_whatsapp(phone_number, confirmation_msg)
+                        logging.info(f"Added {credits} credits to {account_id}")
+            
+            elif transaction_type == 'subscription':
+                phone_number = metadata.get('phone')
+                plan_name = metadata.get('plan_name', 'Subscription')
+                reference = data.get('reference')
+                amount = data.get('amount', 0) / 100
+                plan_code = metadata.get('plan_code')
+                
+                if phone_number:
+                    confirmation_msg = f"""✅ *PAYMENT SUCCESSFUL!*
 
 🎉 Thank you for your subscription!
 
@@ -543,34 +677,30 @@ def billing_webhook():
 Your subscription is now ACTIVE.
 
 Reply 8 for main menu."""
-                
-                send_whatsapp(phone_number, confirmation_msg)
-                
-                try:
-                    user_result = supabase.table("bot_users").select("auth_user_id").eq("platform", "whatsapp").eq("user_id", str(phone_number)).execute()
-                    if user_result.data:
-                        auth_user_id = user_result.data[0].get("auth_user_id")
-                        if auth_user_id:
-                            supabase.table("subscriptions").insert({
-                                "account_id": auth_user_id,
-                                "user_id": auth_user_id,
-                                "plan_code": plan_code,
-                                "plan": plan_code,
-                                "status": "active",
-                                "paystack_ref": reference,
-                                "amount": float(amount),
-                                "amount_kobo": int(amount * 100),
-                                "currency": "NGN",
-                                "created_at": datetime.now().isoformat(),
-                                "updated_at": datetime.now().isoformat()
-                            }).execute()
-                            logging.info(f"✅ Subscription activated for {phone_number}: {plan_name}")
-                        else:
-                            logging.error(f"No auth_user_id found for {phone_number}")
-                    else:
-                        logging.error(f"No user found for {phone_number}")
-                except Exception as e:
-                    logging.error(f"Failed to update subscription: {e}")
+                    
+                    send_whatsapp(phone_number, confirmation_msg)
+                    
+                    try:
+                        user_result = supabase.table("bot_users").select("auth_user_id").eq("platform", "whatsapp").eq("user_id", str(phone_number)).execute()
+                        if user_result.data:
+                            auth_user_id = user_result.data[0].get("auth_user_id")
+                            if auth_user_id:
+                                supabase.table("subscriptions").insert({
+                                    "account_id": auth_user_id,
+                                    "user_id": auth_user_id,
+                                    "plan_code": plan_code,
+                                    "plan": plan_code,
+                                    "status": "active",
+                                    "paystack_ref": reference,
+                                    "amount": float(amount),
+                                    "amount_kobo": int(amount * 100),
+                                    "currency": "NGN",
+                                    "created_at": datetime.now().isoformat(),
+                                    "updated_at": datetime.now().isoformat()
+                                }).execute()
+                                logging.info(f"✅ Subscription activated for {phone_number}: {plan_name}")
+                    except Exception as e:
+                        logging.error(f"Failed to update subscription: {e}")
         
         return "OK", 200
     except Exception as e:
@@ -621,6 +751,9 @@ def webhook():
                 
                 logging.info(f"Message from {from_number}: {text}")
                 
+                # Get or create account_id
+                account_id = get_or_create_account_id(from_number)
+                
                 # Global commands
                 if text == '#':
                     user_state.pop(from_number, None)
@@ -644,6 +777,59 @@ def webhook():
                             send_whatsapp(from_number, get_main_menu())
                     else:
                         send_whatsapp(from_number, get_main_menu())
+                    continue
+                
+                # ============ OPTION 5: LINK WEBSITE ACCOUNT (Placeholder) ============
+                if text == '5':
+                    send_whatsapp(from_number, """🔗 *Link to Website Account*
+
+This feature will be available soon.
+
+To link your account, please visit:
+www.naijataxguides.com/channels
+
+Reply 8 for main menu.""")
+                    continue
+                
+                # ============ OPTION 6: BUY AI CREDITS ============
+                if text == '6':
+                    user_state[from_number] = {"step": "buy_credits", "timestamp": current_time}
+                    send_whatsapp(from_number, get_credit_packages_menu())
+                    continue
+                
+                # Handle credit package selection
+                if from_number in user_state and user_state[from_number].get("step") == "buy_credits":
+                    if text in ["1", "2", "3", "4"]:
+                        package_num = int(text)
+                        package = CREDIT_PACKAGES.get(package_num)
+                        
+                        if package:
+                            payment = create_credit_payment(account_id, package_num, from_number)
+                            if payment and payment.get("success"):
+                                send_whatsapp(from_number, f"""💎 *Payment Link Generated!*
+
+Package: {package['description']}
+Amount: ₦{package['amount_ngn']:,}
+
+🔗 *Click here to complete payment:*
+{payment['payment_link']}
+
+After successful payment, your credits will be added automatically.
+
+💡 Reference: {payment['reference']}
+
+0 - Cancel | # - Main Menu""")
+                                user_state.pop(from_number, None)
+                            else:
+                                send_whatsapp(from_number, "❌ Failed to generate payment link. Please try again later.\n\nReply 8 for main menu.")
+                                user_state.pop(from_number, None)
+                        else:
+                            send_whatsapp(from_number, "❌ Invalid package. Please reply with 1, 2, 3, or 4.")
+                    elif text == '0':
+                        user_state.pop(from_number, None)
+                        send_whatsapp(from_number, "❌ Cancelled.\n\nReply 8 for main menu.")
+                    else:
+                        send_whatsapp(from_number, "Please reply with 1, 2, 3, or 4 to select a package, or 0 to cancel.")
                     continue
                 
                 # Handle ambiguous selection response
@@ -686,13 +872,40 @@ Email example: name@example.com
                     
                     if email_pattern.match(email):
                         reference = f"SUB_{plan.get('plan_code')}_{uuid.uuid4().hex[:8]}"
-                        payment = create_paystack_payment(plan, email, from_number, reference)
+                        amount = plan.get("price", 0) * 100
+                        base_url = os.getenv("PUBLIC_BACKEND_BASE_URL", "https://incredible-nonie-bmsconcept-37359733.koyeb.app")
+                        callback_url = f"{base_url}/payment/success?phone={from_number}&plan={plan.get('name')}"
                         
-                        if payment.get("success"):
-                            payment_link = payment.get("payment_link")
-                            user_state[from_number] = {"step": 3, "plan": plan, "reference": reference, "timestamp": datetime.now().timestamp()}
+                        payload = {
+                            "amount": amount,
+                            "email": email,
+                            "reference": reference,
+                            "currency": "NGN",
+                            "metadata": {
+                                "plan_code": plan.get("plan_code"),
+                                "plan_name": plan.get("name"),
+                                "phone": from_number,
+                                "channel": "whatsapp",
+                                "type": "subscription"
+                            },
+                            "callback_url": callback_url
+                        }
+                        
+                        headers = {
+                            "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",
+                            "Content-Type": "application/json"
+                        }
+                        
+                        try:
+                            response = requests.post(f"{PAYSTACK_API_URL}/transaction/initialize", json=payload, headers=headers, timeout=30)
                             
-                            response = f"""✅ *Payment Link Generated!*
+                            if response.status_code == 200:
+                                data = response.json()
+                                if data.get("status"):
+                                    payment_link = data["data"]["authorization_url"]
+                                    user_state[from_number] = {"step": 3, "plan": plan, "reference": reference, "timestamp": datetime.now().timestamp()}
+                                    
+                                    response_msg = f"""✅ *Payment Link Generated!*
 
 Plan: {plan.get('name')}
 Amount: ₦{plan.get('price', 0):,}
@@ -705,9 +918,16 @@ After successful payment, you will be redirected back to WhatsApp.
 💡 Payment reference: {reference}
 
 0 - Cancel | # - Main Menu"""
-                            send_whatsapp(from_number, response)
-                        else:
-                            send_whatsapp(from_number, f"❌ Failed to generate payment link. Please try again later.\n\nReply 4 to view plans again.")
+                                    send_whatsapp(from_number, response_msg)
+                                else:
+                                    send_whatsapp(from_number, "❌ Failed to generate payment link. Please try again later.\n\nReply 4 to view plans again.")
+                                    user_state.pop(from_number, None)
+                            else:
+                                send_whatsapp(from_number, "❌ Payment service error. Please try again later.")
+                                user_state.pop(from_number, None)
+                        except Exception as e:
+                            logging.error(f"Payment error: {e}")
+                            send_whatsapp(from_number, "❌ Failed to generate payment link. Please try again later.")
                             user_state.pop(from_number, None)
                     elif text == '0' or text == '#':
                         user_state.pop(from_number, None)
@@ -740,11 +960,11 @@ After successful payment, you will be redirected back to WhatsApp.
                 elif text == '1':
                     send_whatsapp(from_number, "💬 Please type your tax question.\n\n💡 # - Save & Menu | 0 - Cancel")
                 elif text == '2':
-                    send_whatsapp(from_number, "💳 *AI Credits Balance*\n\nYou have 10 credits remaining.\n\nBuy more with Option 6.")
-                elif text == '5':
-                    send_whatsapp(from_number, "🔗 *Link Website Account*\n\nVisit www.naijataxguides.com/settings to link your account.")
-                elif text == '6':
-                    send_whatsapp(from_number, "💰 *Buy AI Credits*\n\nVisit www.naijataxguides.com/credits to purchase.")
+                    balance = get_credit_balance(account_id)
+                    if balance == 0:
+                        send_whatsapp(from_number, f"💎 *AI Credits Balance*\n\nYou have *0 credits* remaining.\n\nEach credit = 1 AI tax question.\n\nTo buy credits, reply with 6.")
+                    else:
+                        send_whatsapp(from_number, f"💎 *AI Credits Balance*\n\nYou have *{balance} credits* remaining.\n\nEach credit = 1 AI tax question.\n\nTo buy more credits, reply with 6.")
                 elif text == '7':
                     send_whatsapp(from_number, """*📋 TAX FILING & MANAGEMENT*
 
