@@ -87,7 +87,7 @@ def get_all_plans():
         return []
 
 def get_user_subscription(phone_number):
-    """Get user's active subscription"""
+    """Get user's active subscription - using account_id column"""
     try:
         user_result = supabase.table("bot_users").select("*").eq("platform", "whatsapp").eq("user_id", str(phone_number)).execute()
         if not user_result.data:
@@ -95,7 +95,7 @@ def get_user_subscription(phone_number):
         
         account_id = user_result.data[0].get("id")
         
-        sub_result = supabase.table("subscriptions").select("*").eq("user_id", account_id).eq("status", "active").order("created_at", desc=True).limit(1).execute()
+        sub_result = supabase.table("subscriptions").select("*").eq("account_id", account_id).eq("status", "active").order("created_at", desc=True).limit(1).execute()
         
         if sub_result.data:
             return sub_result.data[0]
@@ -116,18 +116,19 @@ You are on the Free Plan.
 
 Reply with 4 to view available plans and upgrade."""
     
-    plan_name = subscription.get("plan_name", "Unknown")
+    plan_code = subscription.get("plan_code", "Unknown")
     amount = subscription.get("amount", 0)
     created_at = subscription.get("created_at", "")
     status = subscription.get("status", "active")
     
     plan_credits = plan.get("ai_credits_total", 0) if plan else 0
+    plan_display = plan.get("name", plan_code) if plan else plan_code
     
     created_date = created_at[:10] if created_at else "Unknown"
     
     return f"""📋 *YOUR SUBSCRIPTION*
 
-✅ Plan: {plan_name}
+✅ Plan: {plan_display}
 💰 Amount: ₦{amount:,.2f}
 🎯 Credits: {plan_credits} AI credits
 📅 Activated: {created_date}
@@ -139,7 +140,6 @@ Reply with 4 to view available plans and upgrade."""
 To cancel or upgrade, contact support."""
 
 def extract_number(text):
-    """Extract digits from text, handling ₦ and commas"""
     cleaned = text.replace('₦', '').replace(',', '').replace(' ', '').strip()
     match = re.search(r'(\d+)', cleaned)
     if match:
@@ -207,7 +207,6 @@ def find_plan_by_input(plans, user_input):
     return {"found": False}
 
 def create_paystack_payment(plan, email, phone_number, reference):
-    """Create Paystack payment link"""
     try:
         amount = plan.get("price", 0) * 100
         plan_name = plan.get("name", "Subscription")
@@ -497,7 +496,6 @@ def health():
 
 @app.route('/payment/success', methods=['GET'])
 def payment_success():
-    """Callback page after successful Paystack payment"""
     phone = request.args.get('phone', '')
     plan_name = request.args.get('plan', 'Subscription')
     
@@ -511,7 +509,6 @@ def payment_success():
 
 @app.route('/api/billing/webhook', methods=['POST'])
 def billing_webhook():
-    """Handle Paystack webhook for payment confirmation"""
     try:
         payload = request.get_json()
         if not payload:
@@ -550,12 +547,13 @@ Reply 8 for main menu."""
                     if user_result.data:
                         account_id = user_result.data[0].get("id")
                         supabase.table("subscriptions").insert({
-                            "user_id": account_id,
+                            "account_id": account_id,
                             "plan_code": plan_code,
-                            "plan_name": plan_name,
                             "status": "active",
-                            "reference": reference,
+                            "paystack_ref": reference,
                             "amount": amount,
+                            "amount_kobo": amount * 100,
+                            "currency": "NGN",
                             "created_at": datetime.now().isoformat()
                         }).execute()
                         logging.info(f"Subscription activated for {phone_number}: {plan_name}")
@@ -595,7 +593,6 @@ def webhook():
                 text = msg.get('text', {}).get('body', '').strip()
                 logging.info(f"Message from {from_number}: {text}")
                 
-                # Global commands
                 if text == '#':
                     user_state.pop(from_number, None)
                     send_whatsapp(from_number, get_main_menu())
@@ -620,7 +617,6 @@ def webhook():
                         send_whatsapp(from_number, get_main_menu())
                     continue
                 
-                # Handle ambiguous selection response
                 if from_number in user_state and user_state[from_number].get("ambiguous"):
                     state = user_state[from_number]
                     matches = state.get("matches", [])
@@ -650,7 +646,6 @@ Email example: name@example.com
                         send_whatsapp(from_number, "Please reply with 1 or 2 to select your plan, or 0 to cancel.")
                     continue
                 
-                # Handle email collection (step 2)
                 if from_number in user_state and user_state[from_number].get("step") == 2:
                     plan = user_state[from_number].get("plan")
                     email = text.strip().lower()
@@ -684,7 +679,6 @@ After successful payment, you will be redirected back to WhatsApp.
                         send_whatsapp(from_number, "❌ *Invalid email address.*\n\nPlease send a valid email address (e.g., name@example.com).\n\n* - Back | 0 - Cancel | # - Main Menu")
                     continue
                 
-                # Main menu navigation
                 if text == '4':
                     plans = get_plans_list_menu()
                     send_whatsapp(from_number, plans)
