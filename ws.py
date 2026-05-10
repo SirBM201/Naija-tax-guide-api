@@ -80,21 +80,20 @@ def get_plans_list_menu():
         
         menu_lines = ["📋 *AVAILABLE SUBSCRIPTION PLANS*\n"]
         
-        # Separate plans by tier
         starter_plans = [p for p in plans if "starter" in p.get("plan_code", "")]
         professional_plans = [p for p in plans if "professional" in p.get("plan_code", "")]
         business_plans = [p for p in plans if "business" in p.get("plan_code", "")]
         
         def get_billing(plan_code):
             if "yearly" in plan_code:
-                return "year"
+                return "yearly"
             elif "quarterly" in plan_code:
-                return "quarter"
-            return "month"
+                return "quarterly"
+            return "monthly"
         
         def sort_by_billing(plan_list):
             order = {"monthly": 0, "quarterly": 1, "yearly": 2}
-            return sorted(plan_list, key=lambda x: order[get_billing(x.get("plan_code", ""))])
+            return sorted(plan_list, key=lambda x: order.get(get_billing(x.get("plan_code", "")), 99))
         
         if starter_plans:
             menu_lines.append("*STARTER PLANS*")
@@ -103,7 +102,8 @@ def get_plans_list_menu():
                 price = plan.get("price", 0)
                 credits = plan.get("ai_credits_total", 0)
                 billing = get_billing(plan.get("plan_code", ""))
-                menu_lines.append(f"  • {name} - ₦{price:,}/{billing} - {credits} credits")
+                billing_display = {"monthly": "month", "quarterly": "quarter", "yearly": "year"}.get(billing, billing)
+                menu_lines.append(f"  • {name} - ₦{price:,}/{billing_display} - {credits} credits")
             menu_lines.append("")
         
         if professional_plans:
@@ -113,7 +113,8 @@ def get_plans_list_menu():
                 price = plan.get("price", 0)
                 credits = plan.get("ai_credits_total", 0)
                 billing = get_billing(plan.get("plan_code", ""))
-                menu_lines.append(f"  • {name} - ₦{price:,}/{billing} - {credits} credits")
+                billing_display = {"monthly": "month", "quarterly": "quarter", "yearly": "year"}.get(billing, billing)
+                menu_lines.append(f"  • {name} - ₦{price:,}/{billing_display} - {credits} credits")
             menu_lines.append("")
         
         if business_plans:
@@ -123,7 +124,8 @@ def get_plans_list_menu():
                 price = plan.get("price", 0)
                 credits = plan.get("ai_credits_total", 0)
                 billing = get_billing(plan.get("plan_code", ""))
-                menu_lines.append(f"  • {name} - ₦{price:,}/{billing} - {credits} credits")
+                billing_display = {"monthly": "month", "quarterly": "quarter", "yearly": "year"}.get(billing, billing)
+                menu_lines.append(f"  • {name} - ₦{price:,}/{billing_display} - {credits} credits")
             menu_lines.append("")
         
         menu_lines.append("💡 *How to subscribe:*")
