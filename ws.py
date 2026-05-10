@@ -27,6 +27,9 @@ WHATSAPP_ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 WHATSAPP_API_URL = "https://graph.facebook.com/v18.0"
 
+# Track user subscription selection state
+user_selection = {}
+
 # ============ TAX CALCULATION ============
 def calculate_paye(monthly_gross):
     annual_gross = monthly_gross * 12
@@ -70,10 +73,55 @@ def calculate_paye(monthly_gross):
         "rate": round(rate, 1)
     }
 
-def get_plans_list_menu():
+def get_all_plans():
     try:
         result = supabase.table("plans").select("*").eq("active", True).execute()
         plans = result.data or []
+        return plans
+    except Exception as e:
+        logging.error(f"Error fetching plans: {e}")
+        return []
+
+def find_plan_by_name(plans, name):
+    name_lower = name.lower().strip()
+    for plan in plans:
+        if plan.get("name", "").lower() == name_lower:
+            return plan
+    return None
+
+def find_plan_by_code(plans, code):
+    code_map = {
+        "S1": "starter_monthly",
+        "S2": "starter_quarterly", 
+        "S3": "starter_yearly",
+        "P1": "professional_monthly",
+        "P2": "professional_quarterly",
+        "P3": "professional_yearly",
+        "B1": "business_monthly",
+        "B2": "business_quarterly",
+        "B3": "business_yearly"
+    }
+    
+    plan_code = code_map.get(code.upper())
+    if plan_code:
+        for plan in plans:
+            if plan.get("plan_code", "") == plan_code:
+                return plan
+    return None
+
+def find_plan_by_credits(plans, credits_text):
+    try:
+        credits = int(credits_text)
+        for plan in plans:
+            if plan.get("ai_credits_total", 0) == credits:
+                return plan
+    except:
+        pass
+    return None
+
+def get_plans_list_menu():
+    try:
+        plans = get_all_plans()
         
         if not plans:
             return "📋 *Subscription Plans*\n\nNo plans available at the moment. Please check back later."
@@ -95,15 +143,30 @@ def get_plans_list_menu():
             order = {"monthly": 0, "quarterly": 1, "yearly": 2}
             return sorted(plan_list, key=lambda x: order.get(get_billing(x.get("plan_code", "")), 99))
         
+        # Code mapping for display
+        code_map = {
+            "starter_monthly": "S1",
+            "starter_quarterly": "S2",
+            "starter_yearly": "S3",
+            "professional_monthly": "P1",
+            "professional_quarterly": "P2",
+            "professional_yearly": "P3",
+            "business_monthly": "B1",
+            "business_quarterly": "B2",
+            "business_yearly": "B3"
+        }
+        
         if starter_plans:
             menu_lines.append("*STARTER PLANS*")
             for plan in sort_by_billing(starter_plans):
                 name = plan.get("name", "Unknown")
                 price = plan.get("price", 0)
                 credits = plan.get("ai_credits_total", 0)
-                billing = get_billing(plan.get("plan_code", ""))
+                plan_code = plan.get("plan_code", "")
+                billing = get_billing(plan_code)
                 billing_display = {"monthly": "month", "quarterly": "quarter", "yearly": "year"}.get(billing, billing)
-                menu_lines.append(f"  • {name} - ₦{price:,}/{billing_display} - {credits} credits")
+                short_code = code_map.get(plan_code, "")
+                menu_lines.append(f"  • {name} - ₦{price:,}/{billing_display} - {credits} credits [{short_code}]")
             menu_lines.append("")
         
         if professional_plans:
@@ -112,9 +175,11 @@ def get_plans_list_menu():
                 name = plan.get("name", "Unknown")
                 price = plan.get("price", 0)
                 credits = plan.get("ai_credits_total", 0)
-                billing = get_billing(plan.get("plan_code", ""))
+                plan_code = plan.get("plan_code", "")
+                billing = get_billing(plan_code)
                 billing_display = {"monthly": "month", "quarterly": "quarter", "yearly": "year"}.get(billing, billing)
-                menu_lines.append(f"  • {name} - ₦{price:,}/{billing_display} - {credits} credits")
+                short_code = code_map.get(plan_code, "")
+                menu_lines.append(f"  • {name} - ₦{price:,}/{billing_display} - {credits} credits [{short_code}]")
             menu_lines.append("")
         
         if business_plans:
@@ -123,24 +188,28 @@ def get_plans_list_menu():
                 name = plan.get("name", "Unknown")
                 price = plan.get("price", 0)
                 credits = plan.get("ai_credits_total", 0)
-                billing = get_billing(plan.get("plan_code", ""))
+                plan_code = plan.get("plan_code", "")
+                billing = get_billing(plan_code)
                 billing_display = {"monthly": "month", "quarterly": "quarter", "yearly": "year"}.get(billing, billing)
-                menu_lines.append(f"  • {name} - ₦{price:,}/{billing_display} - {credits} credits")
+                short_code = code_map.get(plan_code, "")
+                menu_lines.append(f"  • {name} - ₦{price:,}/{billing_display} - {credits} credits [{short_code}]")
             menu_lines.append("")
         
-        menu_lines.append("💡 *How to subscribe:*")
-        menu_lines.append("Reply with the plan name (e.g., 'Starter Monthly')")
-        menu_lines.append("Or reply with the code:")
-        menu_lines.append("  • S1 - Starter Monthly")
-        menu_lines.append("  • S2 - Starter Quarterly")
-        menu_lines.append("  • S3 - Starter Yearly")
-        menu_lines.append("  • P1 - Professional Monthly")
-        menu_lines.append("  • P2 - Professional Quarterly")
-        menu_lines.append("  • P3 - Professional Yearly")
-        menu_lines.append("  • B1 - Business Monthly")
-        menu_lines.append("  • B2 - Business Quarterly")
-        menu_lines.append("  • B3 - Business Yearly")
-        menu_lines.append("\n0 - Cancel | # - Main Menu")
+        menu_lines.append("💡 *How to subscribe (3 ways):*")
+        menu_lines.append("")
+        menu_lines.append("1️⃣ *By Plan Name:*")
+        menu_lines.append("   Type the full plan name")
+        menu_lines.append("   Example: 'Business Monthly'")
+        menu_lines.append("")
+        menu_lines.append("2️⃣ *By Plan Code:*")
+        menu_lines.append("   Type the short code shown in [brackets]")
+        menu_lines.append("   Example: 'B1' for Business Monthly")
+        menu_lines.append("")
+        menu_lines.append("3️⃣ *By Credits Quota:*")
+        menu_lines.append("   Type the number of AI credits")
+        menu_lines.append("   Example: '800' for Business Monthly")
+        menu_lines.append("")
+        menu_lines.append("0 - Cancel | # - Main Menu")
         
         return "\n".join(menu_lines)
     except Exception as e:
@@ -217,6 +286,7 @@ def webhook():
                 text = msg.get('text', {}).get('body', '').strip()
                 logging.info(f"Message from {from_number}: {text}")
                 
+                # Handle subscription selection
                 if text == '4':
                     plans = get_plans_list_menu()
                     send_whatsapp(from_number, plans)
@@ -236,9 +306,49 @@ Net: *₦{data['net']:,.0f}*
 Rate: {data['rate']}%"""
                         send_whatsapp(from_number, result)
                     except:
-                        send_whatsapp(from_number, "Send a valid number")
+                        send_whatsapp(from_number, "Send a valid number (e.g., 500000)")
                 else:
-                    send_whatsapp(from_number, get_main_menu())
+                    # Check if user is trying to subscribe by name, code, or credits
+                    plans = get_all_plans()
+                    
+                    # Try to find by name
+                    plan = find_plan_by_name(plans, text)
+                    
+                    # If not found by name, try by code
+                    if not plan:
+                        plan = find_plan_by_code(plans, text)
+                    
+                    # If not found by code, try by credits
+                    if not plan:
+                        plan = find_plan_by_credits(plans, text)
+                    
+                    if plan:
+                        plan_name = plan.get("name", "Unknown")
+                        price = plan.get("price", 0)
+                        credits = plan.get("ai_credits_total", 0)
+                        plan_code = plan.get("plan_code", "")
+                        
+                        billing = "month"
+                        if "quarterly" in plan_code:
+                            billing = "quarter"
+                        elif "yearly" in plan_code:
+                            billing = "year"
+                        
+                        response = f"""*SUBSCRIPTION SELECTED*
+
+Plan: {plan_name}
+Price: ₦{price:,}/{billing}
+AI Credits: {credits} credits per {billing}
+
+To complete your subscription, please visit:
+www.naijataxguides.com/subscribe
+
+Or reply with 'CONFIRM' to proceed via WhatsApp.
+
+0 - Cancel | # - Main Menu"""
+                        send_whatsapp(from_number, response)
+                    else:
+                        send_whatsapp(from_number, get_main_menu())
         
         return "ok"
     except Exception as e:
