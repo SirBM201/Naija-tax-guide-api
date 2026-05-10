@@ -114,8 +114,6 @@ def get_plans_list_menu():
         if not plans:
             return "📋 *Subscription Plans*\n\nNo plans available at the moment. Please check back later."
         
-        plans.sort(key=lambda x: x.get("price", 0))
-        
         menu_lines = ["📋 *Subscription Plans*\n"]
         
         # Add Free Plan
@@ -124,17 +122,17 @@ def get_plans_list_menu():
         menu_lines.append("• Basic tax calculator")
         menu_lines.append("• Standard support\n")
         
-        # Add Starter (Pro) plans
-        starter_plans = [p for p in plans if "starter" in p.get("plan_code", "")]
-        if starter_plans:
+        # Add Starter/Pro plans (price around 5000)
+        pro_plans = [p for p in plans if p.get("price", 0) <= 6000]
+        if pro_plans:
             menu_lines.append("*Pro Plan* - ₦5,000/month")
             menu_lines.append("• 50 AI questions per month")
             menu_lines.append("• Advanced calculator")
             menu_lines.append("• Priority support")
             menu_lines.append("• Export reports\n")
         
-        # Add Business plans
-        business_plans = [p for p in plans if "business" in p.get("plan_code", "")]
+        # Add Business plans (price around 25000)
+        business_plans = [p for p in plans if p.get("price", 0) >= 20000]
         if business_plans:
             menu_lines.append("*Business Plan* - ₦15,000/month")
             menu_lines.append("• Unlimited AI questions")
@@ -149,7 +147,7 @@ def get_plans_list_menu():
         
         return "\n".join(menu_lines)
     except Exception as e:
-        logging.error(f"Error: {e}")
+        logging.error(f"Error fetching plans: {e}")
         return "📋 *Subscription Plans*\n\nPlease visit www.naijataxguides.com/plans"
 
 # ============ MENUS ============
