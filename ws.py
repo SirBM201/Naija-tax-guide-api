@@ -27,6 +27,9 @@ WHATSAPP_ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 WHATSAPP_API_URL = "https://graph.facebook.com/v18.0"
 
+# Track user state for ambiguous selections
+user_state = {}
+
 # ============ TAX CALCULATION ============
 def calculate_paye(monthly_gross):
     annual_gross = monthly_gross * 12
@@ -79,17 +82,25 @@ def get_all_plans():
         return []
 
 def extract_number(text):
-    """Extract digits from text"""
-    match = re.search(r'[\d,]+', text.replace(',', ''))
+    """Extract digits from text, handling ₦ and commas"""
+    # Remove ₦ symbol, commas, spaces
+    cleaned = text.replace('₦', '').replace(',', '').replace(' ', '').strip()
+    # Extract digits
+    match = re.search(r'(\d+)', cleaned)
     if match:
-        return float(match.group())
+        return int(match.group(1))
     return None
 
-def find_plan_by_input(plans, user_input):
-    user_input = user_input.strip()
-    input_lower = user_input.lower()
-    
-    # Code mapping
+def find_plans_by_credits(plans, credits):
+    """Find all plans with matching credits"""
+    return [p for p in plans if p.get("ai_credits_total", 0) == credits]
+
+def find_plans_by_price(plans, price):
+    """Find all plans with matching price"""
+    return [p for p in plans if p.get("price", 0) == price]
+
+def find_plan_by_code(plans, code):
+    """Find plan by short code (S1, P2, B3, etc.)"""
     code_map = {
         "S1": "starter_monthly",
         "S2": "starter_quarterly", 
@@ -102,56 +113,54 @@ def find_plan_by_input(plans, user_input):
         "B3": "business_yearly"
     }
     
-    # Check by Plan Code FIRST (S1, P1, B1, etc.)
-    if input_lower in code_map:
-        target_code = code_map[input_lower]
+    target_code = code_map.get(code.upper())
+    if target_code:
         for plan in plans:
             if plan.get("plan_code", "") == target_code:
                 return plan
-    
-    # Check by Plan Name
+    return None
+
+def find_plan_by_name(plans, name):
+    """Find plan by exact name"""
+    name_lower = name.lower().strip()
     for plan in plans:
-        if plan.get("name", "").lower() == input_lower:
+        if plan.get("name", "").lower() == name_lower:
             return plan
-        # Also check partial matches for common variations
-        if "starter" in input_lower and "starter" in plan.get("plan_code", ""):
-            if "monthly" in input_lower and "monthly" in plan.get("plan_code", ""):
-                return plan
-            if "quarterly" in input_lower and "quarterly" in plan.get("plan_code", ""):
-                return plan
-            if "yearly" in input_lower and "yearly" in plan.get("plan_code", ""):
-                return plan
-        if "professional" in input_lower and "professional" in plan.get("plan_code", ""):
-            if "monthly" in input_lower and "monthly" in plan.get("plan_code", ""):
-                return plan
-            if "quarterly" in input_lower and "quarterly" in plan.get("plan_code", ""):
-                return plan
-            if "yearly" in input_lower and "yearly" in plan.get("plan_code", ""):
-                return plan
-        if "business" in input_lower and "business" in plan.get("plan_code", ""):
-            if "monthly" in input_lower and "monthly" in plan.get("plan_code", ""):
-                return plan
-            if "quarterly" in input_lower and "quarterly" in plan.get("plan_code", ""):
-                return plan
-            if "yearly" in input_lower and "yearly" in plan.get("plan_code", ""):
-                return plan
+    return None
+
+def find_plan_by_input(plans, user_input, from_number):
+    """Find plan by name, code, price, or credits with ambiguity handling"""
+    user_input = user_input.strip()
+    input_lower = user_input.lower()
     
-    # Extract number for credits or price search
+    # 1. Check by Plan Code
+    plan = find_plan_by_code(plans, user_input)
+    if plan:
+        return {"found": True, "plan": plan, "ambiguous": False}
+    
+    # 2. Check by Plan Name
+    plan = find_plan_by_name(plans, user_input)
+    if plan:
+        return {"found": True, "plan": plan, "ambiguous": False}
+    
+    # Extract number for price/credits search
     number = extract_number(user_input)
     if number is not None:
-        # Check if user included "credits" keyword
-        if "credit" in input_lower:
-            # Search by credits
-            for plan in plans:
-                if plan.get("ai_credits_total", 0) == number:
-                    return plan
-        else:
-            # Search by price
-            for plan in plans:
-                if plan.get("price", 0) == number:
-                    return plan
+        # 3. Check by Price (with or without ₦ symbol)
+        price_matches = find_plans_by_price(plans, number)
+        if len(price_matches) == 1:
+            return {"found": True, "plan": price_matches[0], "ambiguous": False}
+        elif len(price_matches) > 1:
+            return {"found": True, "ambiguous": True, "matches": price_matches, "type": "price"}
+        
+        # 4. Check by Credits
+        credits_matches = find_plans_by_credits(plans, number)
+        if len(credits_matches) == 1:
+            return {"found": True, "plan": credits_matches[0], "ambiguous": False}
+        elif len(credits_matches) > 1:
+            return {"found": True, "ambiguous": True, "matches": credits_matches, "type": "credits"}
     
-    return None
+    return {"found": False}
 
 def get_plans_list_menu():
     try:
@@ -177,7 +186,6 @@ def get_plans_list_menu():
             order = {"monthly": 0, "quarterly": 1, "yearly": 2}
             return sorted(plan_list, key=lambda x: order.get(get_billing(x.get("plan_code", "")), 99))
         
-        # Code mapping for display
         code_display = {
             "starter_monthly": "S1",
             "starter_quarterly": "S2",
@@ -243,12 +251,12 @@ def get_plans_list_menu():
         menu_lines.append("   Example: `S1` for Starter Monthly")
         menu_lines.append("")
         menu_lines.append("3️⃣ *By Credits:*")
-        menu_lines.append("   Type `100 credits` or just `100`")
-        menu_lines.append("   Example: `100 credits` finds Starter Monthly")
+        menu_lines.append("   Type the number of AI credits")
+        menu_lines.append("   Example: `100` finds Starter Monthly")
         menu_lines.append("")
         menu_lines.append("4️⃣ *By Price:*")
-        menu_lines.append("   Type `₦14,000` or `14000`")
-        menu_lines.append("   Example: `14000` finds Starter Quarterly")
+        menu_lines.append("   Type the amount (with or without ₦)")
+        menu_lines.append("   Example: `14000` or `₦14,000` finds Starter Quarterly")
         menu_lines.append("")
         menu_lines.append("0 - Cancel | # - Main Menu")
         
@@ -327,6 +335,49 @@ def webhook():
                 text = msg.get('text', {}).get('body', '').strip()
                 logging.info(f"Message from {from_number}: {text}")
                 
+                # Handle ambiguous selection response
+                if from_number in user_state and user_state[from_number].get("ambiguous"):
+                    state = user_state[from_number]
+                    matches = state.get("matches", [])
+                    
+                    if text in ["1", "2"]:
+                        idx = int(text) - 1
+                        if idx < len(matches):
+                            plan = matches[idx]
+                            plan_name = plan.get("name", "Unknown")
+                            price = plan.get("price", 0)
+                            credits = plan.get("ai_credits_total", 0)
+                            plan_code = plan.get("plan_code", "")
+                            
+                            billing = "month"
+                            if "quarterly" in plan_code:
+                                billing = "quarter"
+                            elif "yearly" in plan_code:
+                                billing = "year"
+                            
+                            response = f"""*SUBSCRIPTION SELECTED*
+
+✅ Plan: {plan_name}
+💰 Price: ₦{price:,}/{billing}
+🎯 AI Credits: {credits} credits per {billing}
+
+To complete your subscription, please visit:
+www.naijataxguides.com/subscribe
+
+Or reply with 'CONFIRM' to proceed via WhatsApp.
+
+0 - Cancel | # - Main Menu"""
+                            send_whatsapp(from_number, response)
+                            del user_state[from_number]
+                        else:
+                            send_whatsapp(from_number, "Invalid selection. Please reply with 1 or 2.")
+                    elif text == '0':
+                        del user_state[from_number]
+                        send_whatsapp(from_number, get_main_menu())
+                    else:
+                        send_whatsapp(from_number, "Please reply with 1 or 2 to select your plan, or 0 to cancel.")
+                    continue
+                
                 if text == '4':
                     plans = get_plans_list_menu()
                     send_whatsapp(from_number, plans)
@@ -348,23 +399,49 @@ Rate: {data['rate']}%"""
                     except:
                         send_whatsapp(from_number, "Send a valid number (e.g., 500000)")
                 else:
-                    # Try to find plan by input (name, code, credits, price)
+                    # Try to find plan by input
                     plans = get_all_plans()
-                    plan = find_plan_by_input(plans, text)
+                    result = find_plan_by_input(plans, text, from_number)
                     
-                    if plan:
-                        plan_name = plan.get("name", "Unknown")
-                        price = plan.get("price", 0)
-                        credits = plan.get("ai_credits_total", 0)
-                        plan_code = plan.get("plan_code", "")
-                        
-                        billing = "month"
-                        if "quarterly" in plan_code:
-                            billing = "quarter"
-                        elif "yearly" in plan_code:
-                            billing = "year"
-                        
-                        response = f"""*SUBSCRIPTION SELECTED*
+                    if result.get("found"):
+                        if result.get("ambiguous"):
+                            matches = result.get("matches", [])
+                            match_type = result.get("type", "criteria")
+                            
+                            # Build selection message
+                            selection_msg = f"🔍 *Multiple plans found with this {match_type}:*\n\n"
+                            for i, plan in enumerate(matches, 1):
+                                name = plan.get("name", "Unknown")
+                                price = plan.get("price", 0)
+                                credits = plan.get("ai_credits_total", 0)
+                                plan_code = plan.get("plan_code", "")
+                                
+                                billing = "month"
+                                if "quarterly" in plan_code:
+                                    billing = "quarter"
+                                elif "yearly" in plan_code:
+                                    billing = "year"
+                                
+                                selection_msg += f"{i}. {name} - ₦{price:,}/{billing} - {credits} credits\n"
+                            
+                            selection_msg += "\nPlease reply with the number (1 or 2) to select your plan.\n0 - Cancel | # - Main Menu"
+                            
+                            send_whatsapp(from_number, selection_msg)
+                            user_state[from_number] = {"ambiguous": True, "matches": matches}
+                        else:
+                            plan = result.get("plan")
+                            plan_name = plan.get("name", "Unknown")
+                            price = plan.get("price", 0)
+                            credits = plan.get("ai_credits_total", 0)
+                            plan_code = plan.get("plan_code", "")
+                            
+                            billing = "month"
+                            if "quarterly" in plan_code:
+                                billing = "quarter"
+                            elif "yearly" in plan_code:
+                                billing = "year"
+                            
+                            response = f"""*SUBSCRIPTION SELECTED*
 
 ✅ Plan: {plan_name}
 💰 Price: ₦{price:,}/{billing}
@@ -376,7 +453,7 @@ www.naijataxguides.com/subscribe
 Or reply with 'CONFIRM' to proceed via WhatsApp.
 
 0 - Cancel | # - Main Menu"""
-                        send_whatsapp(from_number, response)
+                            send_whatsapp(from_number, response)
                     else:
                         send_whatsapp(from_number, get_main_menu())
         
