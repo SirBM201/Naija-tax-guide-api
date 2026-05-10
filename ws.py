@@ -70,7 +70,6 @@ def calculate_paye(monthly_gross):
         "rate": round(rate, 1)
     }
 
-# ============ SUBSCRIPTION PLANS ============
 def get_plans_list_menu():
     try:
         result = supabase.table("plans").select("*").eq("active", True).execute()
@@ -81,33 +80,71 @@ def get_plans_list_menu():
         
         menu_lines = ["📋 *AVAILABLE SUBSCRIPTION PLANS*\n"]
         
-        # Sort by price
-        plans.sort(key=lambda x: x.get("price", 0))
+        # Separate plans by tier
+        starter_plans = [p for p in plans if "starter" in p.get("plan_code", "")]
+        professional_plans = [p for p in plans if "professional" in p.get("plan_code", "")]
+        business_plans = [p for p in plans if "business" in p.get("plan_code", "")]
         
-        for idx, plan in enumerate(plans, 1):
-            name = plan.get("name", "Unknown")
-            price = plan.get("price", 0)
-            credits = plan.get("ai_credits_total", 0)
-            
-            plan_code = plan.get("plan_code", "")
+        def get_billing(plan_code):
             if "yearly" in plan_code:
-                billing = "year"
+                return "year"
             elif "quarterly" in plan_code:
-                billing = "quarter"
-            else:
-                billing = "month"
-            
-            menu_lines.append(f"{idx}. *{name}* - ₦{price:,}/{billing} - {credits} AI credits")
+                return "quarter"
+            return "month"
         
-        menu_lines.append("\n💡 Send plan number to subscribe")
-        menu_lines.append("0 - Cancel | # - Main Menu")
+        def sort_by_billing(plan_list):
+            order = {"monthly": 0, "quarterly": 1, "yearly": 2}
+            return sorted(plan_list, key=lambda x: order[get_billing(x.get("plan_code", ""))])
+        
+        if starter_plans:
+            menu_lines.append("*STARTER PLANS*")
+            for plan in sort_by_billing(starter_plans):
+                name = plan.get("name", "Unknown")
+                price = plan.get("price", 0)
+                credits = plan.get("ai_credits_total", 0)
+                billing = get_billing(plan.get("plan_code", ""))
+                menu_lines.append(f"  • {name} - ₦{price:,}/{billing} - {credits} credits")
+            menu_lines.append("")
+        
+        if professional_plans:
+            menu_lines.append("*PROFESSIONAL PLANS*")
+            for plan in sort_by_billing(professional_plans):
+                name = plan.get("name", "Unknown")
+                price = plan.get("price", 0)
+                credits = plan.get("ai_credits_total", 0)
+                billing = get_billing(plan.get("plan_code", ""))
+                menu_lines.append(f"  • {name} - ₦{price:,}/{billing} - {credits} credits")
+            menu_lines.append("")
+        
+        if business_plans:
+            menu_lines.append("*BUSINESS PLANS*")
+            for plan in sort_by_billing(business_plans):
+                name = plan.get("name", "Unknown")
+                price = plan.get("price", 0)
+                credits = plan.get("ai_credits_total", 0)
+                billing = get_billing(plan.get("plan_code", ""))
+                menu_lines.append(f"  • {name} - ₦{price:,}/{billing} - {credits} credits")
+            menu_lines.append("")
+        
+        menu_lines.append("💡 *How to subscribe:*")
+        menu_lines.append("Reply with the plan name (e.g., 'Starter Monthly')")
+        menu_lines.append("Or reply with the code:")
+        menu_lines.append("  • S1 - Starter Monthly")
+        menu_lines.append("  • S2 - Starter Quarterly")
+        menu_lines.append("  • S3 - Starter Yearly")
+        menu_lines.append("  • P1 - Professional Monthly")
+        menu_lines.append("  • P2 - Professional Quarterly")
+        menu_lines.append("  • P3 - Professional Yearly")
+        menu_lines.append("  • B1 - Business Monthly")
+        menu_lines.append("  • B2 - Business Quarterly")
+        menu_lines.append("  • B3 - Business Yearly")
+        menu_lines.append("\n0 - Cancel | # - Main Menu")
         
         return "\n".join(menu_lines)
     except Exception as e:
         logging.error(f"Error fetching plans: {e}")
         return "📋 *Subscription Plans*\n\nPlease visit www.naijataxguides.com/plans"
 
-# ============ MENUS ============
 def get_main_menu():
     return """*🤖 Naija Tax Guide*
 
@@ -146,7 +183,6 @@ def send_whatsapp(to_phone, text):
         logging.error(f"Send error: {e}")
         return False
 
-# ============ WEBHOOK ============
 @app.route('/health', methods=['GET'])
 def health():
     return "OK"
