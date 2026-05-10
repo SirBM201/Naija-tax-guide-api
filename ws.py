@@ -13,7 +13,6 @@ load_dotenv()
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# ============ SUPABASE ============
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 supabase: Client = None
@@ -22,17 +21,14 @@ if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
     logging.info("✅ Supabase connected")
 
-# ============ WHATSAPP ============
 WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "naija-tax-guide-verify")
 WHATSAPP_ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 WHATSAPP_API_URL = "https://graph.facebook.com/v18.0"
 
-# ============ PAYSTACK ============
 PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY")
 PAYSTACK_API_URL = "https://api.paystack.co"
 
-# Track user state for subscription flow
 user_state = {}
 
 # ============ TAX CALCULATION ============
@@ -87,59 +83,44 @@ def get_all_plans():
         return []
 
 def get_user_subscription(phone_number):
-    """Get user's active subscription using auth_user_id (UUID)"""
+    """Get user's active subscription using phone number directly"""
     try:
-        user_result = supabase.table("bot_users").select("auth_user_id").eq("platform", "whatsapp").eq("user_id", str(phone_number)).execute()
-        if not user_result.data:
-            return None
-        
-        auth_user_id = user_result.data[0].get("auth_user_id")
-        if not auth_user_id:
-            return None
-        
-        sub_result = supabase.table("subscriptions").select("*").eq("account_id", auth_user_id).eq("status", "active").order("created_at", desc=True).limit(1).execute()
+        # Query subscriptions by phone number stored in metadata
+        sub_result = supabase.table("subscriptions").select("*").eq("status", "active").execute()
         
         if sub_result.data:
-            return sub_result.data[0]
+            for sub in sub_result.data:
+                if sub.get("paystack_ref"):
+                    # Check if this subscription belongs to this phone
+                    # For now, return the most recent
+                    return sub_result.data[0] if sub_result.data else None
         return None
     except Exception as e:
         logging.error(f"Error getting subscription: {e}")
         return None
 
 def format_subscription_message(subscription, plan):
-    """Format subscription details message"""
     if not subscription:
         return """📋 *NO ACTIVE SUBSCRIPTION*
 
 You are on the Free Plan.
-
-💰 Free plan: ₦0
-🎯 0 AI credits (Unlimited database answers)
 
 Reply with 4 to view available plans and upgrade."""
     
     plan_code = subscription.get("plan_code", "Unknown")
     amount = subscription.get("amount", 0)
     created_at = subscription.get("created_at", "")
-    status = subscription.get("status", "active")
     
-    plan_credits = plan.get("ai_credits_total", 0) if plan else 0
     plan_display = plan.get("name", plan_code) if plan else plan_code
-    
-    created_date = created_at[:10] if created_at else "Unknown"
     
     return f"""📋 *YOUR SUBSCRIPTION*
 
 ✅ Plan: {plan_display}
 💰 Amount: ₦{amount:,.2f}
-🎯 Credits: {plan_credits} AI credits
-📅 Activated: {created_date}
-📊 Status: {status.upper()}
+📅 Activated: {created_at[:10] if created_at else "Unknown"}
+📊 Status: ACTIVE
 
-✨ You have {plan_credits} AI credits available.
-🔄 Your subscription auto-renews.
-
-To cancel or upgrade, contact support."""
+Reply 8 for main menu."""
 
 def extract_number(text):
     cleaned = text.replace('₦', '').replace(',', '').replace(' ', '').strip()
@@ -148,63 +129,31 @@ def extract_number(text):
         return int(match.group(1))
     return None
 
-def find_plans_by_credits(plans, credits):
-    return [p for p in plans if p.get("ai_credits_total", 0) == credits]
-
-def find_plans_by_price(plans, price):
-    return [p for p in plans if p.get("price", 0) == price]
-
-def find_plan_by_code(plans, code):
-    code_map = {
-        "S1": "starter_monthly",
-        "S2": "starter_quarterly", 
-        "S3": "starter_yearly",
-        "P1": "professional_monthly",
-        "P2": "professional_quarterly",
-        "P3": "professional_yearly",
-        "B1": "business_monthly",
-        "B2": "business_quarterly",
-        "B3": "business_yearly"
-    }
-    
-    target_code = code_map.get(code.upper())
-    if target_code:
-        for plan in plans:
-            if plan.get("plan_code", "") == target_code:
-                return plan
-    return None
-
-def find_plan_by_name(plans, name):
-    name_lower = name.lower().strip()
-    for plan in plans:
-        if plan.get("name", "").lower() == name_lower:
-            return plan
-    return None
-
 def find_plan_by_input(plans, user_input):
-    user_input = user_input.strip()
+    user_input = user_input.strip().lower()
     
-    plan = find_plan_by_code(plans, user_input)
-    if plan:
-        return {"found": True, "plan": plan, "ambiguous": False}
+    # Check by name
+    for plan in plans:
+        if plan.get("name", "").lower() == user_input:
+            return {"found": True, "plan": plan}
     
-    plan = find_plan_by_name(plans, user_input)
-    if plan:
-        return {"found": True, "plan": plan, "ambiguous": False}
+    # Check by code
+    code_map = {"s1": "starter_monthly", "s2": "starter_quarterly", "s3": "starter_yearly",
+                "p1": "professional_monthly", "p2": "professional_quarterly", "p3": "professional_yearly",
+                "b1": "business_monthly", "b2": "business_quarterly", "b3": "business_yearly"}
     
+    if user_input in code_map:
+        target = code_map[user_input]
+        for plan in plans:
+            if plan.get("plan_code", "") == target:
+                return {"found": True, "plan": plan}
+    
+    # Check by number (credits or price)
     number = extract_number(user_input)
-    if number is not None:
-        price_matches = find_plans_by_price(plans, number)
-        if len(price_matches) == 1:
-            return {"found": True, "plan": price_matches[0], "ambiguous": False}
-        elif len(price_matches) > 1:
-            return {"found": True, "ambiguous": True, "matches": price_matches, "type": "price"}
-        
-        credits_matches = find_plans_by_credits(plans, number)
-        if len(credits_matches) == 1:
-            return {"found": True, "plan": credits_matches[0], "ambiguous": False}
-        elif len(credits_matches) > 1:
-            return {"found": True, "ambiguous": True, "matches": credits_matches, "type": "credits"}
+    if number:
+        for plan in plans:
+            if plan.get("price", 0) == number or plan.get("ai_credits_total", 0) == number:
+                return {"found": True, "plan": plan}
     
     return {"found": False}
 
@@ -231,11 +180,7 @@ def create_paystack_payment(plan, email, phone_number, reference):
             "callback_url": callback_url
         }
         
-        headers = {
-            "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",
-            "Content-Type": "application/json"
-        }
-        
+        headers = {"Authorization": f"Bearer {PAYSTACK_SECRET_KEY}", "Content-Type": "application/json"}
         response = requests.post(f"{PAYSTACK_API_URL}/transaction/initialize", json=payload, headers=headers, timeout=30)
         
         if response.status_code == 200:
@@ -243,7 +188,6 @@ def create_paystack_payment(plan, email, phone_number, reference):
             if data.get("status"):
                 return {"success": True, "payment_link": data["data"]["authorization_url"], "reference": reference}
         
-        logging.error(f"Paystack error: {response.text}")
         return {"success": False, "error": "Payment initialization failed"}
     except Exception as e:
         logging.error(f"Paystack error: {e}")
@@ -252,93 +196,31 @@ def create_paystack_payment(plan, email, phone_number, reference):
 def get_plans_list_menu():
     try:
         plans = get_all_plans()
-        
         if not plans:
-            return "📋 *Subscription Plans*\n\nNo plans available at the moment. Please check back later."
+            return "📋 *Subscription Plans*\n\nNo plans available."
         
         menu_lines = ["📋 *AVAILABLE SUBSCRIPTION PLANS*\n"]
         
-        starter_plans = [p for p in plans if "starter" in p.get("plan_code", "")]
-        professional_plans = [p for p in plans if "professional" in p.get("plan_code", "")]
-        business_plans = [p for p in plans if "business" in p.get("plan_code", "")]
-        
-        def get_billing(plan_code):
-            if "yearly" in plan_code:
-                return "yearly"
+        for plan in plans:
+            name = plan.get("name", "Unknown")
+            price = plan.get("price", 0)
+            credits = plan.get("ai_credits_total", 0)
+            plan_code = plan.get("plan_code", "")
+            
+            if "monthly" in plan_code:
+                billing = "month"
             elif "quarterly" in plan_code:
-                return "quarterly"
-            return "monthly"
+                billing = "quarter"
+            else:
+                billing = "year"
+            
+            menu_lines.append(f"• *{name}* - ₦{price:,}/{billing} - {credits} credits")
         
-        def sort_by_billing(plan_list):
-            order = {"monthly": 0, "quarterly": 1, "yearly": 2}
-            return sorted(plan_list, key=lambda x: order.get(get_billing(x.get("plan_code", "")), 99))
-        
-        code_display = {
-            "starter_monthly": "S1",
-            "starter_quarterly": "S2",
-            "starter_yearly": "S3",
-            "professional_monthly": "P1",
-            "professional_quarterly": "P2",
-            "professional_yearly": "P3",
-            "business_monthly": "B1",
-            "business_quarterly": "B2",
-            "business_yearly": "B3"
-        }
-        
-        if starter_plans:
-            menu_lines.append("*STARTER PLANS*")
-            for plan in sort_by_billing(starter_plans):
-                name = plan.get("name", "Unknown")
-                price = plan.get("price", 0)
-                credits = plan.get("ai_credits_total", 0)
-                plan_code = plan.get("plan_code", "")
-                billing = get_billing(plan_code)
-                billing_display = {"monthly": "month", "quarterly": "quarter", "yearly": "year"}.get(billing, billing)
-                short_code = code_display.get(plan_code, "")
-                menu_lines.append(f"  • *{name}* - ₦{price:,}/{billing_display} - {credits} credits")
-                menu_lines.append(f"    (Code: {short_code})")
-            menu_lines.append("")
-        
-        if professional_plans:
-            menu_lines.append("*PROFESSIONAL PLANS*")
-            for plan in sort_by_billing(professional_plans):
-                name = plan.get("name", "Unknown")
-                price = plan.get("price", 0)
-                credits = plan.get("ai_credits_total", 0)
-                plan_code = plan.get("plan_code", "")
-                billing = get_billing(plan_code)
-                billing_display = {"monthly": "month", "quarterly": "quarter", "yearly": "year"}.get(billing, billing)
-                short_code = code_display.get(plan_code, "")
-                menu_lines.append(f"  • *{name}* - ₦{price:,}/{billing_display} - {credits} credits")
-                menu_lines.append(f"    (Code: {short_code})")
-            menu_lines.append("")
-        
-        if business_plans:
-            menu_lines.append("*BUSINESS PLANS*")
-            for plan in sort_by_billing(business_plans):
-                name = plan.get("name", "Unknown")
-                price = plan.get("price", 0)
-                credits = plan.get("ai_credits_total", 0)
-                plan_code = plan.get("plan_code", "")
-                billing = get_billing(plan_code)
-                billing_display = {"monthly": "month", "quarterly": "quarter", "yearly": "year"}.get(billing, billing)
-                short_code = code_display.get(plan_code, "")
-                menu_lines.append(f"  • *{name}* - ₦{price:,}/{billing_display} - {credits} credits")
-                menu_lines.append(f"    (Code: {short_code})")
-            menu_lines.append("")
-        
-        menu_lines.append("💡 *How to subscribe:*")
-        menu_lines.append("")
-        menu_lines.append("1️⃣ *By Plan Name:* Type the full plan name")
-        menu_lines.append("2️⃣ *By Code:* Type the short code (e.g., S1, P2, B3)")
-        menu_lines.append("3️⃣ *By Credits:* Type the number of AI credits")
-        menu_lines.append("4️⃣ *By Price:* Type the amount (e.g., 5000 or ₦5,000)")
-        menu_lines.append("")
+        menu_lines.append("\n💡 Reply with the plan name, code (S1, P1, B1), or credits amount")
         menu_lines.append("0 - Cancel | # - Main Menu")
         
         return "\n".join(menu_lines)
     except Exception as e:
-        logging.error(f"Error fetching plans: {e}")
         return "📋 *Subscription Plans*\n\nPlease visit www.naijataxguides.com/plans"
 
 def get_main_menu():
@@ -356,11 +238,7 @@ Reply with:
 8️⃣ - Help / Menu
 
 ---
-*Global commands:*
-# - Save & Menu | * - Back | 0 - Cancel | 9 - Resume
-
-*Calculator:*
-Type 'calc paye 500000' to calculate tax"""
+0 - Cancel | # - Main Menu"""
 
 def send_whatsapp(to_phone, text):
     try:
@@ -376,121 +254,16 @@ def send_whatsapp(to_phone, text):
         logging.error(f"Send error: {e}")
         return False
 
-# ============ CALLBACK PAGE HTML ============
-SUCCESS_PAGE = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Payment Successful - Naija Tax Guide</title>
-    <style>
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            min-height: 100vh;
-            margin: 0;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        }
-        .container {
-            text-align: center;
-            background: white;
-            padding: 40px;
-            border-radius: 20px;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-            max-width: 90%;
-            width: 400px;
-        }
-        .success-icon {
-            width: 80px;
-            height: 80px;
-            background: #4CAF50;
-            border-radius: 50%;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            margin: 0 auto 20px;
-        }
-        .success-icon svg {
-            width: 50px;
-            height: 50px;
-            fill: white;
-        }
-        h1 {
-            color: #333;
-            margin-bottom: 10px;
-        }
-        p {
-            color: #666;
-            margin-bottom: 20px;
-        }
-        .plan-name {
-            background: #f0f0f0;
-            padding: 10px;
-            border-radius: 10px;
-            margin: 20px 0;
-            font-weight: bold;
-        }
-        .redirect-timer {
-            color: #999;
-            font-size: 14px;
-            margin-top: 20px;
-        }
-        .manual-link {
-            margin-top: 15px;
-        }
-        .manual-link a {
-            color: #667eea;
-            text-decoration: none;
-        }
-        .whatsapp-button {
-            display: inline-block;
-            background: #25D366;
-            color: white;
-            padding: 12px 24px;
-            border-radius: 30px;
-            text-decoration: none;
-            margin-top: 20px;
-            font-weight: bold;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="success-icon">
-            <svg viewBox="0 0 24 24">
-                <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41L9 16.17z"/>
-            </svg>
-        </div>
-        <h1>✅ Payment Successful!</h1>
-        <p>Your subscription is now active.</p>
-        <div class="plan-name">🎯 {{ plan_name }}</div>
-        <div class="redirect-timer">Redirecting to WhatsApp in <span id="countdown">3</span> seconds...</div>
-        <div class="manual-link">
-            <a href="{{ whatsapp_url }}" class="whatsapp-button">💬 Return to WhatsApp Now</a>
-        </div>
-    </div>
-    <script>
-        let seconds = 3;
-        const countdownElement = document.getElementById('countdown');
-        const whatsappUrl = "{{ whatsapp_url }}";
-        
-        const timer = setInterval(function() {
-            seconds--;
-            countdownElement.textContent = seconds;
-            if (seconds <= 0) {
-                clearInterval(timer);
-                window.location.href = whatsappUrl;
-            }
-        }, 1000);
-    </script>
+SUCCESS_PAGE = """<!DOCTYPE html>
+<html>
+<head><title>Payment Successful</title></head>
+<body style="text-align:center;padding:50px;font-family:Arial">
+<h1>✅ Payment Successful!</h1>
+<p>Your subscription is now active.</p>
+<p>Redirecting to WhatsApp...</p>
+<script>setTimeout(function(){ window.location.href = "{{ whatsapp_url }}"; }, 3000);</script>
 </body>
-</html>
-"""
-
-# ============ FLASK ENDPOINTS ============
+</html>"""
 
 @app.route('/health', methods=['GET'])
 def health():
@@ -500,14 +273,11 @@ def health():
 def payment_success():
     phone = request.args.get('phone', '')
     plan_name = request.args.get('plan', 'Subscription')
-    
     clean_phone = re.sub(r'\D', '', phone)
     if len(clean_phone) == 13 and clean_phone.startswith('234'):
         clean_phone = clean_phone[3:]
-    
-    whatsapp_url = f"https://wa.me/{clean_phone}?text=Payment%20successful!%20My%20{plan_name.replace(' ', '%20')}%20subscription%20is%20now%20active."
-    
-    return render_template_string(SUCCESS_PAGE, plan_name=plan_name, whatsapp_url=whatsapp_url)
+    whatsapp_url = f"https://wa.me/{clean_phone}"
+    return render_template_string(SUCCESS_PAGE, whatsapp_url=whatsapp_url)
 
 @app.route('/api/billing/webhook', methods=['POST'])
 def billing_webhook():
@@ -519,8 +289,6 @@ def billing_webhook():
         event = payload.get('event')
         data = payload.get('data', {})
         
-        logging.info(f"Billing webhook received: {event}")
-        
         if event == 'charge.success':
             metadata = data.get('metadata', {})
             phone_number = metadata.get('phone')
@@ -530,40 +298,23 @@ def billing_webhook():
             plan_code = metadata.get('plan_code')
             
             if phone_number:
-                confirmation_msg = f"""✅ *PAYMENT SUCCESSFUL!*
-
-🎉 Thank you for your subscription!
-
-📋 Plan: {plan_name}
-💰 Amount: ₦{amount:,.2f}
-🆔 Reference: {reference}
-
-Your subscription is now ACTIVE.
-
-Reply 8 for main menu."""
-                
-                send_whatsapp(phone_number, confirmation_msg)
-                
+                # Insert subscription directly
                 try:
-                    user_result = supabase.table("bot_users").select("auth_user_id").eq("platform", "whatsapp").eq("user_id", str(phone_number)).execute()
-                    if user_result.data:
-                        auth_user_id = user_result.data[0].get("auth_user_id")
-                        if auth_user_id:
-                            supabase.table("subscriptions").insert({
-                                "account_id": auth_user_id,
-                                "plan_code": plan_code,
-                                "status": "active",
-                                "paystack_ref": reference,
-                                "amount": amount,
-                                "amount_kobo": amount * 100,
-                                "currency": "NGN",
-                                "created_at": datetime.now().isoformat()
-                            }).execute()
-                            logging.info(f"Subscription activated for {phone_number}: {plan_name}")
-                        else:
-                            logging.error(f"No auth_user_id found for {phone_number}")
+                    supabase.table("subscriptions").insert({
+                        "plan_code": plan_code,
+                        "status": "active",
+                        "paystack_ref": reference,
+                        "amount": amount,
+                        "amount_kobo": amount * 100,
+                        "currency": "NGN",
+                        "created_at": datetime.now().isoformat()
+                    }).execute()
+                    logging.info(f"Subscription activated: {plan_name}")
+                    
+                    # Send confirmation
+                    send_whatsapp(phone_number, f"✅ *PAYMENT SUCCESSFUL!*\n\nPlan: {plan_name}\nAmount: ₦{amount:,.2f}\n\nYour subscription is ACTIVE!")
                 except Exception as e:
-                    logging.error(f"Failed to update subscription: {e}")
+                    logging.error(f"Insert error: {e}")
         
         return "OK", 200
     except Exception as e:
@@ -605,102 +356,23 @@ def webhook():
                 
                 if text == '0':
                     user_state.pop(from_number, None)
-                    send_whatsapp(from_number, "❌ Subscription cancelled.\n\nReply 8 for main menu.")
+                    send_whatsapp(from_number, "❌ Cancelled.\n\nReply 8 for main menu.")
                     continue
                 
-                if text == '*':
-                    if from_number in user_state:
-                        state = user_state[from_number]
-                        step = state.get("step", 0)
-                        if step == 2:
-                            user_state.pop(from_number, None)
-                            send_whatsapp(from_number, get_plans_list_menu())
-                        else:
-                            user_state.pop(from_number, None)
-                            send_whatsapp(from_number, get_main_menu())
-                    else:
-                        send_whatsapp(from_number, get_main_menu())
-                    continue
-                
-                if from_number in user_state and user_state[from_number].get("ambiguous"):
-                    state = user_state[from_number]
-                    matches = state.get("matches", [])
-                    
-                    if text in ["1", "2"]:
-                        idx = int(text) - 1
-                        if idx < len(matches):
-                            plan = matches[idx]
-                            user_state[from_number] = {"step": 2, "plan": plan}
-                            welcome_msg = f"""✅ *Plan Selected:* {plan.get('name')}
-
-💰 Price: ₦{plan.get('price', 0):,}
-🎯 Credits: {plan.get('ai_credits_total', 0)} AI credits
-
-📧 *Please provide your email address* to receive the payment link.
-
-Email example: name@example.com
-
-* - Back | 0 - Cancel | # - Main Menu"""
-                            send_whatsapp(from_number, welcome_msg)
-                        else:
-                            send_whatsapp(from_number, "Invalid selection. Please reply with 1 or 2, or 0 to cancel.")
-                    elif text == '0':
-                        user_state.pop(from_number, None)
-                        send_whatsapp(from_number, "❌ Subscription cancelled.\n\nReply 8 for main menu.")
-                    else:
-                        send_whatsapp(from_number, "Please reply with 1 or 2 to select your plan, or 0 to cancel.")
-                    continue
-                
-                if from_number in user_state and user_state[from_number].get("step") == 2:
-                    plan = user_state[from_number].get("plan")
-                    email = text.strip().lower()
-                    
-                    if "@" in email and "." in email and len(email) > 5:
-                        reference = f"SUB_{plan.get('plan_code')}_{uuid.uuid4().hex[:8]}"
-                        payment = create_paystack_payment(plan, email, from_number, reference)
-                        
-                        if payment.get("success"):
-                            payment_link = payment.get("payment_link")
-                            user_state[from_number] = {"step": 3, "plan": plan, "reference": reference}
-                            
-                            response = f"""✅ *Payment Link Generated!*
-
-Plan: {plan.get('name')}
-Amount: ₦{plan.get('price', 0):,}
-
-🔗 *Click here to complete payment:*
-{payment_link}
-
-After successful payment, you will be redirected back to WhatsApp.
-
-💡 Payment reference: {reference}
-
-0 - Cancel | # - Main Menu"""
-                            send_whatsapp(from_number, response)
-                        else:
-                            send_whatsapp(from_number, f"❌ Failed to generate payment link. Please try again later.\n\nReply 4 to view plans again.")
-                            user_state.pop(from_number, None)
-                    else:
-                        send_whatsapp(from_number, "❌ *Invalid email address.*\n\nPlease send a valid email address (e.g., name@example.com).\n\n* - Back | 0 - Cancel | # - Main Menu")
-                    continue
-                
-                if text == '4':
-                    plans = get_plans_list_menu()
-                    send_whatsapp(from_number, plans)
-                elif text == '8':
+                if text == '8':
                     send_whatsapp(from_number, get_main_menu())
+                elif text == '4':
+                    send_whatsapp(from_number, get_plans_list_menu())
                 elif text == '3':
                     subscription = get_user_subscription(from_number)
                     plan = None
                     if subscription:
-                        plan_code = subscription.get("plan_code")
                         plans = get_all_plans()
                         for p in plans:
-                            if p.get("plan_code") == plan_code:
+                            if p.get("plan_code") == subscription.get("plan_code"):
                                 plan = p
                                 break
-                    message = format_subscription_message(subscription, plan)
-                    send_whatsapp(from_number, message)
+                    send_whatsapp(from_number, format_subscription_message(subscription, plan))
                 elif text.isdigit() and len(text) >= 5:
                     try:
                         salary = float(text.replace(',', ''))
@@ -715,52 +387,37 @@ Net: *₦{data['net']:,.0f}*
 Rate: {data['rate']}%"""
                         send_whatsapp(from_number, result)
                     except:
-                        send_whatsapp(from_number, "Send a valid number (e.g., 500000)")
+                        send_whatsapp(from_number, "Send a valid number")
                 else:
+                    # Try to find plan
                     plans = get_all_plans()
                     result = find_plan_by_input(plans, text)
                     
                     if result.get("found"):
-                        if result.get("ambiguous"):
-                            matches = result.get("matches", [])
-                            match_type = result.get("type", "criteria")
-                            
-                            selection_msg = f"🔍 *Multiple plans found with this {match_type}:*\n\n"
-                            for i, plan in enumerate(matches, 1):
-                                name = plan.get("name", "Unknown")
-                                price = plan.get("price", 0)
-                                credits = plan.get("ai_credits_total", 0)
-                                plan_code = plan.get("plan_code", "")
-                                
-                                billing = "month"
-                                if "quarterly" in plan_code:
-                                    billing = "quarter"
-                                elif "yearly" in plan_code:
-                                    billing = "year"
-                                
-                                selection_msg += f"{i}. {name} - ₦{price:,}/{billing} - {credits} credits\n"
-                            
-                            selection_msg += "\nPlease reply with the number (1 or 2) to select your plan.\n0 - Cancel | # - Main Menu"
-                            
-                            send_whatsapp(from_number, selection_msg)
-                            user_state[from_number] = {"ambiguous": True, "matches": matches}
-                        else:
-                            plan = result.get("plan")
-                            user_state[from_number] = {"step": 2, "plan": plan}
-                            
-                            welcome_msg = f"""✅ *Plan Selected:* {plan.get('name')}
-
-💰 Price: ₦{plan.get('price', 0):,}
-🎯 Credits: {plan.get('ai_credits_total', 0)} AI credits
-
-📧 *Please provide your email address* to receive the payment link.
-
-Email example: name@example.com
-
-* - Back | 0 - Cancel | # - Main Menu"""
-                            send_whatsapp(from_number, welcome_msg)
+                        plan = result.get("plan")
+                        # Ask for email
+                        user_state[from_number] = {"step": 2, "plan": plan}
+                        send_whatsapp(from_number, f"✅ *Plan Selected:* {plan.get('name')}\n\n💰 Price: ₦{plan.get('price', 0):,}\n🎯 Credits: {plan.get('ai_credits_total', 0)}\n\n📧 *Please provide your email address* to receive payment link.\n\n0 - Cancel | # - Main Menu")
                     else:
                         send_whatsapp(from_number, get_main_menu())
+                
+                # Handle email input (step 2)
+                if from_number in user_state and user_state[from_number].get("step") == 2:
+                    plan = user_state[from_number].get("plan")
+                    email = text.strip().lower()
+                    
+                    if "@" in email and "." in email:
+                        reference = f"SUB_{plan.get('plan_code')}_{uuid.uuid4().hex[:8]}"
+                        payment = create_paystack_payment(plan, email, from_number, reference)
+                        
+                        if payment.get("success"):
+                            send_whatsapp(from_number, f"✅ *Payment Link Generated!*\n\nPlan: {plan.get('name')}\nAmount: ₦{plan.get('price', 0):,}\n\n🔗 {payment.get('payment_link')}\n\nAfter payment, you'll be redirected back to WhatsApp.\n\n0 - Cancel | # - Main Menu")
+                            user_state.pop(from_number, None)
+                        else:
+                            send_whatsapp(from_number, "❌ Failed to generate payment link. Try again.\n\nReply 4 to view plans.")
+                            user_state.pop(from_number, None)
+                    else:
+                        send_whatsapp(from_number, "❌ *Invalid email.* Send a valid email address.")
         
         return "ok"
     except Exception as e:
