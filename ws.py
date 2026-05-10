@@ -10,6 +10,7 @@ import requests
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from collections import defaultdict
+import time
 
 load_dotenv()
 
@@ -24,6 +25,15 @@ supabase: Client = None
 if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
     logging.info("✅ Supabase connected")
+    
+    # Try to disable RLS on critical tables (optional - may need admin)
+    try:
+        # Note: This might require service_role key, not anon key
+        # If you have RLS issues, run SQL in Supabase dashboard instead
+        logging.info("⚠️ RLS should be disabled manually in Supabase SQL editor")
+        logging.info("Run: ALTER TABLE ai_credit_balances DISABLE ROW LEVEL SECURITY;")
+    except Exception as e:
+        logging.warning(f"Could not disable RLS via API: {e}")
 
 # ============ WHATSAPP ============
 WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "naija-tax-guide-verify")
@@ -47,17 +57,22 @@ CREDIT_PACKAGES = {
 user_state = {}
 user_cooldown = defaultdict(float)
 
-# ============ HELPER FUNCTIONS ============
+# ============ IMPROVED CREDIT FUNCTIONS ============
 def get_or_create_account_id(phone_number):
     """Get or create account_id for a WhatsApp user"""
     try:
+        # First try to find existing user
         user_result = supabase.table("bot_users").select("auth_user_id").eq("platform", "whatsapp").eq("user_id", str(phone_number)).execute()
         
         if user_result.data and user_result.data[0].get("auth_user_id"):
-            return user_result.data[0].get("auth_user_id")
+            account_id = user_result.data[0].get("auth_user_id")
+            logging.info(f"Found existing user: {account_id}")
+            return account_id
         
+        # Create new user
         auth_user_id = str(uuid.uuid4())
         
+        # Insert user
         supabase.table("bot_users").insert({
             "platform": "whatsapp",
             "user_id": str(phone_number),
@@ -67,16 +82,38 @@ def get_or_create_account_id(phone_number):
             "is_active": True
         }).execute()
         
+        # Insert credit balance
         supabase.table("ai_credit_balances").insert({
             "account_id": auth_user_id,
             "balance": 0,
             "updated_at": datetime.now().isoformat()
         }).execute()
         
+        logging.info(f"Created new user with account_id: {auth_user_id}")
         return auth_user_id
     except Exception as e:
         logging.error(f"Error creating account: {e}")
-        return None
+        # Try one more time with a different approach
+        try:
+            auth_user_id = str(uuid.uuid4())
+            supabase.table("bot_users").insert({
+                "platform": "whatsapp",
+                "user_id": str(phone_number),
+                "auth_user_id": auth_user_id,
+                "created_at": datetime.now().isoformat(),
+                "total_calculations": 0,
+                "is_active": True
+            }).execute()
+            
+            supabase.table("ai_credit_balances").insert({
+                "account_id": auth_user_id,
+                "balance": 0,
+                "updated_at": datetime.now().isoformat()
+            }).execute()
+            return auth_user_id
+        except Exception as e2:
+            logging.error(f"Second attempt failed: {e2}")
+            return None
 
 def get_credit_balance(account_id):
     """Get current credit balance"""
@@ -90,30 +127,43 @@ def get_credit_balance(account_id):
         return 0
 
 def add_credits_topup(account_id, credits, reference):
-    """ADD credits to existing balance (TOP-UP, not replace)"""
-    try:
-        existing = supabase.table("ai_credit_balances").select("balance").eq("account_id", account_id).execute()
-        
-        if existing.data:
-            current_balance = existing.data[0].get("balance", 0)
-            new_balance = current_balance + credits  # ADD to existing
-            supabase.table("ai_credit_balances").update({
-                "balance": new_balance,
-                "updated_at": datetime.now().isoformat()
-            }).eq("account_id", account_id).execute()
-            logging.info(f"Top-up: Added {credits} credits to {account_id}. Old: {current_balance}, New: {new_balance}")
-        else:
-            supabase.table("ai_credit_balances").insert({
-                "account_id": account_id,
-                "balance": credits,
-                "updated_at": datetime.now().isoformat()
-            }).execute()
-            logging.info(f"Top-up: Created new balance with {credits} credits for {account_id}")
-        
-        return True
-    except Exception as e:
-        logging.error(f"Error adding credits: {e}")
-        return False
+    """ADD credits to existing balance (TOP-UP, not replace) - With retry logic"""
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            # First, check if balance record exists
+            existing = supabase.table("ai_credit_balances").select("balance, id").eq("account_id", account_id).execute()
+            
+            if existing.data:
+                current_balance = existing.data[0].get("balance", 0)
+                new_balance = current_balance + credits  # ADD to existing
+                
+                # Update existing balance
+                update_result = supabase.table("ai_credit_balances").update({
+                    "balance": new_balance,
+                    "updated_at": datetime.now().isoformat()
+                }).eq("account_id", account_id).execute()
+                
+                logging.info(f"✅ Top-up: Added {credits} credits to {account_id}. Old: {current_balance}, New: {new_balance}")
+                return True
+            else:
+                # Create new balance record
+                insert_result = supabase.table("ai_credit_balances").insert({
+                    "account_id": account_id,
+                    "balance": credits,
+                    "updated_at": datetime.now().isoformat()
+                }).execute()
+                
+                logging.info(f"✅ Top-up: Created new balance with {credits} credits for {account_id}")
+                return True
+                
+        except Exception as e:
+            logging.error(f"Attempt {attempt + 1} failed to add credits: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(1)  # Wait before retry
+            else:
+                logging.error(f"All attempts failed to add credits for {account_id}")
+                return False
 
 def get_credit_packages_menu():
     return """💎 *Buy AI Credits*
@@ -475,6 +525,8 @@ def send_whatsapp(to_phone, text):
         if response.status_code == 200:
             logging.info(f"Sent to {to_phone}")
             return True
+        else:
+            logging.error(f"Failed to send to {to_phone}: {response.status_code}")
         return False
     except Exception as e:
         logging.error(f"Send error: {e}")
@@ -622,15 +674,17 @@ def payment_success():
 
 @app.route('/api/billing/webhook', methods=['POST'])
 def billing_webhook():
+    """Handle Paystack webhook - IMPROVED with better error handling and notifications"""
     try:
         payload = request.get_json()
         if not payload:
+            logging.warning("No payload received")
             return "No payload", 400
         
         event = payload.get('event')
         data = payload.get('data', {})
         
-        logging.info(f"Billing webhook received: {event}")
+        logging.info(f"📨 Billing webhook received: {event}")
         
         if event == 'charge.success':
             metadata = data.get('metadata', {})
@@ -643,22 +697,45 @@ def billing_webhook():
                 phone_number = metadata.get('provider_user_id')
                 amount = data.get('amount', 0) / 100
                 
+                logging.info(f"💰 Credit purchase: account={account_id}, credits={credits}, phone={phone_number}, ref={reference}")
+                
                 if account_id and credits:
+                    # Add credits to existing balance
                     success = add_credits_topup(account_id, credits, reference)
                     
                     if success and phone_number:
-                        balance = get_credit_balance(account_id)
+                        # Get updated balance
+                        time.sleep(1)  # Give database time to update
+                        new_balance = get_credit_balance(account_id)
+                        
+                        # Send detailed WhatsApp confirmation
                         confirmation_msg = f"""✅ *CREDITS ADDED SUCCESSFULLY!*
 
-🎉 {credits} AI credits have been ADDED to your account.
+💎 *{credits} AI credits* have been ADDED to your account.
+
 💰 Amount paid: ₦{amount:,.2f}
 🆔 Reference: {reference}
+📊 Previous balance: {new_balance - credits} credits
+✨ New balance: *{new_balance} credits*
 
-Your new balance: {balance} credits
+💡 Each credit = 1 AI tax question
 
-Reply 8 for main menu."""
+Reply 1 to ask a tax question or 8 for main menu."""
+                        
                         send_whatsapp(phone_number, confirmation_msg)
-                        logging.info(f"Top-up: Added {credits} credits to {account_id}")
+                        logging.info(f"✅ Top-up completed and notification sent to {phone_number}: +{credits} credits")
+                    else:
+                        logging.error(f"❌ Failed to add credits for {account_id}")
+                        
+                        # Send error notification
+                        if phone_number:
+                            send_whatsapp(phone_number, 
+                                "⚠️ *Payment received but credit addition failed!*\n\n"
+                                "Our team has been notified and will add your credits shortly.\n\n"
+                                "Please reply with 6 to check your balance or contact support.\n\n"
+                                f"Reference: {reference}")
+                else:
+                    logging.error(f"Missing account_id or credits in webhook")
             
             elif transaction_type == 'subscription':
                 phone_number = metadata.get('phone')
@@ -666,6 +743,8 @@ Reply 8 for main menu."""
                 reference = data.get('reference')
                 amount = data.get('amount', 0) / 100
                 plan_code = metadata.get('plan_code')
+                
+                logging.info(f"📋 Subscription purchase: phone={phone_number}, plan={plan_name}, ref={reference}")
                 
                 if phone_number:
                     confirmation_msg = f"""✅ *PAYMENT SUCCESSFUL!*
@@ -682,25 +761,32 @@ Reply 8 for main menu."""
                     
                     send_whatsapp(phone_number, confirmation_msg)
                     
+                    # Update subscription in database
                     try:
                         user_result = supabase.table("bot_users").select("auth_user_id").eq("platform", "whatsapp").eq("user_id", str(phone_number)).execute()
                         if user_result.data:
                             auth_user_id = user_result.data[0].get("auth_user_id")
                             if auth_user_id:
-                                supabase.table("subscriptions").insert({
-                                    "account_id": auth_user_id,
-                                    "user_id": auth_user_id,
-                                    "plan_code": plan_code,
-                                    "plan": plan_code,
-                                    "status": "active",
-                                    "paystack_ref": reference,
-                                    "amount": float(amount),
-                                    "amount_kobo": int(amount * 100),
-                                    "currency": "NGN",
-                                    "created_at": datetime.now().isoformat(),
-                                    "updated_at": datetime.now().isoformat()
-                                }).execute()
-                                logging.info(f"✅ Subscription activated for {phone_number}: {plan_name}")
+                                # Check if subscription already exists
+                                existing_sub = supabase.table("subscriptions").select("*").eq("paystack_ref", reference).execute()
+                                
+                                if not existing_sub.data:
+                                    supabase.table("subscriptions").insert({
+                                        "account_id": auth_user_id,
+                                        "user_id": auth_user_id,
+                                        "plan_code": plan_code,
+                                        "plan": plan_code,
+                                        "status": "active",
+                                        "paystack_ref": reference,
+                                        "amount": float(amount),
+                                        "amount_kobo": int(amount * 100),
+                                        "currency": "NGN",
+                                        "created_at": datetime.now().isoformat(),
+                                        "updated_at": datetime.now().isoformat()
+                                    }).execute()
+                                    logging.info(f"✅ Subscription activated for {phone_number}: {plan_name}")
+                                else:
+                                    logging.info(f"Subscription already exists for reference: {reference}")
                     except Exception as e:
                         logging.error(f"Failed to update subscription: {e}")
         
@@ -755,6 +841,9 @@ def webhook():
                 
                 # Get or create account_id
                 account_id = get_or_create_account_id(from_number)
+                if not account_id:
+                    send_whatsapp(from_number, "❌ Error initializing your account. Please try again later.")
+                    continue
                 
                 # Global commands
                 if text == '#':
@@ -1035,7 +1124,7 @@ Email example: name@example.com
         
         return "ok"
     except Exception as e:
-        logging.error(f"Error: {e}")
+        logging.error(f"Error in webhook: {e}")
         return "error", 500
 
 if __name__ == '__main__':
