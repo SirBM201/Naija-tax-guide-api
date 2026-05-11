@@ -91,24 +91,24 @@ def get_read_client():
 def get_canonical_account_id(phone_number):
     """
     Get or create canonical account_id that works with ask_guarded service.
-    Uses admin client for writes (bypasses RLS) since this is backend operation.
+    Uses admin client for ALL writes (bypasses RLS) since this is backend operation.
     """
     try:
         read_client = get_read_client()
         admin_client = get_admin_client()
         
-        # Step 1: Check if user exists in bot_users
+        # Step 1: Check if user exists in bot_users (using read client)
         user_result = read_client.table("bot_users").select("auth_user_id").eq("platform", "whatsapp").eq("user_id", str(phone_number)).execute()
         
         if user_result.data and user_result.data[0].get("auth_user_id"):
             auth_user_id = user_result.data[0].get("auth_user_id")
             logging.info(f"Found existing bot_user: {auth_user_id}")
             
-            # Step 2: Check if account exists in accounts table
+            # Step 2: Check if account exists in accounts table (using read client)
             account_result = read_client.table("accounts").select("account_id").eq("account_id", auth_user_id).execute()
             
             if not account_result.data:
-                # Create accounts entry using admin client (bypasses RLS for backend operation)
+                # Create accounts entry using admin client (bypasses RLS)
                 logging.info(f"Creating accounts entry for existing user {auth_user_id}")
                 admin_client.table("accounts").insert({
                     "account_id": auth_user_id,
@@ -124,11 +124,11 @@ def get_canonical_account_id(phone_number):
             
             return auth_user_id
         
-        # Step 3: Create new user
+        # Step 3: Create new user - using admin client for ALL inserts
         auth_user_id = str(uuid.uuid4())
         logging.info(f"Creating new user with ID: {auth_user_id}")
         
-        # Insert into bot_users (using admin client for write)
+        # Insert into bot_users using ADMIN CLIENT (bypasses RLS)
         admin_client.table("bot_users").insert({
             "platform": "whatsapp",
             "user_id": str(phone_number),
@@ -137,8 +137,9 @@ def get_canonical_account_id(phone_number):
             "total_calculations": 0,
             "is_active": True
         }).execute()
+        logging.info(f"✅ Created bot_users entry")
         
-        # Insert into accounts (using admin client)
+        # Insert into accounts using ADMIN CLIENT (bypasses RLS)
         admin_client.table("accounts").insert({
             "account_id": auth_user_id,
             "id": auth_user_id,
@@ -149,9 +150,9 @@ def get_canonical_account_id(phone_number):
             "updated_at": datetime.now().isoformat(),
             "has_used_trial": False
         }).execute()
-        logging.info(f"✅ Created accounts entry for new user {auth_user_id}")
+        logging.info(f"✅ Created accounts entry")
         
-        # Insert credit balance (using admin client)
+        # Insert credit balance using ADMIN CLIENT (bypasses RLS)
         admin_client.table("ai_credit_balances").insert({
             "account_id": auth_user_id,
             "balance": 0,
@@ -159,13 +160,30 @@ def get_canonical_account_id(phone_number):
             "topup_credits": 0,
             "updated_at": datetime.now().isoformat()
         }).execute()
+        logging.info(f"✅ Created credit balance")
         
         logging.info(f"✅ New user fully created: {auth_user_id}")
         return auth_user_id
         
     except Exception as e:
         logging.error(f"Error getting canonical account: {e}")
-        return None
+        # Fallback: try one more time with just the essential inserts
+        try:
+            admin_client = get_admin_client()
+            auth_user_id = str(uuid.uuid4())
+            admin_client.table("bot_users").insert({
+                "platform": "whatsapp",
+                "user_id": str(phone_number),
+                "auth_user_id": auth_user_id,
+                "created_at": datetime.now().isoformat(),
+                "total_calculations": 0,
+                "is_active": True
+            }).execute()
+            logging.info(f"✅ Fallback: Created bot_users entry for {auth_user_id}")
+            return auth_user_id
+        except Exception as fallback_error:
+            logging.error(f"Fallback also failed: {fallback_error}")
+            return None
 
 def get_credit_balance(account_id):
     """Get current credit balance using read client"""
