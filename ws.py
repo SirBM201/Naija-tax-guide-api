@@ -48,7 +48,7 @@ CREDIT_PACKAGES = {
 user_state = {}
 user_cooldown = defaultdict(float)
 
-# ============ FIXED CREDIT FUNCTIONS ============
+# ============ CREDIT FUNCTIONS ============
 def get_or_create_account_id(phone_number):
     """Get or create account_id for a WhatsApp user"""
     try:
@@ -91,26 +91,27 @@ def get_credit_balance(account_id):
     try:
         result = supabase.table("ai_credit_balances").select("balance").eq("account_id", account_id).limit(1).execute()
         if result.data:
-            return result.data[0].get("balance", 0)
+            return int(result.data[0].get("balance", 0))
         return 0
     except Exception as e:
         logging.error(f"Error getting balance: {e}")
         return 0
 
 def add_credits_topup(account_id, credits, reference):
-    """ADD credits to existing balance (TOP-UP, not replace) - FIXED without 'id' column"""
+    """ADD credits to existing balance (TOP-UP, not replace) - Fixed type conversion"""
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            # First, check if balance record exists - WITHOUT selecting 'id'
+            # First, check if balance record exists
             existing = supabase.table("ai_credit_balances").select("balance").eq("account_id", account_id).execute()
             
             if existing.data:
-                current_balance = existing.data[0].get("balance", 0)
-                new_balance = current_balance + credits  # ADD to existing
+                # Convert to int - database might return string
+                current_balance = int(existing.data[0].get("balance", 0))
+                new_balance = current_balance + int(credits)  # Ensure credits is also int
                 
                 # Update existing balance
-                update_result = supabase.table("ai_credit_balances").update({
+                supabase.table("ai_credit_balances").update({
                     "balance": new_balance,
                     "updated_at": datetime.now().isoformat()
                 }).eq("account_id", account_id).execute()
@@ -119,9 +120,9 @@ def add_credits_topup(account_id, credits, reference):
                 return True
             else:
                 # Create new balance record
-                insert_result = supabase.table("ai_credit_balances").insert({
+                supabase.table("ai_credit_balances").insert({
                     "account_id": account_id,
-                    "balance": credits,
+                    "balance": int(credits),
                     "updated_at": datetime.now().isoformat()
                 }).execute()
                 
@@ -131,7 +132,7 @@ def add_credits_topup(account_id, credits, reference):
         except Exception as e:
             logging.error(f"Attempt {attempt + 1} failed to add credits: {e}")
             if attempt < max_retries - 1:
-                time.sleep(1)  # Wait before retry
+                time.sleep(1)
             else:
                 logging.error(f"All attempts failed to add credits for {account_id}")
                 return False
@@ -645,7 +646,7 @@ def payment_success():
 
 @app.route('/api/billing/webhook', methods=['POST'])
 def billing_webhook():
-    """Handle Paystack webhook - FIXED with better error handling"""
+    """Handle Paystack webhook - Fixed with type conversion"""
     try:
         payload = request.get_json()
         if not payload:
