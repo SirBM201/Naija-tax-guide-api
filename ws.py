@@ -36,7 +36,7 @@ WHATSAPP_API_URL = "https://graph.facebook.com/v18.0"
 PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY")
 PAYSTACK_API_URL = "https://api.paystack.co"
 
-# Credit packages with LETTER CODES (to avoid menu number conflicts)
+# Credit packages with LETTER CODES
 CREDIT_PACKAGES = {
     "T10": {"credits": 10, "amount_ngn": 500, "amount_kobo": 50000, "code": "T10", "description": "10 AI Credits"},
     "T50": {"credits": 50, "amount_ngn": 2000, "amount_kobo": 200000, "code": "T50", "description": "50 AI Credits"},
@@ -49,10 +49,10 @@ user_state = {}
 user_cooldown = defaultdict(float)
 
 # ============ CREDIT FUNCTIONS ============
+
 def get_or_create_account_id(phone_number):
     """Get or create account_id for a WhatsApp user"""
     try:
-        # First try to find existing user
         user_result = supabase.table("bot_users").select("auth_user_id").eq("platform", "whatsapp").eq("user_id", str(phone_number)).execute()
         
         if user_result.data and user_result.data[0].get("auth_user_id"):
@@ -60,10 +60,8 @@ def get_or_create_account_id(phone_number):
             logging.info(f"Found existing user: {account_id}")
             return account_id
         
-        # Create new user
         auth_user_id = str(uuid.uuid4())
         
-        # Insert user
         supabase.table("bot_users").insert({
             "platform": "whatsapp",
             "user_id": str(phone_number),
@@ -73,10 +71,13 @@ def get_or_create_account_id(phone_number):
             "is_active": True
         }).execute()
         
-        # Insert credit balance
+        # Create unified credit balance
         supabase.table("ai_credit_balances").insert({
             "account_id": auth_user_id,
             "balance": 0,
+            "plan_credits": 0,
+            "topup_credits": 0,
+            "subscription_expires_at": None,
             "updated_at": datetime.now().isoformat()
         }).execute()
         
@@ -87,7 +88,7 @@ def get_or_create_account_id(phone_number):
         return None
 
 def get_credit_balance(account_id):
-    """Get current credit balance"""
+    """Get total credit balance (plan + topup)"""
     try:
         result = supabase.table("ai_credit_balances").select("balance").eq("account_id", account_id).limit(1).execute()
         if result.data:
@@ -97,45 +98,103 @@ def get_credit_balance(account_id):
         logging.error(f"Error getting balance: {e}")
         return 0
 
-def add_credits_topup(account_id, credits, reference):
-    """ADD credits to existing balance (TOP-UP, not replace) - Fixed type conversion"""
+def get_credit_details(account_id):
+    """Get detailed credit information"""
+    try:
+        result = supabase.table("ai_credit_balances").select("*").eq("account_id", account_id).limit(1).execute()
+        if result.data:
+            return result.data[0]
+        return {"balance": 0, "plan_credits": 0, "topup_credits": 0, "subscription_expires_at": None}
+    except Exception as e:
+        logging.error(f"Error getting credit details: {e}")
+        return {"balance": 0, "plan_credits": 0, "topup_credits": 0, "subscription_expires_at": None}
+
+def add_topup_credits(account_id, credits, reference):
+    """Add top-up credits to user's balance (used FIRST, carry over on renewal)"""
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            # First, check if balance record exists
-            existing = supabase.table("ai_credit_balances").select("balance").eq("account_id", account_id).execute()
+            # Get current credit details
+            existing = supabase.table("ai_credit_balances").select("*").eq("account_id", account_id).execute()
             
             if existing.data:
-                # Convert to int - database might return string
                 current_balance = int(existing.data[0].get("balance", 0))
-                new_balance = current_balance + int(credits)  # Ensure credits is also int
+                current_topup = int(existing.data[0].get("topup_credits", 0))
+                current_plan = int(existing.data[0].get("plan_credits", 0))
                 
-                # Update existing balance
+                new_topup = current_topup + int(credits)
+                new_balance = current_balance + int(credits)
+                
+                # Update with new top-up credits
                 supabase.table("ai_credit_balances").update({
                     "balance": new_balance,
+                    "topup_credits": new_topup,
                     "updated_at": datetime.now().isoformat()
                 }).eq("account_id", account_id).execute()
                 
-                logging.info(f"✅ Top-up: Added {credits} credits to {account_id}. Old: {current_balance}, New: {new_balance}")
+                logging.info(f"✅ Top-up: Added {credits} top-up credits. Old topup: {current_topup}, New topup: {new_topup}. Total balance: {new_balance}")
                 return True
             else:
-                # Create new balance record
+                # Create new balance record with top-up credits
                 supabase.table("ai_credit_balances").insert({
                     "account_id": account_id,
                     "balance": int(credits),
+                    "plan_credits": 0,
+                    "topup_credits": int(credits),
+                    "subscription_expires_at": None,
                     "updated_at": datetime.now().isoformat()
                 }).execute()
                 
-                logging.info(f"✅ Top-up: Created new balance with {credits} credits for {account_id}")
+                logging.info(f"✅ Top-up: Created new balance with {credits} top-up credits")
                 return True
                 
         except Exception as e:
-            logging.error(f"Attempt {attempt + 1} failed to add credits: {e}")
+            logging.error(f"Attempt {attempt + 1} failed to add top-up credits: {e}")
             if attempt < max_retries - 1:
                 time.sleep(1)
             else:
-                logging.error(f"All attempts failed to add credits for {account_id}")
+                logging.error(f"All attempts failed to add top-up credits for {account_id}")
                 return False
+
+def deduct_credits(account_id, cost=1):
+    """Deduct credits using top-up first, then plan credits"""
+    try:
+        details = get_credit_details(account_id)
+        current_topup = int(details.get("topup_credits", 0))
+        current_plan = int(details.get("plan_credits", 0))
+        current_balance = int(details.get("balance", 0))
+        
+        if current_balance < cost:
+            return {"success": False, "error": "insufficient_credits", "balance": current_balance}
+        
+        # Deduct from top-up first (since they are purchased)
+        if current_topup >= cost:
+            new_topup = current_topup - cost
+            new_balance = current_balance - cost
+            supabase.table("ai_credit_balances").update({
+                "balance": new_balance,
+                "topup_credits": new_topup,
+                "updated_at": datetime.now().isoformat()
+            }).eq("account_id", account_id).execute()
+            logging.info(f"Deducted {cost} credit(s) from top-up. Remaining topup: {new_topup}")
+        else:
+            # Use all top-up first, then plan credits
+            remaining_cost = cost - current_topup
+            new_topup = 0
+            new_plan = current_plan - remaining_cost
+            new_balance = current_balance - cost
+            supabase.table("ai_credit_balances").update({
+                "balance": new_balance,
+                "topup_credits": 0,
+                "plan_credits": new_plan,
+                "updated_at": datetime.now().isoformat()
+            }).eq("account_id", account_id).execute()
+            logging.info(f"Deducted {cost} credit(s): used {current_topup} top-up, {remaining_cost} plan. Remaining plan: {new_plan}")
+        
+        return {"success": True, "new_balance": new_balance}
+    except Exception as e:
+        logging.error(f"Error deducting credits: {e}")
+        return {"success": False, "error": str(e)}
 
 def get_credit_packages_menu():
     return """💎 *Buy AI Credits*
@@ -149,8 +208,42 @@ T500 - 500 credits - ₦15,000
 
 0 - Cancel | # - Main Menu"""
 
+def check_pending_transaction(account_id):
+    """Check if there's a pending transaction for this user to prevent duplicate links"""
+    try:
+        # Check for pending transactions in last 5 minutes
+        five_min_ago = (datetime.now() - timedelta(minutes=5)).isoformat()
+        pending = supabase.table("paystack_transactions")\
+            .select("reference, metadata")\
+            .eq("account_id", account_id)\
+            .eq("status", "pending")\
+            .gte("created_at", five_min_ago)\
+            .execute()
+        
+        if pending.data:
+            for tx in pending.data:
+                metadata = tx.get("metadata", {})
+                if metadata.get("type") == "credit_purchase":
+                    logging.info(f"Found pending transaction: {tx.get('reference')}")
+                    return tx.get("reference")
+        return None
+    except Exception as e:
+        logging.warning(f"Error checking pending transaction: {e}")
+        return None
+
 def create_credit_payment(account_id, package_code, phone_number):
-    """Create Paystack payment for credit purchase"""
+    """Create Paystack payment for credit purchase - with duplicate prevention"""
+    # Check for existing pending transaction
+    existing_reference = check_pending_transaction(account_id)
+    if existing_reference:
+        logging.info(f"Using existing pending transaction: {existing_reference}")
+        # Could return existing payment link here, but better to create new to be safe
+        # Let's expire old one and create new
+        supabase.table("paystack_transactions").update({
+            "status": "expired",
+            "updated_at": datetime.now().isoformat()
+        }).eq("reference", existing_reference).execute()
+    
     package = CREDIT_PACKAGES.get(package_code.upper())
     if not package:
         return None
@@ -190,6 +283,19 @@ def create_credit_payment(account_id, package_code, phone_number):
         if response.status_code == 200:
             data = response.json()
             if data.get("status"):
+                # Store as pending transaction
+                supabase.table("paystack_transactions").insert({
+                    "reference": reference,
+                    "account_id": account_id,
+                    "amount": amount_kobo,
+                    "currency": "NGN",
+                    "status": "pending",
+                    "plan_code": package_code,
+                    "metadata": payload["metadata"],
+                    "created_at": datetime.now().isoformat(),
+                    "updated_at": datetime.now().isoformat()
+                }).execute()
+                
                 return {
                     "success": True,
                     "payment_link": data["data"]["authorization_url"],
@@ -646,7 +752,7 @@ def payment_success():
 
 @app.route('/api/billing/webhook', methods=['POST'])
 def billing_webhook():
-    """Handle Paystack webhook - Fixed with type conversion"""
+    """Handle Paystack webhook - with deduplication and unified credit system"""
     try:
         payload = request.get_json()
         if not payload:
@@ -661,65 +767,112 @@ def billing_webhook():
         if event == 'charge.success':
             metadata = data.get('metadata', {})
             transaction_type = metadata.get('type', 'subscription')
+            reference = data.get('reference')
+            
+            # IMPORTANT: Check if this transaction was already processed
+            try:
+                existing_tx = supabase.table("paystack_transactions").select("status").eq("reference", reference).execute()
+                if existing_tx.data:
+                    current_status = existing_tx.data[0].get("status")
+                    if current_status == 'success':
+                        logging.info(f"⏭️ Transaction {reference} already processed. Skipping duplicate webhook.")
+                        return "OK - Already Processed", 200
+            except Exception as e:
+                logging.warning(f"Could not check existing transaction: {e}")
             
             if transaction_type == 'credit_purchase':
                 account_id = metadata.get('account_id')
-                credits = metadata.get('credits', 0)
-                reference = data.get('reference')
+                credits_raw = metadata.get('credits', 0)
                 phone_number = metadata.get('provider_user_id')
                 amount = data.get('amount', 0) / 100
                 
+                # Convert credits to int safely
+                try:
+                    credits = int(credits_raw)
+                except (TypeError, ValueError):
+                    logging.error(f"Could not convert credits to int: {credits_raw}")
+                    credits = 0
+                
                 logging.info(f"💰 Credit purchase: account={account_id}, credits={credits}, phone={phone_number}, ref={reference}")
                 
-                if account_id and credits:
-                    # Add credits to existing balance
-                    success = add_credits_topup(account_id, credits, reference)
+                if account_id and credits > 0:
+                    # Add top-up credits to unified balance
+                    success = add_topup_credits(account_id, credits, reference)
                     
                     if success and phone_number:
-                        # Get updated balance
-                        time.sleep(1)  # Give database time to update
-                        new_balance = get_credit_balance(account_id)
-                        old_balance = new_balance - credits
+                        # Mark transaction as successful
+                        try:
+                            supabase.table("paystack_transactions").update({
+                                "status": "success",
+                                "updated_at": datetime.now().isoformat()
+                            }).eq("reference", reference).execute()
+                            logging.info(f"✅ Transaction {reference} marked as success")
+                        except Exception as e:
+                            logging.warning(f"Could not update transaction status: {e}")
                         
-                        # Send detailed WhatsApp confirmation
+                        # Get updated credit details
+                        time.sleep(1)
+                        credit_details = get_credit_details(account_id)
+                        total_balance = int(credit_details.get("balance", 0))
+                        topup_credits = int(credit_details.get("topup_credits", 0))
+                        plan_credits = int(credit_details.get("plan_credits", 0))
+                        
                         confirmation_msg = f"""✅ *CREDITS ADDED SUCCESSFULLY!*
 
 💎 *{credits} AI credits* have been ADDED to your account.
 
 💰 Amount paid: ₦{amount:,.2f}
 🆔 Reference: {reference}
-📊 Previous balance: {old_balance} credits
-✨ New balance: *{new_balance} credits*
 
-💡 Each credit = 1 AI tax question
+📊 *Current Balance Details:*
+• Total Credits: *{total_balance}*
+• Top-up Credits: {topup_credits} (never expire with active subscription)
+• Plan Credits: {plan_credits}
+
+💡 Top-up credits are used FIRST when you ask questions.
+🔄 Credits carry over when your subscription auto-renews.
 
 Reply 1 to ask a tax question or 8 for main menu."""
                         
                         send_whatsapp(phone_number, confirmation_msg)
-                        logging.info(f"✅ Top-up completed and notification sent to {phone_number}: +{credits} credits")
+                        logging.info(f"✅ Top-up completed: +{credits} credits for {phone_number}")
                     else:
                         logging.error(f"❌ Failed to add credits for {account_id}")
-                        
-                        # Send error notification
                         if phone_number:
                             send_whatsapp(phone_number, 
                                 "⚠️ *Payment received but credit addition failed!*\n\n"
-                                "Our team has been notified and will add your credits shortly.\n\n"
-                                "Please reply with 6 to check your balance or contact support.\n\n"
-                                f"Reference: {reference}")
+                                f"Reference: {reference}\n\nReply 8 for main menu.")
                 else:
-                    logging.error(f"Missing account_id or credits in webhook")
+                    logging.error(f"Missing account_id or invalid credits: account_id={account_id}, credits={credits}")
             
             elif transaction_type == 'subscription':
                 phone_number = metadata.get('phone')
                 plan_name = metadata.get('plan_name', 'Subscription')
-                reference = data.get('reference')
                 amount = data.get('amount', 0) / 100
                 plan_code = metadata.get('plan_code')
+                
+                # Check if subscription already exists
+                try:
+                    existing_sub = supabase.table("subscriptions").select("*").eq("paystack_ref", reference).execute()
+                    if existing_sub.data:
+                        logging.info(f"⏭️ Subscription {reference} already processed. Skipping.")
+                        return "OK - Already Processed", 200
+                except Exception:
+                    pass
                 
                 logging.info(f"📋 Subscription purchase: phone={phone_number}, plan={plan_name}, ref={reference}")
                 
                 if phone_number:
+                    # Get plan details
+                    plan_details = None
+                    for p in get_all_plans():
+                        if p.get("plan_code") == plan_code:
+                            plan_details = p
+                            break
+                    
+                    plan_credits = plan_details.get("ai_credits_total", 0) if plan_details else 0
+                    duration_days = plan_details.get("duration_days", 30) if plan_details else 30
+                    
                     confirmation_msg = f"""✅ *PAYMENT SUCCESSFUL!*
 
 🎉 Thank you for your subscription!
@@ -727,6 +880,7 @@ Reply 1 to ask a tax question or 8 for main menu."""
 📋 Plan: {plan_name}
 💰 Amount: ₦{amount:,.2f}
 🆔 Reference: {reference}
+🎯 Credits: {plan_credits} AI credits per {duration_days} days
 
 Your subscription is now ACTIVE.
 
@@ -734,32 +888,51 @@ Reply 8 for main menu."""
                     
                     send_whatsapp(phone_number, confirmation_msg)
                     
-                    # Update subscription in database
                     try:
                         user_result = supabase.table("bot_users").select("auth_user_id").eq("platform", "whatsapp").eq("user_id", str(phone_number)).execute()
                         if user_result.data:
                             auth_user_id = user_result.data[0].get("auth_user_id")
                             if auth_user_id:
-                                # Check if subscription already exists
-                                existing_sub = supabase.table("subscriptions").select("*").eq("paystack_ref", reference).execute()
+                                expires_at = datetime.now() + timedelta(days=duration_days)
                                 
-                                if not existing_sub.data:
-                                    supabase.table("subscriptions").insert({
+                                supabase.table("subscriptions").insert({
+                                    "account_id": auth_user_id,
+                                    "user_id": auth_user_id,
+                                    "plan_code": plan_code,
+                                    "plan": plan_code,
+                                    "status": "active",
+                                    "paystack_ref": reference,
+                                    "amount": float(amount),
+                                    "amount_kobo": int(amount * 100),
+                                    "currency": "NGN",
+                                    "expires_at": expires_at.isoformat(),
+                                    "created_at": datetime.now().isoformat(),
+                                    "updated_at": datetime.now().isoformat()
+                                }).execute()
+                                
+                                # Update unified credit balance with plan credits
+                                # Preserve existing top-up credits
+                                existing_balance = supabase.table("ai_credit_balances").select("*").eq("account_id", auth_user_id).execute()
+                                if existing_balance.data:
+                                    current_topup = int(existing_balance.data[0].get("topup_credits", 0))
+                                    new_balance = plan_credits + current_topup
+                                    supabase.table("ai_credit_balances").update({
+                                        "balance": new_balance,
+                                        "plan_credits": plan_credits,
+                                        "subscription_expires_at": expires_at.isoformat(),
+                                        "updated_at": datetime.now().isoformat()
+                                    }).eq("account_id", auth_user_id).execute()
+                                else:
+                                    supabase.table("ai_credit_balances").insert({
                                         "account_id": auth_user_id,
-                                        "user_id": auth_user_id,
-                                        "plan_code": plan_code,
-                                        "plan": plan_code,
-                                        "status": "active",
-                                        "paystack_ref": reference,
-                                        "amount": float(amount),
-                                        "amount_kobo": int(amount * 100),
-                                        "currency": "NGN",
-                                        "created_at": datetime.now().isoformat(),
+                                        "balance": plan_credits,
+                                        "plan_credits": plan_credits,
+                                        "topup_credits": 0,
+                                        "subscription_expires_at": expires_at.isoformat(),
                                         "updated_at": datetime.now().isoformat()
                                     }).execute()
-                                    logging.info(f"✅ Subscription activated for {phone_number}: {plan_name}")
-                                else:
-                                    logging.info(f"Subscription already exists for reference: {reference}")
+                                
+                                logging.info(f"✅ Subscription activated for {phone_number}: {plan_name} with {plan_credits} credits")
                     except Exception as e:
                         logging.error(f"Failed to update subscription: {e}")
         
@@ -795,7 +968,6 @@ def webhook():
             if msg_type == 'text':
                 text = msg.get('text', {}).get('body', '').strip()
                 
-                # Check for duplicate message (2 second cooldown)
                 current_time = datetime.now().timestamp()
                 cooldown_key = f"{from_number}:{text}"
                 if user_cooldown[cooldown_key] > current_time - 2:
@@ -803,7 +975,6 @@ def webhook():
                     continue
                 user_cooldown[cooldown_key] = current_time
                 
-                # Auto-clear stale state (5 minutes inactivity)
                 if from_number in user_state:
                     state_time = user_state[from_number].get("timestamp", 0)
                     if current_time - state_time > 300:
@@ -812,7 +983,6 @@ def webhook():
                 
                 logging.info(f"Message from {from_number}: {text}")
                 
-                # Get or create account_id
                 account_id = get_or_create_account_id(from_number)
                 if not account_id:
                     send_whatsapp(from_number, "❌ Error initializing your account. Please try again later.")
@@ -843,7 +1013,7 @@ def webhook():
                         send_whatsapp(from_number, get_main_menu())
                     continue
                 
-                # ============ OPTION 5: LINK WEBSITE ACCOUNT (Placeholder) ============
+                # Option 5: Link website account
                 if text == '5':
                     send_whatsapp(from_number, """🔗 *Link to Website Account*
 
@@ -855,13 +1025,13 @@ www.naijataxguides.com/channels
 Reply 8 for main menu.""")
                     continue
                 
-                # ============ OPTION 6: BUY AI CREDITS ============
+                # Option 6: Buy AI credits
                 if text == '6':
                     user_state[from_number] = {"step": "buy_credits", "timestamp": current_time}
                     send_whatsapp(from_number, get_credit_packages_menu())
                     continue
                 
-                # Handle credit package selection (using LETTER CODES: T10, T50, T100, T500)
+                # Handle credit package selection (after pressing 6)
                 if from_number in user_state and user_state[from_number].get("step") == "buy_credits":
                     package_code = text.upper().strip()
                     
@@ -879,7 +1049,9 @@ Amount: ₦{package['amount_ngn']:,}
 🔗 *Click here to complete payment:*
 {payment['payment_link']}
 
-After successful payment, your credits will be ADDED to your existing balance.
+After successful payment, your credits will be ADDED to your existing balance as TOP-UP credits.
+
+💡 Top-up credits are used FIRST and carry over when your subscription renews.
 
 💡 Reference: {payment['reference']}
 
@@ -927,12 +1099,11 @@ Email example: name@example.com
                         send_whatsapp(from_number, "Please reply with 1 or 2 to select your plan, or 0 to cancel.")
                     continue
                 
-                # Handle email collection (step 2)
+                # Handle email collection for subscription
                 if from_number in user_state and user_state[from_number].get("step") == 2:
                     plan = user_state[from_number].get("plan")
                     email = text.strip().lower()
                     
-                    # Email validation pattern
                     email_pattern = re.compile(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
                     
                     if email_pattern.match(email):
@@ -1025,11 +1196,33 @@ After successful payment, you will be redirected back to WhatsApp.
                 elif text == '1':
                     send_whatsapp(from_number, "💬 Please type your tax question.\n\n💡 # - Save & Menu | 0 - Cancel")
                 elif text == '2':
-                    balance = get_credit_balance(account_id)
-                    if balance == 0:
-                        send_whatsapp(from_number, f"💎 *AI Credits Balance*\n\nYou have *0 credits* remaining.\n\nEach credit = 1 AI tax question.\n\nTo buy credits:\n1. Press 6 to see packages\n2. Then reply with T10, T50, T100, or T500")
+                    credit_details = get_credit_details(account_id)
+                    total_balance = int(credit_details.get("balance", 0))
+                    topup_credits = int(credit_details.get("topup_credits", 0))
+                    plan_credits = int(credit_details.get("plan_credits", 0))
+                    
+                    if total_balance == 0:
+                        send_whatsapp(from_number, f"""💎 *AI Credits Balance*
+
+Total Credits: *0*
+• Top-up Credits: 0
+• Plan Credits: 0
+
+Each credit = 1 AI tax question.
+
+Top-up credits are used FIRST and carry over when your subscription renews.
+
+To buy credits: Press 6""")
                     else:
-                        send_whatsapp(from_number, f"💎 *AI Credits Balance*\n\nYou have *{balance} credits* remaining.\n\nEach credit = 1 AI tax question.\n\nTo buy more credits:\n1. Press 6 to see packages\n2. Then reply with T10, T50, T100, or T500")
+                        send_whatsapp(from_number, f"""💎 *AI Credits Balance*
+
+Total Credits: *{total_balance}*
+• Top-up Credits: {topup_credits} (used first, carry over)
+• Plan Credits: {plan_credits}
+
+Each credit = 1 AI tax question.
+
+To buy more credits: Press 6""")
                 elif text == '7':
                     send_whatsapp(from_number, """*📋 TAX FILING & MANAGEMENT*
 
