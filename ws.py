@@ -21,8 +21,14 @@ logging.basicConfig(level=logging.INFO)
 
 # ============ SUPABASE - DUAL CLIENT SETUP WITH RLS ============
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_ANON_KEY = os.getenv("SUPABASE_KEY")  # anon key - respects RLS
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_SERVICE_KEY")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_ANON_KEY")
+# Try multiple possible environment variable names for service role key
+SUPABASE_SERVICE_ROLE_KEY = (
+    os.getenv("SUPABASE_SERVICE_ROLE_KEY") or 
+    os.getenv("SUPABASE_SERVICE_KEY") or 
+    os.getenv("SERVICE_ROLE_KEY") or
+    os.getenv("SUPABASE_ADMIN_KEY")
+)
 
 # Client for authenticated users (respects RLS)
 supabase: Client = None
@@ -38,7 +44,8 @@ if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
     supabase_admin = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
     logging.info("✅ Supabase admin client connected (bypasses RLS for backend ops)")
 else:
-    logging.warning("⚠️ SUPABASE_SERVICE_ROLE_KEY not set. Some operations may fail due to RLS.")
+    logging.error("❌ SUPABASE_SERVICE_ROLE_KEY not set. Admin operations will fail!")
+    logging.error(f"Available keys: SUPABASE_KEY={bool(SUPABASE_ANON_KEY)}, SERVICE_ROLE_KEY={bool(SUPABASE_SERVICE_ROLE_KEY)}")
 
 # ============ IMPORT SERVICES ============
 try:
@@ -77,6 +84,7 @@ user_cooldown = defaultdict(float)
 def get_admin_client():
     """Get admin client for backend writes (bypasses RLS)"""
     if not supabase_admin:
+        logging.error("Supabase admin client not available. Check SUPABASE_SERVICE_ROLE_KEY environment variable.")
         raise Exception("Supabase admin client not available. Set SUPABASE_SERVICE_ROLE_KEY.")
     return supabase_admin
 
@@ -95,7 +103,6 @@ def get_canonical_account_id(phone_number):
     """
     try:
         read_client = get_read_client()
-        admin_client = get_admin_client()
         
         # Step 1: Check if user exists in bot_users (using read client)
         user_result = read_client.table("bot_users").select("auth_user_id").eq("platform", "whatsapp").eq("user_id", str(phone_number)).execute()
@@ -104,12 +111,13 @@ def get_canonical_account_id(phone_number):
             auth_user_id = user_result.data[0].get("auth_user_id")
             logging.info(f"Found existing bot_user: {auth_user_id}")
             
-            # Step 2: Check if account exists in accounts table (using read client)
+            # Step 2: Check if account exists in accounts table
             account_result = read_client.table("accounts").select("account_id").eq("account_id", auth_user_id).execute()
             
             if not account_result.data:
-                # Create accounts entry using admin client (bypasses RLS)
+                # Create accounts entry using admin client
                 logging.info(f"Creating accounts entry for existing user {auth_user_id}")
+                admin_client = get_admin_client()
                 admin_client.table("accounts").insert({
                     "account_id": auth_user_id,
                     "id": auth_user_id,
@@ -124,11 +132,14 @@ def get_canonical_account_id(phone_number):
             
             return auth_user_id
         
-        # Step 3: Create new user - using admin client for ALL inserts
+        # Step 3: Create new user - MUST use admin client for ALL inserts
         auth_user_id = str(uuid.uuid4())
         logging.info(f"Creating new user with ID: {auth_user_id}")
         
-        # Insert into bot_users using ADMIN CLIENT (bypasses RLS)
+        # Get admin client (will raise exception if not available)
+        admin_client = get_admin_client()
+        
+        # Insert into bot_users using ADMIN CLIENT
         admin_client.table("bot_users").insert({
             "platform": "whatsapp",
             "user_id": str(phone_number),
@@ -139,7 +150,7 @@ def get_canonical_account_id(phone_number):
         }).execute()
         logging.info(f"✅ Created bot_users entry")
         
-        # Insert into accounts using ADMIN CLIENT (bypasses RLS)
+        # Insert into accounts using ADMIN CLIENT
         admin_client.table("accounts").insert({
             "account_id": auth_user_id,
             "id": auth_user_id,
@@ -152,7 +163,7 @@ def get_canonical_account_id(phone_number):
         }).execute()
         logging.info(f"✅ Created accounts entry")
         
-        # Insert credit balance using ADMIN CLIENT (bypasses RLS)
+        # Insert credit balance using ADMIN CLIENT
         admin_client.table("ai_credit_balances").insert({
             "account_id": auth_user_id,
             "balance": 0,
@@ -167,23 +178,7 @@ def get_canonical_account_id(phone_number):
         
     except Exception as e:
         logging.error(f"Error getting canonical account: {e}")
-        # Fallback: try one more time with just the essential inserts
-        try:
-            admin_client = get_admin_client()
-            auth_user_id = str(uuid.uuid4())
-            admin_client.table("bot_users").insert({
-                "platform": "whatsapp",
-                "user_id": str(phone_number),
-                "auth_user_id": auth_user_id,
-                "created_at": datetime.now().isoformat(),
-                "total_calculations": 0,
-                "is_active": True
-            }).execute()
-            logging.info(f"✅ Fallback: Created bot_users entry for {auth_user_id}")
-            return auth_user_id
-        except Exception as fallback_error:
-            logging.error(f"Fallback also failed: {fallback_error}")
-            return None
+        return None
 
 def get_credit_balance(account_id):
     """Get current credit balance using read client"""
