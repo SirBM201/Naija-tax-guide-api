@@ -2,8 +2,6 @@ import os
 import re
 import logging
 import uuid
-import random
-import string
 import sys
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, render_template_string
@@ -21,26 +19,26 @@ load_dotenv()
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# ============ SUPABASE - DUAL CLIENT SETUP ============
+# ============ SUPABASE - DUAL CLIENT SETUP WITH RLS ============
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")  # anon key - limited permissions
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_KEY")  # anon key - respects RLS
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_SERVICE_KEY")
 
-supabase_anon: Client = None  # For reads only (respects RLS)
-supabase_admin: Client = None  # For writes that need to bypass RLS
+# Client for authenticated users (respects RLS)
+supabase: Client = None
 
-if SUPABASE_URL and SUPABASE_KEY:
-    supabase_anon = create_client(SUPABASE_URL, SUPABASE_KEY)
-    logging.info("✅ Supabase anon client connected (respects RLS)")
-    
+# Admin client for backend operations (bypasses RLS via service role)
+supabase_admin: Client = None
+
+if SUPABASE_URL and SUPABASE_ANON_KEY:
+    supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+    logging.info("✅ Supabase client connected (respects RLS)")
+
 if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
     supabase_admin = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
-    logging.info("✅ Supabase admin client connected (bypasses RLS - for account creation only)")
+    logging.info("✅ Supabase admin client connected (bypasses RLS for backend ops)")
 else:
-    logging.warning("⚠️ SUPABASE_SERVICE_ROLE_KEY not set. Account creation may fail due to RLS.")
-
-# Default to anon client for general operations
-supabase = supabase_anon
+    logging.warning("⚠️ SUPABASE_SERVICE_ROLE_KEY not set. Some operations may fail due to RLS.")
 
 # ============ IMPORT SERVICES ============
 try:
@@ -76,85 +74,43 @@ user_cooldown = defaultdict(float)
 
 # ============ DATABASE OPERATION HELPERS ============
 
-def db_read(table_name):
-    """Use anon client for reads (respects RLS)"""
-    return supabase_anon.table(table_name)
+def get_admin_client():
+    """Get admin client for backend writes (bypasses RLS)"""
+    if not supabase_admin:
+        raise Exception("Supabase admin client not available. Set SUPABASE_SERVICE_ROLE_KEY.")
+    return supabase_admin
 
-def db_write(table_name):
-    """Use admin client for writes (bypasses RLS when needed)"""
-    if supabase_admin:
-        return supabase_admin.table(table_name)
-    return supabase_anon.table(table_name)  # fallback
+def get_read_client():
+    """Get read client for queries (respects RLS)"""
+    if not supabase:
+        raise Exception("Supabase client not available.")
+    return supabase
 
 # ============ ACCOUNT MANAGEMENT ============
 
 def get_canonical_account_id(phone_number):
     """
     Get or create canonical account_id that works with ask_guarded service.
-    Uses admin client for account creation to bypass RLS safely.
+    Uses admin client for writes (bypasses RLS) since this is backend operation.
     """
     try:
-        # Step 1: Check if user exists in bot_users (using anon client for read)
-        user_result = supabase_anon.table("bot_users").select("auth_user_id").eq("platform", "whatsapp").eq("user_id", str(phone_number)).execute()
+        read_client = get_read_client()
+        admin_client = get_admin_client()
+        
+        # Step 1: Check if user exists in bot_users
+        user_result = read_client.table("bot_users").select("auth_user_id").eq("platform", "whatsapp").eq("user_id", str(phone_number)).execute()
         
         if user_result.data and user_result.data[0].get("auth_user_id"):
             auth_user_id = user_result.data[0].get("auth_user_id")
             logging.info(f"Found existing bot_user: {auth_user_id}")
             
-            # Step 2: Check if account exists in accounts table (required by ask_guarded)
-            account_result = supabase_anon.table("accounts").select("account_id").eq("account_id", auth_user_id).execute()
+            # Step 2: Check if account exists in accounts table
+            account_result = read_client.table("accounts").select("account_id").eq("account_id", auth_user_id).execute()
             
             if not account_result.data:
-                # Account exists in bot_users but not in accounts - create it using admin client
+                # Create accounts entry using admin client (bypasses RLS for backend operation)
                 logging.info(f"Creating accounts entry for existing user {auth_user_id}")
-                if supabase_admin:
-                    supabase_admin.table("accounts").insert({
-                        "account_id": auth_user_id,
-                        "id": auth_user_id,
-                        "provider": "whatsapp",
-                        "provider_user_id": str(phone_number),
-                        "phone": str(phone_number),
-                        "created_at": datetime.now().isoformat(),
-                        "updated_at": datetime.now().isoformat(),
-                        "has_used_trial": False
-                    }).execute()
-                    logging.info(f"✅ Created accounts entry for {auth_user_id}")
-                else:
-                    logging.error("Cannot create accounts entry: no admin client")
-            
-            return auth_user_id
-        
-        # Step 3: Create new user (both bot_users and accounts)
-        auth_user_id = str(uuid.uuid4())
-        logging.info(f"Creating new user with ID: {auth_user_id}")
-        
-        # Insert into bot_users (using anon client - respects RLS, should be allowed)
-        supabase_anon.table("bot_users").insert({
-            "platform": "whatsapp",
-            "user_id": str(phone_number),
-            "auth_user_id": auth_user_id,
-            "created_at": datetime.now().isoformat(),
-            "total_calculations": 0,
-            "is_active": True
-        }).execute()
-        
-        # Insert into accounts (using admin client to bypass RLS)
-        if supabase_admin:
-            supabase_admin.table("accounts").insert({
-                "account_id": auth_user_id,
-                "id": auth_user_id,
-                "provider": "whatsapp",
-                "provider_user_id": str(phone_number),
-                "phone": str(phone_number),
-                "created_at": datetime.now().isoformat(),
-                "updated_at": datetime.now().isoformat(),
-                "has_used_trial": False
-            }).execute()
-            logging.info(f"✅ Created accounts entry for new user {auth_user_id}")
-        else:
-            # Fallback - try anon client (will fail if RLS is enabled)
-            try:
-                supabase_anon.table("accounts").insert({
+                admin_client.table("accounts").insert({
                     "account_id": auth_user_id,
                     "id": auth_user_id,
                     "provider": "whatsapp",
@@ -164,13 +120,39 @@ def get_canonical_account_id(phone_number):
                     "updated_at": datetime.now().isoformat(),
                     "has_used_trial": False
                 }).execute()
-                logging.warning(f"Created accounts entry using anon client (RLS may be disabled)")
-            except Exception as e:
-                logging.error(f"Failed to create accounts entry: {e}")
-                return None
+                logging.info(f"✅ Created accounts entry for {auth_user_id}")
+            
+            return auth_user_id
         
-        # Insert credit balance (using anon client)
-        supabase_anon.table("ai_credit_balances").insert({
+        # Step 3: Create new user
+        auth_user_id = str(uuid.uuid4())
+        logging.info(f"Creating new user with ID: {auth_user_id}")
+        
+        # Insert into bot_users (using admin client for write)
+        admin_client.table("bot_users").insert({
+            "platform": "whatsapp",
+            "user_id": str(phone_number),
+            "auth_user_id": auth_user_id,
+            "created_at": datetime.now().isoformat(),
+            "total_calculations": 0,
+            "is_active": True
+        }).execute()
+        
+        # Insert into accounts (using admin client)
+        admin_client.table("accounts").insert({
+            "account_id": auth_user_id,
+            "id": auth_user_id,
+            "provider": "whatsapp",
+            "provider_user_id": str(phone_number),
+            "phone": str(phone_number),
+            "created_at": datetime.now().isoformat(),
+            "updated_at": datetime.now().isoformat(),
+            "has_used_trial": False
+        }).execute()
+        logging.info(f"✅ Created accounts entry for new user {auth_user_id}")
+        
+        # Insert credit balance (using admin client)
+        admin_client.table("ai_credit_balances").insert({
             "account_id": auth_user_id,
             "balance": 0,
             "plan_credits": 0,
@@ -191,7 +173,8 @@ def get_credit_balance(account_id):
         if SERVICES_AVAILABLE:
             return get_credits_balance(account_id)
         else:
-            result = supabase_anon.table("ai_credit_balances").select("balance").eq("account_id", account_id).limit(1).execute()
+            read_client = get_read_client()
+            result = read_client.table("ai_credit_balances").select("balance").eq("account_id", account_id).limit(1).execute()
             if result.data:
                 return int(result.data[0].get("balance", 0))
             return 0
@@ -202,7 +185,8 @@ def get_credit_balance(account_id):
 def get_credit_details(account_id):
     """Get detailed credit information"""
     try:
-        result = supabase_anon.table("ai_credit_balances").select("*").eq("account_id", account_id).limit(1).execute()
+        read_client = get_read_client()
+        result = read_client.table("ai_credit_balances").select("*").eq("account_id", account_id).limit(1).execute()
         if result.data:
             return result.data[0]
         return {"balance": 0, "plan_credits": 0, "topup_credits": 0}
@@ -211,11 +195,14 @@ def get_credit_details(account_id):
         return {"balance": 0, "plan_credits": 0, "topup_credits": 0}
 
 def add_topup_credits(account_id, credits, reference):
-    """Add top-up credits to user's balance"""
+    """Add top-up credits to user's balance using admin client for write"""
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            existing = supabase_anon.table("ai_credit_balances").select("*").eq("account_id", account_id).execute()
+            admin_client = get_admin_client()
+            
+            # Check existing balance
+            existing = admin_client.table("ai_credit_balances").select("*").eq("account_id", account_id).execute()
             
             if existing.data:
                 current_balance = int(existing.data[0].get("balance", 0))
@@ -224,7 +211,7 @@ def add_topup_credits(account_id, credits, reference):
                 new_topup = current_topup + int(credits)
                 new_balance = current_balance + int(credits)
                 
-                supabase_anon.table("ai_credit_balances").update({
+                admin_client.table("ai_credit_balances").update({
                     "balance": new_balance,
                     "topup_credits": new_topup,
                     "updated_at": datetime.now().isoformat()
@@ -233,7 +220,7 @@ def add_topup_credits(account_id, credits, reference):
                 logging.info(f"✅ Top-up: +{credits} credits. Old: {current_balance}, New: {new_balance}")
                 return True
             else:
-                supabase_anon.table("ai_credit_balances").insert({
+                admin_client.table("ai_credit_balances").insert({
                     "account_id": account_id,
                     "balance": int(credits),
                     "plan_credits": 0,
@@ -267,8 +254,9 @@ T500 - 500 credits - ₦15,000
 def check_pending_transaction(account_id):
     """Check if there's a pending transaction for this user"""
     try:
+        read_client = get_read_client()
         five_min_ago = (datetime.now() - timedelta(minutes=5)).isoformat()
-        pending = supabase_anon.table("paystack_transactions")\
+        pending = read_client.table("paystack_transactions")\
             .select("reference, metadata")\
             .eq("account_id", account_id)\
             .eq("status", "pending")\
@@ -289,7 +277,8 @@ def create_credit_payment(account_id, package_code, phone_number):
     """Create Paystack payment for credit purchase"""
     existing_reference = check_pending_transaction(account_id)
     if existing_reference:
-        supabase_anon.table("paystack_transactions").update({
+        admin_client = get_admin_client()
+        admin_client.table("paystack_transactions").update({
             "status": "expired",
             "updated_at": datetime.now().isoformat()
         }).eq("reference", existing_reference).execute()
@@ -333,7 +322,8 @@ def create_credit_payment(account_id, package_code, phone_number):
         if response.status_code == 200:
             data = response.json()
             if data.get("status"):
-                supabase_anon.table("paystack_transactions").insert({
+                admin_client = get_admin_client()
+                admin_client.table("paystack_transactions").insert({
                     "reference": reference,
                     "account_id": account_id,
                     "amount": amount_kobo,
@@ -404,7 +394,8 @@ def calculate_paye(monthly_gross):
 
 def get_all_plans():
     try:
-        result = supabase_anon.table("plans").select("*").eq("active", True).execute()
+        read_client = get_read_client()
+        result = read_client.table("plans").select("*").eq("active", True).execute()
         return result.data or []
     except Exception as e:
         logging.error(f"Error fetching plans: {e}")
@@ -416,7 +407,8 @@ def get_user_subscription(phone_number):
         if not canonical_account_id:
             return None
         
-        sub_result = supabase_anon.table("subscriptions").select("*").eq("account_id", canonical_account_id).eq("status", "active").order("created_at", desc=True).limit(1).execute()
+        read_client = get_read_client()
+        sub_result = read_client.table("subscriptions").select("*").eq("account_id", canonical_account_id).eq("status", "active").order("created_at", desc=True).limit(1).execute()
         
         if sub_result.data:
             return sub_result.data[0]
@@ -815,7 +807,8 @@ def billing_webhook():
             
             # Check if already processed
             try:
-                existing_tx = supabase_anon.table("paystack_transactions").select("status").eq("reference", reference).execute()
+                read_client = get_read_client()
+                existing_tx = read_client.table("paystack_transactions").select("status").eq("reference", reference).execute()
                 if existing_tx.data and existing_tx.data[0].get("status") == 'success':
                     logging.info(f"⏭️ Transaction {reference} already processed.")
                     return "OK - Already Processed", 200
@@ -838,7 +831,8 @@ def billing_webhook():
                     
                     if success and phone_number:
                         try:
-                            supabase_anon.table("paystack_transactions").update({
+                            admin_client = get_admin_client()
+                            admin_client.table("paystack_transactions").update({
                                 "status": "success",
                                 "updated_at": datetime.now().isoformat()
                             }).eq("reference", reference).execute()
@@ -906,7 +900,8 @@ Reply 8 for menu."""
                             duration_days = plan_details.get("duration_days", 30) if plan_details else 30
                             expires_at = datetime.now() + timedelta(days=duration_days)
                             
-                            supabase_anon.table("subscriptions").insert({
+                            admin_client = get_admin_client()
+                            admin_client.table("subscriptions").insert({
                                 "account_id": canonical_account_id,
                                 "user_id": canonical_account_id,
                                 "plan_code": plan_code,
@@ -922,18 +917,18 @@ Reply 8 for menu."""
                             }).execute()
                             
                             # Update credit balance
-                            existing_balance = supabase_anon.table("ai_credit_balances").select("*").eq("account_id", canonical_account_id).execute()
+                            existing_balance = admin_client.table("ai_credit_balances").select("*").eq("account_id", canonical_account_id).execute()
                             if existing_balance.data:
                                 current_topup = int(existing_balance.data[0].get("topup_credits", 0))
                                 new_balance = plan_credits + current_topup
-                                supabase_anon.table("ai_credit_balances").update({
+                                admin_client.table("ai_credit_balances").update({
                                     "balance": new_balance,
                                     "plan_credits": plan_credits,
                                     "subscription_expires_at": expires_at.isoformat(),
                                     "updated_at": datetime.now().isoformat()
                                 }).eq("account_id", canonical_account_id).execute()
                             else:
-                                supabase_anon.table("ai_credit_balances").insert({
+                                admin_client.table("ai_credit_balances").insert({
                                     "account_id": canonical_account_id,
                                     "balance": plan_credits,
                                     "plan_credits": plan_credits,
