@@ -34,11 +34,10 @@ else:
 # ============ IMPORT SERVICES ============
 try:
     from app.services.ask_service import ask_guarded
-    from app.services.credits_service import get_credit_balance as get_credits_balance
     SERVICES_AVAILABLE = True
-    logging.info("✅ Services imported successfully")
+    logging.info("✅ AI services imported successfully")
 except Exception as e:
-    logging.error(f"❌ Failed to import services: {e}")
+    logging.error(f"❌ Failed to import AI services: {e}")
     SERVICES_AVAILABLE = False
 
 # ============ WHATSAPP ============
@@ -51,17 +50,110 @@ WHATSAPP_API_URL = "https://graph.facebook.com/v18.0"
 PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY")
 PAYSTACK_API_URL = "https://api.paystack.co"
 
-# Credit packages
+# Credit packages (ONLY for users with active subscription)
 CREDIT_PACKAGES = {
-    "T10": {"credits": 10, "amount_ngn": 500, "amount_kobo": 50000, "code": "T10", "description": "10 AI Credits"},
-    "T50": {"credits": 50, "amount_ngn": 2000, "amount_kobo": 200000, "code": "T50", "description": "50 AI Credits"},
-    "T100": {"credits": 100, "amount_ngn": 3500, "amount_kobo": 350000, "code": "T100", "description": "100 AI Credits"},
-    "T500": {"credits": 500, "amount_ngn": 15000, "amount_kobo": 1500000, "code": "T500", "description": "500 AI Credits"},
+    "T10": {"credits": 10, "amount_ngn": 500, "amount_kobo": 50000, "code": "T10", "description": "10 AI Credits", "requires_subscription": True},
+    "T50": {"credits": 50, "amount_ngn": 2000, "amount_kobo": 200000, "code": "T50", "description": "50 AI Credits", "requires_subscription": True},
+    "T100": {"credits": 100, "amount_ngn": 3500, "amount_kobo": 350000, "code": "T100", "description": "100 AI Credits", "requires_subscription": True},
+    "T500": {"credits": 500, "amount_ngn": 15000, "amount_kobo": 1500000, "code": "T500", "description": "500 AI Credits", "requires_subscription": True},
+}
+
+# Feature credit costs (default values, can be overridden by plan settings)
+DEFAULT_CREDIT_COSTS = {
+    "ai_question": 1,
+    "document_generation_simple": 5,
+    "document_generation_complex": 10,
+    "document_scanning": 3,
+    "report_generation": 15,
+    "tax_filing_paye": 10,
+    "tax_filing_cit": 20,
+    "tax_filing_vat": 20,
+    "consolidated_report": 30
+}
+
+# Free plan daily limits
+FREE_PLAN_LIMITS = {
+    "db_answers_daily": 50,
+    "calculations_daily": 20
 }
 
 # Track user state
 user_state = {}
 user_cooldown = defaultdict(float)
+daily_usage_cache = {}
+
+# ============ DAILY USAGE TRACKING ============
+
+def get_today_date():
+    return datetime.now().date().isoformat()
+
+def check_daily_limit(account_id, usage_type):
+    """Check if user has exceeded daily free limit"""
+    try:
+        today = get_today_date()
+        cache_key = f"{account_id}:{usage_type}:{today}"
+        
+        # Check cache first
+        if cache_key in daily_usage_cache:
+            current_usage = daily_usage_cache[cache_key]
+        else:
+            # Query database
+            result = supabase.table("daily_free_usage").select(f"{usage_type}_used").eq("account_id", account_id).eq("usage_date", today).execute()
+            if result.data:
+                current_usage = result.data[0].get(f"{usage_type}_used", 0)
+            else:
+                current_usage = 0
+            daily_usage_cache[cache_key] = current_usage
+        
+        # Get limit based on usage type
+        if usage_type == "db_answers":
+            limit = FREE_PLAN_LIMITS["db_answers_daily"]
+        elif usage_type == "calculations":
+            limit = FREE_PLAN_LIMITS["calculations_daily"]
+        else:
+            return True, 0
+        
+        if current_usage >= limit:
+            return False, limit
+        
+        return True, limit
+        
+    except Exception as e:
+        logging.error(f"Error checking daily limit: {e}")
+        return True, 0
+
+def increment_daily_usage(account_id, usage_type):
+    """Increment daily usage counter"""
+    try:
+        today = get_today_date()
+        cache_key = f"{account_id}:{usage_type}:{today}"
+        
+        # Update cache
+        current_usage = daily_usage_cache.get(cache_key, 0)
+        daily_usage_cache[cache_key] = current_usage + 1
+        
+        # Update database (upsert)
+        existing = supabase.table("daily_free_usage").select("*").eq("account_id", account_id).eq("usage_date", today).execute()
+        
+        if existing.data:
+            supabase.table("daily_free_usage").update({
+                f"{usage_type}_used": current_usage + 1,
+                "updated_at": datetime.now().isoformat()
+            }).eq("account_id", account_id).eq("usage_date", today).execute()
+        else:
+            supabase.table("daily_free_usage").insert({
+                "account_id": account_id,
+                "usage_date": today,
+                f"{usage_type}_used": 1,
+                "db_answers_used": 0,
+                "calculations_used": 0,
+                "created_at": datetime.now().isoformat()
+            }).execute()
+        
+        return True
+    except Exception as e:
+        logging.error(f"Error incrementing daily usage: {e}")
+        return False
 
 # ============ ACCOUNT MANAGEMENT ============
 
@@ -72,7 +164,7 @@ def get_canonical_account_id(phone_number):
         return None
     
     try:
-        # Check if user exists in accounts table by provider_user_id
+        # Check if user exists in accounts table
         account_result = supabase.table("accounts").select("account_id").eq("provider_user_id", str(phone_number)).execute()
         
         if account_result.data:
@@ -80,7 +172,7 @@ def get_canonical_account_id(phone_number):
             logging.info(f"Found existing account: {account_id}")
             return account_id
         
-        # Check if user exists in bot_users
+        # Check bot_users
         user_result = supabase.table("bot_users").select("auth_user_id").eq("platform", "whatsapp").eq("user_id", str(phone_number)).execute()
         
         if user_result.data and user_result.data[0].get("auth_user_id"):
@@ -142,39 +234,36 @@ def get_canonical_account_id(phone_number):
         return None
 
 def get_active_subscription(account_id):
-    """Check if user has an active subscription"""
+    """Get active subscription for user"""
     try:
         if not supabase:
             return None
         result = supabase.table("subscriptions").select("*").eq("account_id", account_id).eq("status", "active").execute()
         if result.data:
-            return result.data[0]
+            sub = result.data[0]
+            # Check if expired
+            expires_at = sub.get("expires_at")
+            if expires_at:
+                try:
+                    expiry = datetime.fromisoformat(expires_at.replace('Z', '+00:00'))
+                    if expiry < datetime.now():
+                        return None
+                except:
+                    pass
+            return sub
         return None
     except Exception as e:
         logging.error(f"Error checking subscription: {e}")
         return None
 
 def has_active_subscription(account_id):
-    """Return True if user has active subscription (not expired)"""
-    sub = get_active_subscription(account_id)
-    if not sub:
-        return False
-    expires_at = sub.get("expires_at")
-    if expires_at:
-        try:
-            expiry = datetime.fromisoformat(expires_at.replace('Z', '+00:00'))
-            if expiry < datetime.now():
-                return False
-        except:
-            pass
-    return True
+    """Return True if user has active subscription"""
+    return get_active_subscription(account_id) is not None
 
 def get_credit_balance(account_id):
     """Get total credit balance (plan + topup)"""
     try:
-        if SERVICES_AVAILABLE:
-            return get_credits_balance(account_id)
-        elif supabase:
+        if supabase:
             result = supabase.table("ai_credit_balances").select("balance").eq("account_id", account_id).limit(1).execute()
             if result.data:
                 return int(result.data[0].get("balance", 0))
@@ -196,13 +285,61 @@ def get_credit_details(account_id):
         logging.error(f"Error getting credit details: {e}")
         return {"balance": 0, "plan_credits": 0, "topup_credits": 0}
 
+def deduct_credits(account_id, cost, feature_name):
+    """Deduct credits from user's balance (top-up first, then plan)"""
+    try:
+        if not supabase:
+            return False, "Service unavailable"
+        
+        credit_details = get_credit_details(account_id)
+        current_topup = int(credit_details.get("topup_credits", 0))
+        current_plan = int(credit_details.get("plan_credits", 0))
+        current_balance = int(credit_details.get("balance", 0))
+        
+        if current_balance < cost:
+            return False, f"Insufficient credits. Need {cost} credits, have {current_balance}. Buy top-up: T10, T50, T100, T500"
+        
+        # Deduct from top-up first
+        if current_topup >= cost:
+            new_topup = current_topup - cost
+            new_balance = current_balance - cost
+            supabase.table("ai_credit_balances").update({
+                "balance": new_balance,
+                "topup_credits": new_topup,
+                "updated_at": datetime.now().isoformat()
+            }).eq("account_id", account_id).execute()
+            logging.info(f"Deducted {cost} credits from top-up for {feature_name}. Remaining topup: {new_topup}")
+        else:
+            # Use all top-up, then plan credits
+            remaining_cost = cost - current_topup
+            new_topup = 0
+            new_plan = current_plan - remaining_cost
+            new_balance = current_balance - cost
+            supabase.table("ai_credit_balances").update({
+                "balance": new_balance,
+                "topup_credits": 0,
+                "plan_credits": new_plan,
+                "updated_at": datetime.now().isoformat()
+            }).eq("account_id", account_id).execute()
+            logging.info(f"Deducted {cost} credits for {feature_name}: used {current_topup} top-up, {remaining_cost} plan")
+        
+        return True, f"Successfully used {cost} credits for {feature_name}"
+        
+    except Exception as e:
+        logging.error(f"Error deducting credits: {e}")
+        return False, str(e)
+
 def add_topup_credits(account_id, credits, reference):
-    """Add top-up credits to user's balance"""
+    """Add top-up credits to user's balance (ONLY for users with active subscription)"""
+    # Verify user has active subscription
+    if not has_active_subscription(account_id):
+        return False, "You need an active subscription to buy top-up credits. Reply 4 to view plans."
+    
     max_retries = 3
     for attempt in range(max_retries):
         try:
             if not supabase:
-                return False
+                return False, "Service unavailable"
             
             existing = supabase.table("ai_credit_balances").select("*").eq("account_id", account_id).execute()
             
@@ -220,7 +357,7 @@ def add_topup_credits(account_id, credits, reference):
                 }).eq("account_id", account_id).execute()
                 
                 logging.info(f"✅ Top-up: +{credits} credits. New balance: {new_balance}")
-                return True
+                return True, f"Successfully added {credits} top-up credits"
             else:
                 supabase.table("ai_credit_balances").insert({
                     "account_id": account_id,
@@ -231,20 +368,26 @@ def add_topup_credits(account_id, credits, reference):
                 }).execute()
                 
                 logging.info(f"✅ Top-up: Created new balance with {credits} credits")
-                return True
+                return True, f"Successfully added {credits} top-up credits"
                 
         except Exception as e:
             logging.error(f"Attempt {attempt + 1} failed: {e}")
             if attempt < max_retries - 1:
                 time.sleep(1)
             else:
-                logging.error(f"All attempts failed")
-                return False
+                return False, str(e)
+
+def get_credit_cost(feature, plan_code=None):
+    """Get credit cost for a feature (can be customized by plan)"""
+    # In future, this could query plan-specific costs from database
+    return DEFAULT_CREDIT_COSTS.get(feature, 1)
 
 def get_credit_packages_menu():
     return """💎 *Buy AI Credits*
 
-Reply with any of these codes (works directly):
+⚠️ *Requires Active Subscription*
+
+Reply with any code to buy top-up credits:
 
 T10 - 10 credits - ₦500
 T50 - 50 credits - ₦2,000
@@ -253,104 +396,93 @@ T500 - 500 credits - ₦15,000
 
 0 - Cancel | # - Main Menu"""
 
-def check_pending_transaction(account_id):
-    """Check if there's a pending transaction for this user"""
-    try:
-        if not supabase:
-            return None
-        five_min_ago = (datetime.now() - timedelta(minutes=5)).isoformat()
-        pending = supabase.table("paystack_transactions")\
-            .select("reference, metadata")\
-            .eq("account_id", account_id)\
-            .eq("status", "pending")\
-            .gte("created_at", five_min_ago)\
-            .execute()
-        
-        if pending.data:
-            for tx in pending.data:
-                metadata = tx.get("metadata", {})
-                if metadata.get("type") == "credit_purchase":
-                    return tx.get("reference")
-        return None
-    except Exception as e:
-        logging.warning(f"Error checking pending transaction: {e}")
-        return None
+# ============ PREMIUM FEATURE HANDLERS ============
 
-def create_credit_payment(account_id, package_code, phone_number):
-    """Create Paystack payment for credit purchase"""
-    existing_reference = check_pending_transaction(account_id)
-    if existing_reference and supabase:
-        supabase.table("paystack_transactions").update({
-            "status": "expired",
-            "updated_at": datetime.now().isoformat()
-        }).eq("reference", existing_reference).execute()
+def handle_ai_question(account_id, question):
+    """Handle AI question with credit deduction"""
+    if not has_active_subscription(account_id):
+        return "❌ *Premium Feature*\n\nAI answers require an active subscription.\n\nReply 4 to view plans and subscribe.", False
     
-    package = CREDIT_PACKAGES.get(package_code.upper())
-    if not package:
-        return None
+    cost = get_credit_cost("ai_question")
+    credit_details = get_credit_details(account_id)
+    current_balance = int(credit_details.get("balance", 0))
     
-    reference = f"CREDIT_{package['credits']}_{uuid.uuid4().hex[:8]}"
-    amount_kobo = package["amount_kobo"]
-    credits = package["credits"]
+    if current_balance < cost:
+        return f"""❌ *Insufficient Credits*
+
+Need {cost} credit for AI answer.
+Current balance: {current_balance} credits
+
+Options:
+1. Buy top-up credits: T10, T50, T100, T500
+2. Your plan renews on: (check with option 3)
+3. Check balance: Reply 2
+
+Each credit = 1 AI question or premium action""", False
     
-    base_url = os.getenv("PUBLIC_BACKEND_BASE_URL", "https://incredible-nonie-bmsconcept-37359733.koyeb.app")
-    callback_url = f"{base_url}/payment/success?phone={phone_number}&type=credits&credits={credits}"
+    # Deduct credits
+    success, message = deduct_credits(account_id, cost, "AI question")
+    if not success:
+        return f"❌ {message}", False
     
-    payload = {
-        "amount": amount_kobo,
-        "email": f"wa_{phone_number}@temp.ng",
-        "reference": reference,
-        "currency": "NGN",
-        "metadata": {
+    # Call AI service
+    try:
+        result = ask_guarded({
+            "question": question,
             "account_id": account_id,
-            "credits": credits,
-            "package_code": package_code,
-            "type": "credit_purchase",
-            "channel_type": "whatsapp",
-            "provider_user_id": phone_number,
-            "amount_ngn": package["amount_ngn"]
-        },
-        "callback_url": callback_url
-    }
-    
-    headers = {
-        "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",
-        "Content-Type": "application/json"
-    }
-    
-    try:
-        response = requests.post(f"{PAYSTACK_API_URL}/transaction/initialize", json=payload, headers=headers, timeout=30)
+            "lang": "en",
+            "channel": "whatsapp"
+        })
         
-        if response.status_code == 200:
-            data = response.json()
-            if data.get("status") and supabase:
-                supabase.table("paystack_transactions").insert({
-                    "reference": reference,
-                    "account_id": account_id,
-                    "amount": amount_kobo,
-                    "currency": "NGN",
-                    "status": "pending",
-                    "plan_code": package_code,
-                    "metadata": payload["metadata"],
-                    "created_at": datetime.now().isoformat(),
-                    "updated_at": datetime.now().isoformat()
-                }).execute()
-                
-                return {
-                    "success": True,
-                    "payment_link": data["data"]["authorization_url"],
-                    "reference": reference,
-                    "credits": credits,
-                    "amount": package["amount_ngn"]
-                }
-        
-        logging.error(f"Paystack error: {response.text}")
-        return None
+        if result.get("ok"):
+            answer = result.get("answer", "")
+            new_balance = get_credit_balance(account_id)
+            return f"{answer}\n\n---\n💎 *Credits remaining:* {new_balance}\n\nReply 1 for another question or 8 for menu.", True
+        else:
+            # Refund credits if AI fails
+            add_topup_credits(account_id, cost, f"REFUND_{uuid.uuid4().hex[:8]}")
+            return f"❌ AI service error: {result.get('error', 'Unknown error')}\n\nCredits have been refunded.", False
     except Exception as e:
-        logging.error(f"Payment error: {e}")
-        return None
+        add_topup_credits(account_id, cost, f"REFUND_{uuid.uuid4().hex[:8]}")
+        return f"❌ Error: {str(e)}\n\nCredits have been refunded.", False
 
-# ============ TAX CALCULATION ============
+def handle_database_answer(account_id, question):
+    """Handle database/cached answer (free for all users)"""
+    # Check daily limit for free users
+    if not has_active_subscription(account_id):
+        allowed, limit = check_daily_limit(account_id, "db_answers")
+        if not allowed:
+            return f"""📚 *Daily Limit Reached*
+
+You have reached your daily limit of {limit} database answers.
+
+Subscribe to a plan for:
+• Unlimited database answers
+• AI-powered responses
+• Document generation
+• Tax filing assistance
+
+Reply 4 to view plans"""
+    
+    # Here you would query your database for cached answers
+    # For now, return a placeholder
+    result = ask_guarded({
+        "question": question,
+        "account_id": account_id,
+        "lang": "en",
+        "channel": "whatsapp",
+        "force_cache": True
+    })
+    
+    if result.get("ok") and result.get("from_cache"):
+        # Increment daily usage for free users
+        if not has_active_subscription(account_id):
+            increment_daily_usage(account_id, "db_answers")
+        return result.get("answer", "I couldn't find an answer in the database."), True
+    else:
+        return None, False  # Not found in database, needs AI
+
+# ============ TAX CALCULATION (Free feature) ============
 def calculate_paye(monthly_gross):
     annual_gross = monthly_gross * 12
     pension = monthly_gross * 0.08
@@ -393,6 +525,7 @@ def calculate_paye(monthly_gross):
         "rate": round(rate, 1)
     }
 
+# ============ SUBSCRIPTION PLANS ============
 def get_all_plans():
     try:
         if supabase:
@@ -413,28 +546,32 @@ def get_user_subscription(phone_number):
         
         if sub_result.data:
             return sub_result.data[0]
-        
-        any_sub = supabase.table("subscriptions").select("*").eq("account_id", canonical_account_id).order("created_at", desc=True).limit(1).execute()
-        if any_sub.data:
-            return any_sub.data[0]
-            
         return None
     except Exception as e:
         logging.error(f"Error getting subscription: {e}")
         return None
 
 def format_subscription_message(subscription, plan, credit_details):
-    """Format subscription message with actual credit balance"""
     if not subscription:
         return """📋 *NO ACTIVE SUBSCRIPTION*
 
 You are on the Free Plan.
 
-💰 Free plan: ₦0
-🎯 Only top-up credits work
+📊 *Free Plan Limits (daily):*
+• Database answers: 50
+• Calculations: 20
+• AI answers: 0 (requires subscription)
+• Premium features: 0
 
-To buy credits: Type T10, T50, T100, or T500 directly
-To view plans: Reply 4"""
+💡 *To access premium features:*
+Reply 4 to view subscription plans
+
+*Premium features include:*
+• AI-powered answers
+• Document generation
+• Document scanning
+• Tax filing assistance
+• Report generation"""
     
     plan_name = plan.get("name", "Unknown") if plan else subscription.get("plan", "Unknown")
     amount = subscription.get("amount", 0)
@@ -445,7 +582,6 @@ To view plans: Reply 4"""
     
     created_date = created_at[:10] if created_at else "Unknown"
     
-    # Get current credit balance
     total_balance = int(credit_details.get("balance", 0))
     topup_credits = int(credit_details.get("topup_credits", 0))
     plan_credits_remaining = int(credit_details.get("plan_credits", 0))
@@ -466,20 +602,23 @@ To view plans: Reply 4"""
 
 ✅ Plan: {plan_name}
 💰 Amount: ₦{amount:,.2f}
-🎯 Plan Credits: {plan_credits} per period
+🎯 Monthly Credits: {plan_credits}
 📅 Activated: {created_date}{days_remaining}
 📊 Status: {status.upper()}
 🔄 Auto-renew: ON
 
-📊 *Current Credit Balance:*
+📊 *Credit Balance:*
 • Total available: {total_balance} credits
 • Top-up credits: {topup_credits} (used first)
 • Plan credits: {plan_credits_remaining}
 
-💡 Each question = 1 credit
-🔄 Credits roll over on auto-renewal
+💡 *Premium Features:*
+• AI questions: 1 credit
+• Document generation: 5-10 credits
+• Document scanning: 3 credits
+• Tax filing: 10-20 credits
 
-To buy extra credits: Type T10, T50, T100, or T500"""
+To buy top-up credits: Type T10, T50, T100, or T500"""
 
 def get_plans_list_menu():
     try:
@@ -488,7 +627,7 @@ def get_plans_list_menu():
         if not plans:
             return "📋 *Subscription Plans*\n\nNo plans available at the moment."
         
-        menu_lines = ["📋 *AVAILABLE SUBSCRIPTION PLANS*\n"]
+        menu_lines = ["📋 *AVAILABLE SUBSCRIPTION PLANS*\n", "⚠️ *Required for premium features*\n"]
         
         starter_plans = [p for p in plans if "starter" in p.get("plan_code", "")]
         professional_plans = [p for p in plans if "professional" in p.get("plan_code", "")]
@@ -527,7 +666,7 @@ def get_plans_list_menu():
                 billing = get_billing(plan_code)
                 billing_display = {"monthly": "month", "quarterly": "quarter", "yearly": "year"}.get(billing, billing)
                 short_code = code_display.get(plan_code, "")
-                menu_lines.append(f"  • *{name}* - ₦{price:,}/{billing_display} - {credits} credits")
+                menu_lines.append(f"  • *{name}* - ₦{price:,}/{billing_display} - {credits} credits/month")
                 menu_lines.append(f"    (Code: {short_code})")
             menu_lines.append("")
         
@@ -541,7 +680,7 @@ def get_plans_list_menu():
                 billing = get_billing(plan_code)
                 billing_display = {"monthly": "month", "quarterly": "quarter", "yearly": "year"}.get(billing, billing)
                 short_code = code_display.get(plan_code, "")
-                menu_lines.append(f"  • *{name}* - ₦{price:,}/{billing_display} - {credits} credits")
+                menu_lines.append(f"  • *{name}* - ₦{price:,}/{billing_display} - {credits} credits/month")
                 menu_lines.append(f"    (Code: {short_code})")
             menu_lines.append("")
         
@@ -555,16 +694,15 @@ def get_plans_list_menu():
                 billing = get_billing(plan_code)
                 billing_display = {"monthly": "month", "quarterly": "quarter", "yearly": "year"}.get(billing, billing)
                 short_code = code_display.get(plan_code, "")
-                menu_lines.append(f"  • *{name}* - ₦{price:,}/{billing_display} - {credits} credits")
+                menu_lines.append(f"  • *{name}* - ₦{price:,}/{billing_display} - {credits} credits/month")
                 menu_lines.append(f"    (Code: {short_code})")
             menu_lines.append("")
         
-        menu_lines.append("💡 *How to subscribe:*")
-        menu_lines.append("")
-        menu_lines.append("1️⃣ *By Plan Name:* Type the full plan name")
-        menu_lines.append("2️⃣ *By Code:* Type the short code (e.g., S1, P2, B3)")
-        menu_lines.append("3️⃣ *By Credits:* Type the number of AI credits")
-        menu_lines.append("4️⃣ *By Price:* Type the amount (e.g., 5000 or ₦5,000)")
+        menu_lines.append("💡 *Premium Features (require active plan):*")
+        menu_lines.append("• AI answers: 1 credit")
+        menu_lines.append("• Document generation: 5-10 credits")
+        menu_lines.append("• Document scanning: 3 credits")
+        menu_lines.append("• Tax filing: 10-20 credits")
         menu_lines.append("")
         menu_lines.append("0 - Cancel | # - Main Menu")
         
@@ -579,21 +717,29 @@ def get_main_menu():
 Reply with:
 
 1️⃣ - Ask a tax question
-2️⃣ - Check AI credits balance
-3️⃣ - Check my subscription plan
+2️⃣ - Check credits balance
+3️⃣ - Check my subscription
 4️⃣ - View subscription plans
-5️⃣ - Link to website account (coming soon)
-6️⃣ - Buy AI credits (menu)
-7️⃣ - Tax filing & management (coming soon)
+5️⃣ - Premium features (coming soon)
+6️⃣ - Buy top-up credits
+7️⃣ - Tax filing & management
 8️⃣ - Help / Menu
 
 ---
-*Quick Commands (work directly):*
-T10, T50, T100, T500 - Buy credits immediately
-S1, P1, B1 etc. - Subscribe to plan
+*Free Features:*
+• Database answers (50/day)
+• Tax calculations (20/day)
+
+*Premium Features (require subscription):*
+• AI answers (1 credit)
+• Document generation
+• Tax filing assistance
+
+*Quick Commands:*
+T10, T50, T100, T500 - Buy top-up (requires subscription)
 
 *Global commands:*
-# - Save & Menu | * - Back | 0 - Cancel | 9 - Resume"""
+# - Menu | * - Back | 0 - Cancel"""
 
 def send_whatsapp(to_phone, text):
     try:
@@ -791,7 +937,7 @@ def billing_webhook():
                     credits = 0
                 
                 if account_id and credits > 0:
-                    success = add_topup_credits(account_id, credits, reference)
+                    success, message = add_topup_credits(account_id, credits, reference)
                     
                     if success and phone_number:
                         try:
@@ -811,7 +957,7 @@ def billing_webhook():
                         
                         confirmation_msg = f"""✅ *CREDITS ADDED SUCCESSFULLY!*
 
-💎 *{credits} AI credits* added to your account.
+💎 *{credits} top-up credits* added to your account.
 
 💰 Amount: ₦{amount:,.2f}
 🆔 Reference: {reference}
@@ -821,16 +967,16 @@ def billing_webhook():
 • Top-up: {topup_credits} (used first)
 • Plan: {plan_credits}
 
-💡 Each question = 1 credit
+💡 Each credit = 1 AI question or premium action
 
 Reply 1 for tax questions or 8 for menu."""
                         
                         send_whatsapp(phone_number, confirmation_msg)
                         logging.info(f"✅ Top-up completed: +{credits} credits")
                     else:
-                        logging.error(f"❌ Failed to add credits for {account_id}")
+                        logging.error(f"❌ Failed to add credits: {message}")
                         if phone_number:
-                            send_whatsapp(phone_number, f"⚠️ Payment received but credit addition failed. Reference: {reference}\n\nReply 8 for menu.")
+                            send_whatsapp(phone_number, f"⚠️ {message}\n\nReference: {reference}\n\nReply 8 for menu.")
             
             elif transaction_type == 'subscription':
                 phone_number = metadata.get('phone')
@@ -885,7 +1031,7 @@ Reply 8 for menu."""
                                 }).execute()
                                 logging.info(f"✅ Subscription activated: {plan_name}")
                                 
-                                # Update credit balance (add plan credits, preserve top-up)
+                                # Update credit balance
                                 existing_balance = supabase.table("ai_credit_balances").select("*").eq("account_id", canonical_account_id).execute()
                                 if existing_balance.data:
                                     current_topup = int(existing_balance.data[0].get("topup_credits", 0))
@@ -965,9 +1111,22 @@ def webhook():
                     send_whatsapp(from_number, "❌ Error initializing your account. Please try again later.")
                     continue
                 
-                # ============ DIRECT T-CODE CREDIT PURCHASE (WORKS IMMEDIATELY) ============
+                # ============ DIRECT T-CODE CREDIT PURCHASE ============
+                # Top-up credits require active subscription
                 t_code = text.upper().strip()
                 if t_code in ["T10", "T50", "T100", "T500"]:
+                    # Check if user has active subscription
+                    if not has_active_subscription(canonical_account_id):
+                        send_whatsapp(from_number, """❌ *Subscription Required*
+
+Top-up credits can only be purchased by users with an active subscription.
+
+📋 *Why?* Top-ups are add-ons to your existing plan.
+💰 *Benefits:* Extra credits on top of your monthly allocation.
+
+Reply 4 to view subscription plans and subscribe first.""")
+                        continue
+                    
                     package = CREDIT_PACKAGES.get(t_code)
                     if package:
                         payment = create_credit_payment(canonical_account_id, t_code, from_number)
@@ -981,6 +1140,7 @@ Amount: ₦{package['amount_ngn']:,}
 
 Reference: {payment['reference']}
 
+⚠️ Top-up credits require an active subscription.
 0 - Cancel | # - Main Menu""")
                         else:
                             send_whatsapp(from_number, "❌ Failed to generate payment link.\n\nReply 8 for menu.")
@@ -1004,13 +1164,37 @@ Reference: {payment['reference']}
                     send_whatsapp(from_number, get_main_menu())
                     continue
                 
-                # Option 5 - Link website account
+                # Option 5 - Premium features (placeholder)
                 if text == '5':
-                    send_whatsapp(from_number, "🔗 *Link to Website Account*\n\nFeature coming soon.\n\nReply 8 for main menu.")
+                    send_whatsapp(from_number, """🔗 *Premium Features*
+
+✨ Available with active subscription:
+
+• AI-powered tax answers
+• Document generation (receipts, forms)
+• Document scanning & analysis
+• Tax filing assistance
+• Report generation
+
+📋 Features require credits:
+• AI question: 1 credit
+• Document generation: 5-10 credits
+• Document scanning: 3 credits
+• Tax filing: 10-20 credits
+
+Reply 4 to view plans or 6 to buy top-ups""")
                     continue
                 
-                # Option 6 - Buy AI credits (menu mode)
+                # Option 6 - Buy top-up credits (menu)
                 if text == '6':
+                    if not has_active_subscription(canonical_account_id):
+                        send_whatsapp(from_number, """❌ *Subscription Required*
+
+Top-up credits can only be purchased with an active subscription.
+
+Reply 4 to view subscription plans.
+Reply 8 for main menu.""")
+                        continue
                     user_state[from_number] = {"step": "buy_credits", "timestamp": current_time}
                     send_whatsapp(from_number, get_credit_packages_menu())
                     continue
@@ -1020,6 +1204,12 @@ Reference: {payment['reference']}
                     package_code = text.upper().strip()
                     
                     if package_code in ["T10", "T50", "T100", "T500"]:
+                        # Double-check subscription status
+                        if not has_active_subscription(canonical_account_id):
+                            send_whatsapp(from_number, "❌ Subscription required for top-ups. Reply 4 to view plans.")
+                            user_state.pop(from_number, None)
+                            continue
+                        
                         package = CREDIT_PACKAGES.get(package_code)
                         if package:
                             payment = create_credit_payment(canonical_account_id, package_code, from_number)
@@ -1115,73 +1305,73 @@ Reference: {reference}
                 
                 # ============ HANDLE TAX QUESTIONS ============
                 
-                # Get credit details for balance display
-                credit_details = get_credit_details(canonical_account_id)
-                total_balance = int(credit_details.get("balance", 0))
+                # Check if user has active subscription for premium features
                 has_sub = has_active_subscription(canonical_account_id)
                 
                 # Handle tax question (when in asking state after pressing 1)
                 if from_number in user_state and user_state[from_number].get("step") == "asking_question":
-                    if SERVICES_AVAILABLE:
-                        if not has_sub and total_balance <= 0:
-                            send_whatsapp(from_number, "❌ You have 0 credits and no active subscription.\n\nTo buy credits: Type T10, T50, T100, or T500\nTo subscribe: Reply 4")
-                            user_state.pop(from_number, None)
-                            continue
-                        
-                        result = ask_guarded({
-                            "question": text,
-                            "account_id": canonical_account_id,
-                            "lang": "en",
-                            "channel": "whatsapp"
-                        })
-                        
-                        if result.get("ok"):
-                            answer = result.get("answer", "")
-                            # Get updated balance after deduction
-                            new_credit_details = get_credit_details(canonical_account_id)
-                            new_balance = int(new_credit_details.get("balance", 0))
-                            new_topup = int(new_credit_details.get("topup_credits", 0))
-                            new_plan = int(new_credit_details.get("plan_credits", 0))
-                            
-                            send_whatsapp(from_number, f"{answer}\n\n---\n💎 *Remaining credits:* {new_balance}\n📊 Top-up: {new_topup} | Plan: {new_plan}\n\nReply 1 for another question or 8 for menu.")
-                        else:
-                            error = result.get("error", "Unknown error")
-                            send_whatsapp(from_number, f"❌ Error: {error}\n\nPlease try again.")
-                    else:
-                        send_whatsapp(from_number, "❌ AI service unavailable. Please try again later.")
+                    # Try database answer first
+                    db_response, found = handle_database_answer(canonical_account_id, text)
                     
+                    if found and db_response:
+                        # Database answer found (free)
+                        send_whatsapp(from_number, f"{db_response}\n\n---\n📚 *Answer from database*\n\nReply 1 for another question or 8 for menu.")
+                        user_state.pop(from_number, None)
+                        continue
+                    
+                    # Not in database - requires AI (premium feature)
+                    if not has_sub:
+                        send_whatsapp(from_number, """❌ *Premium Feature*
+
+This question requires AI assistance, which is a premium feature.
+
+📋 *To access AI answers:*
+1. Subscribe to a plan (Reply 4)
+2. Get monthly credits
+3. Each AI answer = 1 credit
+
+💡 Free tier includes database answers (50/day) and tax calculations.
+
+Reply 4 to view plans""")
+                        user_state.pop(from_number, None)
+                        continue
+                    
+                    # User has subscription, handle AI question with credit deduction
+                    ai_response, success = handle_ai_question(canonical_account_id, text)
+                    send_whatsapp(from_number, ai_response)
                     user_state.pop(from_number, None)
                     continue
                 
-                # Handle direct question (no state, just type a question)
+                # Handle direct question
                 is_question = (len(text) > 10 and not text.upper().startswith('T') and not text.isdigit() and text not in ['#', '*', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9'])
                 
                 if is_question and from_number not in user_state:
-                    if SERVICES_AVAILABLE:
-                        if not has_sub and total_balance <= 0:
-                            send_whatsapp(from_number, "❌ You have 0 credits and no active subscription.\n\nTo buy credits: Type T10, T50, T100, or T500\nTo subscribe: Reply 4")
-                            continue
-                        
-                        result = ask_guarded({
-                            "question": text,
-                            "account_id": canonical_account_id,
-                            "lang": "en",
-                            "channel": "whatsapp"
-                        })
-                        
-                        if result.get("ok"):
-                            answer = result.get("answer", "")
-                            new_credit_details = get_credit_details(canonical_account_id)
-                            new_balance = int(new_credit_details.get("balance", 0))
-                            new_topup = int(new_credit_details.get("topup_credits", 0))
-                            new_plan = int(new_credit_details.get("plan_credits", 0))
-                            
-                            send_whatsapp(from_number, f"{answer}\n\n---\n💎 *Remaining credits:* {new_balance}\n📊 Top-up: {new_topup} | Plan: {new_plan}\n\nReply 1 for another question or 8 for menu.")
-                        else:
-                            error = result.get("error", "Unknown error")
-                            send_whatsapp(from_number, f"❌ Error: {error}\n\nPlease try again.")
-                    else:
-                        send_whatsapp(from_number, "❌ AI service unavailable.")
+                    # Try database answer first
+                    db_response, found = handle_database_answer(canonical_account_id, text)
+                    
+                    if found and db_response:
+                        send_whatsapp(from_number, f"{db_response}\n\n---\n📚 *Answer from database*\n\nReply 1 for another question or 8 for menu.")
+                        continue
+                    
+                    # Not in database - requires AI (premium feature)
+                    if not has_sub:
+                        send_whatsapp(from_number, """❌ *Premium Feature*
+
+This question requires AI assistance, which is a premium feature.
+
+📋 *To access AI answers:*
+1. Subscribe to a plan (Reply 4)
+2. Get monthly credits
+3. Each AI answer = 1 credit
+
+💡 Free tier includes database answers (50/day) and tax calculations.
+
+Reply 4 to view plans""")
+                        continue
+                    
+                    # User has subscription, handle AI question
+                    ai_response, success = handle_ai_question(canonical_account_id, text)
+                    send_whatsapp(from_number, ai_response)
                     continue
                 
                 # Main menu navigation
@@ -1204,7 +1394,7 @@ Reference: {reference}
                     send_whatsapp(from_number, format_subscription_message(subscription, plan, credit_details))
                 elif text == '1':
                     user_state[from_number] = {"step": "asking_question", "timestamp": current_time}
-                    send_whatsapp(from_number, "💬 Please type your tax question.\n\n💡 # - Menu | 0 - Cancel")
+                    send_whatsapp(from_number, "💬 Please type your tax question.\n\n💡 I'll check my database first (free). If not found, AI will answer (1 credit for subscribers).\n\n# - Menu | 0 - Cancel")
                 elif text == '2':
                     credit_details = get_credit_details(canonical_account_id)
                     total_balance = int(credit_details.get("balance", 0))
@@ -1212,31 +1402,60 @@ Reference: {reference}
                     plan_credits = int(credit_details.get("plan_credits", 0))
                     
                     if has_sub:
-                        send_whatsapp(from_number, f"""💎 *AI Credits Balance*
+                        send_whatsapp(from_number, f"""💎 *Credit Balance*
 
 ✅ ACTIVE SUBSCRIPTION
 📊 Total available: *{total_balance}* credits
 • Top-up credits: {topup_credits} (used first)
 • Plan credits: {plan_credits}
 
-💡 Each question = 1 credit
-🔄 Credits roll over on auto-renewal
+💡 *Credit Usage:*
+• AI question: 1 credit
+• Document generation: 5-10 credits
+• Document scanning: 3 credits
+• Tax filing: 10-20 credits
 
-To buy extra credits: Type T10, T50, T100, or T500""")
+To buy top-ups: T10, T50, T100, T500""")
                     else:
-                        send_whatsapp(from_number, f"""💎 *AI Credits Balance*
+                        # Check daily limits for free user
+                        db_allowed, db_limit = check_daily_limit(canonical_account_id, "db_answers")
+                        calc_allowed, calc_limit = check_daily_limit(canonical_account_id, "calculations")
+                        
+                        send_whatsapp(from_number, f"""💎 *Free Plan*
 
-📊 Total available: *{total_balance}* credits
-• Top-up credits: {topup_credits} (used first)
-• Plan credits: {plan_credits}
+📊 *Daily Limits:*
+• Database answers: {db_limit if db_allowed else 'Limit reached'}
+• Tax calculations: {calc_limit if calc_allowed else 'Limit reached'}
+• AI answers: 0 (requires subscription)
 
-💡 Each question = 1 credit
+💡 *Upgrade to subscribe:*
+• Monthly credits
+• AI answers (1 credit)
+• Document features
+• Tax filing assistance
 
-No active subscription? Reply 4 to view plans
-Buy credits: Type T10, T50, T100, or T500""")
+Reply 4 to view plans""")
                 elif text == '7':
-                    send_whatsapp(from_number, "📋 *TAX FILING & MANAGEMENT*\n\nComing soon!")
+                    send_whatsapp(from_number, """📋 *TAX FILING & MANAGEMENT*
+
+Coming soon! Premium feature (requires active subscription).
+
+Features planned:
+• PAYE filing assistance
+• VAT return preparation
+• CIT calculation & filing
+• Document generation
+
+Reply 4 to subscribe""")
                 elif text.isdigit() and len(text) >= 5:
+                    # Check daily limit for calculations for free users
+                    if not has_sub:
+                        allowed, limit = check_daily_limit(canonical_account_id, "calculations")
+                        if not allowed:
+                            send_whatsapp(from_number, f"📊 *Daily Limit Reached*\n\nYou have reached your daily limit of {limit} tax calculations.\n\nSubscribe for unlimited calculations: Reply 4")
+                            continue
+                        increment_daily_usage(canonical_account_id, "calculations")
+                    
                     try:
                         salary = float(text.replace(',', ''))
                         data = calculate_paye(salary)
@@ -1263,7 +1482,13 @@ Rate: {data['rate']}%"""
                             send_whatsapp(from_number, f"""✅ *Plan Selected:* {plan.get('name')}
 
 💰 Price: ₦{plan.get('price', 0):,}
-🎯 Credits: {plan.get('ai_credits_total', 0)} AI credits per period
+🎯 Credits: {plan.get('ai_credits_total', 0)} credits/month
+
+✨ *Premium features included:*
+• AI answers (1 credit each)
+• Document generation
+• Document scanning
+• Tax filing assistance
 
 📧 *Please provide your email address* for payment link.
 
@@ -1284,7 +1509,7 @@ def find_plan_by_input(plans, user_input):
     """Find plan by code, name, credits, or price"""
     user_input = user_input.strip()
     
-    # Check by plan code (S1, P1, B1, etc.)
+    # Check by plan code
     code_map = {
         "S1": "starter_monthly",
         "S2": "starter_quarterly", 
@@ -1318,6 +1543,103 @@ def find_plan_by_input(plans, user_input):
         pass
     
     return {"found": False}
+
+def create_credit_payment(account_id, package_code, phone_number):
+    """Create Paystack payment for credit purchase"""
+    existing_reference = check_pending_transaction(account_id)
+    if existing_reference and supabase:
+        supabase.table("paystack_transactions").update({
+            "status": "expired",
+            "updated_at": datetime.now().isoformat()
+        }).eq("reference", existing_reference).execute()
+    
+    package = CREDIT_PACKAGES.get(package_code.upper())
+    if not package:
+        return None
+    
+    reference = f"CREDIT_{package['credits']}_{uuid.uuid4().hex[:8]}"
+    amount_kobo = package["amount_kobo"]
+    credits = package["credits"]
+    
+    base_url = os.getenv("PUBLIC_BACKEND_BASE_URL", "https://incredible-nonie-bmsconcept-37359733.koyeb.app")
+    callback_url = f"{base_url}/payment/success?phone={phone_number}&type=credits&credits={credits}"
+    
+    payload = {
+        "amount": amount_kobo,
+        "email": f"wa_{phone_number}@temp.ng",
+        "reference": reference,
+        "currency": "NGN",
+        "metadata": {
+            "account_id": account_id,
+            "credits": credits,
+            "package_code": package_code,
+            "type": "credit_purchase",
+            "channel_type": "whatsapp",
+            "provider_user_id": phone_number,
+            "amount_ngn": package["amount_ngn"]
+        },
+        "callback_url": callback_url
+    }
+    
+    headers = {
+        "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",
+        "Content-Type": "application/json"
+    }
+    
+    try:
+        response = requests.post(f"{PAYSTACK_API_URL}/transaction/initialize", json=payload, headers=headers, timeout=30)
+        
+        if response.status_code == 200:
+            data = response.json()
+            if data.get("status") and supabase:
+                supabase.table("paystack_transactions").insert({
+                    "reference": reference,
+                    "account_id": account_id,
+                    "amount": amount_kobo,
+                    "currency": "NGN",
+                    "status": "pending",
+                    "plan_code": package_code,
+                    "metadata": payload["metadata"],
+                    "created_at": datetime.now().isoformat(),
+                    "updated_at": datetime.now().isoformat()
+                }).execute()
+                
+                return {
+                    "success": True,
+                    "payment_link": data["data"]["authorization_url"],
+                    "reference": reference,
+                    "credits": credits,
+                    "amount": package["amount_ngn"]
+                }
+        
+        logging.error(f"Paystack error: {response.text}")
+        return None
+    except Exception as e:
+        logging.error(f"Payment error: {e}")
+        return None
+
+def check_pending_transaction(account_id):
+    """Check if there's a pending transaction for this user"""
+    try:
+        if not supabase:
+            return None
+        five_min_ago = (datetime.now() - timedelta(minutes=5)).isoformat()
+        pending = supabase.table("paystack_transactions")\
+            .select("reference, metadata")\
+            .eq("account_id", account_id)\
+            .eq("status", "pending")\
+            .gte("created_at", five_min_ago)\
+            .execute()
+        
+        if pending.data:
+            for tx in pending.data:
+                metadata = tx.get("metadata", {})
+                if metadata.get("type") == "credit_purchase":
+                    return tx.get("reference")
+        return None
+    except Exception as e:
+        logging.warning(f"Error checking pending transaction: {e}")
+        return None
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 8000))
