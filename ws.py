@@ -19,6 +19,12 @@ load_dotenv()
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
+# ============ LEGAL DISCLAIMER ============
+LEGAL_DISCLAIMER = """
+---
+⚠️ *DISCLAIMER*: This information is for general informational purposes only and does not constitute professional tax advice. Tax laws are complex and subject to change. You should consult with a qualified tax professional for advice specific to your situation. Naija Tax Guide is not liable for any actions taken based on this information.
+"""
+
 # ============ SUPABASE ============
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_ANON_KEY")
@@ -58,17 +64,24 @@ CREDIT_PACKAGES = {
     "T500": {"credits": 500, "amount_ngn": 15000, "amount_kobo": 1500000, "code": "T500", "description": "500 AI Credits", "requires_subscription": True},
 }
 
-# Feature credit costs (default values, can be overridden by plan settings)
+# Feature credit costs
 DEFAULT_CREDIT_COSTS = {
     "ai_question": 1,
+    "paye_filing": 10,
+    "vat_filing": 15,
+    "cit_filing": 20,
+    "document_simple": 5,
+    "document_complex": 10
+}
+
+# Tax filing credit costs
+TAX_FILING_COSTS = {
+    "paye_assistance": 10,
+    "vat_preparation": 15,
+    "cit_filing": 20,
     "document_generation_simple": 5,
     "document_generation_complex": 10,
-    "document_scanning": 3,
-    "report_generation": 15,
-    "tax_filing_paye": 10,
-    "tax_filing_cit": 20,
-    "tax_filing_vat": 20,
-    "consolidated_report": 30
+    "filing_summary": 5
 }
 
 # Free plan daily limits
@@ -93,11 +106,9 @@ def check_daily_limit(account_id, usage_type):
         today = get_today_date()
         cache_key = f"{account_id}:{usage_type}:{today}"
         
-        # Check cache first
         if cache_key in daily_usage_cache:
             current_usage = daily_usage_cache[cache_key]
         else:
-            # Query database
             result = supabase.table("daily_free_usage").select(f"{usage_type}_used").eq("account_id", account_id).eq("usage_date", today).execute()
             if result.data:
                 current_usage = result.data[0].get(f"{usage_type}_used", 0)
@@ -105,7 +116,6 @@ def check_daily_limit(account_id, usage_type):
                 current_usage = 0
             daily_usage_cache[cache_key] = current_usage
         
-        # Get limit based on usage type
         if usage_type == "db_answers":
             limit = FREE_PLAN_LIMITS["db_answers_daily"]
         elif usage_type == "calculations":
@@ -128,11 +138,9 @@ def increment_daily_usage(account_id, usage_type):
         today = get_today_date()
         cache_key = f"{account_id}:{usage_type}:{today}"
         
-        # Update cache
         current_usage = daily_usage_cache.get(cache_key, 0)
         daily_usage_cache[cache_key] = current_usage + 1
         
-        # Update database (upsert)
         existing = supabase.table("daily_free_usage").select("*").eq("account_id", account_id).eq("usage_date", today).execute()
         
         if existing.data:
@@ -164,7 +172,6 @@ def get_canonical_account_id(phone_number):
         return None
     
     try:
-        # Check if user exists in accounts table
         account_result = supabase.table("accounts").select("account_id").eq("provider_user_id", str(phone_number)).execute()
         
         if account_result.data:
@@ -172,7 +179,6 @@ def get_canonical_account_id(phone_number):
             logging.info(f"Found existing account: {account_id}")
             return account_id
         
-        # Check bot_users
         user_result = supabase.table("bot_users").select("auth_user_id").eq("platform", "whatsapp").eq("user_id", str(phone_number)).execute()
         
         if user_result.data and user_result.data[0].get("auth_user_id"):
@@ -194,7 +200,6 @@ def get_canonical_account_id(phone_number):
                 }).execute()
                 return auth_user_id
         
-        # Create new user
         auth_user_id = str(uuid.uuid4())
         
         supabase.table("bot_users").insert({
@@ -241,7 +246,6 @@ def get_active_subscription(account_id):
         result = supabase.table("subscriptions").select("*").eq("account_id", account_id).eq("status", "active").execute()
         if result.data:
             sub = result.data[0]
-            # Check if expired
             expires_at = sub.get("expires_at")
             if expires_at:
                 try:
@@ -299,7 +303,6 @@ def deduct_credits(account_id, cost, feature_name):
         if current_balance < cost:
             return False, f"Insufficient credits. Need {cost} credits, have {current_balance}. Buy top-up: T10, T50, T100, T500"
         
-        # Deduct from top-up first
         if current_topup >= cost:
             new_topup = current_topup - cost
             new_balance = current_balance - cost
@@ -308,9 +311,8 @@ def deduct_credits(account_id, cost, feature_name):
                 "topup_credits": new_topup,
                 "updated_at": datetime.now().isoformat()
             }).eq("account_id", account_id).execute()
-            logging.info(f"Deducted {cost} credits from top-up for {feature_name}. Remaining topup: {new_topup}")
+            logging.info(f"Deducted {cost} credits from top-up for {feature_name}")
         else:
-            # Use all top-up, then plan credits
             remaining_cost = cost - current_topup
             new_topup = 0
             new_plan = current_plan - remaining_cost
@@ -331,7 +333,6 @@ def deduct_credits(account_id, cost, feature_name):
 
 def add_topup_credits(account_id, credits, reference):
     """Add top-up credits to user's balance (ONLY for users with active subscription)"""
-    # Verify user has active subscription
     if not has_active_subscription(account_id):
         return False, "You need an active subscription to buy top-up credits. Reply 4 to view plans."
     
@@ -378,8 +379,6 @@ def add_topup_credits(account_id, credits, reference):
                 return False, str(e)
 
 def get_credit_cost(feature, plan_code=None):
-    """Get credit cost for a feature (can be customized by plan)"""
-    # In future, this could query plan-specific costs from database
     return DEFAULT_CREDIT_COSTS.get(feature, 1)
 
 def get_credit_packages_menu():
@@ -395,92 +394,6 @@ T100 - 100 credits - ₦3,500
 T500 - 500 credits - ₦15,000
 
 0 - Cancel | # - Main Menu"""
-
-# ============ PREMIUM FEATURE HANDLERS ============
-
-def handle_ai_question(account_id, question):
-    """Handle AI question with credit deduction"""
-    if not has_active_subscription(account_id):
-        return "❌ *Premium Feature*\n\nAI answers require an active subscription.\n\nReply 4 to view plans and subscribe.", False
-    
-    cost = get_credit_cost("ai_question")
-    credit_details = get_credit_details(account_id)
-    current_balance = int(credit_details.get("balance", 0))
-    
-    if current_balance < cost:
-        return f"""❌ *Insufficient Credits*
-
-Need {cost} credit for AI answer.
-Current balance: {current_balance} credits
-
-Options:
-1. Buy top-up credits: T10, T50, T100, T500
-2. Your plan renews on: (check with option 3)
-3. Check balance: Reply 2
-
-Each credit = 1 AI question or premium action""", False
-    
-    # Deduct credits
-    success, message = deduct_credits(account_id, cost, "AI question")
-    if not success:
-        return f"❌ {message}", False
-    
-    # Call AI service
-    try:
-        result = ask_guarded({
-            "question": question,
-            "account_id": account_id,
-            "lang": "en",
-            "channel": "whatsapp"
-        })
-        
-        if result.get("ok"):
-            answer = result.get("answer", "")
-            new_balance = get_credit_balance(account_id)
-            return f"{answer}\n\n---\n💎 *Credits remaining:* {new_balance}\n\nReply 1 for another question or 8 for menu.", True
-        else:
-            # Refund credits if AI fails
-            add_topup_credits(account_id, cost, f"REFUND_{uuid.uuid4().hex[:8]}")
-            return f"❌ AI service error: {result.get('error', 'Unknown error')}\n\nCredits have been refunded.", False
-    except Exception as e:
-        add_topup_credits(account_id, cost, f"REFUND_{uuid.uuid4().hex[:8]}")
-        return f"❌ Error: {str(e)}\n\nCredits have been refunded.", False
-
-def handle_database_answer(account_id, question):
-    """Handle database/cached answer (free for all users)"""
-    # Check daily limit for free users
-    if not has_active_subscription(account_id):
-        allowed, limit = check_daily_limit(account_id, "db_answers")
-        if not allowed:
-            return f"""📚 *Daily Limit Reached*
-
-You have reached your daily limit of {limit} database answers.
-
-Subscribe to a plan for:
-• Unlimited database answers
-• AI-powered responses
-• Document generation
-• Tax filing assistance
-
-Reply 4 to view plans"""
-    
-    # Here you would query your database for cached answers
-    # For now, return a placeholder
-    result = ask_guarded({
-        "question": question,
-        "account_id": account_id,
-        "lang": "en",
-        "channel": "whatsapp",
-        "force_cache": True
-    })
-    
-    if result.get("ok") and result.get("from_cache"):
-        # Increment daily usage for free users
-        if not has_active_subscription(account_id):
-            increment_daily_usage(account_id, "db_answers")
-        return result.get("answer", "I couldn't find an answer in the database."), True
-    else:
-        return None, False  # Not found in database, needs AI
 
 # ============ TAX CALCULATION (Free feature) ============
 def calculate_paye(monthly_gross):
@@ -525,6 +438,357 @@ def calculate_paye(monthly_gross):
         "rate": round(rate, 1)
     }
 
+# ============ TAX FILING & MANAGEMENT ============
+
+def get_filing_menu():
+    return """📋 *TAX FILING & MANAGEMENT*
+
+⚠️ *Premium Feature* (Requires Active Subscription)
+⚠️ *Disclaimer*: This is for informational purposes. Consult a tax professional.
+
+Select an option:
+
+1️⃣ - PAYE Filing Assistance (10 credits)
+2️⃣ - VAT Return Preparation (15 credits)
+3️⃣ - CIT Calculation & Filing (20 credits)
+4️⃣ - Generate Document (5-10 credits)
+5️⃣ - View Filing History
+6️⃣ - Back to Main Menu
+
+💡 Each option deducts credits from your balance
+
+0 - Cancel | # - Main Menu"""
+
+def get_paye_filing_questions(step, inputs=None):
+    steps = {
+        1: "📋 *PAYE Filing - Step 1/5*\n\nEnter employee's monthly salary:\n(Example: 500000)\n\n0 - Cancel | # - Menu",
+        2: "📋 *PAYE Filing - Step 2/5*\n\nEnter pension contribution (employee):\n(Example: 40000 or 0 if none)\n\n0 - Cancel | # - Menu",
+        3: "📋 *PAYE Filing - Step 3/5*\n\nEnter NHF contribution (employee):\n(Example: 12500 or 0 if none)\n\n0 - Cancel | # - Menu",
+        4: "📋 *PAYE Filing - Step 4/5*\n\nEnter other allowances (if any):\n(Example: 50000 or 0)\n\n0 - Cancel | # - Menu",
+        5: "📋 *PAYE Filing - Step 5/5*\n\nEnter tax reliefs (if any):\n(Example: 200000 or 0)\n\n0 - Cancel | # - Menu"
+    }
+    return steps.get(step, "Invalid step. Start over with 7.")
+
+def process_paye_filing(inputs):
+    salary = float(inputs.get("salary", 0))
+    pension = float(inputs.get("pension", 0))
+    nhf = float(inputs.get("nhf", 0))
+    allowances = float(inputs.get("allowances", 0))
+    reliefs = float(inputs.get("reliefs", 200000))
+    
+    annual_gross = (salary + allowances) * 12
+    annual_pension = pension * 12
+    annual_nhf = nhf * 12
+    
+    cra_fixed = reliefs
+    cra_one_percent = annual_gross * 0.01
+    cra_base = max(cra_fixed, cra_one_percent)
+    cra_percentage = annual_gross * 0.20
+    cra_total = cra_base + cra_percentage
+    
+    total_deductions = annual_pension + annual_nhf + cra_total
+    chargeable = max(0, annual_gross - total_deductions)
+    
+    if chargeable <= 300000:
+        annual_tax = chargeable * 0.07
+    elif chargeable <= 600000:
+        annual_tax = 21000 + (chargeable - 300000) * 0.11
+    elif chargeable <= 1100000:
+        annual_tax = 54000 + (chargeable - 600000) * 0.15
+    elif chargeable <= 1600000:
+        annual_tax = 129000 + (chargeable - 1100000) * 0.19
+    elif chargeable <= 3200000:
+        annual_tax = 224000 + (chargeable - 1600000) * 0.21
+    else:
+        annual_tax = 560000 + (chargeable - 3200000) * 0.24
+    
+    monthly_tax = annual_tax / 12
+    
+    return f"""📋 *PAYE FILING SUMMARY*
+
+📊 *Employee Details:*
+Monthly Salary: ₦{salary:,.2f}
+Pension: ₦{pension:,.2f}
+NHF: ₦{nhf:,.2f}
+Allowances: ₦{allowances:,.2f}
+
+💰 *Tax Calculation:*
+Annual Gross: ₦{annual_gross:,.2f}
+Chargeable Income: ₦{chargeable:,.2f}
+Annual Tax: ₦{annual_tax:,.2f}
+*Monthly Tax: ₦{monthly_tax:,.2f}*
+
+📝 *Filing Reference:* PAYE_{datetime.now().strftime('%Y%m%d')}_{uuid.uuid4().hex[:6]}
+
+✅ Filing recorded for your records.
+{LEGAL_DISCLAIMER}
+
+Reply 8 for main menu or 7 for more filing options"""
+
+def get_vat_filing_questions(step, inputs=None):
+    steps = {
+        1: "📋 *VAT Filing - Step 1/4*\n\nEnter total sales for the period:\n(Example: 5000000)\n\n0 - Cancel | # - Menu",
+        2: "📋 *VAT Filing - Step 2/4*\n\nEnter total purchases (excluding VAT):\n(Example: 3000000)\n\n0 - Cancel | # - Menu",
+        3: "📋 *VAT Filing - Step 3/4*\n\nEnter VAT rate (default 7.5%):\n(Reply 1 for 7.5%, or enter custom rate)\n\n0 - Cancel | # - Menu",
+        4: "📋 *VAT Filing - Step 4/4*\n\nEnter filing period (month/year):\n(Example: May 2026)\n\n0 - Cancel | # - Menu"
+    }
+    return steps.get(step, "Invalid step. Start over with 7.")
+
+def process_vat_filing(inputs):
+    sales = float(inputs.get("sales", 0))
+    purchases = float(inputs.get("purchases", 0))
+    vat_rate = float(inputs.get("vat_rate", 7.5)) / 100
+    period = inputs.get("period", datetime.now().strftime("%B %Y"))
+    
+    output_vat = sales * vat_rate
+    input_vat = purchases * vat_rate
+    vat_payable = max(0, output_vat - input_vat)
+    
+    return f"""📋 *VAT FILING SUMMARY*
+
+📊 *Period:* {period}
+
+💰 *Transaction Details:*
+Total Sales: ₦{sales:,.2f}
+Output VAT: ₦{output_vat:,.2f}
+Total Purchases: ₦{purchases:,.2f}
+Input VAT: ₦{input_vat:,.2f}
+
+📝 *VAT Payable:*
+*₦{vat_payable:,.2f}*
+
+📋 *Filing Reference:* VAT_{datetime.now().strftime('%Y%m%d')}_{uuid.uuid4().hex[:6]}
+
+✅ Filing recorded. Payment due by 21st of next month.
+{LEGAL_DISCLAIMER}
+
+Reply 8 for main menu or 7 for more filing options"""
+
+def get_cit_filing_questions(step, inputs=None):
+    steps = {
+        1: "📋 *CIT Filing - Step 1/5*\n\nEnter company's total revenue for the year:\n(Example: 50000000)\n\n0 - Cancel | # - Menu",
+        2: "📋 *CIT Filing - Step 2/5*\n\nEnter cost of sales:\n(Example: 25000000)\n\n0 - Cancel | # - Menu",
+        3: "📋 *CIT Filing - Step 3/5*\n\nEnter operating expenses:\n(Example: 10000000)\n\n0 - Cancel | # - Menu",
+        4: "📋 *CIT Filing - Step 4/5*\n\nEnter capital allowances:\n(Example: 2000000)\n\n0 - Cancel | # - Menu",
+        5: "📋 *CIT Filing - Step 5/5*\n\nEnter tax year:\n(Example: 2026)\n\n0 - Cancel | # - Menu"
+    }
+    return steps.get(step, "Invalid step. Start over with 7.")
+
+def process_cit_filing(inputs):
+    revenue = float(inputs.get("revenue", 0))
+    cost_of_sales = float(inputs.get("cost_of_sales", 0))
+    expenses = float(inputs.get("expenses", 0))
+    allowances = float(inputs.get("allowances", 0))
+    tax_year = inputs.get("tax_year", str(datetime.now().year))
+    
+    gross_profit = revenue - cost_of_sales
+    taxable_profit = max(0, gross_profit - expenses - allowances)
+    
+    if revenue > 100000000:
+        cit_rate = 0.30
+        company_size = "Large"
+    elif revenue > 25000000:
+        cit_rate = 0.20
+        company_size = "Medium"
+    else:
+        cit_rate = 0.00
+        company_size = "Small (Exempt)"
+    
+    cit_payable = taxable_profit * cit_rate
+    education_tax = taxable_profit * 0.03 if revenue > 25000000 else 0
+    total_tax = cit_payable + education_tax
+    
+    return f"""📋 *CIT FILING SUMMARY*
+
+🏢 *Company Details:*
+Size: {company_size}
+Tax Year: {tax_year}
+
+📊 *Financial Summary:*
+Revenue: ₦{revenue:,.2f}
+Cost of Sales: ₦{cost_of_sales:,.2f}
+Gross Profit: ₦{gross_profit:,.2f}
+Operating Expenses: ₦{expenses:,.2f}
+Capital Allowances: ₦{allowances:,.2f}
+Taxable Profit: ₦{taxable_profit:,.2f}
+
+💰 *Tax Calculation:*
+CIT Rate: {cit_rate*100}%
+CIT Payable: ₦{cit_payable:,.2f}
+Education Tax: ₦{education_tax:,.2f}
+*Total Tax Due: ₦{total_tax:,.2f}*
+
+📋 *Filing Reference:* CIT_{tax_year}_{uuid.uuid4().hex[:6]}
+
+✅ Filing recorded. Payment due within 6 months of year end.
+{LEGAL_DISCLAIMER}
+
+Reply 8 for main menu or 7 for more filing options"""
+
+def get_document_generation_menu():
+    return """📄 *Document Generation*
+
+⚠️ *Disclaimer*: Documents are for informational purposes only.
+Not legally binding. Consult a professional for official filings.
+
+Select document type:
+
+1️⃣ - Tax Payment Receipt (5 credits)
+2️⃣ - PAYE Filing Form (5 credits)
+3️⃣ - VAT Return Form (5 credits)
+4️⃣ - CIT Computation Report (10 credits)
+5️⃣ - Annual Tax Summary (10 credits)
+6️⃣ - Back to Filing Menu
+
+0 - Cancel | # - Main Menu"""
+
+def process_document_generation(doc_type, account_id, user_data):
+    doc_types = {
+        "1": {"name": "Tax Payment Receipt", "cost": 5},
+        "2": {"name": "PAYE Filing Form", "cost": 5},
+        "3": {"name": "VAT Return Form", "cost": 5},
+        "4": {"name": "CIT Computation Report", "cost": 10},
+        "5": {"name": "Annual Tax Summary", "cost": 10}
+    }
+    
+    doc_info = doc_types.get(doc_type)
+    if not doc_info:
+        return None, "Invalid document type"
+    
+    doc_ref = f"DOC_{doc_info['name'].replace(' ', '_')}_{uuid.uuid4().hex[:8]}"
+    
+    result = f"""📄 *Document Generated*
+
+📋 Type: {doc_info['name']}
+🆔 Reference: {doc_ref}
+📅 Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}
+💳 Credits Used: {doc_info['cost']}
+
+📎 *Document Summary:* Your {doc_info['name']} has been generated.
+
+✅ Document saved to your account history.
+{LEGAL_DISCLAIMER}
+
+Reply 8 for main menu or 7 for more documents"""
+    
+    return doc_ref, result
+
+def get_filing_history(account_id):
+    try:
+        if not supabase:
+            return "Unable to retrieve filing history."
+        
+        result = supabase.table("tax_filings").select("*").eq("account_id", account_id).order("created_at", desc=True).limit(10).execute()
+        
+        if not result.data:
+            return "📋 *Filing History*\n\nNo filings found.\n\nStart a filing with option 7."
+        
+        history = "📋 *Filing History*\n\n"
+        for filing in result.data[:5]:
+            filing_type = filing.get("filing_type", "Unknown")
+            reference = filing.get("reference", "N/A")
+            status = filing.get("status", "submitted")
+            created_at = filing.get("created_at", "")[:10]
+            history += f"• {filing_type}: {reference} ({status})\n  📅 {created_at}\n\n"
+        
+        history += LEGAL_DISCLAIMER + "\n\nReply 7 to start a new filing."
+        return history
+    except Exception as e:
+        logging.error(f"Error getting filing history: {e}")
+        return "Error retrieving filing history. Please try again."
+
+def save_filing_record(account_id, filing_type, reference, inputs, result_summary):
+    try:
+        if supabase:
+            supabase.table("tax_filings").insert({
+                "account_id": account_id,
+                "filing_type": filing_type,
+                "reference": reference,
+                "inputs": inputs,
+                "result_summary": result_summary,
+                "status": "submitted",
+                "created_at": datetime.now().isoformat()
+            }).execute()
+            return True
+    except Exception as e:
+        logging.error(f"Error saving filing: {e}")
+    return False
+
+# ============ PREMIUM FEATURE HANDLERS ============
+
+def handle_ai_question(account_id, question):
+    if not has_active_subscription(account_id):
+        return f"""❌ *Premium Feature*
+
+AI answers require an active subscription.
+
+📋 *To access AI answers:*
+1. Subscribe to a plan (Reply 4)
+2. Get monthly credits
+3. Each AI answer = 1 credit
+
+{LEGAL_DISCLAIMER}
+
+Reply 4 to view plans""", False
+    
+    cost = get_credit_cost("ai_question")
+    credit_details = get_credit_details(account_id)
+    current_balance = int(credit_details.get("balance", 0))
+    
+    if current_balance < cost:
+        return f"""❌ *Insufficient Credits*
+
+Need {cost} credit for AI answer.
+Current balance: {current_balance} credits
+
+Options:
+1. Buy top-up credits: T10, T50, T100, T500
+2. Your plan renews on: (check with option 3)
+3. Check balance: Reply 2
+
+{LEGAL_DISCLAIMER}""", False
+    
+    success, message = deduct_credits(account_id, cost, "AI question")
+    if not success:
+        return f"❌ {message}", False
+    
+    try:
+        result = ask_guarded({
+            "question": question,
+            "account_id": account_id,
+            "lang": "en",
+            "channel": "whatsapp"
+        })
+        
+        if result.get("ok"):
+            answer = result.get("answer", "")
+            new_balance = get_credit_balance(account_id)
+            return f"{answer}\n\n---\n💎 *Credits remaining:* {new_balance}\n\n{LEGAL_DISCLAIMER}\n\nReply 1 for another question or 8 for menu.", True
+        else:
+            add_topup_credits(account_id, cost, f"REFUND_{uuid.uuid4().hex[:8]}")
+            return f"❌ AI service error: {result.get('error', 'Unknown error')}\n\nCredits have been refunded.\n{LEGAL_DISCLAIMER}", False
+    except Exception as e:
+        add_topup_credits(account_id, cost, f"REFUND_{uuid.uuid4().hex[:8]}")
+        return f"❌ Error: {str(e)}\n\nCredits have been refunded.\n{LEGAL_DISCLAIMER}", False
+
+def handle_database_answer(account_id, question):
+    if not has_active_subscription(account_id):
+        allowed, limit = check_daily_limit(account_id, "db_answers")
+        if not allowed:
+            return f"""📚 *Daily Limit Reached*
+
+You have reached your daily limit of {limit} database answers.
+
+Subscribe to a plan for:
+• Unlimited database answers• AI-powered responses
+• Document generation
+• Tax filing assistance
+
+Reply 4 to view plans""", False
+    
+    # For now, since we don't have a database cache, return None to indicate not found
+    return None, False
+
 # ============ SUBSCRIPTION PLANS ============
 def get_all_plans():
     try:
@@ -553,7 +817,7 @@ def get_user_subscription(phone_number):
 
 def format_subscription_message(subscription, plan, credit_details):
     if not subscription:
-        return """📋 *NO ACTIVE SUBSCRIPTION*
+        return f"""📋 *NO ACTIVE SUBSCRIPTION*
 
 You are on the Free Plan.
 
@@ -566,22 +830,15 @@ You are on the Free Plan.
 💡 *To access premium features:*
 Reply 4 to view subscription plans
 
-*Premium features include:*
-• AI-powered answers
-• Document generation
-• Document scanning
-• Tax filing assistance
-• Report generation"""
+{LEGAL_DISCLAIMER}"""
     
     plan_name = plan.get("name", "Unknown") if plan else subscription.get("plan", "Unknown")
     amount = subscription.get("amount", 0)
     created_at = subscription.get("created_at", "")
     status = subscription.get("status", "active")
-    
     plan_credits = plan.get("ai_credits_total", 0) if plan else 0
     
     created_date = created_at[:10] if created_at else "Unknown"
-    
     total_balance = int(credit_details.get("balance", 0))
     topup_credits = int(credit_details.get("topup_credits", 0))
     plan_credits_remaining = int(credit_details.get("plan_credits", 0))
@@ -614,9 +871,12 @@ Reply 4 to view subscription plans
 
 💡 *Premium Features:*
 • AI questions: 1 credit
+• PAYE filing: 10 credits
+• VAT filing: 15 credits
+• CIT filing: 20 credits
 • Document generation: 5-10 credits
-• Document scanning: 3 credits
-• Tax filing: 10-20 credits
+
+{LEGAL_DISCLAIMER}
 
 To buy top-up credits: Type T10, T50, T100, or T500"""
 
@@ -700,9 +960,12 @@ def get_plans_list_menu():
         
         menu_lines.append("💡 *Premium Features (require active plan):*")
         menu_lines.append("• AI answers: 1 credit")
+        menu_lines.append("• PAYE filing: 10 credits")
+        menu_lines.append("• VAT filing: 15 credits")
+        menu_lines.append("• CIT filing: 20 credits")
         menu_lines.append("• Document generation: 5-10 credits")
-        menu_lines.append("• Document scanning: 3 credits")
-        menu_lines.append("• Tax filing: 10-20 credits")
+        menu_lines.append("")
+        menu_lines.append(LEGAL_DISCLAIMER)
         menu_lines.append("")
         menu_lines.append("0 - Cancel | # - Main Menu")
         
@@ -712,7 +975,7 @@ def get_plans_list_menu():
         return "📋 *Subscription Plans*\n\nPlease visit www.naijataxguides.com/plans"
 
 def get_main_menu():
-    return """*🤖 Naija Tax Guide*
+    return f"""*🤖 Naija Tax Guide*
 
 Reply with:
 
@@ -720,7 +983,7 @@ Reply with:
 2️⃣ - Check credits balance
 3️⃣ - Check my subscription
 4️⃣ - View subscription plans
-5️⃣ - Premium features (coming soon)
+5️⃣ - Premium features
 6️⃣ - Buy top-up credits
 7️⃣ - Tax filing & management
 8️⃣ - Help / Menu
@@ -732,14 +995,18 @@ Reply with:
 
 *Premium Features (require subscription):*
 • AI answers (1 credit)
-• Document generation
-• Tax filing assistance
+• PAYE filing (10 credits)
+• VAT filing (15 credits)
+• CIT filing (20 credits)
+• Document generation (5-10 credits)
 
 *Quick Commands:*
 T10, T50, T100, T500 - Buy top-up (requires subscription)
 
 *Global commands:*
-# - Menu | * - Back | 0 - Cancel"""
+# - Menu | * - Back | 0 - Cancel
+
+{LEGAL_DISCLAIMER}"""
 
 def send_whatsapp(to_phone, text):
     try:
@@ -915,7 +1182,6 @@ def billing_webhook():
             transaction_type = metadata.get('type', 'subscription')
             reference = data.get('reference')
             
-            # Check if already processed
             try:
                 if supabase:
                     existing_tx = supabase.table("paystack_transactions").select("status").eq("reference", reference).execute()
@@ -969,6 +1235,8 @@ def billing_webhook():
 
 💡 Each credit = 1 AI question or premium action
 
+{LEGAL_DISCLAIMER}
+
 Reply 1 for tax questions or 8 for menu."""
                         
                         send_whatsapp(phone_number, confirmation_msg)
@@ -994,6 +1262,8 @@ Reply 1 for tax questions or 8 for menu."""
 🆔 Reference: {reference}
 
 Your subscription is now ACTIVE.
+
+{LEGAL_DISCLAIMER}
 
 Reply 8 for menu."""
                     
@@ -1031,7 +1301,6 @@ Reply 8 for menu."""
                                 }).execute()
                                 logging.info(f"✅ Subscription activated: {plan_name}")
                                 
-                                # Update credit balance
                                 existing_balance = supabase.table("ai_credit_balances").select("*").eq("account_id", canonical_account_id).execute()
                                 if existing_balance.data:
                                     current_topup = int(existing_balance.data[0].get("topup_credits", 0))
@@ -1105,26 +1374,25 @@ def webhook():
                     send_whatsapp(from_number, "❌ Service unavailable. Please try again later.")
                     continue
                 
-                # Get canonical account_id
                 canonical_account_id = get_canonical_account_id(from_number)
                 if not canonical_account_id:
                     send_whatsapp(from_number, "❌ Error initializing your account. Please try again later.")
                     continue
                 
                 # ============ DIRECT T-CODE CREDIT PURCHASE ============
-                # Top-up credits require active subscription
                 t_code = text.upper().strip()
                 if t_code in ["T10", "T50", "T100", "T500"]:
-                    # Check if user has active subscription
                     if not has_active_subscription(canonical_account_id):
-                        send_whatsapp(from_number, """❌ *Subscription Required*
+                        send_whatsapp(from_number, f"""❌ *Subscription Required*
 
 Top-up credits can only be purchased by users with an active subscription.
 
 📋 *Why?* Top-ups are add-ons to your existing plan.
 💰 *Benefits:* Extra credits on top of your monthly allocation.
 
-Reply 4 to view subscription plans and subscribe first.""")
+Reply 4 to view subscription plans and subscribe first.
+
+{LEGAL_DISCLAIMER}""")
                         continue
                     
                     package = CREDIT_PACKAGES.get(t_code)
@@ -1141,6 +1409,7 @@ Amount: ₦{package['amount_ngn']:,}
 Reference: {payment['reference']}
 
 ⚠️ Top-up credits require an active subscription.
+{LEGAL_DISCLAIMER}
 0 - Cancel | # - Main Menu""")
                         else:
                             send_whatsapp(from_number, "❌ Failed to generate payment link.\n\nReply 8 for menu.")
@@ -1164,23 +1433,24 @@ Reference: {payment['reference']}
                     send_whatsapp(from_number, get_main_menu())
                     continue
                 
-                # Option 5 - Premium features (placeholder)
+                # Option 5 - Premium features info
                 if text == '5':
-                    send_whatsapp(from_number, """🔗 *Premium Features*
+                    send_whatsapp(from_number, f"""🔗 *Premium Features*
 
 ✨ Available with active subscription:
 
-• AI-powered tax answers
-• Document generation (receipts, forms)
-• Document scanning & analysis
-• Tax filing assistance
-• Report generation
+• AI-powered tax answers (1 credit)
+• PAYE Filing Assistance (10 credits)
+• VAT Return Preparation (15 credits)
+• CIT Filing (20 credits)
+• Document generation (5-10 credits)
+• Document scanning (3 credits)
 
-📋 Features require credits:
-• AI question: 1 credit
-• Document generation: 5-10 credits
-• Document scanning: 3 credits
-• Tax filing: 10-20 credits
+📋 Features require credits from your plan:
+• Top-up credits available for purchase
+• Credits roll over on auto-renewal
+
+{LEGAL_DISCLAIMER}
 
 Reply 4 to view plans or 6 to buy top-ups""")
                     continue
@@ -1188,12 +1458,14 @@ Reply 4 to view plans or 6 to buy top-ups""")
                 # Option 6 - Buy top-up credits (menu)
                 if text == '6':
                     if not has_active_subscription(canonical_account_id):
-                        send_whatsapp(from_number, """❌ *Subscription Required*
+                        send_whatsapp(from_number, f"""❌ *Subscription Required*
 
 Top-up credits can only be purchased with an active subscription.
 
 Reply 4 to view subscription plans.
-Reply 8 for main menu.""")
+Reply 8 for main menu.
+
+{LEGAL_DISCLAIMER}""")
                         continue
                     user_state[from_number] = {"step": "buy_credits", "timestamp": current_time}
                     send_whatsapp(from_number, get_credit_packages_menu())
@@ -1204,7 +1476,6 @@ Reply 8 for main menu.""")
                     package_code = text.upper().strip()
                     
                     if package_code in ["T10", "T50", "T100", "T500"]:
-                        # Double-check subscription status
                         if not has_active_subscription(canonical_account_id):
                             send_whatsapp(from_number, "❌ Subscription required for top-ups. Reply 4 to view plans.")
                             user_state.pop(from_number, None)
@@ -1223,6 +1494,7 @@ Amount: ₦{package['amount_ngn']:,}
 
 Reference: {payment['reference']}
 
+{LEGAL_DISCLAIMER}
 0 - Cancel | # - Main Menu""")
                                 user_state.pop(from_number, None)
                             else:
@@ -1284,6 +1556,7 @@ Amount: ₦{plan.get('price', 0):,}
 
 Reference: {reference}
 
+{LEGAL_DISCLAIMER}
 0 - Cancel | # - Main Menu""")
                                     user_state.pop(from_number, None)
                                 else:
@@ -1303,25 +1576,335 @@ Reference: {reference}
                         send_whatsapp(from_number, "❌ Invalid email. Send a valid email address, 0 to cancel, or # for menu.")
                     continue
                 
+                # ============ TAX FILING & MANAGEMENT HANDLERS ============
+                
+                # Filing menu
+                if from_number in user_state and user_state[from_number].get("step") == "filing_menu":
+                    if text == '1':
+                        if not has_active_subscription(canonical_account_id):
+                            send_whatsapp(from_number, "❌ Premium feature requires active subscription. Reply 4 to view plans.")
+                            user_state.pop(from_number, None)
+                            continue
+                        user_state[from_number] = {
+                            "step": "paye_filing",
+                            "filing_step": 1,
+                            "inputs": {},
+                            "timestamp": current_time
+                        }
+                        send_whatsapp(from_number, get_paye_filing_questions(1))
+                    elif text == '2':
+                        if not has_active_subscription(canonical_account_id):
+                            send_whatsapp(from_number, "❌ Premium feature requires active subscription. Reply 4 to view plans.")
+                            user_state.pop(from_number, None)
+                            continue
+                        user_state[from_number] = {
+                            "step": "vat_filing",
+                            "filing_step": 1,
+                            "inputs": {},
+                            "timestamp": current_time
+                        }
+                        send_whatsapp(from_number, get_vat_filing_questions(1))
+                    elif text == '3':
+                        if not has_active_subscription(canonical_account_id):
+                            send_whatsapp(from_number, "❌ Premium feature requires active subscription. Reply 4 to view plans.")
+                            user_state.pop(from_number, None)
+                            continue
+                        user_state[from_number] = {
+                            "step": "cit_filing",
+                            "filing_step": 1,
+                            "inputs": {},
+                            "timestamp": current_time
+                        }
+                        send_whatsapp(from_number, get_cit_filing_questions(1))
+                    elif text == '4':
+                        if not has_active_subscription(canonical_account_id):
+                            send_whatsapp(from_number, "❌ Premium feature requires active subscription. Reply 4 to view plans.")
+                            user_state.pop(from_number, None)
+                            continue
+                        user_state[from_number] = {"step": "doc_menu", "timestamp": current_time}
+                        send_whatsapp(from_number, get_document_generation_menu())
+                    elif text == '5':
+                        history = get_filing_history(canonical_account_id)
+                        send_whatsapp(from_number, history)
+                        user_state.pop(from_number, None)
+                    elif text == '6':
+                        user_state.pop(from_number, None)
+                        send_whatsapp(from_number, get_main_menu())
+                    elif text == '0':
+                        user_state.pop(from_number, None)
+                        send_whatsapp(from_number, "❌ Cancelled.\n\nReply 8 for main menu.")
+                    else:
+                        send_whatsapp(from_number, "Please select 1-6, or 0 to cancel.")
+                    continue
+                
+                # Document generation menu
+                if from_number in user_state and user_state[from_number].get("step") == "doc_menu":
+                    if text in ['1', '2', '3', '4', '5']:
+                        doc_info = {
+                            '1': {'name': 'Tax Payment Receipt', 'cost': 5},
+                            '2': {'name': 'PAYE Filing Form', 'cost': 5},
+                            '3': {'name': 'VAT Return Form', 'cost': 5},
+                            '4': {'name': 'CIT Computation Report', 'cost': 10},
+                            '5': {'name': 'Annual Tax Summary', 'cost': 10}
+                        }
+                        doc = doc_info[text]
+                        
+                        credit_details = get_credit_details(canonical_account_id)
+                        if int(credit_details.get("balance", 0)) < doc['cost']:
+                            send_whatsapp(from_number, f"""❌ *Insufficient Credits*
+
+Need {doc['cost']} credits to generate {doc['name']}.
+Current balance: {credit_details.get('balance', 0)} credits
+
+Buy top-ups: T10, T50, T100, T500
+Subscribe: Reply 4
+
+{LEGAL_DISCLAIMER}""")
+                            user_state.pop(from_number, None)
+                            continue
+                        
+                        success, message = deduct_credits(canonical_account_id, doc['cost'], f"Document: {doc['name']}")
+                        if not success:
+                            send_whatsapp(from_number, f"❌ {message}")
+                            user_state.pop(from_number, None)
+                            continue
+                        
+                        doc_ref, result = process_document_generation(text, canonical_account_id, {})
+                        send_whatsapp(from_number, result)
+                        user_state.pop(from_number, None)
+                    elif text == '6':
+                        user_state[from_number] = {"step": "filing_menu", "timestamp": current_time}
+                        send_whatsapp(from_number, get_filing_menu())
+                    elif text == '0':
+                        user_state.pop(from_number, None)
+                        send_whatsapp(from_number, "❌ Cancelled.\n\nReply 8 for main menu.")
+                    else:
+                        send_whatsapp(from_number, "Please select 1-6, or 0 to cancel.")
+                    continue
+                
+                # PAYE Filing steps
+                if from_number in user_state and user_state[from_number].get("step") == "paye_filing":
+                    state = user_state[from_number]
+                    step = state.get("filing_step", 1)
+                    inputs = state.get("inputs", {})
+                    
+                    if text == '0':
+                        user_state.pop(from_number, None)
+                        send_whatsapp(from_number, "❌ Filing cancelled.\n\nReply 8 for main menu.")
+                        continue
+                    
+                    if step == 1:
+                        try:
+                            inputs["salary"] = float(text.replace(',', ''))
+                            user_state[from_number] = {"step": "paye_filing", "filing_step": 2, "inputs": inputs, "timestamp": current_time}
+                            send_whatsapp(from_number, get_paye_filing_questions(2))
+                        except:
+                            send_whatsapp(from_number, "❌ Invalid amount. Please enter a valid number.")
+                    elif step == 2:
+                        try:
+                            inputs["pension"] = float(text.replace(',', ''))
+                            user_state[from_number] = {"step": "paye_filing", "filing_step": 3, "inputs": inputs, "timestamp": current_time}
+                            send_whatsapp(from_number, get_paye_filing_questions(3))
+                        except:
+                            send_whatsapp(from_number, "❌ Invalid amount. Please enter a valid number.")
+                    elif step == 3:
+                        try:
+                            inputs["nhf"] = float(text.replace(',', ''))
+                            user_state[from_number] = {"step": "paye_filing", "filing_step": 4, "inputs": inputs, "timestamp": current_time}
+                            send_whatsapp(from_number, get_paye_filing_questions(4))
+                        except:
+                            send_whatsapp(from_number, "❌ Invalid amount. Please enter a valid number.")
+                    elif step == 4:
+                        try:
+                            inputs["allowances"] = float(text.replace(',', ''))
+                            user_state[from_number] = {"step": "paye_filing", "filing_step": 5, "inputs": inputs, "timestamp": current_time}
+                            send_whatsapp(from_number, get_paye_filing_questions(5))
+                        except:
+                            send_whatsapp(from_number, "❌ Invalid amount. Please enter a valid number.")
+                    elif step == 5:
+                        try:
+                            inputs["reliefs"] = float(text.replace(',', '')) if text != '0' else 200000
+                            
+                            cost = TAX_FILING_COSTS["paye_assistance"]
+                            credit_details = get_credit_details(canonical_account_id)
+                            if int(credit_details.get("balance", 0)) < cost:
+                                send_whatsapp(from_number, f"""❌ *Insufficient Credits*
+
+Need {cost} credits for PAYE filing.
+Current balance: {credit_details.get('balance', 0)} credits
+
+Buy top-ups: T10, T50, T100, T500
+
+{LEGAL_DISCLAIMER}""")
+                                user_state.pop(from_number, None)
+                                continue
+                            
+                            success, message = deduct_credits(canonical_account_id, cost, "PAYE Filing Assistance")
+                            if not success:
+                                send_whatsapp(from_number, f"❌ {message}")
+                                user_state.pop(from_number, None)
+                                continue
+                            
+                            result = process_paye_filing(inputs)
+                            reference = f"PAYE_{datetime.now().strftime('%Y%m%d')}_{uuid.uuid4().hex[:6]}"
+                            save_filing_record(canonical_account_id, "PAYE", reference, inputs, result)
+                            send_whatsapp(from_number, result)
+                            user_state.pop(from_number, None)
+                        except Exception as e:
+                            logging.error(f"PAYE filing error: {e}")
+                            send_whatsapp(from_number, f"❌ Error processing filing: {str(e)}")
+                            user_state.pop(from_number, None)
+                    continue
+                
+                # VAT Filing steps
+                if from_number in user_state and user_state[from_number].get("step") == "vat_filing":
+                    state = user_state[from_number]
+                    step = state.get("filing_step", 1)
+                    inputs = state.get("inputs", {})
+                    
+                    if text == '0':
+                        user_state.pop(from_number, None)
+                        send_whatsapp(from_number, "❌ Filing cancelled.\n\nReply 8 for main menu.")
+                        continue
+                    
+                    if step == 1:
+                        try:
+                            inputs["sales"] = float(text.replace(',', ''))
+                            user_state[from_number] = {"step": "vat_filing", "filing_step": 2, "inputs": inputs, "timestamp": current_time}
+                            send_whatsapp(from_number, get_vat_filing_questions(2))
+                        except:
+                            send_whatsapp(from_number, "❌ Invalid amount. Please enter a valid number.")
+                    elif step == 2:
+                        try:
+                            inputs["purchases"] = float(text.replace(',', ''))
+                            user_state[from_number] = {"step": "vat_filing", "filing_step": 3, "inputs": inputs, "timestamp": current_time}
+                            send_whatsapp(from_number, get_vat_filing_questions(3))
+                        except:
+                            send_whatsapp(from_number, "❌ Invalid amount. Please enter a valid number.")
+                    elif step == 3:
+                        if text == '1':
+                            inputs["vat_rate"] = 7.5
+                        else:
+                            try:
+                                inputs["vat_rate"] = float(text.replace('%', ''))
+                            except:
+                                send_whatsapp(from_number, "❌ Invalid rate. Enter 1 for 7.5%, or a custom rate (e.g., 10)")
+                                continue
+                        user_state[from_number] = {"step": "vat_filing", "filing_step": 4, "inputs": inputs, "timestamp": current_time}
+                        send_whatsapp(from_number, get_vat_filing_questions(4))
+                    elif step == 4:
+                        inputs["period"] = text.strip()
+                        
+                        cost = TAX_FILING_COSTS["vat_preparation"]
+                        credit_details = get_credit_details(canonical_account_id)
+                        if int(credit_details.get("balance", 0)) < cost:
+                            send_whatsapp(from_number, f"""❌ *Insufficient Credits*
+
+Need {cost} credits for VAT filing.
+Current balance: {credit_details.get('balance', 0)} credits
+
+Buy top-ups: T10, T50, T100, T500
+
+{LEGAL_DISCLAIMER}""")
+                            user_state.pop(from_number, None)
+                            continue
+                        
+                        success, message = deduct_credits(canonical_account_id, cost, "VAT Return Preparation")
+                        if not success:
+                            send_whatsapp(from_number, f"❌ {message}")
+                            user_state.pop(from_number, None)
+                            continue
+                        
+                        result = process_vat_filing(inputs)
+                        reference = f"VAT_{datetime.now().strftime('%Y%m%d')}_{uuid.uuid4().hex[:6]}"
+                        save_filing_record(canonical_account_id, "VAT", reference, inputs, result)
+                        send_whatsapp(from_number, result)
+                        user_state.pop(from_number, None)
+                    continue
+                
+                # CIT Filing steps
+                if from_number in user_state and user_state[from_number].get("step") == "cit_filing":
+                    state = user_state[from_number]
+                    step = state.get("filing_step", 1)
+                    inputs = state.get("inputs", {})
+                    
+                    if text == '0':
+                        user_state.pop(from_number, None)
+                        send_whatsapp(from_number, "❌ Filing cancelled.\n\nReply 8 for main menu.")
+                        continue
+                    
+                    if step == 1:
+                        try:
+                            inputs["revenue"] = float(text.replace(',', ''))
+                            user_state[from_number] = {"step": "cit_filing", "filing_step": 2, "inputs": inputs, "timestamp": current_time}
+                            send_whatsapp(from_number, get_cit_filing_questions(2))
+                        except:
+                            send_whatsapp(from_number, "❌ Invalid amount. Please enter a valid number.")
+                    elif step == 2:
+                        try:
+                            inputs["cost_of_sales"] = float(text.replace(',', ''))
+                            user_state[from_number] = {"step": "cit_filing", "filing_step": 3, "inputs": inputs, "timestamp": current_time}
+                            send_whatsapp(from_number, get_cit_filing_questions(3))
+                        except:
+                            send_whatsapp(from_number, "❌ Invalid amount. Please enter a valid number.")
+                    elif step == 3:
+                        try:
+                            inputs["expenses"] = float(text.replace(',', ''))
+                            user_state[from_number] = {"step": "cit_filing", "filing_step": 4, "inputs": inputs, "timestamp": current_time}
+                            send_whatsapp(from_number, get_cit_filing_questions(4))
+                        except:
+                            send_whatsapp(from_number, "❌ Invalid amount. Please enter a valid number.")
+                    elif step == 4:
+                        try:
+                            inputs["allowances"] = float(text.replace(',', ''))
+                            user_state[from_number] = {"step": "cit_filing", "filing_step": 5, "inputs": inputs, "timestamp": current_time}
+                            send_whatsapp(from_number, get_cit_filing_questions(5))
+                        except:
+                            send_whatsapp(from_number, "❌ Invalid amount. Please enter a valid number.")
+                    elif step == 5:
+                        inputs["tax_year"] = text.strip()
+                        
+                        cost = TAX_FILING_COSTS["cit_filing"]
+                        credit_details = get_credit_details(canonical_account_id)
+                        if int(credit_details.get("balance", 0)) < cost:
+                            send_whatsapp(from_number, f"""❌ *Insufficient Credits*
+
+Need {cost} credits for CIT filing.
+Current balance: {credit_details.get('balance', 0)} credits
+
+Buy top-ups: T10, T50, T100, T500
+
+{LEGAL_DISCLAIMER}""")
+                            user_state.pop(from_number, None)
+                            continue
+                        
+                        success, message = deduct_credits(canonical_account_id, cost, "CIT Filing")
+                        if not success:
+                            send_whatsapp(from_number, f"❌ {message}")
+                            user_state.pop(from_number, None)
+                            continue
+                        
+                        result = process_cit_filing(inputs)
+                        reference = f"CIT_{inputs['tax_year']}_{uuid.uuid4().hex[:6]}"
+                        save_filing_record(canonical_account_id, "CIT", reference, inputs, result)
+                        send_whatsapp(from_number, result)
+                        user_state.pop(from_number, None)
+                    continue
+                
                 # ============ HANDLE TAX QUESTIONS ============
                 
-                # Check if user has active subscription for premium features
                 has_sub = has_active_subscription(canonical_account_id)
                 
-                # Handle tax question (when in asking state after pressing 1)
                 if from_number in user_state and user_state[from_number].get("step") == "asking_question":
-                    # Try database answer first
                     db_response, found = handle_database_answer(canonical_account_id, text)
                     
                     if found and db_response:
-                        # Database answer found (free)
-                        send_whatsapp(from_number, f"{db_response}\n\n---\n📚 *Answer from database*\n\nReply 1 for another question or 8 for menu.")
+                        send_whatsapp(from_number, f"{db_response}\n\n---\n📚 *Answer from database*\n\n{LEGAL_DISCLAIMER}\n\nReply 1 for another question or 8 for menu.")
                         user_state.pop(from_number, None)
                         continue
                     
-                    # Not in database - requires AI (premium feature)
                     if not has_sub:
-                        send_whatsapp(from_number, """❌ *Premium Feature*
+                        send_whatsapp(from_number, f"""❌ *Premium Feature*
 
 This question requires AI assistance, which is a premium feature.
 
@@ -1332,30 +1915,28 @@ This question requires AI assistance, which is a premium feature.
 
 💡 Free tier includes database answers (50/day) and tax calculations.
 
+{LEGAL_DISCLAIMER}
+
 Reply 4 to view plans""")
                         user_state.pop(from_number, None)
                         continue
                     
-                    # User has subscription, handle AI question with credit deduction
                     ai_response, success = handle_ai_question(canonical_account_id, text)
                     send_whatsapp(from_number, ai_response)
                     user_state.pop(from_number, None)
                     continue
                 
-                # Handle direct question
                 is_question = (len(text) > 10 and not text.upper().startswith('T') and not text.isdigit() and text not in ['#', '*', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9'])
                 
                 if is_question and from_number not in user_state:
-                    # Try database answer first
                     db_response, found = handle_database_answer(canonical_account_id, text)
                     
                     if found and db_response:
-                        send_whatsapp(from_number, f"{db_response}\n\n---\n📚 *Answer from database*\n\nReply 1 for another question or 8 for menu.")
+                        send_whatsapp(from_number, f"{db_response}\n\n---\n📚 *Answer from database*\n\n{LEGAL_DISCLAIMER}\n\nReply 1 for another question or 8 for menu.")
                         continue
                     
-                    # Not in database - requires AI (premium feature)
                     if not has_sub:
-                        send_whatsapp(from_number, """❌ *Premium Feature*
+                        send_whatsapp(from_number, f"""❌ *Premium Feature*
 
 This question requires AI assistance, which is a premium feature.
 
@@ -1366,10 +1947,11 @@ This question requires AI assistance, which is a premium feature.
 
 💡 Free tier includes database answers (50/day) and tax calculations.
 
+{LEGAL_DISCLAIMER}
+
 Reply 4 to view plans""")
                         continue
                     
-                    # User has subscription, handle AI question
                     ai_response, success = handle_ai_question(canonical_account_id, text)
                     send_whatsapp(from_number, ai_response)
                     continue
@@ -1411,13 +1993,15 @@ Reply 4 to view plans""")
 
 💡 *Credit Usage:*
 • AI question: 1 credit
+• PAYE filing: 10 credits
+• VAT filing: 15 credits
+• CIT filing: 20 credits
 • Document generation: 5-10 credits
-• Document scanning: 3 credits
-• Tax filing: 10-20 credits
+
+{LEGAL_DISCLAIMER}
 
 To buy top-ups: T10, T50, T100, T500""")
                     else:
-                        # Check daily limits for free user
                         db_allowed, db_limit = check_daily_limit(canonical_account_id, "db_answers")
                         calc_allowed, calc_limit = check_daily_limit(canonical_account_id, "calculations")
                         
@@ -1434,25 +2018,35 @@ To buy top-ups: T10, T50, T100, T500""")
 • Document features
 • Tax filing assistance
 
+{LEGAL_DISCLAIMER}
+
 Reply 4 to view plans""")
                 elif text == '7':
-                    send_whatsapp(from_number, """📋 *TAX FILING & MANAGEMENT*
+                    if not has_active_subscription(canonical_account_id):
+                        send_whatsapp(from_number, f"""❌ *Premium Feature*
 
-Coming soon! Premium feature (requires active subscription).
+Tax Filing & Management requires an active subscription.
 
-Features planned:
-• PAYE filing assistance
-• VAT return preparation
-• CIT calculation & filing
-• Document generation
+📋 *Subscription Benefits:*
+• PAYE filing assistance (10 credits)
+• VAT return preparation (15 credits)
+• CIT calculation & filing (20 credits)
+• Document generation (5-10 credits)
+• Filing history tracking
 
-Reply 4 to subscribe""")
+{LEGAL_DISCLAIMER}
+
+Reply 4 to view subscription plans""")
+                        continue
+                    
+                    user_state[from_number] = {"step": "filing_menu", "timestamp": current_time}
+                    send_whatsapp(from_number, get_filing_menu())
+                    continue
                 elif text.isdigit() and len(text) >= 5:
-                    # Check daily limit for calculations for free users
                     if not has_sub:
                         allowed, limit = check_daily_limit(canonical_account_id, "calculations")
                         if not allowed:
-                            send_whatsapp(from_number, f"📊 *Daily Limit Reached*\n\nYou have reached your daily limit of {limit} tax calculations.\n\nSubscribe for unlimited calculations: Reply 4")
+                            send_whatsapp(from_number, f"📊 *Daily Limit Reached*\n\nYou have reached your daily limit of {limit} tax calculations.\n\nSubscribe for unlimited calculations: Reply 4\n\n{LEGAL_DISCLAIMER}")
                             continue
                         increment_daily_usage(canonical_account_id, "calculations")
                     
@@ -1466,12 +2060,13 @@ Pension: ₦{data['pension']:,.0f}
 NHF: ₦{data['nhf']:,.0f}
 Tax: ₦{data['tax']:,.0f}
 Net: *₦{data['net']:,.0f}*
-Rate: {data['rate']}%"""
+Rate: {data['rate']}%
+
+{LEGAL_DISCLAIMER}"""
                         send_whatsapp(from_number, result)
                     except:
                         send_whatsapp(from_number, "Send a valid number (e.g., 500000)")
                 else:
-                    # Check if user is selecting a plan
                     if from_number in user_state and user_state[from_number].get("step") == "selecting_plan":
                         plans = get_all_plans()
                         result = find_plan_by_input(plans, text)
@@ -1486,9 +2081,12 @@ Rate: {data['rate']}%"""
 
 ✨ *Premium features included:*
 • AI answers (1 credit each)
-• Document generation
-• Document scanning
-• Tax filing assistance
+• PAYE filing (10 credits)
+• VAT filing (15 credits)
+• CIT filing (20 credits)
+• Document generation (5-10 credits)
+
+{LEGAL_DISCLAIMER}
 
 📧 *Please provide your email address* for payment link.
 
@@ -1506,10 +2104,8 @@ Email example: name@example.com
         return "error", 500
 
 def find_plan_by_input(plans, user_input):
-    """Find plan by code, name, credits, or price"""
     user_input = user_input.strip()
     
-    # Check by plan code
     code_map = {
         "S1": "starter_monthly",
         "S2": "starter_quarterly", 
@@ -1528,12 +2124,10 @@ def find_plan_by_input(plans, user_input):
             if plan.get("plan_code", "") == target_code:
                 return {"found": True, "plan": plan, "ambiguous": False}
     
-    # Check by name
     for plan in plans:
         if plan.get("name", "").lower() == user_input.lower():
             return {"found": True, "plan": plan, "ambiguous": False}
     
-    # Check by credits amount
     try:
         num = int(re.sub(r'[^\d]', '', user_input))
         for plan in plans:
@@ -1545,7 +2139,6 @@ def find_plan_by_input(plans, user_input):
     return {"found": False}
 
 def create_credit_payment(account_id, package_code, phone_number):
-    """Create Paystack payment for credit purchase"""
     existing_reference = check_pending_transaction(account_id)
     if existing_reference and supabase:
         supabase.table("paystack_transactions").update({
@@ -1619,7 +2212,6 @@ def create_credit_payment(account_id, package_code, phone_number):
         return None
 
 def check_pending_transaction(account_id):
-    """Check if there's a pending transaction for this user"""
     try:
         if not supabase:
             return None
