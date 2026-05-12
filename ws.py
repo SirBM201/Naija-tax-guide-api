@@ -19,7 +19,7 @@ load_dotenv()
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# ============ SUPABASE - SIMPLE CLIENT ============
+# ============ SUPABASE ============
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_ANON_KEY")
 
@@ -51,7 +51,7 @@ WHATSAPP_API_URL = "https://graph.facebook.com/v18.0"
 PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY")
 PAYSTACK_API_URL = "https://api.paystack.co"
 
-# Credit packages with LETTER CODES
+# Credit packages
 CREDIT_PACKAGES = {
     "T10": {"credits": 10, "amount_ngn": 500, "amount_kobo": 50000, "code": "T10", "description": "10 AI Credits"},
     "T50": {"credits": 50, "amount_ngn": 2000, "amount_kobo": 200000, "code": "T50", "description": "50 AI Credits"},
@@ -155,11 +155,10 @@ def get_active_subscription(account_id):
         return None
 
 def has_active_subscription(account_id):
-    """Return True if user has active subscription"""
+    """Return True if user has active subscription (not expired)"""
     sub = get_active_subscription(account_id)
     if not sub:
         return False
-    # Check if expired
     expires_at = sub.get("expires_at")
     if expires_at:
         try:
@@ -171,7 +170,7 @@ def has_active_subscription(account_id):
     return True
 
 def get_credit_balance(account_id):
-    """Get current credit balance"""
+    """Get total credit balance (plan + topup)"""
     try:
         if SERVICES_AVAILABLE:
             return get_credits_balance(account_id)
@@ -424,27 +423,32 @@ def get_user_subscription(phone_number):
         logging.error(f"Error getting subscription: {e}")
         return None
 
-def format_subscription_message(subscription, plan):
+def format_subscription_message(subscription, plan, credit_details):
+    """Format subscription message with actual credit balance"""
     if not subscription:
         return """📋 *NO ACTIVE SUBSCRIPTION*
 
 You are on the Free Plan.
 
 💰 Free plan: ₦0
-🎯 0 AI credits
+🎯 Only top-up credits work
 
 To buy credits: Type T10, T50, T100, or T500 directly
 To view plans: Reply 4"""
     
-    plan_code = subscription.get("plan_code", "Unknown")
+    plan_name = plan.get("name", "Unknown") if plan else subscription.get("plan", "Unknown")
     amount = subscription.get("amount", 0)
     created_at = subscription.get("created_at", "")
     status = subscription.get("status", "active")
     
     plan_credits = plan.get("ai_credits_total", 0) if plan else 0
-    plan_display = plan.get("name", plan_code) if plan else plan_code
     
     created_date = created_at[:10] if created_at else "Unknown"
+    
+    # Get current credit balance
+    total_balance = int(credit_details.get("balance", 0))
+    topup_credits = int(credit_details.get("topup_credits", 0))
+    plan_credits_remaining = int(credit_details.get("plan_credits", 0))
     
     expires_at = subscription.get("expires_at")
     days_remaining = ""
@@ -460,16 +464,22 @@ To view plans: Reply 4"""
     
     return f"""📋 *YOUR SUBSCRIPTION*
 
-✅ Plan: {plan_display}
+✅ Plan: {plan_name}
 💰 Amount: ₦{amount:,.2f}
-🎯 Credits: {plan_credits} AI credits per period
+🎯 Plan Credits: {plan_credits} per period
 📅 Activated: {created_date}{days_remaining}
 📊 Status: {status.upper()}
+🔄 Auto-renew: ON
 
-✨ You have UNLIMITED credits while subscription is active!
-🔄 Your subscription auto-renews.
+📊 *Current Credit Balance:*
+• Total available: {total_balance} credits
+• Top-up credits: {topup_credits} (used first)
+• Plan credits: {plan_credits_remaining}
 
-To buy extra top-up credits: Type T10, T50, T100, or T500 directly"""
+💡 Each question = 1 credit
+🔄 Credits roll over on auto-renewal
+
+To buy extra credits: Type T10, T50, T100, or T500"""
 
 def get_plans_list_menu():
     try:
@@ -811,6 +821,8 @@ def billing_webhook():
 • Top-up: {topup_credits} (used first)
 • Plan: {plan_credits}
 
+💡 Each question = 1 credit
+
 Reply 1 for tax questions or 8 for menu."""
                         
                         send_whatsapp(phone_number, confirmation_msg)
@@ -873,6 +885,7 @@ Reply 8 for menu."""
                                 }).execute()
                                 logging.info(f"✅ Subscription activated: {plan_name}")
                                 
+                                # Update credit balance (add plan credits, preserve top-up)
                                 existing_balance = supabase.table("ai_credit_balances").select("*").eq("account_id", canonical_account_id).execute()
                                 if existing_balance.data:
                                     current_topup = int(existing_balance.data[0].get("topup_credits", 0))
@@ -953,7 +966,6 @@ def webhook():
                     continue
                 
                 # ============ DIRECT T-CODE CREDIT PURCHASE (WORKS IMMEDIATELY) ============
-                # T10, T50, T100, T500 work directly without pressing 6 first
                 t_code = text.upper().strip()
                 if t_code in ["T10", "T50", "T100", "T500"]:
                     package = CREDIT_PACKAGES.get(t_code)
@@ -997,13 +1009,13 @@ Reference: {payment['reference']}
                     send_whatsapp(from_number, "🔗 *Link to Website Account*\n\nFeature coming soon.\n\nReply 8 for main menu.")
                     continue
                 
-                # Option 6 - Buy AI credits (menu mode - for users who prefer menu)
+                # Option 6 - Buy AI credits (menu mode)
                 if text == '6':
                     user_state[from_number] = {"step": "buy_credits", "timestamp": current_time}
                     send_whatsapp(from_number, get_credit_packages_menu())
                     continue
                 
-                # Handle credit package selection (when in menu mode after pressing 6)
+                # Handle credit package selection (menu mode)
                 if from_number in user_state and user_state[from_number].get("step") == "buy_credits":
                     package_code = text.upper().strip()
                     
@@ -1103,56 +1115,38 @@ Reference: {reference}
                 
                 # ============ HANDLE TAX QUESTIONS ============
                 
-                # Check if user has active subscription (unlimited credits)
+                # Get credit details for balance display
+                credit_details = get_credit_details(canonical_account_id)
+                total_balance = int(credit_details.get("balance", 0))
                 has_sub = has_active_subscription(canonical_account_id)
-                
-                # If no subscription, check credit balance
-                if not has_sub:
-                    balance = get_credit_balance(canonical_account_id)
-                    if balance <= 0:
-                        # Only show this message for actual question attempts
-                        if text == '1' or (len(text) > 10 and not text.isdigit()):
-                            send_whatsapp(from_number, "❌ You have 0 credits and no active subscription.\n\nTo buy credits: Type T10, T50, T100, or T500\nTo subscribe: Reply 4")
-                            if text == '1':
-                                user_state.pop(from_number, None)
-                            continue
                 
                 # Handle tax question (when in asking state after pressing 1)
                 if from_number in user_state and user_state[from_number].get("step") == "asking_question":
                     if SERVICES_AVAILABLE:
-                        # For subscribed users, no credit deduction needed
-                        if not has_sub:
-                            # Deduct 1 credit for non-subscribed users
-                            result = ask_guarded({
-                                "question": text,
-                                "account_id": canonical_account_id,
-                                "lang": "en",
-                                "channel": "whatsapp"
-                            })
+                        if not has_sub and total_balance <= 0:
+                            send_whatsapp(from_number, "❌ You have 0 credits and no active subscription.\n\nTo buy credits: Type T10, T50, T100, or T500\nTo subscribe: Reply 4")
+                            user_state.pop(from_number, None)
+                            continue
+                        
+                        result = ask_guarded({
+                            "question": text,
+                            "account_id": canonical_account_id,
+                            "lang": "en",
+                            "channel": "whatsapp"
+                        })
+                        
+                        if result.get("ok"):
+                            answer = result.get("answer", "")
+                            # Get updated balance after deduction
+                            new_credit_details = get_credit_details(canonical_account_id)
+                            new_balance = int(new_credit_details.get("balance", 0))
+                            new_topup = int(new_credit_details.get("topup_credits", 0))
+                            new_plan = int(new_credit_details.get("plan_credits", 0))
                             
-                            if result.get("ok"):
-                                answer = result.get("answer", "")
-                                new_balance = get_credit_balance(canonical_account_id)
-                                send_whatsapp(from_number, f"{answer}\n\n---\n💎 Remaining credits: {new_balance}\n\nReply 1 for another question or 8 for menu.")
-                            else:
-                                error = result.get("error", "Unknown error")
-                                if error == "insufficient_credits":
-                                    send_whatsapp(from_number, "❌ Insufficient credits.\n\nBuy credits: T10, T50, T100, T500\nSubscribe: Reply 4")
-                                else:
-                                    send_whatsapp(from_number, f"❌ Error: {error}\n\nPlease try again.")
+                            send_whatsapp(from_number, f"{answer}\n\n---\n💎 *Remaining credits:* {new_balance}\n📊 Top-up: {new_topup} | Plan: {new_plan}\n\nReply 1 for another question or 8 for menu.")
                         else:
-                            # Subscribed users have unlimited access
-                            result = ask_guarded({
-                                "question": text,
-                                "account_id": canonical_account_id,
-                                "lang": "en",
-                                "channel": "whatsapp"
-                            })
-                            if result.get("ok"):
-                                answer = result.get("answer", "")
-                                send_whatsapp(from_number, f"{answer}\n\n---\n💎 You have an ACTIVE subscription - UNLIMITED credits!\n\nReply 1 for another question or 8 for menu.")
-                            else:
-                                send_whatsapp(from_number, f"❌ Error: {result.get('error', 'Unknown')}\n\nPlease try again.")
+                            error = result.get("error", "Unknown error")
+                            send_whatsapp(from_number, f"❌ Error: {error}\n\nPlease try again.")
                     else:
                         send_whatsapp(from_number, "❌ AI service unavailable. Please try again later.")
                     
@@ -1164,12 +1158,9 @@ Reference: {reference}
                 
                 if is_question and from_number not in user_state:
                     if SERVICES_AVAILABLE:
-                        if not has_sub:
-                            # Check and deduct credit for non-subscribed users
-                            balance = get_credit_balance(canonical_account_id)
-                            if balance <= 0:
-                                send_whatsapp(from_number, "❌ You have 0 credits and no active subscription.\n\nTo buy credits: Type T10, T50, T100, or T500\nTo subscribe: Reply 4")
-                                continue
+                        if not has_sub and total_balance <= 0:
+                            send_whatsapp(from_number, "❌ You have 0 credits and no active subscription.\n\nTo buy credits: Type T10, T50, T100, or T500\nTo subscribe: Reply 4")
+                            continue
                         
                         result = ask_guarded({
                             "question": text,
@@ -1180,11 +1171,12 @@ Reference: {reference}
                         
                         if result.get("ok"):
                             answer = result.get("answer", "")
-                            if not has_sub:
-                                new_balance = get_credit_balance(canonical_account_id)
-                                send_whatsapp(from_number, f"{answer}\n\n---\n💎 Remaining credits: {new_balance}\n\nReply 1 for another question or 8 for menu.")
-                            else:
-                                send_whatsapp(from_number, f"{answer}\n\n---\n💎 You have an ACTIVE subscription - UNLIMITED credits!\n\nReply 1 for another question or 8 for menu.")
+                            new_credit_details = get_credit_details(canonical_account_id)
+                            new_balance = int(new_credit_details.get("balance", 0))
+                            new_topup = int(new_credit_details.get("topup_credits", 0))
+                            new_plan = int(new_credit_details.get("plan_credits", 0))
+                            
+                            send_whatsapp(from_number, f"{answer}\n\n---\n💎 *Remaining credits:* {new_balance}\n📊 Top-up: {new_topup} | Plan: {new_plan}\n\nReply 1 for another question or 8 for menu.")
                         else:
                             error = result.get("error", "Unknown error")
                             send_whatsapp(from_number, f"❌ Error: {error}\n\nPlease try again.")
@@ -1208,38 +1200,40 @@ Reference: {reference}
                             if p.get("plan_code") == plan_code:
                                 plan = p
                                 break
-                    send_whatsapp(from_number, format_subscription_message(subscription, plan))
+                    credit_details = get_credit_details(canonical_account_id)
+                    send_whatsapp(from_number, format_subscription_message(subscription, plan, credit_details))
                 elif text == '1':
                     user_state[from_number] = {"step": "asking_question", "timestamp": current_time}
                     send_whatsapp(from_number, "💬 Please type your tax question.\n\n💡 # - Menu | 0 - Cancel")
                 elif text == '2':
-                    balance = get_credit_balance(canonical_account_id)
                     credit_details = get_credit_details(canonical_account_id)
-                    topup_credits = credit_details.get("topup_credits", 0)
-                    plan_credits = credit_details.get("plan_credits", 0)
+                    total_balance = int(credit_details.get("balance", 0))
+                    topup_credits = int(credit_details.get("topup_credits", 0))
+                    plan_credits = int(credit_details.get("plan_credits", 0))
                     
                     if has_sub:
-                        send_whatsapp(from_number, f"""💎 *AI Credits Status*
+                        send_whatsapp(from_number, f"""💎 *AI Credits Balance*
 
-You have an ACTIVE SUBSCRIPTION!
-→ UNLIMITED credits for tax questions
+✅ ACTIVE SUBSCRIPTION
+📊 Total available: *{total_balance}* credits
+• Top-up credits: {topup_credits} (used first)
+• Plan credits: {plan_credits}
 
-📊 *Balance Details:*
-• Top-up Credits: {topup_credits} (used first if subscription expires)
-• Plan Credits: {plan_credits}
+💡 Each question = 1 credit
+🔄 Credits roll over on auto-renewal
 
-To buy extra top-up credits: Type T10, T50, T100, or T500""")
+To buy extra credits: Type T10, T50, T100, or T500""")
                     else:
                         send_whatsapp(from_number, f"""💎 *AI Credits Balance*
 
-Total: *{balance}* credits
-• Top-up: {topup_credits} (used first)
-• Plan: {plan_credits}
+📊 Total available: *{total_balance}* credits
+• Top-up credits: {topup_credits} (used first)
+• Plan credits: {plan_credits}
 
-Each credit = 1 AI tax question.
+💡 Each question = 1 credit
 
-Buy credits: Type T10, T50, T100, or T500 directly
-Subscribe: Reply 4""")
+No active subscription? Reply 4 to view plans
+Buy credits: Type T10, T50, T100, or T500""")
                 elif text == '7':
                     send_whatsapp(from_number, "📋 *TAX FILING & MANAGEMENT*\n\nComing soon!")
                 elif text.isdigit() and len(text) >= 5:
@@ -1269,7 +1263,7 @@ Rate: {data['rate']}%"""
                             send_whatsapp(from_number, f"""✅ *Plan Selected:* {plan.get('name')}
 
 💰 Price: ₦{plan.get('price', 0):,}
-🎯 Credits: {plan.get('ai_credits_total', 0)} AI credits
+🎯 Credits: {plan.get('ai_credits_total', 0)} AI credits per period
 
 📧 *Please provide your email address* for payment link.
 
