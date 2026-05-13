@@ -400,19 +400,87 @@ T500 - 500 credits - ₦15,000
 
 0 - Cancel | # - Main Menu"""
 
-# ============ TAX CALCULATION (Free feature via CALC command) ============
-def calculate_paye(monthly_gross):
-    annual_gross = monthly_gross * 12
-    pension = monthly_gross * 0.08
-    nhf = monthly_gross * 0.025
+# ============ SMART TAX CALCULATION ============
+
+def parse_calc_parameter(value_str):
+    """Parse parameter - detects if it's percentage (<=100) or amount (>100)"""
+    try:
+        value = float(value_str.replace(',', ''))
+        if value <= 100:
+            return {"type": "percentage", "value": value}
+        else:
+            return {"type": "amount", "value": value}
+    except:
+        return None
+
+def calculate_paye_smart(monthly_gross, custom_params=None):
+    """Calculate PAYE with smart parameter parsing"""
+    if custom_params is None:
+        custom_params = {}
     
-    cra_fixed = 200000
+    # Parse pension
+    pension_value = None
+    pension_type = "percentage"
+    if "pension" in custom_params:
+        parsed = parse_calc_parameter(custom_params["pension"])
+        if parsed:
+            pension_type = parsed["type"]
+            pension_value = parsed["value"]
+    
+    # Parse NHF
+    nhf_value = None
+    nhf_type = "percentage"
+    if "nhf" in custom_params:
+        parsed = parse_calc_parameter(custom_params["nhf"])
+        if parsed:
+            nhf_type = parsed["type"]
+            nhf_value = parsed["value"]
+    
+    # Parse allowances
+    allowances = float(custom_params.get("allowance", 0))
+    
+    # Parse relief
+    relief = float(custom_params.get("relief", 200000))
+    
+    # Calculate standard values for comparison
+    std_pension_amount = monthly_gross * 0.08
+    std_nhf_amount = monthly_gross * 0.025
+    
+    # Calculate actual values
+    if pension_value is not None:
+        if pension_type == "percentage":
+            pension_amount = monthly_gross * (pension_value / 100)
+            pension_display = f"{pension_value}%"
+        else:
+            pension_amount = pension_value
+            pension_display = f"₦{pension_value:,.2f} (fixed)"
+    else:
+        pension_amount = std_pension_amount
+        pension_display = "8% (standard)"
+    
+    if nhf_value is not None:
+        if nhf_type == "percentage":
+            nhf_amount = monthly_gross * (nhf_value / 100)
+            nhf_display = f"{nhf_value}%"
+        else:
+            nhf_amount = nhf_value
+            nhf_display = f"₦{nhf_value:,.2f} (fixed)"
+    else:
+        nhf_amount = std_nhf_amount
+        nhf_display = "2.5% (standard)"
+    
+    annual_gross = monthly_gross * 12
+    annual_pension = pension_amount * 12
+    annual_nhf = nhf_amount * 12
+    annual_allowances = allowances * 12
+    
+    cra_fixed = relief
     cra_one_percent = annual_gross * 0.01
     cra_base = max(cra_fixed, cra_one_percent)
     cra_percentage = annual_gross * 0.20
     cra_total = cra_base + cra_percentage
     
-    total_deductions = (pension * 12) + (nhf * 12) + cra_total
+    total_deductions = annual_pension + annual_nhf + annual_allowances + cra_total
     chargeable = max(0, annual_gross - total_deductions)
     
     if chargeable <= 300000:
@@ -436,10 +504,14 @@ def calculate_paye(monthly_gross):
     
     return {
         "gross": monthly_gross,
-        "pension": round(pension),
-        "nhf": round(nhf),
+        "pension_amount": pension_amount,
+        "pension_display": pension_display,
+        "nhf_amount": nhf_amount,
+        "nhf_display": nhf_display,
+        "allowances": allowances,
+        "relief": relief,
         "tax": round(monthly_tax),
-        "net": round(monthly_gross - pension - nhf - monthly_tax),
+        "net": round(monthly_gross - pension_amount - nhf_amount - allowances - monthly_tax),
         "rate": round(rate, 1)
     }
 
@@ -475,6 +547,25 @@ def calculate_cit(revenue, expenses, allowances=0):
         "total": round(cit + education_tax, 2)
     }
 
+def extract_calc_params(text):
+    """Extract custom parameters from CALC command"""
+    params = {}
+    
+    # Pattern: PARAM=VALUE (e.g., PENSION=5, NHF=40000)
+    patterns = {
+        'pension': r'PENSION[=:]\s*(\d+(?:\.\d+)?)',
+        'nhf': r'NHF[=:]\s*(\d+(?:\.\d+)?)',
+        'allowance': r'ALLOWANCE[=:]\s*(\d+(?:\.\d+)?)',
+        'relief': r'RELIEF[=:]\s*(\d+(?:\.\d+)?)'
+    }
+    
+    for key, pattern in patterns.items():
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            params[key] = match.group(1)
+    
+    return params
+
 def handle_calc_command(phone_number, text, account_id):
     """Handle CALC command for tax calculations (free feature)"""
     calc_text = text[4:].strip().upper()
@@ -484,39 +575,61 @@ def handle_calc_command(phone_number, text, account_id):
         return f"""📊 *Tax Calculator*
 
 Examples:
-• CALC PAYE 500000 - Calculate PAYE tax
-• CALC 500000 - Same as above
+• CALC PAYE 500000 - Standard calculation (8% pension, 2.5% NHF)
+• CALC PAYE 500000 PENSION=5 - 5% pension
+• CALC PAYE 500000 PENSION=40000 - ₦40,000 pension (fixed)
+• CALC PAYE 500000 NHF=2 - 2% NHF
+• CALC PAYE 500000 ALLOWANCE=50000 - With allowances
 • CALC VAT 100000 - Calculate VAT at 7.5%
 • CALC CIT 50000000 20000000 - CIT with revenue & expenses
 
-{DISCLAIMER_CALC}
+💡 Values ≤100 = percentage, >100 = amount in Naira
 
-For official filing, press 7 then F1-F3"""
+{DISCLAIMER_CALC}"""
     
     # PAYE Calculation
     if calc_text.startswith("PAYE"):
-        amount_str = calc_text.replace("PAYE", "").strip()
+        # Extract amount
+        amount_match = re.search(r'PAYE\s+(\d+(?:[,\d]*)?)', calc_text, re.IGNORECASE)
+        if not amount_match:
+            return "❌ Invalid format. Example: CALC PAYE 500000"
+        
+        amount_str = amount_match.group(1).replace(',', '')
         try:
-            amount = float(amount_str.replace(',', ''))
-            data = calculate_paye(amount)
-            return f"""📊 *PAYE CALCULATION RESULT*
+            amount = float(amount_str)
+            params = extract_calc_params(calc_text)
+            data = calculate_paye_smart(amount, params)
+            
+            result = f"""📊 *PAYE CALCULATION RESULT*
 
 Gross: ₦{data['gross']:,.0f}
-Pension (8%): ₦{data['pension']:,.0f}
-NHF (2.5%): ₦{data['nhf']:,.0f}
+Pension: ₦{data['pension_amount']:,.0f} ({data['pension_display']})
+NHF: ₦{data['nhf_amount']:,.0f} ({data['nhf_display']})
+Allowances: ₦{data['allowances']:,.0f}
+Relief: ₦{data['relief']:,.0f}
 Tax: ₦{data['tax']:,.0f}
 Net: *₦{data['net']:,.0f}*
 Effective Rate: {data['rate']}%
 
 {DISCLAIMER_CALC}"""
+            
+            # Add note if custom values were used
+            if 'pension' in params or 'nhf' in params:
+                result += "\n\n*Using custom rates*"
+            
+            return result
         except:
             return "❌ Invalid amount. Example: CALC PAYE 500000"
     
     # VAT Calculation
     if calc_text.startswith("VAT"):
-        amount_str = calc_text.replace("VAT", "").strip()
+        amount_match = re.search(r'VAT\s+(\d+(?:[,\d]*)?)', calc_text, re.IGNORECASE)
+        if not amount_match:
+            return "❌ Invalid format. Example: CALC VAT 100000"
+        
+        amount_str = amount_match.group(1).replace(',', '')
         try:
-            amount = float(amount_str.replace(',', ''))
+            amount = float(amount_str)
             data = calculate_vat(amount)
             return f"""📊 *VAT CALCULATION RESULT*
 
@@ -531,12 +644,12 @@ Total (incl. VAT): *₦{data['total']:,.2f}*
     
     # CIT Calculation
     if calc_text.startswith("CIT"):
-        parts = calc_text.replace("CIT", "").strip().split()
-        if len(parts) >= 2:
+        numbers = re.findall(r'(\d+(?:[,\d]*)?)', calc_text)
+        if len(numbers) >= 2:
             try:
-                revenue = float(parts[0].replace(',', ''))
-                expenses = float(parts[1].replace(',', ''))
-                allowances = float(parts[2].replace(',', '')) if len(parts) >= 3 else 0
+                revenue = float(numbers[0].replace(',', ''))
+                expenses = float(numbers[1].replace(',', ''))
+                allowances = float(numbers[2].replace(',', '')) if len(numbers) >= 3 else 0
                 data = calculate_cit(revenue, expenses, allowances)
                 
                 size = "Large" if revenue > 100000000 else "Medium" if revenue > 25000000 else "Small (Exempt)"
@@ -560,12 +673,12 @@ Education Tax: ₦{data['education_tax']:,.2f}
     # Simple number - assume PAYE
     try:
         amount = float(calc_text.replace(',', ''))
-        data = calculate_paye(amount)
+        data = calculate_paye_smart(amount)
         return f"""📊 *PAYE CALCULATION RESULT*
 
 Gross: ₦{data['gross']:,.0f}
-Pension: ₦{data['pension']:,.0f}
-NHF: ₦{data['nhf']:,.0f}
+Pension (8%): ₦{data['pension_amount']:,.0f}
+NHF (2.5%): ₦{data['nhf_amount']:,.0f}
 Tax: ₦{data['tax']:,.0f}
 Net: *₦{data['net']:,.0f}*
 Rate: {data['rate']}%
@@ -1742,10 +1855,13 @@ Reference: {reference}
                     continue
                 
                 # ============ FILING MENU HANDLER (F1, F2, F3, F4, F5, F0) ============
+                # IMPORTANT: This MUST come before question detection and other handlers
                 if from_number in user_state and user_state[from_number].get("step") == "filing_menu":
                     filing_code = text.upper().strip()
+                    logging.info(f"🔍 Filing menu active. User sent: '{filing_code}'")
                     
                     if filing_code == "F1":
+                        logging.info("✅ Starting PAYE filing")
                         user_state[from_number] = {
                             "step": "paye_filing",
                             "filing_step": 1,
@@ -1754,6 +1870,7 @@ Reference: {reference}
                         }
                         send_whatsapp(from_number, get_paye_filing_questions(1))
                     elif filing_code == "F2":
+                        logging.info("✅ Starting VAT filing")
                         user_state[from_number] = {
                             "step": "vat_filing",
                             "filing_step": 1,
@@ -1762,6 +1879,7 @@ Reference: {reference}
                         }
                         send_whatsapp(from_number, get_vat_filing_questions(1))
                     elif filing_code == "F3":
+                        logging.info("✅ Starting CIT filing")
                         user_state[from_number] = {
                             "step": "cit_filing",
                             "filing_step": 1,
@@ -1770,13 +1888,16 @@ Reference: {reference}
                         }
                         send_whatsapp(from_number, get_cit_filing_questions(1))
                     elif filing_code == "F4":
+                        logging.info("✅ Opening document menu")
                         user_state[from_number] = {"step": "doc_menu", "timestamp": current_time}
                         send_whatsapp(from_number, get_document_generation_menu())
                     elif filing_code == "F5":
+                        logging.info("✅ Fetching filing history")
                         history = get_filing_history(canonical_account_id)
                         send_whatsapp(from_number, history)
                         user_state.pop(from_number, None)
                     elif filing_code == "F0":
+                        logging.info("✅ Returning to main menu")
                         user_state.pop(from_number, None)
                         send_whatsapp(from_number, get_main_menu())
                     elif text == '0':
