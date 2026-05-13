@@ -19,8 +19,14 @@ load_dotenv()
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# ============ LEGAL DISCLAIMER (Short Version) ============
-LEGAL_DISCLAIMER_SHORT = "⚠️ *For informational purposes only. Not professional tax advice.*"
+# ============ LEGAL DISCLAIMERS (Context-Specific) ============
+DISCLAIMER_MAIN = "🤖 *AI may make mistakes. Always verify with official sources.*"
+DISCLAIMER_AI = "🤖 *AI-generated. Verify important information.*"
+DISCLAIMER_CALC = "📊 *Estimate only. Actual tax may vary.*"
+DISCLAIMER_FILING = "📋 *Record saved. Not an official filing with tax authorities.*"
+DISCLAIMER_DOC = "📄 *For reference only. Not legally binding.*"
+DISCLAIMER_CREDITS = "✅ *Transaction recorded. Contact support for issues.*"
+DISCLAIMER_SUBSCRIPTION = "✅ *Subscription active. Auto-renews unless cancelled.*"
 
 # ============ SUPABASE ============
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -379,7 +385,7 @@ def get_credit_cost(feature, plan_code=None):
     return DEFAULT_CREDIT_COSTS.get(feature, 1)
 
 def get_credit_packages_menu():
-    return """💎 *Buy AI Credits*
+    return f"""💎 *Buy AI Credits*
 
 ⚠️ *Requires Active Subscription*
 
@@ -390,9 +396,11 @@ T50 - 50 credits - ₦2,000
 T100 - 100 credits - ₦3,500
 T500 - 500 credits - ₦15,000
 
+{DISCLAIMER_CREDITS}
+
 0 - Cancel | # - Main Menu"""
 
-# ============ TAX CALCULATION (Free feature) ============
+# ============ TAX CALCULATION (Free feature via CALC command) ============
 def calculate_paye(monthly_gross):
     annual_gross = monthly_gross * 12
     pension = monthly_gross * 0.08
@@ -434,6 +442,137 @@ def calculate_paye(monthly_gross):
         "net": round(monthly_gross - pension - nhf - monthly_tax),
         "rate": round(rate, 1)
     }
+
+def calculate_vat(amount, rate=7.5):
+    """Calculate VAT"""
+    vat = amount * rate / 100
+    total = amount + vat
+    return {
+        "amount": amount,
+        "rate": rate,
+        "vat": round(vat, 2),
+        "total": round(total, 2)
+    }
+
+def calculate_cit(revenue, expenses, allowances=0):
+    """Calculate Company Income Tax"""
+    profit = revenue - expenses - allowances
+    if revenue > 100000000:
+        rate = 30
+    elif revenue > 25000000:
+        rate = 20
+    else:
+        rate = 0
+    cit = profit * rate / 100
+    education_tax = profit * 3 / 100 if revenue > 25000000 else 0
+    return {
+        "revenue": revenue,
+        "expenses": expenses,
+        "profit": profit,
+        "rate": rate,
+        "cit": round(cit, 2),
+        "education_tax": round(education_tax, 2),
+        "total": round(cit + education_tax, 2)
+    }
+
+def handle_calc_command(phone_number, text, account_id):
+    """Handle CALC command for tax calculations (free feature)"""
+    calc_text = text[4:].strip().upper()
+    
+    # Help command
+    if calc_text == "" or calc_text == "HELP":
+        return f"""📊 *Tax Calculator*
+
+Examples:
+• CALC PAYE 500000 - Calculate PAYE tax
+• CALC 500000 - Same as above
+• CALC VAT 100000 - Calculate VAT at 7.5%
+• CALC CIT 50000000 20000000 - CIT with revenue & expenses
+
+{DISCLAIMER_CALC}
+
+For official filing, press 7 then F1-F3"""
+    
+    # PAYE Calculation
+    if calc_text.startswith("PAYE"):
+        amount_str = calc_text.replace("PAYE", "").strip()
+        try:
+            amount = float(amount_str.replace(',', ''))
+            data = calculate_paye(amount)
+            return f"""📊 *PAYE CALCULATION RESULT*
+
+Gross: ₦{data['gross']:,.0f}
+Pension (8%): ₦{data['pension']:,.0f}
+NHF (2.5%): ₦{data['nhf']:,.0f}
+Tax: ₦{data['tax']:,.0f}
+Net: *₦{data['net']:,.0f}*
+Effective Rate: {data['rate']}%
+
+{DISCLAIMER_CALC}"""
+        except:
+            return "❌ Invalid amount. Example: CALC PAYE 500000"
+    
+    # VAT Calculation
+    if calc_text.startswith("VAT"):
+        amount_str = calc_text.replace("VAT", "").strip()
+        try:
+            amount = float(amount_str.replace(',', ''))
+            data = calculate_vat(amount)
+            return f"""📊 *VAT CALCULATION RESULT*
+
+Amount (excl. VAT): ₦{data['amount']:,.2f}
+VAT Rate: {data['rate']}%
+VAT Amount: ₦{data['vat']:,.2f}
+Total (incl. VAT): *₦{data['total']:,.2f}*
+
+{DISCLAIMER_CALC}"""
+        except:
+            return "❌ Invalid amount. Example: CALC VAT 100000"
+    
+    # CIT Calculation
+    if calc_text.startswith("CIT"):
+        parts = calc_text.replace("CIT", "").strip().split()
+        if len(parts) >= 2:
+            try:
+                revenue = float(parts[0].replace(',', ''))
+                expenses = float(parts[1].replace(',', ''))
+                allowances = float(parts[2].replace(',', '')) if len(parts) >= 3 else 0
+                data = calculate_cit(revenue, expenses, allowances)
+                
+                size = "Large" if revenue > 100000000 else "Medium" if revenue > 25000000 else "Small (Exempt)"
+                return f"""📊 *CIT CALCULATION RESULT*
+
+Company Size: {size}
+Revenue: ₦{data['revenue']:,.2f}
+Expenses: ₦{data['expenses']:,.2f}
+Taxable Profit: ₦{data['profit']:,.2f}
+CIT Rate: {data['rate']}%
+CIT Payable: ₦{data['cit']:,.2f}
+Education Tax: ₦{data['education_tax']:,.2f}
+*Total Tax Due: ₦{data['total']:,.2f}*
+
+{DISCLAIMER_CALC}"""
+            except:
+                return "❌ Invalid format. Example: CALC CIT 50000000 20000000"
+        else:
+            return "❌ Need revenue and expenses. Example: CALC CIT 50000000 20000000"
+    
+    # Simple number - assume PAYE
+    try:
+        amount = float(calc_text.replace(',', ''))
+        data = calculate_paye(amount)
+        return f"""📊 *PAYE CALCULATION RESULT*
+
+Gross: ₦{data['gross']:,.0f}
+Pension: ₦{data['pension']:,.0f}
+NHF: ₦{data['nhf']:,.0f}
+Tax: ₦{data['tax']:,.0f}
+Net: *₦{data['net']:,.0f}*
+Rate: {data['rate']}%
+
+{DISCLAIMER_CALC}"""
+    except:
+        return "❌ Invalid command. Type CALC HELP for examples."
 
 # ============ TAX FILING HISTORY ============
 
@@ -492,7 +631,7 @@ def get_filing_history(account_id):
             credits_used = filing.get("credits_used", 0)
             history += f"• *{filing_type}*: {reference}\n  📅 {submitted_at} | 💳 {credits_used} credits | {status}\n\n"
         
-        history += f"\n{LEGAL_DISCLAIMER_SHORT}\n\nReply 7 then F5 to refresh."
+        history += f"\n{DISCLAIMER_FILING}\n\nReply 7 then F5 to refresh."
         return history
     except Exception as e:
         logging.error(f"Error getting filing history: {e}")
@@ -504,9 +643,8 @@ def get_filing_menu():
     return f"""📋 *TAX FILING & MANAGEMENT*
 
 ⚠️ *Premium Feature* (Requires Active Subscription)
-{LEGAL_DISCLAIMER_SHORT}
 
-⚠️ *First press 7, then use these codes:*
+First press 7, then use these codes:
 
 F1 - PAYE Filing Assistance (10 credits)
 F2 - VAT Return Preparation (15 credits)
@@ -516,6 +654,7 @@ F5 - View Filing History
 F0 - Back to Main Menu
 
 💡 Example: Type 7 then F1 to start PAYE filing
+{DISCLAIMER_FILING}
 
 0 - Cancel | # - Main Menu"""
 
@@ -580,8 +719,7 @@ Annual Tax: ₦{annual_tax:,.2f}
 
 📝 *Filing Reference:* PAYE_{datetime.now().strftime('%Y%m%d')}_{uuid.uuid4().hex[:6]}
 
-✅ Filing recorded for your records.
-{LEGAL_DISCLAIMER_SHORT}
+{DISCLAIMER_FILING}
 
 Reply 8 for main menu or 7 then F1-F4 for more filing"""
 
@@ -619,8 +757,7 @@ Input VAT: ₦{input_vat:,.2f}
 
 📋 *Filing Reference:* VAT_{datetime.now().strftime('%Y%m%d')}_{uuid.uuid4().hex[:6]}
 
-✅ Filing recorded. Payment due by 21st of next month.
-{LEGAL_DISCLAIMER_SHORT}
+{DISCLAIMER_FILING}
 
 Reply 8 for main menu or 7 then F1-F4 for more filing"""
 
@@ -680,15 +817,12 @@ Education Tax: ₦{education_tax:,.2f}
 
 📋 *Filing Reference:* CIT_{tax_year}_{uuid.uuid4().hex[:6]}
 
-✅ Filing recorded. Payment due within 6 months of year end.
-{LEGAL_DISCLAIMER_SHORT}
+{DISCLAIMER_FILING}
 
 Reply 8 for main menu or 7 then F1-F4 for more filing"""
 
 def get_document_generation_menu():
     return f"""📄 *Document Generation*
-
-{LEGAL_DISCLAIMER_SHORT}
 
 Select document type:
 
@@ -698,6 +832,8 @@ F4-3 - VAT Return Form (5 credits)
 F4-4 - CIT Computation Report (10 credits)
 F4-5 - Annual Tax Summary (10 credits)
 F0 - Back to Filing Menu
+
+{DISCLAIMER_DOC}
 
 0 - Cancel | # - Main Menu"""
 
@@ -725,8 +861,7 @@ def process_document_generation(doc_type, account_id, user_data):
 
 📎 *Document Summary:* Your {doc_info['name']} has been generated.
 
-✅ Document saved to your account history.
-{LEGAL_DISCLAIMER_SHORT}
+{DISCLAIMER_DOC}
 
 Reply 8 for main menu or 7 then F4 for more documents"""
     
@@ -745,7 +880,7 @@ AI answers require an active subscription.
 2. Get monthly credits
 3. Each AI answer = 1 credit
 
-{LEGAL_DISCLAIMER_SHORT}
+{DISCLAIMER_AI}
 
 Reply 4 to view plans""", False
     
@@ -763,7 +898,7 @@ Options:
 1. Buy top-up credits: T10, T50, T100, T500
 2. Check balance: Reply 2
 
-{LEGAL_DISCLAIMER_SHORT}""", False
+{DISCLAIMER_AI}""", False
     
     success, message = deduct_credits(account_id, cost, "AI question")
     if not success:
@@ -780,13 +915,13 @@ Options:
         if result.get("ok"):
             answer = result.get("answer", "")
             new_balance = get_credit_balance(account_id)
-            return f"{answer}\n\n---\n💎 *Credits remaining:* {new_balance}\n\n{LEGAL_DISCLAIMER_SHORT}\n\nReply 1 for another question or 8 for menu.", True
+            return f"{answer}\n\n---\n💎 *Credits remaining:* {new_balance}\n\n{DISCLAIMER_AI}\n\nReply 1 for another question or 8 for menu.", True
         else:
             add_topup_credits(account_id, cost, f"REFUND_{uuid.uuid4().hex[:8]}")
-            return f"❌ AI service error: {result.get('error', 'Unknown error')}\n\nCredits have been refunded.\n{LEGAL_DISCLAIMER_SHORT}", False
+            return f"❌ AI service error: {result.get('error', 'Unknown error')}\n\nCredits have been refunded.\n{DISCLAIMER_AI}", False
     except Exception as e:
         add_topup_credits(account_id, cost, f"REFUND_{uuid.uuid4().hex[:8]}")
-        return f"❌ Error: {str(e)}\n\nCredits have been refunded.\n{LEGAL_DISCLAIMER_SHORT}", False
+        return f"❌ Error: {str(e)}\n\nCredits have been refunded.\n{DISCLAIMER_AI}", False
 
 def handle_database_answer(account_id, question):
     if not has_active_subscription(account_id):
@@ -836,14 +971,14 @@ You are on the Free Plan.
 
 📊 *Free Plan Limits (daily):*
 • Database answers: 50
-• Calculations: 20
+• Calculations: 20 (use CALC command)
 • AI answers: 0 (requires subscription)
 • Premium features: 0
 
 💡 *To access premium features:*
 Reply 4 to view subscription plans
 
-{LEGAL_DISCLAIMER_SHORT}"""
+{DISCLAIMER_MAIN}"""
     
     plan_name = plan.get("name", "Unknown") if plan else subscription.get("plan", "Unknown")
     amount = subscription.get("amount", 0)
@@ -889,7 +1024,7 @@ Reply 4 to view subscription plans
 • CIT filing: 20 credits
 • Document generation: 5-10 credits
 
-{LEGAL_DISCLAIMER_SHORT}
+{DISCLAIMER_SUBSCRIPTION}
 
 To buy top-up credits: Type T10, T50, T100, or T500"""
 
@@ -978,7 +1113,7 @@ def get_plans_list_menu():
         menu_lines.append("• CIT filing: 20 credits")
         menu_lines.append("• Document generation: 5-10 credits")
         menu_lines.append("")
-        menu_lines.append(LEGAL_DISCLAIMER_SHORT)
+        menu_lines.append(DISCLAIMER_MAIN)
         menu_lines.append("")
         menu_lines.append("0 - Cancel | # - Main Menu")
         
@@ -1003,8 +1138,10 @@ Reply with:
 
 ---
 *Free Features:*
+• CALC 500000 - Calculate PAYE tax
+• CALC VAT 100000 - Calculate VAT
+• CALC CIT 50000000 20000000 - Calculate CIT
 • Database answers (50/day)
-• Tax calculations (20/day)
 
 *Premium Features (require subscription):*
 • AI answers (1 credit)
@@ -1015,6 +1152,7 @@ Reply with:
 
 *Quick Commands:*
 T10, T50, T100, T500 - Buy top-up (requires subscription)
+CALC - Tax calculator (free)
 
 *Filing Commands (press 7 first):*
 F1, F2, F3, F4, F5
@@ -1022,7 +1160,7 @@ F1, F2, F3, F4, F5
 *Global commands:*
 # - Menu | * - Back | 0 - Cancel
 
-{LEGAL_DISCLAIMER_SHORT}"""
+{DISCLAIMER_MAIN}"""
 
 def send_whatsapp(to_phone, text):
     try:
@@ -1251,7 +1389,7 @@ def billing_webhook():
 
 💡 Each credit = 1 AI question or premium action
 
-{LEGAL_DISCLAIMER_SHORT}
+{DISCLAIMER_CREDITS}
 
 Reply 1 for tax questions or 8 for menu."""
                         
@@ -1277,9 +1415,7 @@ Reply 1 for tax questions or 8 for menu."""
 💰 Amount: ₦{amount:,.2f}
 🆔 Reference: {reference}
 
-Your subscription is now ACTIVE.
-
-{LEGAL_DISCLAIMER_SHORT}
+{DISCLAIMER_SUBSCRIPTION}
 
 Reply 8 for menu."""
                     
@@ -1411,6 +1547,12 @@ def webhook():
                     send_whatsapp(from_number, get_main_menu())
                     continue
                 
+                # ============ CALCULATOR COMMAND (Free feature) ============
+                if text.upper().startswith('CALC'):
+                    result = handle_calc_command(from_number, text, canonical_account_id)
+                    send_whatsapp(from_number, result)
+                    continue
+                
                 # ============ DIRECT T-CODE CREDIT PURCHASE ============
                 t_code = text.upper().strip()
                 if t_code in ["T10", "T50", "T100", "T500"]:
@@ -1421,7 +1563,7 @@ Top-up credits can only be purchased with an active subscription.
 
 Reply 4 to view plans.
 
-{LEGAL_DISCLAIMER_SHORT}""")
+{DISCLAIMER_MAIN}""")
                         continue
                     
                     package = CREDIT_PACKAGES.get(t_code)
@@ -1438,7 +1580,7 @@ Amount: ₦{package['amount_ngn']:,}
 Reference: {payment['reference']}
 
 ⚠️ Top-up credits require active subscription.
-{LEGAL_DISCLAIMER_SHORT}
+{DISCLAIMER_CREDITS}
 0 - Cancel | # - Main Menu""")
                         else:
                             send_whatsapp(from_number, "❌ Failed to generate payment link.\n\nReply 8 for menu.")
@@ -1458,7 +1600,7 @@ Reference: {payment['reference']}
 • CIT Filing (20 credits)
 • Document generation (5-10 credits)
 
-{LEGAL_DISCLAIMER_SHORT}
+{DISCLAIMER_MAIN}
 
 Reply 4 to view plans or 6 to buy top-ups""")
                     continue
@@ -1472,7 +1614,7 @@ Top-up credits can only be purchased with an active subscription.
 
 Reply 4 to view plans.
 
-{LEGAL_DISCLAIMER_SHORT}""")
+{DISCLAIMER_CREDITS}""")
                         continue
                     user_state[from_number] = {"step": "buy_credits", "timestamp": current_time}
                     send_whatsapp(from_number, get_credit_packages_menu())
@@ -1485,7 +1627,7 @@ Reply 4 to view plans.
 
 Tax Filing & Management requires an active subscription.
 
-{LEGAL_DISCLAIMER_SHORT}
+{DISCLAIMER_FILING}
 
 Reply 4 to view plans""")
                         continue
@@ -1517,7 +1659,7 @@ Amount: ₦{package['amount_ngn']:,}
 
 Reference: {payment['reference']}
 
-{LEGAL_DISCLAIMER_SHORT}
+{DISCLAIMER_CREDITS}
 0 - Cancel | # - Main Menu""")
                                 user_state.pop(from_number, None)
                             else:
@@ -1579,7 +1721,7 @@ Amount: ₦{plan.get('price', 0):,}
 
 Reference: {reference}
 
-{LEGAL_DISCLAIMER_SHORT}
+{DISCLAIMER_SUBSCRIPTION}
 0 - Cancel | # - Main Menu""")
                                     user_state.pop(from_number, None)
                                 else:
@@ -1600,7 +1742,6 @@ Reference: {reference}
                     continue
                 
                 # ============ FILING MENU HANDLER (F1, F2, F3, F4, F5, F0) ============
-                # IMPORTANT: This MUST come before question detection
                 if from_number in user_state and user_state[from_number].get("step") == "filing_menu":
                     filing_code = text.upper().strip()
                     
@@ -1670,7 +1811,7 @@ Current balance: {credit_details.get('balance', 0)} credits
 
 Buy top-ups: T10, T50, T100, T500
 
-{LEGAL_DISCLAIMER_SHORT}""")
+{DISCLAIMER_CREDITS}""")
                                 user_state.pop(from_number, None)
                                 continue
                             
@@ -1749,7 +1890,7 @@ Current balance: {credit_details.get('balance', 0)} credits
 
 Buy top-ups: T10, T50, T100, T500
 
-{LEGAL_DISCLAIMER_SHORT}""")
+{DISCLAIMER_CREDITS}""")
                                 user_state.pop(from_number, None)
                                 continue
                             
@@ -1819,7 +1960,7 @@ Current balance: {credit_details.get('balance', 0)} credits
 
 Buy top-ups: T10, T50, T100, T500
 
-{LEGAL_DISCLAIMER_SHORT}""")
+{DISCLAIMER_CREDITS}""")
                             user_state.pop(from_number, None)
                             continue
                         
@@ -1888,7 +2029,7 @@ Current balance: {credit_details.get('balance', 0)} credits
 
 Buy top-ups: T10, T50, T100, T500
 
-{LEGAL_DISCLAIMER_SHORT}""")
+{DISCLAIMER_CREDITS}""")
                             user_state.pop(from_number, None)
                             continue
                         
@@ -1914,7 +2055,7 @@ Buy top-ups: T10, T50, T100, T500
                     db_response, found = handle_database_answer(canonical_account_id, text)
                     
                     if found and db_response:
-                        send_whatsapp(from_number, f"{db_response}\n\n---\n📚 *Answer from database*\n\n{LEGAL_DISCLAIMER_SHORT}\n\nReply 1 for another question or 8 for menu.")
+                        send_whatsapp(from_number, f"{db_response}\n\n---\n📚 *Answer from database*\n\n{DISCLAIMER_AI}\n\nReply 1 for another question or 8 for menu.")
                         user_state.pop(from_number, None)
                         continue
                     
@@ -1928,9 +2069,9 @@ This question requires AI assistance, which is a premium feature.
 2. Get monthly credits
 3. Each AI answer = 1 credit
 
-💡 Free tier includes database answers (50/day) and tax calculations.
+💡 Free tier includes database answers (50/day) and tax calculations (CALC command).
 
-{LEGAL_DISCLAIMER_SHORT}
+{DISCLAIMER_AI}
 
 Reply 4 to view plans""")
                         user_state.pop(from_number, None)
@@ -1942,13 +2083,13 @@ Reply 4 to view plans""")
                     continue
                 
                 # Handle direct question (no state, just type a question)
-                is_question = (len(text) > 10 and not text.upper().startswith('T') and not text.upper().startswith('F') and not text.isdigit() and text not in ['#', '*', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9'])
+                is_question = (len(text) > 10 and not text.upper().startswith('T') and not text.upper().startswith('F') and not text.upper().startswith('CALC') and not text.isdigit() and text not in ['#', '*', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9'])
                 
                 if is_question and from_number not in user_state:
                     db_response, found = handle_database_answer(canonical_account_id, text)
                     
                     if found and db_response:
-                        send_whatsapp(from_number, f"{db_response}\n\n---\n📚 *Answer from database*\n\n{LEGAL_DISCLAIMER_SHORT}\n\nReply 1 for another question or 8 for menu.")
+                        send_whatsapp(from_number, f"{db_response}\n\n---\n📚 *Answer from database*\n\n{DISCLAIMER_AI}\n\nReply 1 for another question or 8 for menu.")
                         continue
                     
                     if not has_sub:
@@ -1961,9 +2102,9 @@ This question requires AI assistance, which is a premium feature.
 2. Get monthly credits
 3. Each AI answer = 1 credit
 
-💡 Free tier includes database answers (50/day) and tax calculations.
+💡 Free tier includes database answers (50/day) and tax calculations (CALC command).
 
-{LEGAL_DISCLAIMER_SHORT}
+{DISCLAIMER_AI}
 
 Reply 4 to view plans""")
                         continue
@@ -2014,7 +2155,7 @@ Reply 4 to view plans""")
 • CIT filing: 20 credits
 • Document generation: 5-10 credits
 
-{LEGAL_DISCLAIMER_SHORT}
+{DISCLAIMER_CREDITS}
 
 To buy top-ups: T10, T50, T100, T500""")
                     else:
@@ -2025,7 +2166,7 @@ To buy top-ups: T10, T50, T100, T500""")
 
 📊 *Daily Limits:*
 • Database answers: {db_limit if db_allowed else 'Limit reached'}
-• Tax calculations: {calc_limit if calc_allowed else 'Limit reached'}
+• Tax calculations: {calc_limit if calc_allowed else 'Limit reached'} (use CALC command)
 • AI answers: 0 (requires subscription)
 
 💡 *Upgrade to subscribe:*
@@ -2034,33 +2175,13 @@ To buy top-ups: T10, T50, T100, T500""")
 • Document features
 • Tax filing assistance
 
-{LEGAL_DISCLAIMER_SHORT}
+{DISCLAIMER_MAIN}
 
 Reply 4 to view plans""")
-                elif text.isdigit() and len(text) >= 5:
-                    if not has_sub:
-                        allowed, limit = check_daily_limit(canonical_account_id, "calculations")
-                        if not allowed:
-                            send_whatsapp(from_number, f"📊 *Daily Limit Reached*\n\nYou have reached your daily limit of {limit} tax calculations.\n\nSubscribe for unlimited: Reply 4\n\n{LEGAL_DISCLAIMER_SHORT}")
-                            continue
-                        increment_daily_usage(canonical_account_id, "calculations")
-                    
-                    try:
-                        salary = float(text.replace(',', ''))
-                        data = calculate_paye(salary)
-                        result = f"""*PAYE RESULT*
-
-Gross: ₦{data['gross']:,.0f}
-Pension: ₦{data['pension']:,.0f}
-NHF: ₦{data['nhf']:,.0f}
-Tax: ₦{data['tax']:,.0f}
-Net: *₦{data['net']:,.0f}*
-Rate: {data['rate']}%
-
-{LEGAL_DISCLAIMER_SHORT}"""
-                        send_whatsapp(from_number, result)
-                    except:
-                        send_whatsapp(from_number, "Send a valid number (e.g., 500000)")
+                
+                # ============ NO AUTOMATIC CALCULATOR ON NUMBERS ============
+                # Calculator is now only via CALC command, not on random numbers
+                
                 else:
                     if from_number in user_state and user_state[from_number].get("step") == "selecting_plan":
                         plans = get_all_plans()
@@ -2081,7 +2202,7 @@ Rate: {data['rate']}%
 • CIT filing (20 credits)
 • Document generation (5-10 credits)
 
-{LEGAL_DISCLAIMER_SHORT}
+{DISCLAIMER_SUBSCRIPTION}
 
 📧 *Please provide your email address* for payment link.
 
