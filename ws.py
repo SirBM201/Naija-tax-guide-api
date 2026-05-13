@@ -444,195 +444,24 @@ def save_filing_record(account_id, filing_type, reference, inputs, result_summar
             logging.error("Supabase client not available")
             return False
         
-        filing_id = str(uuid.uuid4())
+        now_iso = datetime.now().isoformat()
         
-        if filing_type == "PAYE":
-            salary = float(inputs.get("salary", 0))
-            pension = float(inputs.get("pension", 0))
-            nhf = float(inputs.get("nhf", 0))
-            allowances = float(inputs.get("allowances", 0))
-            reliefs = float(inputs.get("reliefs", 200000))
+        supabase.table("tax_filings").insert({
+            "user_id": account_id,
+            "tax_type": filing_type,
+            "inputs": inputs,
+            "status": "submitted",
+            "reference": reference,
+            "submitted_at": now_iso,
+            "filing_reference": reference,
+            "result_summary": result_summary[:500] if result_summary else None,
+            "credits_used": credits_used,
+            "channel": "whatsapp",
+            "updated_at": now_iso
+        }).execute()
+        logging.info(f"✅ Filing saved: {reference} for user {account_id}")
+        return True
             
-            annual_gross = (salary + allowances) * 12
-            annual_pension = pension * 12
-            annual_nhf = nhf * 12
-            
-            cra_fixed = reliefs
-            cra_one_percent = annual_gross * 0.01
-            cra_base = max(cra_fixed, cra_one_percent)
-            cra_percentage = annual_gross * 0.20
-            cra_total = cra_base + cra_percentage
-            
-            total_deductions = annual_pension + annual_nhf + cra_total
-            chargeable_income = max(0, annual_gross - total_deductions) / 12
-            
-            if chargeable_income <= 300000:
-                tax_payable = chargeable_income * 0.07
-            elif chargeable_income <= 600000:
-                tax_payable = 21000 + (chargeable_income - 300000) * 0.11
-            elif chargeable_income <= 1100000:
-                tax_payable = 54000 + (chargeable_income - 600000) * 0.15
-            elif chargeable_income <= 1600000:
-                tax_payable = 129000 + (chargeable_income - 1100000) * 0.19
-            elif chargeable_income <= 3200000:
-                tax_payable = 224000 + (chargeable_income - 1600000) * 0.21
-            else:
-                tax_payable = 560000 + (chargeable_income - 3200000) * 0.24
-            
-            calculation_details = {
-                "monthly_salary": salary,
-                "pension": pension,
-                "nhf": nhf,
-                "allowances": allowances,
-                "reliefs": reliefs,
-                "annual_gross": annual_gross,
-                "chargeable_income": chargeable_income,
-                "tax_payable": tax_payable,
-                "full_result": result_summary
-            }
-            
-            supabase.table("tax_filings").insert({
-                "id": filing_id,
-                "filing_id": reference,
-                "user_id": account_id,
-                "tax_type": filing_type,
-                "chargeable_income": chargeable_income,
-                "tax_payable": tax_payable,
-                "relief_amount": reliefs,
-                "pension_deductible": pension,
-                "nhf_deductible": nhf,
-                "cra_deductible": cra_total,
-                "calculation_details": calculation_details,
-                "filing_reference": reference,
-                "inputs": inputs,
-                "result_summary": result_summary[:500] if result_summary else None,
-                "credits_used": credits_used,
-                "status": "submitted",
-                "channel": "whatsapp",
-                "created_at": datetime.now().isoformat(),
-                "updated_at": datetime.now().isoformat()
-            }).execute()
-            logging.info(f"✅ Filing saved: {reference} for user {account_id}")
-            return True
-            
-        elif filing_type == "VAT":
-            sales = float(inputs.get("sales", 0))
-            purchases = float(inputs.get("purchases", 0))
-            vat_rate = float(inputs.get("vat_rate", 7.5))
-            period = inputs.get("period", "")
-            
-            output_vat = sales * (vat_rate / 100)
-            input_vat = purchases * (vat_rate / 100)
-            vat_payable = max(0, output_vat - input_vat)
-            
-            calculation_details = {
-                "sales": sales,
-                "purchases": purchases,
-                "vat_rate": vat_rate,
-                "period": period,
-                "output_vat": output_vat,
-                "input_vat": input_vat,
-                "vat_payable": vat_payable,
-                "full_result": result_summary
-            }
-            
-            supabase.table("tax_filings").insert({
-                "id": filing_id,
-                "filing_id": reference,
-                "user_id": account_id,
-                "tax_type": filing_type,
-                "chargeable_income": vat_payable,
-                "tax_payable": vat_payable,
-                "calculation_details": calculation_details,
-                "filing_reference": reference,
-                "inputs": inputs,
-                "result_summary": result_summary[:500] if result_summary else None,
-                "credits_used": credits_used,
-                "status": "submitted",
-                "channel": "whatsapp",
-                "created_at": datetime.now().isoformat(),
-                "updated_at": datetime.now().isoformat()
-            }).execute()
-            logging.info(f"✅ VAT filing saved: {reference} for user {account_id}")
-            return True
-            
-        elif filing_type == "CIT":
-            revenue = float(inputs.get("revenue", 0))
-            cost_of_sales = float(inputs.get("cost_of_sales", 0))
-            expenses = float(inputs.get("expenses", 0))
-            allowances = float(inputs.get("allowances", 0))
-            tax_year = inputs.get("tax_year", "")
-            
-            gross_profit = revenue - cost_of_sales
-            taxable_profit = max(0, gross_profit - expenses - allowances)
-            
-            if revenue > 100000000:
-                cit_rate = 0.30
-            elif revenue > 25000000:
-                cit_rate = 0.20
-            else:
-                cit_rate = 0.00
-            
-            cit_payable = taxable_profit * cit_rate
-            education_tax = taxable_profit * 0.03 if revenue > 25000000 else 0
-            total_tax = cit_payable + education_tax
-            
-            calculation_details = {
-                "revenue": revenue,
-                "cost_of_sales": cost_of_sales,
-                "gross_profit": gross_profit,
-                "expenses": expenses,
-                "allowances": allowances,
-                "taxable_profit": taxable_profit,
-                "cit_rate": cit_rate,
-                "cit_payable": cit_payable,
-                "education_tax": education_tax,
-                "total_tax": total_tax,
-                "tax_year": tax_year,
-                "full_result": result_summary
-            }
-            
-            supabase.table("tax_filings").insert({
-                "id": filing_id,
-                "filing_id": reference,
-                "user_id": account_id,
-                "tax_type": filing_type,
-                "chargeable_income": taxable_profit,
-                "tax_payable": total_tax,
-                "relief_amount": allowances,
-                "calculation_details": calculation_details,
-                "filing_reference": reference,
-                "inputs": inputs,
-                "result_summary": result_summary[:500] if result_summary else None,
-                "credits_used": credits_used,
-                "status": "submitted",
-                "channel": "whatsapp",
-                "created_at": datetime.now().isoformat(),
-                "updated_at": datetime.now().isoformat()
-            }).execute()
-            logging.info(f"✅ CIT filing saved: {reference} for user {account_id}")
-            return True
-        
-        elif filing_type == "DOCUMENT":
-            supabase.table("tax_filings").insert({
-                "id": filing_id,
-                "filing_id": reference,
-                "user_id": account_id,
-                "tax_type": filing_type,
-                "calculation_details": {"document_type": inputs.get("document_type", "Unknown"), "full_result": result_summary},
-                "filing_reference": reference,
-                "inputs": inputs,
-                "result_summary": result_summary[:500] if result_summary else None,
-                "credits_used": credits_used,
-                "status": "generated",
-                "channel": "whatsapp",
-                "created_at": datetime.now().isoformat(),
-                "updated_at": datetime.now().isoformat()
-            }).execute()
-            logging.info(f"✅ Document saved: {reference} for user {account_id}")
-            return True
-            
-        return False
     except Exception as e:
         logging.error(f"Error saving filing: {e}")
         return False
@@ -644,10 +473,10 @@ def get_filing_history(account_id):
             return "Unable to retrieve filing history."
         
         result = supabase.table("tax_filings")\
-            .select("filing_reference, tax_type, credits_used, status, created_at, channel")\
+            .select("filing_reference, tax_type, credits_used, status, submitted_at, channel")\
             .eq("user_id", account_id)\
             .eq("channel", "whatsapp")\
-            .order("created_at", desc=True)\
+            .order("submitted_at", desc=True)\
             .limit(10)\
             .execute()
         
@@ -659,9 +488,9 @@ def get_filing_history(account_id):
             filing_type = filing.get("tax_type", "Unknown")
             reference = filing.get("filing_reference", "N/A")
             status = filing.get("status", "submitted")
-            created_at = filing.get("created_at", "")[:10] if filing.get("created_at") else "Unknown"
+            submitted_at = filing.get("submitted_at", "")[:10] if filing.get("submitted_at") else "Unknown"
             credits_used = filing.get("credits_used", 0)
-            history += f"• *{filing_type}*: {reference}\n  📅 {created_at} | 💳 {credits_used} credits | {status}\n\n"
+            history += f"• *{filing_type}*: {reference}\n  📅 {submitted_at} | 💳 {credits_used} credits | {status}\n\n"
         
         history += f"\n{LEGAL_DISCLAIMER_SHORT}\n\nReply 7 then F5 to refresh."
         return history
@@ -677,7 +506,7 @@ def get_filing_menu():
 ⚠️ *Premium Feature* (Requires Active Subscription)
 {LEGAL_DISCLAIMER_SHORT}
 
-Reply with code:
+⚠️ *First press 7, then use these codes:*
 
 F1 - PAYE Filing Assistance (10 credits)
 F2 - VAT Return Preparation (15 credits)
@@ -686,7 +515,7 @@ F4 - Generate Document (5-10 credits)
 F5 - View Filing History
 F0 - Back to Main Menu
 
-💡 Each option deducts credits from your balance
+💡 Example: Type 7 then F1 to start PAYE filing
 
 0 - Cancel | # - Main Menu"""
 
@@ -1186,7 +1015,9 @@ Reply with:
 
 *Quick Commands:*
 T10, T50, T100, T500 - Buy top-up (requires subscription)
-F1, F2, F3, F4, F5 - Filing menu (after 7)
+
+*Filing Commands (press 7 first):*
+F1, F2, F3, F4, F5
 
 *Global commands:*
 # - Menu | * - Back | 0 - Cancel
