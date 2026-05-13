@@ -1564,6 +1564,22 @@ def webhook():
                     send_whatsapp(from_number, "❌ Error initializing your account. Please try again later.")
                     continue
                 
+                # ============ GLOBAL COMMANDS ============
+                if text == '#':
+                    user_state.pop(from_number, None)
+                    send_whatsapp(from_number, get_main_menu())
+                    continue
+                
+                if text == '0':
+                    user_state.pop(from_number, None)
+                    send_whatsapp(from_number, "❌ Cancelled.\n\nReply 8 for main menu.")
+                    continue
+                
+                if text == '*':
+                    user_state.pop(from_number, None)
+                    send_whatsapp(from_number, get_main_menu())
+                    continue
+                
                 # ============ DIRECT T-CODE CREDIT PURCHASE ============
                 t_code = text.upper().strip()
                 if t_code in ["T10", "T50", "T100", "T500"]:
@@ -1599,23 +1615,7 @@ Reference: {payment['reference']}
                         send_whatsapp(from_number, "❌ Invalid code. Use T10, T50, T100, or T500.")
                     continue
                 
-                # Global commands
-                if text == '#':
-                    user_state.pop(from_number, None)
-                    send_whatsapp(from_number, get_main_menu())
-                    continue
-                
-                if text == '0':
-                    user_state.pop(from_number, None)
-                    send_whatsapp(from_number, "❌ Cancelled.\n\nReply 8 for main menu.")
-                    continue
-                
-                if text == '*':
-                    user_state.pop(from_number, None)
-                    send_whatsapp(from_number, get_main_menu())
-                    continue
-                
-                # Option 5 - Premium features info
+                # ============ OPTION 5 - PREMIUM FEATURES INFO ============
                 if text == '5':
                     send_whatsapp(from_number, f"""🔗 *Premium Features*
 
@@ -1632,7 +1632,7 @@ Reference: {payment['reference']}
 Reply 4 to view plans or 6 to buy top-ups""")
                     continue
                 
-                # Option 6 - Buy top-up credits (menu)
+                # ============ OPTION 6 - BUY TOP-UP CREDITS ============
                 if text == '6':
                     if not has_active_subscription(canonical_account_id):
                         send_whatsapp(from_number, f"""❌ *Subscription Required*
@@ -1647,7 +1647,23 @@ Reply 4 to view plans.
                     send_whatsapp(from_number, get_credit_packages_menu())
                     continue
                 
-                # Handle credit package selection (menu mode)
+                # ============ OPTION 7 - TAX FILING & MANAGEMENT ============
+                if text == '7':
+                    if not has_active_subscription(canonical_account_id):
+                        send_whatsapp(from_number, f"""❌ *Premium Feature*
+
+Tax Filing & Management requires an active subscription.
+
+{LEGAL_DISCLAIMER_SHORT}
+
+Reply 4 to view plans""")
+                        continue
+                    
+                    user_state[from_number] = {"step": "filing_menu", "timestamp": current_time}
+                    send_whatsapp(from_number, get_filing_menu())
+                    continue
+                
+                # ============ CREDIT PACKAGE SELECTION (after pressing 6) ============
                 if from_number in user_state and user_state[from_number].get("step") == "buy_credits":
                     package_code = text.upper().strip()
                     
@@ -1683,7 +1699,7 @@ Reference: {payment['reference']}
                         send_whatsapp(from_number, "Please reply with T10, T50, T100, T500, or 0 to cancel.")
                     continue
                 
-                # Handle subscription plan selection
+                # ============ SUBSCRIPTION PLAN SELECTION ============
                 if from_number in user_state and user_state[from_number].get("step") == 2:
                     plan = user_state[from_number].get("plan")
                     email = text.strip().lower()
@@ -1752,25 +1768,8 @@ Reference: {reference}
                         send_whatsapp(from_number, "❌ Invalid email. Send a valid email address, 0 to cancel, or # for menu.")
                     continue
                 
-                # ============ TAX FILING & MANAGEMENT HANDLERS ============
-                
-                # Filing menu (when user types 7)
-                if text == '7':
-                    if not has_active_subscription(canonical_account_id):
-                        send_whatsapp(from_number, f"""❌ *Premium Feature*
-
-Tax Filing & Management requires an active subscription.
-
-{LEGAL_DISCLAIMER_SHORT}
-
-Reply 4 to view plans""")
-                        continue
-                    
-                    user_state[from_number] = {"step": "filing_menu", "timestamp": current_time}
-                    send_whatsapp(from_number, get_filing_menu())
-                    continue
-                
-                # Handle filing menu selections (F1, F2, F3, F4, F5, F0)
+                # ============ FILING MENU HANDLER (F1, F2, F3, F4, F5, F0) ============
+                # IMPORTANT: This MUST come before question detection
                 if from_number in user_state and user_state[from_number].get("step") == "filing_menu":
                     filing_code = text.upper().strip()
                     
@@ -1815,7 +1814,7 @@ Reply 4 to view plans""")
                         send_whatsapp(from_number, "Please reply with F1, F2, F3, F4, F5, F0, or 0 to cancel.")
                     continue
                 
-                # Document generation menu (F4-1, F4-2, etc.)
+                # ============ DOCUMENT GENERATION MENU (F4-1 to F4-5) ============
                 if from_number in user_state and user_state[from_number].get("step") == "doc_menu":
                     doc_cmd = text.upper().strip()
                     
@@ -1866,7 +1865,7 @@ Buy top-ups: T10, T50, T100, T500
                         send_whatsapp(from_number, "Please use F4-1 to F4-5, F0 for back, or 0 to cancel.")
                     continue
                 
-                # PAYE Filing steps
+                # ============ PAYE FILING STEPS ============
                 if from_number in user_state and user_state[from_number].get("step") == "paye_filing":
                     state = user_state[from_number]
                     step = state.get("filing_step", 1)
@@ -1940,7 +1939,7 @@ Buy top-ups: T10, T50, T100, T500
                             user_state.pop(from_number, None)
                     continue
                 
-                # VAT Filing steps
+                # ============ VAT FILING STEPS ============
                 if from_number in user_state and user_state[from_number].get("step") == "vat_filing":
                     state = user_state[from_number]
                     step = state.get("filing_step", 1)
@@ -2006,7 +2005,7 @@ Buy top-ups: T10, T50, T100, T500
                         user_state.pop(from_number, None)
                     continue
                 
-                # CIT Filing steps
+                # ============ CIT FILING STEPS ============
                 if from_number in user_state and user_state[from_number].get("step") == "cit_filing":
                     state = user_state[from_number]
                     step = state.get("filing_step", 1)
@@ -2075,10 +2074,11 @@ Buy top-ups: T10, T50, T100, T500
                         user_state.pop(from_number, None)
                     continue
                 
-                # ============ HANDLE TAX QUESTIONS ============
+                # ============ TAX QUESTIONS ============
                 
                 has_sub = has_active_subscription(canonical_account_id)
                 
+                # Handle tax question (when in asking state after pressing 1)
                 if from_number in user_state and user_state[from_number].get("step") == "asking_question":
                     db_response, found = handle_database_answer(canonical_account_id, text)
                     
@@ -2110,6 +2110,7 @@ Reply 4 to view plans""")
                     user_state.pop(from_number, None)
                     continue
                 
+                # Handle direct question (no state, just type a question)
                 is_question = (len(text) > 10 and not text.upper().startswith('T') and not text.upper().startswith('F') and not text.isdigit() and text not in ['#', '*', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9'])
                 
                 if is_question and from_number not in user_state:
@@ -2140,7 +2141,7 @@ Reply 4 to view plans""")
                     send_whatsapp(from_number, ai_response)
                     continue
                 
-                # Main menu navigation
+                # ============ MAIN MENU NAVIGATION ============
                 if text == '4':
                     send_whatsapp(from_number, get_plans_list_menu())
                     user_state[from_number] = {"step": "selecting_plan", "timestamp": current_time}
