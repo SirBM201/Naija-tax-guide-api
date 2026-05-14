@@ -19,6 +19,50 @@ load_dotenv()
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
+# ============ REGISTER WEB BLUEPRINTS (ADDED) ============
+# This enables all web API routes (workspace, auth, billing, etc.)
+try:
+    from app.routes.workspace import bp as workspace_bp
+    from app.routes.web_auth import bp as web_auth_bp
+    from app.routes.web_ask import bp as web_ask_bp
+    from app.routes.billing import bp as billing_bp
+    from app.routes.me import bp as me_bp
+    from app.routes.plans import bp as plans_bp
+    from app.routes.referrals import bp as referrals_bp
+    from app.routes.history import bp as history_bp
+    from app.routes.web_session import bp as web_session_bp
+    from app.routes.accounts import bp as accounts_bp
+    from app.routes.tax import bp as tax_bp
+    from app.routes.subscriptions import bp as subscriptions_bp
+    
+    app.register_blueprint(workspace_bp, url_prefix='/api')
+    app.register_blueprint(web_auth_bp, url_prefix='/api/web/auth')
+    app.register_blueprint(web_ask_bp, url_prefix='/api/web')
+    app.register_blueprint(billing_bp, url_prefix='/api/billing')
+    app.register_blueprint(me_bp, url_prefix='/api')
+    app.register_blueprint(plans_bp, url_prefix='/api')
+    app.register_blueprint(referrals_bp, url_prefix='/api')
+    app.register_blueprint(history_bp, url_prefix='/api')
+    app.register_blueprint(web_session_bp, url_prefix='/api')
+    app.register_blueprint(accounts_bp, url_prefix='/api')
+    app.register_blueprint(tax_bp, url_prefix='/api')
+    app.register_blueprint(subscriptions_bp, url_prefix='/api')
+    
+    print("✅ Web blueprints registered successfully")
+    print("   Available web endpoints:")
+    print("   • GET  /api/workspace/limits")
+    print("   • POST /api/web/auth/request-otp")
+    print("   • POST /api/web/auth/verify-otp")
+    print("   • POST /api/web/ask")
+    print("   • GET  /api/me")
+    print("   • GET  /api/billing/me")
+    print("   • GET  /api/plans")
+except ImportError as e:
+    print(f"⚠️ Could not import web blueprints: {e}")
+except Exception as e:
+    print(f"⚠️ Error registering web blueprints: {e}")
+# ============ END WEB BLUEPRINT REGISTRATION ==========
+
 # ============ LEGAL DISCLAIMERS ============
 DISCLAIMER_MAIN = "🤖 *AI may make mistakes. Always verify with official sources.*"
 DISCLAIMER_AI = "🤖 *AI-generated. Verify important information.*"
