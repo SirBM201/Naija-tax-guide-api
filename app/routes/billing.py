@@ -101,14 +101,14 @@ def _get_account_id_from_session() -> Optional[str]:
 # -------------------- ROUTES --------------------
 
 
-@bp.get("/billing/plans")
+@bp.get("/plans")
 def billing_plans():
     active_only = (request.args.get("active_only") or "1").strip() != "0"
     plans = list_plans(active_only=active_only)
     return jsonify({"ok": True, "plans": plans}), 200
 
 
-@bp.get("/billing/plans/<plan_code>")
+@bp.get("/plans/<plan_code>")
 def billing_plan(plan_code: str):
     p = get_plan(plan_code)
     if not p:
@@ -116,8 +116,8 @@ def billing_plan(plan_code: str):
     return jsonify({"ok": True, "plan": p}), 200
 
 
-@bp.get("/billing/me")
-@bp.get("/billing/subscription")
+@bp.get("/me")
+@bp.get("/subscription")
 def billing_me():
     account_id = _get_account_id_from_session()
     
@@ -140,7 +140,7 @@ def billing_me():
     }), 200
 
 
-@bp.get("/billing/debug-state")
+@bp.get("/debug-state")
 def billing_debug_state():
     account_id = _get_account_id_from_session()
     
@@ -164,11 +164,11 @@ def billing_debug_state():
     }), 200
 
 
-@bp.post("/billing/checkout")
+@bp.post("/checkout")
 def billing_checkout():
     return jsonify({"ok": False, "error": "Not implemented yet"}), 501
 
 
-@bp.post("/billing/webhook")
+@bp.post("/webhook")
 def billing_webhook():
     return jsonify({"ok": True, "message": "Webhook received"}), 200
