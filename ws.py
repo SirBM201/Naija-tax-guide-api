@@ -1,4 +1,4 @@
-﻿import os
+import os
 import logging
 from flask import Flask
 from dotenv import load_dotenv
@@ -36,7 +36,7 @@ from app.routes.telegram import bp as telegram_bp
 from app.routes.cron import bp as cron_bp
 
 # Register all web blueprints
-app.register_blueprint(workspace_bp, url_prefix='/api')
+app.register_blueprint(workspace_bp, url_prefix='/api/workspace')
 app.register_blueprint(web_auth_bp, url_prefix='/api')
 app.register_blueprint(web_ask_bp, url_prefix='/api/web')
 app.register_blueprint(billing_bp, url_prefix='/api/billing')
