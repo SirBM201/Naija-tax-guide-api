@@ -11,8 +11,10 @@ from collections import defaultdict
 
 # Import shared services
 from app.services.ask_service import ask_guarded
-from app.core.supabase_client import supabase_client as supabase_client as supabase
+from app.core.supabase_client import supabase_client as supabase
 import requests
+
+bp = Blueprint("whatsapp", __name__)
 
 bp = Blueprint("whatsapp", __name__)
 
