@@ -1,4 +1,4 @@
-ï»¿import os
+import os
 import logging
 from flask import Flask
 from dotenv import load_dotenv
@@ -37,7 +37,7 @@ from app.routes.cron import bp as cron_bp
 
 # Register all web blueprints
 app.register_blueprint(workspace_bp, url_prefix='/api')
-app.register_blueprint(web_auth_bp, url_prefix='/api/web/auth')
+app.register_blueprint(web_auth_bp, url_prefix='/api')
 app.register_blueprint(web_ask_bp, url_prefix='/api/web')
 app.register_blueprint(billing_bp, url_prefix='/api/billing')
 app.register_blueprint(me_bp, url_prefix='/api')
@@ -54,14 +54,14 @@ app.register_blueprint(web_bp, url_prefix='/api')
 app.register_blueprint(telegram_bp, url_prefix='/api')
 app.register_blueprint(cron_bp, url_prefix='/api')
 
-print("âœ… All blueprints registered successfully")
+print("? All blueprints registered successfully")
 print("   Available endpoints:")
-print("   â€¢ WhatsApp: /api/whatsapp/webhook")
-print("   â€¢ Web workspace: /api/workspace/limits")
-print("   â€¢ Web auth: /api/web/auth/*")
-print("   â€¢ Web ask: /api/web/ask")
-print("   â€¢ Plans: /api/plans")
-print("   â€¢ Health: /api/health")
+print("   • WhatsApp: /api/whatsapp/webhook")
+print("   • Web workspace: /api/workspace/limits")
+print("   • Web auth: /api/web/auth/*")
+print("   • Web ask: /api/web/ask")
+print("   • Plans: /api/plans")
+print("   • Health: /api/health")
 
 # ============ RUN APPLICATION ============
 
