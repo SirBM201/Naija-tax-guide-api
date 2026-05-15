@@ -64,7 +64,7 @@ def get_workspace_limits():
         max_whatsapp_channels = 1
         max_telegram_channels = 1
         
-        if sub_result.data:
+        if sub_result and sub_result.data:
             plan_code = sub_result.data.get("plan_code", "free")
             plan_family = sub_result.data.get("plan_family", "free")
             
@@ -248,7 +248,7 @@ def add_workspace_member():
         .execute()
     
     max_workspace_users = 1
-    if sub_result.data:
+    if sub_result and sub_result.data:
         plan_family = sub_result.data.get("plan_family", "free")
         if plan_family in ["pro", "business"]:
             max_workspace_users = 10
