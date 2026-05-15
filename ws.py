@@ -1,6 +1,7 @@
-﻿import os
+import os
 import logging
 from flask import Flask
+from flask_cors import CORS
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -8,9 +9,32 @@ load_dotenv()
 
 # Create Flask app
 app = Flask(__name__)
+
+# Secret key for sessions
 app.secret_key = os.getenv('SECRET_KEY', 'default-secret-key-change-in-production')
+
+# Session configuration
+app.config['SESSION_COOKIE_SAMESITE'] = 'None'
+app.config['SESSION_COOKIE_SECURE'] = True
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['SESSION_COOKIE_DOMAIN'] = '.koyeb.app'  # Allow subdomains
+
+# CORS configuration - Allow your frontend domain
+CORS(app, 
+     supports_credentials=True,
+     origins=[
+         'https://www.naijataxguides.com',
+         'https://naijataxguides.com',
+         'http://localhost:3000',
+         'http://localhost:5173'
+     ],
+     methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+     allow_headers=['Content-Type', 'Authorization', 'X-Requested-With'],
+     expose_headers=['Content-Type', 'Set-Cookie'])
+
 logging.basicConfig(level=logging.INFO)
 
+# ============ IMPORT AND REGISTER ALL BLUEPRINTS ============
 # ============ IMPORT AND REGISTER ALL BLUEPRINTS ============
 
 # WhatsApp blueprint
