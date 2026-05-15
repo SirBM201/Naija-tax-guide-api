@@ -8,6 +8,7 @@ load_dotenv()
 
 # Create Flask app
 app = Flask(__name__)
+app.secret_key = os.getenv('SECRET_KEY', 'MmFlODZiNGEtYWNkZC00OTk2LWFmMTgtNzc3Zjg1MjQzMGE1')
 logging.basicConfig(level=logging.INFO)
 
 # ============ IMPORT AND REGISTER ALL BLUEPRINTS ============
