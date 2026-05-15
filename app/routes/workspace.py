@@ -50,7 +50,7 @@ def get_workspace_limits():
     
     try:
         sub_result = supabase.table("user_subscriptions")\
-            .select("plan_code, plan_family")\
+            .select("plan_code, plan_family, status, is_active")\
             .eq("account_id", account_id)\
             .eq("is_active", True)\
             .maybe_single()\
