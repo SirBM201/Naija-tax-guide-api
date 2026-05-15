@@ -53,7 +53,7 @@ from app.routes.web_ask import bp as web_ask_bp
 from app.routes.web_session import bp as web_session_bp
 from app.routes.web import bp as web_bp
 app.register_blueprint(web_auth_bp, url_prefix='/api')
-app.register_blueprint(web_ask_bp, url_prefix='/api/web')
+app.register_blueprint(web_ask_bp, url_prefix='/api')
 app.register_blueprint(web_session_bp, url_prefix='/api')
 app.register_blueprint(web_bp, url_prefix='/api')
 
