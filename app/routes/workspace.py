@@ -5,7 +5,7 @@ import logging
 import uuid
 from flask import Blueprint, request, jsonify
 
-from app.core.supabase_client import supabase
+from app.core.supabase_client import supabase_client as supabase
 from app.services.auth_service import get_current_user
 
 logger = logging.getLogger(__name__)

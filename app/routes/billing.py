@@ -7,7 +7,7 @@ import logging
 
 from flask import Blueprint, jsonify, request, session
 
-from app.core.supabase_client import supabase
+from app.core.supabase_client import supabase_client as supabase
 from app.services.plans_service import get_plan, list_plans
 from app.services.web_auth_service import get_account_id_from_request
 from app.services.auth_service import get_current_user
