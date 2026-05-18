@@ -22,7 +22,7 @@ except Exception:  # pragma: no cover
 
 bp = Blueprint("whatsapp", __name__)
 
-WHATSAPP_FLOW_VERSION = "2026-05-18-v5-command-before-link-fix"
+WHATSAPP_FLOW_VERSION = "2026-05-18-v6-emoji-paye-quiz-whatsapp-native"
 
 
 # =============================================================================
@@ -278,6 +278,44 @@ CALC_OPTIONS: Dict[str, Dict[str, Any]] = {
 }
 
 
+QUIZ_BANK: List[Dict[str, Any]] = [
+    {
+        "id": "q_paye_1",
+        "category": "PAYE",
+        "question": "Which tax is usually deducted from an employee's salary by the employer in Nigeria?",
+        "options": {"A": "VAT", "B": "PAYE", "C": "Company Income Tax", "D": "Import Duty"},
+        "answer": "B",
+        "explain": "PAYE means Pay-As-You-Earn. Employers deduct it from employee salaries and remit it to the relevant State Internal Revenue Service.",
+    },
+    {
+        "id": "q_vat_1",
+        "category": "VAT",
+        "question": "What is the common standard VAT rate used in Nigeria for many VATable supplies?",
+        "options": {"A": "2.5%", "B": "5%", "C": "7.5%", "D": "30%"},
+        "answer": "C",
+        "explain": "The commonly applied standard VAT rate is 7.5%, subject to current law and transaction-specific exemptions.",
+    },
+    {
+        "id": "q_cit_1",
+        "category": "Company Tax",
+        "question": "Company Income Tax is mainly charged on what?",
+        "options": {"A": "Company taxable profit", "B": "Employee salary", "C": "Customer phone number", "D": "Bank name only"},
+        "answer": "A",
+        "explain": "Company Income Tax is charged on taxable profit after allowable deductions and adjustments, not directly on employee salary.",
+    },
+    {
+        "id": "q_wht_1",
+        "category": "WHT",
+        "question": "Withholding Tax is usually deducted at what point?",
+        "options": {"A": "At payment point", "B": "Only after 10 years", "C": "When opening email", "D": "Never"},
+        "answer": "A",
+        "explain": "WHT is commonly deducted at payment point where the transaction is subject to withholding tax.",
+    },
+]
+
+QUIZ_FREE_DAILY_LIMIT = 12
+
+
 # =============================================================================
 # Generic helpers
 # =============================================================================
@@ -424,7 +462,7 @@ def _ensure_email_or_prompt(
 
     _set_session_state(wa_id, context="collect_email", pending_action=pending_action, data=data)
     body = (
-        "Please enter your email address to continue with payment.\n\n"
+        "📧 Please enter your email address to continue with payment.\n\n"
         "Example: name@email.com\n\n"
         "This email will be used for your Paystack receipt and account record."
     )
@@ -866,6 +904,12 @@ def _recognize(text: str, context: str = "main") -> Dict[str, Any]:
         return {"kind": "global", "action": "cancel"}
     if norm in {"help", "8"}:
         return {"kind": "main", "action": "help"}
+    if norm in {"q1", "start quiz", "quiz me", "take quiz", "tax quiz"}:
+        return {"kind": "calc", "code": "C6", "action": "tax_quiz"}
+    if norm in {"q2", "quiz rules"}:
+        return {"kind": "quiz_rules", "action": "quiz_rules"}
+    if norm in {"d1", "d2", "d3", "create deadline", "view deadlines", "delete deadline", "deadline reminder", "view reminders", "delete reminder"}:
+        return {"kind": "deadline", "action": "deadline"}
 
     main_map = {
         "1": "ask_prompt",
@@ -965,20 +1009,20 @@ def _recognize(text: str, context: str = "main") -> Dict[str, Any]:
 
 def _main_menu() -> str:
     return (
-        "🇳🇬 Naija Tax Guide\n\n"
+        "🇳🇬 *Naija Tax Guide*\n\n"
         "Reply with:\n"
-        "1 - Ask a tax question\n"
-        "2 - Check Usage Credits\n"
-        "3 - Check current plan\n"
-        "4 - View subscription plans\n"
-        "5 - Link website account\n"
-        "6 - Buy Usage Credit add-ons\n"
-        "7 - Tax tools & filing\n"
-        "8 - Help / Menu\n\n"
-        "Global commands:\n"
-        "0 or MENU - Main menu\n"
-        "* or BACK - Go back\n"
-        "CANCEL - Cancel current flow\n\n"
+        "1️⃣ Ask a tax question\n"
+        "2️⃣ Check Usage Credits 💎\n"
+        "3️⃣ Check current plan 📌\n"
+        "4️⃣ View subscription plans 🛒\n"
+        "5️⃣ Link website account 🔗\n"
+        "6️⃣ Buy Usage Credit add-ons 💳\n"
+        "7️⃣ Tax tools, filing & quiz 🧰\n"
+        "8️⃣ Help / Menu ℹ️\n\n"
+        "Quick commands:\n"
+        "0 or MENU - Main menu 🏠\n"
+        "* or BACK - Go back ↩️\n"
+        "CANCEL - Cancel current flow ❌\n\n"
         "You can also type your Nigerian tax question directly."
     )
 
@@ -1014,32 +1058,33 @@ def _topup_menu() -> str:
 
 def _tools_menu() -> str:
     return (
-        "📋 Tax Tools & Filing\n\n"
-        "F1 - Tax calculators\n"
-        "F2 - PAYE filing guide\n"
-        "F3 - VAT filing guide\n"
-        "F4 - CIT filing guide\n"
-        "F5 - WHT guide\n"
-        "F6 - Tax deadlines/calendar\n"
-        "F7 - Filing checklist\n"
-        "F8 - Back to main menu\n\n"
-        "Reply with a code like F1."
+        "🧰 *Tax Tools & Filing*\n\n"
+        "F1 - Tax calculators 🧮\n"
+        "F2 - PAYE filing guide 👥\n"
+        "F3 - VAT filing guide 🧾\n"
+        "F4 - CIT filing guide 🏢\n"
+        "F5 - WHT guide 💼\n"
+        "F6 - Tax deadlines/calendar 📅\n"
+        "F7 - Filing checklist ✅\n"
+        "F8 - Back to main menu 🏠\n\n"
+        "Reply with a code like F1, F2, or F7."
     )
 
 
 def _calc_menu() -> str:
     return (
-        "🧮 Tax Calculators\n\n"
-        "C1 - PAYE calculator\n"
-        "C2 - Company Income Tax calculator\n"
-        "C3 - VAT calculator\n"
-        "C4 - Withholding Tax calculator\n"
-        "C5 - Salary/net pay comparison\n"
-        "C6 - Tax quiz\n"
-        "C7 - Tax calendar/deadlines\n"
-        "C8 - Back to Tax Tools\n\n"
+        "🧮 *Tax Calculators & Quiz*\n\n"
+        "C1 - PAYE calculator 👥\n"
+        "C2 - Company Income Tax calculator 🏢\n"
+        "C3 - VAT calculator 🧾\n"
+        "C4 - Withholding Tax calculator 💼\n"
+        "C5 - Salary/net pay comparison 📊\n"
+        "C6 - Tax quiz 🎯\n"
+        "C7 - Tax calendar/deadlines 📅\n"
+        "C8 - Back to Tax Tools 🏠\n\n"
         "Examples:\n"
         "C1 250000 monthly\n"
+        "C1 salary 250000 pension 8% nhf 2.5% hmo 5000 loan 10000 monthly\n"
         "C2 profit 5000000 revenue 30000000\n"
         "C3 1000000\n"
         "C4 500000 5%"
@@ -1048,13 +1093,14 @@ def _calc_menu() -> str:
 
 def _help_text() -> str:
     return (
-        "Help - Naija Tax Guide\n\n"
+        "ℹ️ *Help - Naija Tax Guide*\n\n"
         "• Main menu uses numbers 1–8.\n"
-        "• Submenus use short codes like S1, T50, F1, and C1.\n"
+        "• Submenus use short codes like S1, T50, F1, C1, Q1, and D1.\n"
         "• You can type natural words too, e.g. Starter Monthly or VAT calculator.\n"
-        "• Database/cache answers may be served without credit charge.\n"
-        "• AI answers require an active paid plan and Usage Credits.\n"
-        "• Your web, WhatsApp, and Telegram channels share one credit wallet.\n\n"
+        "• Basic calculators are free. 🧮\n"
+        "• Database/cache answers may be served without credit charge. ✅\n"
+        "• AI answers require an active paid plan and Usage Credits. 💎\n"
+        "• Web, WhatsApp, and Telegram share one credit wallet when linked. 🔗\n\n"
         "Reply 0 for main menu."
     )
 
@@ -1181,7 +1227,7 @@ def _init_paystack_checkout(account: Optional[Dict[str, Any]], account_id: str, 
     if create_reference is None or initialize_transaction is None:
         return {
             "ok": False,
-            "message": f"{item['name']} selected.\n\nPlease complete payment from the web app:\n{_base_url()}/plans",
+            "message": f"{item['name']} selected.\n\nPayment link could not be generated right now. Please try again shortly or contact support.",
             "error": "paystack_service_unavailable",
         }
 
@@ -1253,77 +1299,159 @@ def _init_paystack_checkout(account: Optional[Dict[str, Any]], account_id: str, 
 def _guide(action: str) -> str:
     guides = {
         "paye_guide": (
-            "PAYE Filing Guide\n\n"
-            "1. Calculate monthly employee taxable income.\n"
-            "2. Deduct PAYE based on applicable personal income tax bands.\n"
-            "3. Remit PAYE to the relevant State Internal Revenue Service.\n"
-            "4. Keep payroll schedules, payment receipts, and employee records.\n\n"
-            "For full filing support, use the web app."
+            "👥 *PAYE Filing Guide*\n\n"
+            "1. Confirm employee gross pay, allowances, benefits, and approved deductions.\n"
+            "2. Compute taxable income using the applicable PAYE rules.\n"
+            "3. Deduct PAYE from payroll and remit to the relevant State Internal Revenue Service.\n"
+            "4. Keep payroll schedules, payment receipts, pension/NHF records, and employee files.\n\n"
+            "Try: C1 salary 250000 pension 8% nhf 2.5% monthly\n"
+            "Reply F7 for filing checklist or D1 to start a deadline reminder."
         ),
         "vat_guide": (
-            "VAT Filing Guide\n\n"
-            "1. Confirm if your business is VAT-registered.\n"
+            "🧾 *VAT Filing Guide*\n\n"
+            "1. Confirm if your business and transaction are VATable.\n"
             "2. Record output VAT on taxable sales and input VAT on eligible purchases.\n"
             "3. File VAT returns and remit net VAT by the required deadline.\n"
-            "4. Keep invoices and payment records.\n\n"
-            "Standard VAT rate is commonly 7.5%, but confirm current rules for your transaction."
+            "4. Keep invoices, receipts, and payment records.\n\n"
+            "Try: C3 1000000\n"
+            "Reply F7 for filing checklist or D1 to start a deadline reminder."
         ),
         "cit_guide": (
-            "Company Income Tax Filing Guide\n\n"
-            "1. Prepare financial statements.\n"
-            "2. Compute taxable profit after allowable deductions.\n"
+            "🏢 *Company Income Tax Filing Guide*\n\n"
+            "1. Prepare financial statements and supporting schedules.\n"
+            "2. Compute taxable profit after allowable deductions and adjustments.\n"
             "3. Apply the correct CIT rate based on company size/turnover.\n"
             "4. File returns with FIRS and keep all supporting records.\n\n"
-            "Use a qualified accountant for final filing."
+            "Try: C2 profit 5000000 revenue 30000000\n"
+            "For final filing, confirm with a qualified accountant."
         ),
         "wht_guide": (
-            "Withholding Tax Guide\n\n"
+            "💼 *Withholding Tax Guide*\n\n"
             "1. Confirm if the transaction is subject to WHT.\n"
             "2. Apply the correct WHT rate for the transaction type.\n"
             "3. Deduct WHT at payment point.\n"
-            "4. Remit to the relevant tax authority and issue credit notes where applicable."
+            "4. Remit to the relevant tax authority and issue credit notes where applicable.\n\n"
+            "Try: C4 500000 5%"
         ),
         "deadlines": (
-            "Tax Deadlines / Calendar\n\n"
+            "📅 *Tax Deadlines / Calendar*\n\n"
             "• PAYE: usually monthly remittance to the State IRS.\n"
             "• VAT: usually monthly filing/remittance.\n"
-            "• WHT: remit according to applicable authority timelines.\n"
+            "• WHT: remit according to the applicable authority timeline.\n"
             "• CIT: annual company filing after financial year-end.\n\n"
-            "Custom deadline creation is available on paid plans from the web app."
+            "WhatsApp reminder commands:\n"
+            "D1 - Create reminder 🔔\n"
+            "D2 - View reminders 📋\n"
+            "D3 - Delete reminder 🗑️\n\n"
+            "Free users can view the calendar. Paid users can create custom reminders."
         ),
         "filing_checklist": (
-            "Filing Checklist\n\n"
+            "✅ *Filing Checklist*\n\n"
             "• Taxpayer/company registration details\n"
             "• TIN / CAC details where applicable\n"
             "• Sales and expense records\n"
             "• Payroll/PAYE records\n"
+            "• Pension/NHF/approved deduction records where applicable\n"
             "• VAT invoices\n"
             "• WHT receipts/credit notes\n"
             "• Bank statements and payment confirmations\n"
-            "• Prior filings and assessment notices"
+            "• Prior filings and assessment notices\n\n"
+            "Reply F2, F3, F4, or F5 for a specific filing guide."
         ),
     }
     return guides.get(action) or _tools_menu()
 
 
+def _keyword_number(text: str, keywords: List[str]) -> Optional[Tuple[float, bool]]:
+    raw = _clean(text).replace(",", "")
+    for keyword in keywords:
+        pattern = re.compile(rf"\b{re.escape(keyword)}\b\s*(?:=|:)?\s*(?:₦\s*)?(\d+(?:\.\d+)?)\s*(%)?", re.I)
+        match = pattern.search(raw)
+        if match:
+            try:
+                value = float(match.group(1))
+                is_percent = bool(match.group(2)) or (value <= 100 and keyword in {"pension", "voluntary pension", "voluntary_pension", "vpension", "nhf"})
+                return value, is_percent
+            except Exception:
+                return None
+    return None
+
+
+def _annualize_monthly_value(value: float, is_monthly: bool) -> int:
+    return int(round(value * 12 if is_monthly else value))
+
+
+def _parse_payroll_deductions(text: str, annual_gross: int, is_monthly: bool) -> Dict[str, Any]:
+    deductible_specs = [
+        ("Pension", ["pension"]),
+        ("Voluntary pension", ["voluntary pension", "voluntary_pension", "vpension"]),
+        ("NHF", ["nhf", "national housing fund"]),
+    ]
+    net_only_specs = [
+        ("HMO", ["hmo", "health"]),
+        ("Loan", ["loan", "salary advance"]),
+        ("Cooperative", ["cooperative", "coop"]),
+        ("Union dues", ["union", "union dues"]),
+        ("Other deduction", ["other", "other deduction", "deduction"]),
+    ]
+
+    lines: List[str] = []
+    taxable_deductions = 0
+    net_only_deductions = 0
+
+    for label, keywords in deductible_specs:
+        found = _keyword_number(text, keywords)
+        if not found:
+            continue
+        value, is_percent = found
+        annual_value = int(round(annual_gross * (value / 100))) if is_percent else _annualize_monthly_value(value, is_monthly)
+        taxable_deductions += max(0, annual_value)
+        suffix = f"{value:g}%" if is_percent else _money(int(round(value))) + (" monthly" if is_monthly else " yearly")
+        lines.append(f"• {label}: {suffix} = {_money(annual_value)} yearly")
+
+    for label, keywords in net_only_specs:
+        found = _keyword_number(text, keywords)
+        if not found:
+            continue
+        value, is_percent = found
+        annual_value = int(round(annual_gross * (value / 100))) if is_percent else _annualize_monthly_value(value, is_monthly)
+        net_only_deductions += max(0, annual_value)
+        suffix = f"{value:g}%" if is_percent else _money(int(round(value))) + (" monthly" if is_monthly else " yearly")
+        lines.append(f"• {label}: {suffix} = {_money(annual_value)} yearly")
+
+    return {
+        "taxable_deductions": taxable_deductions,
+        "net_only_deductions": net_only_deductions,
+        "total_deductions": taxable_deductions + net_only_deductions,
+        "lines": lines,
+    }
+
+
 def _calculate_paye(text: str) -> str:
     amounts = _extract_amounts(text)
+    norm = _normalize_text(text)
+
     if not amounts:
         return (
-            "PAYE Calculator\n\n"
-            "Send your salary like this:\n"
+            "👥 *PAYE Calculator*\n\n"
+            "Send salary like this:\n"
             "C1 250000 monthly\n"
             "or\n"
             "C1 3000000 yearly\n\n"
-            "This basic calculator is free."
+            "For company-specific payroll deductions, use:\n"
+            "C1 salary 250000 pension 8% nhf 2.5% hmo 5000 loan 10000 monthly\n\n"
+            "Supported deductions: pension, voluntary pension, NHF, HMO, loan, cooperative, union, other.\n"
+            "This basic calculator is free. 🧮"
         )
 
     amount = amounts[0]
-    norm = _normalize_text(text)
-    annual = amount * 12 if "month" in norm or "monthly" in norm else amount
+    is_monthly = "month" in norm or "monthly" in norm
+    annual = amount * 12 if is_monthly else amount
+
+    payroll = _parse_payroll_deductions(text, annual, is_monthly)
 
     relief = max(200000, int(annual * 0.01)) + int(annual * 0.20)
-    taxable = max(0, annual - relief)
+    taxable = max(0, annual - relief - int(payroll["taxable_deductions"]))
 
     bands = [
         (300000, 0.07),
@@ -1343,17 +1471,29 @@ def _calculate_paye(text: str) -> str:
         remaining -= take
 
     monthly_tax = tax / 12
-    net_monthly = (annual / 12) - monthly_tax
+    monthly_gross = annual / 12
+    monthly_all_deductions = int(payroll["total_deductions"]) / 12
+    net_monthly = monthly_gross - monthly_tax - monthly_all_deductions
+
+    deduction_section = ""
+    if payroll["lines"]:
+        deduction_section = (
+            "\n🏢 Company payroll deductions used:\n"
+            + "\n".join(payroll["lines"])
+            + "\n"
+        )
 
     return (
-        "PAYE Calculator Result\n\n"
+        "👥 *PAYE Calculator Result*\n\n"
         f"Gross annual income: {_money(annual)}\n"
         f"Estimated annual relief: {_money(relief)}\n"
+        f"Tax-deductible payroll deductions: {_money(int(payroll['taxable_deductions']))}\n"
         f"Estimated taxable income: {_money(int(taxable))}\n"
         f"Estimated annual PAYE: {_money(int(round(tax)))}\n"
         f"Estimated monthly PAYE: {_money(int(round(monthly_tax)))}\n"
-        f"Estimated monthly net pay: {_money(int(round(net_monthly)))}\n\n"
-        "Note: This is an estimate. Confirm pension, NHF, allowances, benefits, and state-specific treatment before final filing."
+        f"Estimated monthly net after PAYE/deductions: {_money(int(round(net_monthly)))}\n"
+        f"{deduction_section}\n"
+        "⚠️ Note: This is an estimate. Nigerian payroll policies vary by employer. Confirm pension, NHF, allowances, benefits, voluntary deductions, and state-specific treatment before final filing."
     )
 
 
@@ -1361,7 +1501,7 @@ def _calculate_cit(text: str) -> str:
     amounts = _extract_amounts(text)
     if not amounts:
         return (
-            "CIT Calculator\n\n"
+            "🏢 *CIT Calculator*\n\n"
             "Send taxable profit and turnover like this:\n"
             "C2 profit 5000000 revenue 30000000\n\n"
             "This basic calculator is free."
@@ -1384,7 +1524,7 @@ def _calculate_cit(text: str) -> str:
     tax = profit * rate
 
     return (
-        "Company Income Tax Calculator Result\n\n"
+        "🏢 *Company Income Tax Calculator Result*\n\n"
         f"Taxable profit used: {_money(profit)}\n"
         f"Turnover/revenue used: {_money(revenue) if revenue else 'Not provided'}\n"
         f"Category: {category}\n"
@@ -1397,14 +1537,14 @@ def _calculate_cit(text: str) -> str:
 def _calculate_vat(text: str) -> str:
     amounts = _extract_amounts(text)
     if not amounts:
-        return "VAT Calculator\n\nSend taxable sales amount like this:\nC3 1000000\n\nThis basic calculator is free."
+        return "🧾 *VAT Calculator*\n\nSend taxable sales amount like this:\nC3 1000000\n\nThis basic calculator is free. 🧮"
 
     amount = amounts[0]
     vat = amount * 0.075
     total = amount + vat
 
     return (
-        "VAT Calculator Result\n\n"
+        "🧾 *VAT Calculator Result*\n\n"
         f"Taxable amount: {_money(amount)}\n"
         "VAT rate used: 7.5%\n"
         f"VAT amount: {_money(int(round(vat)))}\n"
@@ -1420,7 +1560,7 @@ def _calculate_wht(text: str) -> str:
 
     if not amounts or rate is None:
         return (
-            "WHT Calculator\n\n"
+            "💼 *WHT Calculator*\n\n"
             "Send amount and WHT rate like this:\n"
             "C4 500000 5%\n\n"
             "WHT rates vary by transaction type, so include the rate."
@@ -1430,7 +1570,7 @@ def _calculate_wht(text: str) -> str:
     wht = amount * (rate / 100)
 
     return (
-        "Withholding Tax Calculator Result\n\n"
+        "💼 *Withholding Tax Calculator Result*\n\n"
         f"Transaction amount: {_money(amount)}\n"
         f"WHT rate used: {rate:g}%\n"
         f"WHT to deduct: {_money(int(round(wht)))}\n"
@@ -1443,7 +1583,7 @@ def _salary_compare(text: str) -> str:
     amounts = _extract_amounts(text)
     if len(amounts) < 2:
         return (
-            "Salary Comparison\n\n"
+            "📊 *Salary Comparison*\n\n"
             "Send two salary amounts like this:\n"
             "C5 250000 350000 monthly\n\n"
             "The app will estimate the net difference."
@@ -1452,7 +1592,7 @@ def _salary_compare(text: str) -> str:
     first = _calculate_paye(f"C1 {amounts[0]} monthly")
     second = _calculate_paye(f"C1 {amounts[1]} monthly")
     return (
-        "Salary Comparison\n\n"
+        "📊 *Salary Comparison*\n\n"
         "First salary estimate:\n"
         f"{first}\n\n"
         "Second salary estimate:\n"
@@ -1462,15 +1602,144 @@ def _salary_compare(text: str) -> str:
 
 def _quiz_text() -> str:
     return (
-        "Tax Quiz\n\n"
-        "Question: Which tax is usually deducted from an employee's salary by the employer in Nigeria?\n\n"
-        "A - VAT\n"
-        "B - PAYE\n"
-        "C - Company Income Tax\n"
-        "D - Withholding Tax\n\n"
-        "Reply with A, B, C, or D.\n"
-        "Free users can access limited non-AI quiz attempts daily."
+        "🎯 *Tax Quiz*\n\n"
+        "Q1 - Start non-AI quiz\n"
+        "Q2 - Quiz rules\n"
+        "Q3 - Back to calculators\n\n"
+        "Free users: 12 non-AI quiz attempts daily.\n"
+        "Paid users: unlimited non-AI quiz attempts.\n"
+        "AI explanations can be added later and should consume Usage Credits."
     )
+
+
+def _quiz_rules_text() -> str:
+    return (
+        "🎯 *Quiz Rules*\n\n"
+        "• Non-AI quiz questions do not consume Usage Credits. ✅\n"
+        "• Free users get 12 attempts daily.\n"
+        "• Paid users get unlimited non-AI quiz attempts.\n"
+        "• Reply A, B, C, or D to answer.\n"
+        "• Reply Q1 to start another quiz.\n\n"
+        "Reply 0 for main menu."
+    )
+
+
+def _quiz_attempt_info(state: Dict[str, Any]) -> Tuple[str, int]:
+    today = datetime.now(timezone.utc).date().isoformat()
+    data = state.get("data") if isinstance(state.get("data"), dict) else {}
+    if data.get("quiz_date") == today:
+        try:
+            return today, int(data.get("quiz_attempts") or 0)
+        except Exception:
+            return today, 0
+    return today, 0
+
+
+def _start_quiz(wa_id: str, account_id: str, state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    state = state or _get_session_state(wa_id)
+    today, attempts = _quiz_attempt_info(state)
+
+    if not _is_active_paid_subscription(account_id) and attempts >= QUIZ_FREE_DAILY_LIMIT:
+        body = (
+            "🎯 Daily quiz limit reached.\n\n"
+            f"Free users can take {QUIZ_FREE_DAILY_LIMIT} non-AI quiz attempts daily.\n"
+            "Reply 4 to upgrade for unlimited non-AI quiz attempts, or reply 0 for main menu."
+        )
+        return {"ok": True, "handled": "quiz_limit", "send_result": _send_whatsapp_text(wa_id, body)}
+
+    index = attempts % len(QUIZ_BANK)
+    quiz = QUIZ_BANK[index]
+    data = {
+        "quiz_date": today,
+        "quiz_attempts": attempts,
+        "quiz_id": quiz["id"],
+        "correct": quiz["answer"],
+        "explain": quiz["explain"],
+    }
+    _set_session_state(wa_id, "quiz_answer", "tax_quiz", data)
+
+    options = "\n".join([f"{key} - {value}" for key, value in quiz["options"].items()])
+    body = (
+        f"🎯 *Tax Quiz* ({quiz['category']})\n\n"
+        f"Question {attempts + 1}: {quiz['question']}\n\n"
+        f"{options}\n\n"
+        "Reply A, B, C, or D.\n"
+        "Reply CANCEL to stop."
+    )
+    return {"ok": True, "handled": "quiz_start", "send_result": _send_whatsapp_text(wa_id, body)}
+
+
+def _handle_quiz_answer(wa_id: str, account_id: str, text: str, state: Dict[str, Any]) -> Dict[str, Any]:
+    answer = _normalize_text(text).upper()
+    if answer not in {"A", "B", "C", "D"}:
+        return {
+            "ok": True,
+            "handled": "quiz_invalid_answer",
+            "send_result": _send_whatsapp_text(wa_id, "Please reply with A, B, C, or D.\n\nReply CANCEL to stop the quiz."),
+        }
+
+    data = state.get("data") if isinstance(state.get("data"), dict) else {}
+    correct = _clean(data.get("correct")).upper()
+    today, attempts = _quiz_attempt_info(state)
+    attempts += 1
+
+    passed = answer == correct
+    verdict = "✅ Correct!" if passed else f"❌ Not correct. Correct answer: {correct}."
+    explain = _clean(data.get("explain"))
+
+    _set_session_state(wa_id, "main", "", {"quiz_date": today, "quiz_attempts": attempts})
+
+    remaining = "Unlimited" if _is_active_paid_subscription(account_id) else str(max(0, QUIZ_FREE_DAILY_LIMIT - attempts))
+    body = (
+        f"🎯 *Quiz Result*\n\n"
+        f"{verdict}\n\n"
+        f"Explanation: {explain}\n\n"
+        f"Attempts today: {attempts}\n"
+        f"Remaining today: {remaining}\n\n"
+        "Reply Q1 for another quiz, C1 for PAYE calculator, or 0 for main menu."
+    )
+    return {"ok": True, "handled": "quiz_answer", "send_result": _send_whatsapp_text(wa_id, body)}
+
+
+
+def _deadline_menu(account_id: str) -> str:
+    if not _is_active_paid_subscription(account_id):
+        return (
+            "📅 *Tax Deadline Reminders*\n\n"
+            "Free users can view the general tax calendar. Custom reminders are available on paid plans.\n\n"
+            "D1 - Create reminder 🔔 (paid)\n"
+            "D2 - View reminders 📋\n"
+            "D3 - Delete reminder 🗑️\n\n"
+            "Reply 4 to view plans or 0 for main menu."
+        )
+    return (
+        "📅 *Tax Deadline Reminders*\n\n"
+        "D1 - Create reminder 🔔\n"
+        "D2 - View reminders 📋\n"
+        "D3 - Delete reminder 🗑️\n\n"
+        "Example: D1 PAYE 2026-05-29 7\n"
+        "This means PAYE due date is 2026-05-29 and reminder is 7 days before."
+    )
+
+
+def _handle_deadline_command(wa_id: str, account_id: str, text: str) -> Dict[str, Any]:
+    norm = _normalize_text(text)
+    if norm in {"d1", "create deadline", "deadline reminder", "create reminder"}:
+        if not _is_active_paid_subscription(account_id):
+            return {"ok": True, "handled": "deadline_paid_required", "send_result": _send_whatsapp_text(wa_id, _deadline_menu(account_id))}
+        return {
+            "ok": True,
+            "handled": "deadline_create_prompt",
+            "send_result": _send_whatsapp_text(
+                wa_id,
+                "🔔 *Create Deadline Reminder*\n\nSend it like this:\nD1 PAYE 2026-05-29 7\n\nFormat: D1 tax_type due_date reminder_days_before\nSupported types: PAYE, VAT, CIT, WHT.\n\nFull reminder saving will use your existing tax_deadlines table when we activate this next."
+            ),
+        }
+    if norm in {"d2", "view deadlines", "view reminders"}:
+        return {"ok": True, "handled": "deadline_view", "send_result": _send_whatsapp_text(wa_id, "📋 Saved deadline reminder viewing is ready for the next backend connection step.\n\nReply F6 for calendar guidance or 0 for main menu.")}
+    if norm in {"d3", "delete deadline", "delete reminder"}:
+        return {"ok": True, "handled": "deadline_delete", "send_result": _send_whatsapp_text(wa_id, "🗑️ Deadline deletion flow is ready for the next backend connection step.\n\nReply 0 for main menu.")}
+    return {"ok": True, "handled": "deadline_menu", "send_result": _send_whatsapp_text(wa_id, _deadline_menu(account_id))}
 
 
 def _handle_calculator_action(action: str, text: str) -> str:
@@ -1577,8 +1846,8 @@ def _handle_plan_selection(wa_id: str, account: Dict[str, Any], account_id: str,
     if _plan_rank(current) > _plan_rank(item["plan_code"]) and _subscription_status(account_id) == "active":
         body = (
             f"You currently have a higher plan active:\n{_plan_label(account_id)}\n\n"
-            f"You selected {item['name']}. Downgrades should be managed from web billing so your current access is not lost.\n\n"
-            f"{_base_url()}/billing"
+            f"You selected {item['name']}. Downgrades should be handled carefully so your current access is not lost.\n\n"
+            "For now, choose a higher plan from this chat or contact support for downgrade help."
         )
         return {"ok": True, "handled": "downgrade_redirected", "send_result": _send_whatsapp_text(wa_id, body)}
 
@@ -1617,7 +1886,7 @@ def _handle_plan_selection(wa_id: str, account: Dict[str, Any], account_id: str,
             f"{item['name']} selected.\n\n"
             f"Price: {_money(item['price'])}\n"
             f"Included Usage Credits: {item['credits']}\n\n"
-            f"Open the web app to complete payment:\n{_base_url()}/plans"
+            f"Payment link could not be generated right now. Please reply 4 to try again or contact support."
         )
 
     return {"ok": True, "handled": "plan_selection", "send_result": _send_whatsapp_text(wa_id, body), "checkout": checkout}
@@ -1627,9 +1896,8 @@ def _handle_topup_selection(wa_id: str, account: Dict[str, Any], account_id: str
     if not _is_active_paid_subscription(account_id):
         body = (
             "Usage Credit add-ons are available only to active paid subscribers.\n\n"
-            "Please upgrade first:\n"
-            f"{_base_url()}/plans\n\n"
-            "Reply 4 to view plans or 0 for main menu."
+            "Please upgrade first by replying 4 to view plans.\n\n"
+            "Reply 0 for main menu."
         )
         return {"ok": True, "handled": "topup_blocked_no_paid_plan", "send_result": _send_whatsapp_text(wa_id, body)}
 
@@ -1670,7 +1938,7 @@ def _handle_topup_selection(wa_id: str, account: Dict[str, Any], account_id: str
             f"{item['name']} selected.\n\n"
             f"Credits: {item['credits']}\n"
             f"Price: {_money(item['price'])}\n\n"
-            f"Open the web app to buy add-ons:\n{_base_url()}/credits"
+            f"Payment link could not be generated right now. Please reply 6 to try again or contact support."
         )
 
     return {"ok": True, "handled": "topup_selection", "send_result": _send_whatsapp_text(wa_id, body), "checkout": checkout}
@@ -1748,6 +2016,9 @@ def _handle_text_message(msg: Dict[str, Any]) -> Dict[str, Any]:
             "send_result": _send_whatsapp_text(wa_id, "✅ Email saved successfully.\n\nReply 4 for plans or 6 for Usage Credit add-ons."),
         }
 
+    if context == "quiz_answer":
+        return _handle_quiz_answer(wa_id, account_id, text, state)
+
     payment_reference = _extract_payment_reference(text)
     if payment_reference:
         _set_session_state(wa_id, "main")
@@ -1771,6 +2042,12 @@ def _handle_text_message(msg: Dict[str, Any]) -> Dict[str, Any]:
         if action == "cancel":
             _set_session_state(wa_id, "main")
             return {"ok": True, "handled": "cancel", "send_result": _send_whatsapp_text(wa_id, "Current flow cancelled.\n\n" + _main_menu())}
+
+    if recognition.get("kind") == "quiz_rules":
+        return {"ok": True, "handled": "quiz_rules", "send_result": _send_whatsapp_text(wa_id, _quiz_rules_text())}
+
+    if recognition.get("kind") == "deadline":
+        return _handle_deadline_command(wa_id, account_id, text)
 
     if recognition["kind"] == "invalid_menu":
         return {
@@ -1796,7 +2073,7 @@ def _handle_text_message(msg: Dict[str, Any]) -> Dict[str, Any]:
             return {"ok": True, "handled": "plans_menu", "send_result": _send_whatsapp_text(wa_id, _plans_menu())}
         if action == "link_instruction":
             _set_session_state(wa_id, "link")
-            return {"ok": True, "handled": "link_instruction", "send_result": _send_whatsapp_text(wa_id, "To link your website account, open Channels on the web app, generate a WhatsApp link code, then send the code here.\n\nReply 0 for main menu.")}
+            return {"ok": True, "handled": "link_instruction", "send_result": _send_whatsapp_text(wa_id, "🔗 Send your WhatsApp link code here if you already generated one.\n\nIf you have not generated a code yet, open Channels once from your website account and copy the WhatsApp code here. After linking, you can continue using WhatsApp normally.\n\nReply 0 for main menu.")}
         if action == "topup_menu":
             _set_session_state(wa_id, "topup")
             return {"ok": True, "handled": "topup_menu", "send_result": _send_whatsapp_text(wa_id, _topup_menu())}
@@ -1823,6 +2100,8 @@ def _handle_text_message(msg: Dict[str, Any]) -> Dict[str, Any]:
         if action == "main_menu":
             _set_session_state(wa_id, "main")
             return {"ok": True, "handled": "main_menu", "send_result": _send_whatsapp_text(wa_id, _main_menu())}
+        if action == "deadlines":
+            return _handle_deadline_command(wa_id, account_id, text)
         return {"ok": True, "handled": action, "send_result": _send_whatsapp_text(wa_id, _guide(str(action)))}
 
     if recognition["kind"] == "calc":
@@ -1830,6 +2109,10 @@ def _handle_text_message(msg: Dict[str, Any]) -> Dict[str, Any]:
         if action == "tools_menu":
             _set_session_state(wa_id, "tools")
             return {"ok": True, "handled": "tools_menu", "send_result": _send_whatsapp_text(wa_id, _tools_menu())}
+        if action == "tax_quiz":
+            return _start_quiz(wa_id, account_id, state)
+        if action == "deadlines":
+            return _handle_deadline_command(wa_id, account_id, text)
         calc_text = _clean(recognition.get("rewritten_text") or text)
         return {"ok": True, "handled": action, "send_result": _send_whatsapp_text(wa_id, _handle_calculator_action(str(action), calc_text))}
 
