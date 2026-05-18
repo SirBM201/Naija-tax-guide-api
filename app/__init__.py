@@ -256,6 +256,7 @@ def create_app() -> Flask:
         "app.routes.deadlines",
         "app.routes.channel",
         "app.routes.channel_payment_return",
+        "app.routes.whatsapp",
     ]
 
     for dotted in required_modules:
@@ -266,7 +267,6 @@ def create_app() -> Flask:
     # ============================================================
     optional_modules = [
         "app.routes.cron",
-        "app.routes.whatsapp",
         "app.routes.telegram",
         "app.routes.web_ask",
         "app.routes.web_chat",
