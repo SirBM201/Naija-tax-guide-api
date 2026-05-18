@@ -237,3 +237,5 @@ def delete_deadline():
     except Exception as exc:
         logger.exception("Delete deadline error")
         return _json_error("deadline_delete_failed", 500, root_cause=f"{type(exc).__name__}: {exc}")
+
+
