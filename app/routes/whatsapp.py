@@ -22,7 +22,7 @@ except Exception:  # pragma: no cover
 
 bp = Blueprint("whatsapp", __name__)
 
-WHATSAPP_FLOW_VERSION = "2026-05-18-v4-webhook-405-fix"
+WHATSAPP_FLOW_VERSION = "2026-05-18-v5-command-before-link-fix"
 
 
 # =============================================================================
@@ -829,9 +829,23 @@ def _recognize(text: str, context: str = "main") -> Dict[str, Any]:
     if not raw:
         return {"kind": "empty", "action": "menu"}
 
+    # Compact calculator support: C3985000 means C3 985000.
+    # This prevents calculator commands without a space from being treated as link codes or AI questions.
+    compact_calc = re.match(r"^(c[1-8])(\d{2,9})$", norm)
+    if compact_calc:
+        code = compact_calc.group(1).upper()
+        amount = compact_calc.group(2)
+        if code in CALC_OPTIONS:
+            return {
+                "kind": "calc",
+                "code": code,
+                "action": CALC_OPTIONS[code]["action"],
+                "rewritten_text": f"{code} {amount}",
+            }
+
     # Exact/prefix command recognition must run before natural question fallback.
     # This guarantees "C1 986000" and "C2 profit ..." are calculators, not AI questions.
-    prefix_match = re.match(r"^(s[1-3]|p[1-3]|b[1-3]|t(?:10|50|100|500)|f[1-8]|c[1-8])\\b", norm)
+    prefix_match = re.match(r"^(s[1-3]|p[1-3]|b[1-3]|t(?:10|50|100|500)|f[1-8]|c[1-8])\b", norm)
     if prefix_match:
         code = prefix_match.group(1).upper()
         if code in PLAN_OPTIONS:
@@ -1678,10 +1692,19 @@ def _handle_text_message(msg: Dict[str, Any]) -> Dict[str, Any]:
         _set_session_state(wa_id, "main")
         return {"ok": True, "handled": "empty_menu", "send_result": _send_whatsapp_text(wa_id, _main_menu())}
 
-    link_reply = _try_link_code(wa_id, text, profile_name=profile_name)
-    if link_reply:
-        _set_session_state(wa_id, "main")
-        return {"ok": True, "handled": "link_code", "send_result": _send_whatsapp_text(wa_id, link_reply)}
+    # Recognize commands before trying link-code lookup.
+    # This prevents values like C3 985000 or C3985000 from being queried as link codes,
+    # and prevents free calculators from falling through to AI credit deduction.
+    recognition = _recognize(text, context)
+    is_command_like = recognition.get("kind") in {"global", "main", "plan", "topup", "tool", "calc", "ambiguous", "invalid_menu"}
+
+    # Only attempt link-code lookup when the user is in the link flow, or when the input
+    # is not already recognized as a command/calculator/plan/top-up/tool.
+    if context == "link" or not is_command_like:
+        link_reply = _try_link_code(wa_id, text, profile_name=profile_name)
+        if link_reply:
+            _set_session_state(wa_id, "main")
+            return {"ok": True, "handled": "link_code", "send_result": _send_whatsapp_text(wa_id, link_reply)}
 
     account, account_debug = _create_or_update_wa_account(wa_id, profile_name=profile_name)
     account_id = _account_id_from_row(account)
@@ -1736,8 +1759,6 @@ def _handle_text_message(msg: Dict[str, Any]) -> Dict[str, Any]:
             "If you just paid and this has not updated yet, wait a few seconds and send 3 for plan or 2 for credits."
         )
         return {"ok": True, "handled": "payment_reference_status", "send_result": _send_whatsapp_text(wa_id, body)}
-
-    recognition = _recognize(text, context)
 
     if recognition["kind"] == "global":
         action = recognition["action"]
@@ -1809,7 +1830,8 @@ def _handle_text_message(msg: Dict[str, Any]) -> Dict[str, Any]:
         if action == "tools_menu":
             _set_session_state(wa_id, "tools")
             return {"ok": True, "handled": "tools_menu", "send_result": _send_whatsapp_text(wa_id, _tools_menu())}
-        return {"ok": True, "handled": action, "send_result": _send_whatsapp_text(wa_id, _handle_calculator_action(str(action), text))}
+        calc_text = _clean(recognition.get("rewritten_text") or text)
+        return {"ok": True, "handled": action, "send_result": _send_whatsapp_text(wa_id, _handle_calculator_action(str(action), calc_text))}
 
     # Default: natural tax question.
     result = ask_guarded(
