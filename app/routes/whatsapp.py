@@ -22,7 +22,7 @@ except Exception:  # pragma: no cover
 
 bp = Blueprint("whatsapp", __name__)
 
-WHATSAPP_FLOW_VERSION = "2026-05-18-v6-emoji-paye-quiz-whatsapp-native"
+WHATSAPP_FLOW_VERSION = "2026-05-18-v7-stability-command-cleanup"
 
 
 # =============================================================================
@@ -762,13 +762,18 @@ def _is_active_paid_subscription(account_id: str) -> bool:
 
 
 def _credit_balance(account_id: str) -> int:
-    for table in ("ai_credit_balances", "credit_balances"):
-        row, _err = _query_one(table, "*", account_id=account_id)
-        if row:
-            try:
-                return int(row.get("balance") or row.get("credits") or row.get("credit_balance") or 0)
-            except Exception:
-                return 0
+    """Return the shared Usage Credit balance.
+
+    v7 intentionally reads only ai_credit_balances because the live Supabase
+    project does not expose credit_balances and that fallback produced noisy
+    404 requests in the logs.
+    """
+    row, _err = _query_one("ai_credit_balances", "*", account_id=account_id)
+    if row:
+        try:
+            return int(row.get("balance") or row.get("credits") or row.get("credit_balance") or 0)
+        except Exception:
+            return 0
     return 0
 
 
@@ -882,8 +887,9 @@ def _recognize(text: str, context: str = "main") -> Dict[str, Any]:
             }
 
     # Exact/prefix command recognition must run before natural question fallback.
-    # This guarantees "C1 986000" and "C2 profit ..." are calculators, not AI questions.
-    prefix_match = re.match(r"^(s[1-3]|p[1-3]|b[1-3]|t(?:10|50|100|500)|f[1-8]|c[1-8])\b", norm)
+    # This guarantees "C1 986000", "D1 PAYE ...", and "Q1" are handled as
+    # structured WhatsApp commands, not link codes and not AI questions.
+    prefix_match = re.match(r"^(s[1-3]|p[1-3]|b[1-3]|t(?:10|50|100|500)|f[1-8]|c[1-8]|q[1-5]|d[1-4])\b", norm)
     if prefix_match:
         code = prefix_match.group(1).upper()
         if code in PLAN_OPTIONS:
@@ -894,7 +900,19 @@ def _recognize(text: str, context: str = "main") -> Dict[str, Any]:
             return {"kind": "tool", "code": code, "action": TOOL_OPTIONS[code]["action"]}
         if code in CALC_OPTIONS:
             return {"kind": "calc", "code": code, "action": CALC_OPTIONS[code]["action"]}
+        if code == "Q1":
+            return {"kind": "calc", "code": "C6", "action": "tax_quiz"}
+        if code == "Q2":
+            return {"kind": "quiz_rules", "action": "quiz_rules"}
+        if code == "Q3":
+            return {"kind": "tool", "code": "F1", "action": "calculator_menu"}
+        if code in {"D1", "D2", "D3", "D4"}:
+            return {"kind": "deadline", "action": "deadline", "code": code}
 
+    # Invalid command-like inputs should not consume AI credits.
+    # Examples: C9, F11, Q9, D9, S9, T20.
+    if re.match(r"^(?:s|p|b|t|f|c|q|d)\d+\b", norm):
+        return {"kind": "invalid_menu", "action": "invalid_command", "value": raw}
 
     if norm in {"0", "menu", "main", "main menu", "start", "hello", "hi"}:
         return {"kind": "global", "action": "main_menu"}
@@ -908,7 +926,9 @@ def _recognize(text: str, context: str = "main") -> Dict[str, Any]:
         return {"kind": "calc", "code": "C6", "action": "tax_quiz"}
     if norm in {"q2", "quiz rules"}:
         return {"kind": "quiz_rules", "action": "quiz_rules"}
-    if norm in {"d1", "d2", "d3", "create deadline", "view deadlines", "delete deadline", "deadline reminder", "view reminders", "delete reminder"}:
+    if norm in {"q3", "back to calculators", "calculator menu"}:
+        return {"kind": "tool", "code": "F1", "action": "calculator_menu"}
+    if norm in {"d1", "d2", "d3", "d4", "create deadline", "view deadlines", "delete deadline", "deadline reminder", "view reminders", "delete reminder", "reminder settings"}:
         return {"kind": "deadline", "action": "deadline"}
 
     main_map = {
@@ -1732,7 +1752,7 @@ def _handle_deadline_command(wa_id: str, account_id: str, text: str) -> Dict[str
             "handled": "deadline_create_prompt",
             "send_result": _send_whatsapp_text(
                 wa_id,
-                "🔔 *Create Deadline Reminder*\n\nSend it like this:\nD1 PAYE 2026-05-29 7\n\nFormat: D1 tax_type due_date reminder_days_before\nSupported types: PAYE, VAT, CIT, WHT.\n\nFull reminder saving will use your existing tax_deadlines table when we activate this next."
+                "🔔 *Create Deadline Reminder*\n\nSend it like this:\nD1 PAYE 2026-05-29 7\n\nFormat: D1 tax_type due_date reminder_days_before\nSupported types: PAYE, VAT, CIT, WHT.\n\nThis command is reserved for WhatsApp-native reminder saving. If it does not save yet, reply F6 for the calendar or 0 for menu."
             ),
         }
     if norm in {"d2", "view deadlines", "view reminders"}:
@@ -2053,7 +2073,7 @@ def _handle_text_message(msg: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "ok": True,
             "handled": "invalid_menu_option",
-            "send_result": _send_whatsapp_text(wa_id, "That menu option is not available yet.\n\nReply 0 for main menu, or type your Nigerian tax question in words."),
+            "send_result": _send_whatsapp_text(wa_id, "⚠️ That code/menu option is not available yet, so no AI credit was used.\n\nReply 0 for main menu, F1 for calculators, Q1 for quiz, or type your Nigerian tax question in words."),
         }
 
     if recognition["kind"] == "ambiguous":
@@ -2248,4 +2268,3 @@ def whatsapp_test_reply():
     data = _safe_json()
     result = _send_whatsapp_text(_normalize_phone(data.get("to")), _clean(data.get("text") or "Naija Tax Guide WhatsApp test message."))
     return jsonify(result), 200 if result.get("ok") else 400
-
