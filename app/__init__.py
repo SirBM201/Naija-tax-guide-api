@@ -40,7 +40,8 @@ def _parse_origins(
 
     if not raw:
         if cookie_mode:
-            return [], True, "CORS_ORIGINS is empty but cookie auth requires explicit origins."
+            # Default to frontend domain if not specified
+            return ["https://www.naijataxguides.com", "https://naijataxguides.com"], True, None
         return "*", False, None
 
     if raw == "*":
@@ -51,7 +52,7 @@ def _parse_origins(
     origins = [o.strip() for o in raw.split(",") if o.strip()]
     if not origins:
         if cookie_mode:
-            return [], True, "CORS_ORIGINS parsed empty but cookie auth requires explicit origins."
+            return ["https://www.naijataxguides.com", "https://naijataxguides.com"], True, None
         return "*", False, None
 
     if cookie_mode:
@@ -112,9 +113,15 @@ def create_app() -> Flask:
     if cors_err:
         raise RuntimeError(f"[CORS] {cors_err}")
 
-    # When cookie_mode=True:
-    # - supports_credentials must be True
-    # - origins must be explicit list (not '*')
+    # Ensure frontend domains are included for cookie auth
+    if cookie_mode and origins != "*":
+        frontend_domains = ["https://www.naijataxguides.com", "https://naijataxguides.com"]
+        if isinstance(origins, list):
+            for fd in frontend_domains:
+                if fd not in origins:
+                    origins.append(fd)
+        supports_credentials = True
+
     CORS(
         app,
         resources={rf"{api_prefix}/*": {"origins": origins}},
@@ -232,6 +239,7 @@ def create_app() -> Flask:
         "app.routes.webhooks",
         "app.routes.plans",
         "app.routes.billing",
+        "app.routes.link",
         "app.routes.link_tokens",
         "app.routes.admin_link_tokens",
         "app.routes.accounts_admin",
@@ -241,11 +249,11 @@ def create_app() -> Flask:
         "app.routes.web_session",
         "app.routes.tax",
         "app.routes.workspace",
-        "app.routes.link",
         "app.routes.referrals",
         "app.routes.entry",
         "app.routes.history",
         "app.routes.support",
+        "app.routes.deadlines",
         "app.routes.channel",
         "app.routes.channel_payment_return",
     ]
