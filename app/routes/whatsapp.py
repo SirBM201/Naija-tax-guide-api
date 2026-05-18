@@ -1609,9 +1609,6 @@ def _handle_plan_selection(wa_id: str, account: Dict[str, Any], account_id: str,
     return {"ok": True, "handled": "plan_selection", "send_result": _send_whatsapp_text(wa_id, body), "checkout": checkout}
 
 
-def _handle_topup_selection
-
-
 def _handle_topup_selection(wa_id: str, account: Dict[str, Any], account_id: str, code: str) -> Dict[str, Any]:
     if not _is_active_paid_subscription(account_id):
         body = (
@@ -1664,8 +1661,6 @@ def _handle_topup_selection(wa_id: str, account: Dict[str, Any], account_id: str
 
     return {"ok": True, "handled": "topup_selection", "send_result": _send_whatsapp_text(wa_id, body), "checkout": checkout}
 
-
-def _handle_text_message
 
 
 def _handle_text_message(msg: Dict[str, Any]) -> Dict[str, Any]:
