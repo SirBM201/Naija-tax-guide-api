@@ -22,7 +22,7 @@ except Exception:  # pragma: no cover
 
 bp = Blueprint("whatsapp", __name__)
 
-WHATSAPP_FLOW_VERSION = "2026-05-18-v7-stability-command-cleanup"
+WHATSAPP_FLOW_VERSION = "2026-05-19-v10-deadline-quiz-polish"
 
 
 # =============================================================================
@@ -469,6 +469,134 @@ def _ensure_email_or_prompt(
     return {"ok": True, "handled": "collect_email", "send_result": _send_whatsapp_text(wa_id, body)}
 
 
+
+# _V10_PATCH_MARKER
+def _today_key() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _session_data(state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    data = (state or {}).get("data")
+    return data if isinstance(data, dict) else {}
+
+
+def _patch_session_data(wa_id: str, **updates: Any) -> None:
+    state = _get_session_state(wa_id)
+    data = _session_data(state)
+    data.update({k: v for k, v in updates.items() if v is not None})
+    _set_session_state(
+        wa_id,
+        context=_clean((state or {}).get("context")) or "main",
+        pending_action=_clean((state or {}).get("pending_action")) or "",
+        data=data,
+    )
+
+
+def _deadline_allowed_for_account(account_id: str) -> bool:
+    return _is_active_paid_subscription(account_id)
+
+
+def _deadline_usage_text() -> str:
+    return (
+        "📅 *Deadline commands*\n\n"
+        "D1 PAYE 2026-05-29 7 - create reminder\n"
+        "D2 - view my reminders\n"
+        "D3 1 - delete reminder number 1 from D2 list\n"
+        "D4 1 14 - set reminder number 1 to 14 days before\n\n"
+        "Paid users can create and manage custom deadline reminders. Free users can still view general tax guidance."
+    )
+
+
+def _quiz_usage_text() -> str:
+    return (
+        "🧠 *Tax Quiz Centre*\n\n"
+        "Q1 - start a quiz\n"
+        "Q2 - choose category\n"
+        "Q3 - view score\n"
+        "Q4 - review last answer\n"
+        "Q5 - AI explanation for last quiz answer\n\n"
+        "Reply A, B, C, or D after a question. Free users get 12 non-AI quiz attempts daily. Paid users get unlimited non-AI quiz attempts."
+    )
+
+
+def _extract_choice_letter(text: Any) -> str:
+    value = _lower(text)
+    match = re.search(r"\b([abcd])\b", value)
+    return match.group(1).upper() if match else ""
+
+
+def _quiz_attempts_for_today(data: Dict[str, Any]) -> int:
+    usage = data.get("quiz_usage")
+    if not isinstance(usage, dict):
+        return 0
+    if usage.get("date") != _today_key():
+        return 0
+    return int(usage.get("attempts") or 0)
+
+
+def _increment_quiz_attempts(wa_id: str) -> int:
+    state = _get_session_state(wa_id)
+    data = _session_data(state)
+    usage = data.get("quiz_usage") if isinstance(data.get("quiz_usage"), dict) else {}
+    today = _today_key()
+    if usage.get("date") != today:
+        usage = {"date": today, "attempts": 0}
+    usage["attempts"] = int(usage.get("attempts") or 0) + 1
+    data["quiz_usage"] = usage
+    _set_session_state(
+        wa_id,
+        context=_clean((state or {}).get("context")) or "main",
+        pending_action=_clean((state or {}).get("pending_action")) or "",
+        data=data,
+    )
+    return int(usage["attempts"])
+
+
+def _deadline_display_line(item: Dict[str, Any], index: int) -> str:
+    tax_type = _clean(item.get("tax_type") or "Tax").upper()
+    due = _clean(item.get("due_date") or "No date")
+    days = item.get("reminder_days_before")
+    enabled = item.get("enabled", True)
+    status = "✅" if enabled else "⏸️"
+    try:
+        days_text = f"{int(days)} days before"
+    except Exception:
+        days_text = "default reminder"
+    return f"{index}. {status} {tax_type} — {due} ({days_text})"
+
+
+def _get_deadline_list(account_id: str, limit: int = 10) -> List[Dict[str, Any]]:
+    rows = _safe_get(
+        "tax_deadlines",
+        params={
+            "select": "*",
+            "account_id": f"eq.{account_id}",
+            "order": "created_at.desc",
+            "limit": str(limit),
+        },
+    )
+    return rows if isinstance(rows, list) else []
+
+
+def _deadline_by_index(account_id: str, index: int) -> Optional[Dict[str, Any]]:
+    rows = _get_deadline_list(account_id, limit=10)
+    if index < 1 or index > len(rows):
+        return None
+    return rows[index - 1]
+
+
+
+
+def _supabase_delete(table: str, params: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    url = f"{_supabase_url().rstrip('/')}/rest/v1/{table}"
+    response = requests.delete(url, headers=_supabase_headers(prefer="return=representation"), params=params or {}, timeout=25)
+    try:
+        data = response.json() if response.text else []
+    except Exception:
+        data = response.text
+    return {"ok": response.status_code < 400, "status_code": response.status_code, "data": data}
+
+
 def _query_one(table: str, select_cols: str = "*", **eq_filters: Any) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     try:
         q = _sb().table(table).select(select_cols)
@@ -507,6 +635,18 @@ def _safe_insert(table: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": True, "data": getattr(res, "data", None)}
     except Exception as exc:
         return {"ok": False, "error": f"{table}: {type(exc).__name__}: {_clip(exc)}"}
+
+
+
+def _safe_delete(table: str, **filters: Any) -> Dict[str, Any]:
+    try:
+        params = {}
+        for key, value in filters.items():
+            if value is not None and _clean(value):
+                params[key] = f"eq.{_clean(value)}"
+        return _supabase_delete(table, params=params)
+    except Exception as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {str(exc)[:500]}"}
 
 
 def _safe_update(table: str, payload: Dict[str, Any], **eq_filters: Any) -> Dict[str, Any]:
@@ -2175,6 +2315,141 @@ def _handle_topup_selection(wa_id: str, account: Dict[str, Any], account_id: str
 
 
 
+
+def _handle_deadline_delete_v10(wa_id: str, account_id: str, text: str) -> Dict[str, Any]:
+    if not _deadline_allowed_for_account(account_id):
+        body = (
+            "🔒 Custom deadline management is available on paid plans.\n\n"
+            "Reply 4 to view plans, or D2 to view any existing reminders."
+        )
+        return {"ok": True, "handled": "deadline_delete_blocked", "send_result": _send_whatsapp_text(wa_id, body)}
+
+    match = re.search(r"\bD3\s+(\d{1,2})\b", _clean(text), flags=re.I)
+    if not match:
+        return {"ok": True, "handled": "deadline_delete_help", "send_result": _send_whatsapp_text(wa_id, "🗑️ To delete a reminder, reply like this:\n\nD3 1\n\nUse D2 first to see your reminder numbers.")}
+
+    idx = int(match.group(1))
+    item = _deadline_by_index(account_id, idx)
+    if not item:
+        return {"ok": True, "handled": "deadline_delete_not_found", "send_result": _send_whatsapp_text(wa_id, "I could not find that reminder number. Reply D2 to view your current reminders.")}
+
+    deadline_id = _clean(item.get("id"))
+    if not deadline_id:
+        return {"ok": True, "handled": "deadline_delete_missing_id", "send_result": _send_whatsapp_text(wa_id, "I found the reminder, but it has no valid ID. Please try D2 again or contact support.")}
+
+    result = _safe_delete("tax_deadlines", id=deadline_id)
+    body = (
+        "🗑️ *Deadline reminder deleted*\n\n"
+        f"{_deadline_display_line(item, idx)}\n\n"
+        "Reply D2 to view remaining reminders."
+    )
+    return {"ok": True, "handled": "deadline_deleted", "send_result": _send_whatsapp_text(wa_id, body), "delete_result": result if _debug_enabled() else None}
+
+
+def _handle_deadline_settings_v10(wa_id: str, account_id: str, text: str) -> Dict[str, Any]:
+    if not _deadline_allowed_for_account(account_id):
+        body = (
+            "🔒 Custom reminder settings are available on paid plans.\n\n"
+            "Reply 4 to view plans, or D2 to view any existing reminders."
+        )
+        return {"ok": True, "handled": "deadline_settings_blocked", "send_result": _send_whatsapp_text(wa_id, body)}
+
+    match = re.search(r"\bD4\s+(\d{1,2})\s+(\d{1,3})\b", _clean(text), flags=re.I)
+    if not match:
+        return {
+            "ok": True,
+            "handled": "deadline_settings_help",
+            "send_result": _send_whatsapp_text(
+                wa_id,
+                "⚙️ To update reminder days, reply like this:\n\nD4 1 14\n\nThis means: set reminder number 1 to remind you 14 days before due date. Use D2 first to see your reminder numbers.",
+            ),
+        }
+
+    idx = int(match.group(1))
+    days = max(0, min(365, int(match.group(2))))
+    item = _deadline_by_index(account_id, idx)
+    if not item:
+        return {"ok": True, "handled": "deadline_settings_not_found", "send_result": _send_whatsapp_text(wa_id, "I could not find that reminder number. Reply D2 to view your current reminders.")}
+
+    deadline_id = _clean(item.get("id"))
+    payload = {"reminder_days_before": days, "updated_at": _now_iso()}
+    result = _safe_update("tax_deadlines", payload, id=deadline_id)
+
+    item = dict(item)
+    item["reminder_days_before"] = days
+    body = (
+        "⚙️ *Reminder updated*\n\n"
+        f"{_deadline_display_line(item, idx)}\n\n"
+        "Reply D2 to view all reminders."
+    )
+    return {"ok": True, "handled": "deadline_settings_updated", "send_result": _send_whatsapp_text(wa_id, body), "update_result": result if _debug_enabled() else None}
+
+
+def _handle_quiz_answer_v10(wa_id: str, account_id: str, text: str) -> Optional[Dict[str, Any]]:
+    choice = _extract_choice_letter(text)
+    if not choice:
+        return None
+
+    state = _get_session_state(wa_id)
+    data = _session_data(state)
+    active = data.get("active_quiz") if isinstance(data.get("active_quiz"), dict) else None
+    if not active:
+        return None
+
+    paid = _is_active_paid_subscription(account_id)
+    if not paid:
+        attempts = _quiz_attempts_for_today(data)
+        if attempts >= 12:
+            return {
+                "ok": True,
+                "handled": "quiz_free_limit",
+                "send_result": _send_whatsapp_text(
+                    wa_id,
+                    "🔒 You have used your 12 free non-AI quiz attempts for today.\n\nPaid plans include unlimited non-AI quiz attempts. Reply 4 to view plans.",
+                ),
+            }
+
+    correct = _clean(active.get("answer") or active.get("correct") or active.get("correct_answer")).upper()[:1]
+    if correct not in {"A", "B", "C", "D"}:
+        correct = "A"
+
+    attempts_after = _increment_quiz_attempts(wa_id)
+
+    state = _get_session_state(wa_id)
+    data = _session_data(state)
+    score = data.get("quiz_score") if isinstance(data.get("quiz_score"), dict) else {"correct": 0, "total": 0}
+    score["total"] = int(score.get("total") or 0) + 1
+    if choice == correct:
+        score["correct"] = int(score.get("correct") or 0) + 1
+
+    last_quiz = {
+        "question": active.get("question"),
+        "selected": choice,
+        "correct": correct,
+        "is_correct": choice == correct,
+        "explanation": active.get("explanation") or active.get("note") or "",
+        "category": active.get("category") or "General",
+    }
+    data["quiz_score"] = score
+    data["last_quiz"] = last_quiz
+    data["active_quiz"] = None
+
+    _set_session_state(wa_id, context="main", pending_action="", data=data)
+
+    verdict = "✅ Correct!" if choice == correct else f"❌ Not correct. Correct answer: {correct}"
+    attempts_text = "Unlimited on paid plan" if paid else str(attempts_after)
+    body = (
+        f"🧠 *Quiz Result*\n\n"
+        f"Your answer: {choice}\n"
+        f"{verdict}\n\n"
+        f"Score: {score['correct']}/{score['total']}\n"
+        f"Today's free attempts used: {attempts_text}\n\n"
+        "Reply Q1 for another quiz, Q4 to review last answer, or Q5 for AI explanation."
+    )
+    return {"ok": True, "handled": "quiz_answer", "send_result": _send_whatsapp_text(wa_id, body)}
+
+
+
 def _handle_text_message(msg: Dict[str, Any]) -> Dict[str, Any]:
     wa_id = _normalize_phone(msg.get("wa_id"))
     text = _clean(msg.get("text"))
@@ -2248,6 +2523,50 @@ def _handle_text_message(msg: Dict[str, Any]) -> Dict[str, Any]:
 
     if context == "quiz_answer":
         return _handle_quiz_answer(wa_id, account_id, text, state)
+
+    
+    # v10: handle quiz answers and deadline management before link-code/AI fallback.
+    quiz_answer_result = _handle_quiz_answer_v10(wa_id, account_id, text)
+    if quiz_answer_result:
+        return quiz_answer_result
+
+    upper_text = _clean(text).upper()
+    if re.match(r"^D3\b", upper_text):
+        return _handle_deadline_delete_v10(wa_id, account_id, text)
+
+    if re.match(r"^D4\b", upper_text):
+        return _handle_deadline_settings_v10(wa_id, account_id, text)
+
+    # v10: dedicated quiz utility commands.
+    if re.match(r"^Q3\b", upper_text):
+        state = _get_session_state(wa_id)
+        data = _session_data(state)
+        score = data.get("quiz_score") if isinstance(data.get("quiz_score"), dict) else {"correct": 0, "total": 0}
+        body = (
+            "📊 *Your Quiz Score*\n\n"
+            f"Correct: {int(score.get('correct') or 0)}\n"
+            f"Total attempts: {int(score.get('total') or 0)}\n\n"
+            "Reply Q1 for a new quiz or Q4 to review your last answer."
+        )
+        return {"ok": True, "handled": "quiz_score", "send_result": _send_whatsapp_text(wa_id, body)}
+
+    if re.match(r"^Q4\b", upper_text):
+        state = _get_session_state(wa_id)
+        data = _session_data(state)
+        last = data.get("last_quiz") if isinstance(data.get("last_quiz"), dict) else None
+        if not last:
+            return {"ok": True, "handled": "quiz_review_empty", "send_result": _send_whatsapp_text(wa_id, "📌 No quiz answer to review yet. Reply Q1 to start a quiz.")}
+        status = "✅ Correct" if last.get("is_correct") else "❌ Not correct"
+        body = (
+            "📌 *Last Quiz Review*\n\n"
+            f"Question: {_clean(last.get('question'))}\n"
+            f"Your answer: {_clean(last.get('selected'))}\n"
+            f"Correct answer: {_clean(last.get('correct'))}\n"
+            f"Status: {status}\n\n"
+            "Reply Q5 if you want an AI explanation."
+        )
+        return {"ok": True, "handled": "quiz_review", "send_result": _send_whatsapp_text(wa_id, body)}
+
 
     payment_reference = _extract_payment_reference(text)
     if payment_reference:
