@@ -22,7 +22,7 @@ except Exception:  # pragma: no cover
 
 bp = Blueprint("whatsapp", __name__)
 
-WHATSAPP_FLOW_VERSION = "2026-05-19-v15-quiz-completion-polish"
+WHATSAPP_FLOW_VERSION = "2026-05-19-v16-q5-paid-short-ai"
 
 
 # =============================================================================
@@ -2031,10 +2031,10 @@ def _quiz_text() -> str:
         "Q2 - Choose category\n"
         "Q3 - Today's score\n"
         "Q4 - Review last answer\n"
-        "Q5 - AI explanation for last answer 💎\n\n"
+        "Q5 - Short AI explanation for last answer 💎\n\n"
         f"Free users: {QUIZ_FREE_DAILY_LIMIT} non-AI quiz attempts daily.\n"
         "Paid users: unlimited non-AI quiz attempts.\n"
-        "Only Q5 uses AI/Usage Credits."
+        "Only Q5 uses AI and costs 1 Usage Credit."
     )
 
 
@@ -2046,7 +2046,7 @@ def _quiz_rules_text() -> str:
         "✅ Paid users get unlimited non-AI quiz attempts.\n"
         "✅ Reply A, B, C, or D to answer.\n"
         "✅ Reply Q2 to choose a category.\n"
-        "💎 Q5 uses AI/Usage Credits only when you ask for deeper explanation.\n\n"
+        "💎 Q5 costs 1 Usage Credit and returns a short AI explanation only.\n\n"
         "Reply Q1 to start or 0 for main menu."
     )
 
@@ -2330,29 +2330,68 @@ def _handle_quiz_command(wa_id: str, account_id: str, text: str, state: Dict[str
         explanation = _clean((last or {}).get("explanation") or data.get("last_quiz_explain"))
 
         if not question:
-            return {"ok": True, "handled": "quiz_ai_no_context", "send_result": _send_whatsapp_text(wa_id, "No last quiz question found yet. Reply Q1 to start a quiz first.")}
+            return {
+                "ok": True,
+                "handled": "quiz_ai_no_context",
+                "send_result": _send_whatsapp_text(
+                    wa_id,
+                    "No last quiz question found yet. Reply Q1 to start a quiz first."
+                ),
+            }
+
+        # v16: Q5 is never free. It requires an active paid plan and must deduct Usage Credits.
+        if not _is_active_paid_subscription(account_id):
+            body = (
+                "🔒 *Q5 AI Explanation is a paid feature*\\n\\n"
+                "Q1–Q4 remain free/non-AI according to your plan limits.\\n"
+                "Q5 uses AI and costs 1 Usage Credit because it calls the AI explanation engine.\\n\\n"
+                "Reply 4 to view plans or Q4 to review the normal non-AI explanation."
+            )
+            return {"ok": True, "handled": "quiz_ai_paid_required", "send_result": _send_whatsapp_text(wa_id, body)}
 
         result = ask_guarded({
             "account_id": account_id,
             "question": (
-                "Explain this Nigerian tax quiz answer in simple, beginner-friendly terms. "
-                f"Question: {question}. Correct option: {correct}. Base explanation: {explanation}. "
-                "Keep it practical and concise."
+                "Give a very short Nigerian tax quiz explanation in 2 to 4 simple bullet points only. "
+                "Maximum 90 words. Do not add long disclaimers. "
+                f"Question: {question}. Correct option: {correct}. Base explanation: {explanation}."
             ),
             "lang": "en",
             "channel": "whatsapp",
             "provider": "wa",
             "provider_user_id": wa_id,
             "action_code": "quiz_ai_explanation",
+            "credits_required": 1,
+            "force_usage_charge": True,
+            "max_words": 90,
+            "max_output_tokens": 180,
         })
+
         answer = _clean(result.get("answer") or result.get("message") or "I could not generate the explanation right now.")
+        answer = _clip(answer, 700)
+
         meta = result.get("meta") if isinstance(result, dict) and isinstance(result.get("meta"), dict) else {}
-        credit_note = ""
-        if meta.get("usage_charged") is True:
-            credit_note = f"\n\n💎 Credit used: {meta.get('credits_consumed') or 1}. Balance: {meta.get('credits_left', 'not shown')}."
-        elif meta.get("usage_charged") is False:
-            credit_note = "\n\n💎 Credit charged: No."
-        return {"ok": True, "handled": "quiz_ai_explanation", "send_result": _send_whatsapp_text(wa_id, _clip("💡 *AI Quiz Explanation*\n\n" + answer + credit_note + "\n\nReply Q1 for another quiz or 0 for menu.", 3900))}
+        usage_charged = meta.get("usage_charged")
+        credits_consumed = meta.get("credits_consumed") or 1
+        credits_left = meta.get("credits_left", "not shown")
+
+        # Safety: if the AI call did not charge usage, do not present it as free.
+        if usage_charged is False:
+            body = (
+                "⚠️ *Q5 could not be charged*\\n\\n"
+                "Q5 is not free because it uses AI. Please check your Usage Credits or try again later.\\n\\n"
+                "Reply 2 to check balance, 6 to buy add-ons, or Q4 for the normal non-AI review."
+            )
+            return {"ok": True, "handled": "quiz_ai_not_charged_blocked", "send_result": _send_whatsapp_text(wa_id, body)}
+
+        credit_note = f"\\n\\n💎 Usage Credit deducted: {credits_consumed}\\nBalance: {credits_left}"
+        body = (
+            "💡 *Q5 Short AI Explanation*\\n\\n"
+            f"{answer}"
+            f"{credit_note}\\n\\n"
+            "Reply Q1 for another quiz, Q3 for score, or 0 for menu."
+        )
+        return {"ok": True, "handled": "quiz_ai_explanation_paid_short", "send_result": _send_whatsapp_text(wa_id, _clip(body, 1300))}
 
     return {"ok": True, "handled": "quiz_menu", "send_result": _send_whatsapp_text(wa_id, _quiz_text())}
 
