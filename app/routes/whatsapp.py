@@ -22,7 +22,7 @@ except Exception:  # pragma: no cover
 
 bp = Blueprint("whatsapp", __name__)
 
-WHATSAPP_FLOW_VERSION = "2026-05-19-v14-deadline-delete-time-mode"
+WHATSAPP_FLOW_VERSION = "2026-05-19-v15-quiz-completion-polish"
 
 
 # =============================================================================
@@ -288,12 +288,60 @@ QUIZ_BANK: List[Dict[str, Any]] = [
         "explain": "PAYE means Pay-As-You-Earn. Employers deduct it from employee salaries and remit it to the relevant State Internal Revenue Service.",
     },
     {
+        "id": "q_paye_2",
+        "category": "PAYE",
+        "question": "Who usually remits PAYE after deducting it from employees' salaries?",
+        "options": {"A": "The employee's landlord", "B": "The employer", "C": "The bank cashier", "D": "The customer"},
+        "answer": "B",
+        "explain": "The employer deducts PAYE from salary and remits it to the relevant State Internal Revenue Service.",
+    },
+    {
+        "id": "q_paye_3",
+        "category": "PAYE",
+        "question": "PAYE is mainly connected to which type of income?",
+        "options": {"A": "Salary and employment income", "B": "Imported goods only", "C": "Company share capital", "D": "Bank transfer charges"},
+        "answer": "A",
+        "explain": "PAYE applies to salary or employment income earned by individuals.",
+    },
+    {
+        "id": "q_paye_4",
+        "category": "PAYE",
+        "question": "If a company owner earns salary from the company, what tax may apply to that salary?",
+        "options": {"A": "PAYE / Personal Income Tax", "B": "Only Company Income Tax", "C": "Import Duty", "D": "No tax ever"},
+        "answer": "A",
+        "explain": "Company tax and personal income tax are separate. Salary paid to the owner can still be subject to PAYE/PIT.",
+    },
+    {
         "id": "q_vat_1",
         "category": "VAT",
         "question": "What is the common standard VAT rate used in Nigeria for many VATable supplies?",
         "options": {"A": "2.5%", "B": "5%", "C": "7.5%", "D": "30%"},
         "answer": "C",
         "explain": "The commonly applied standard VAT rate is 7.5%, subject to current law and transaction-specific exemptions.",
+    },
+    {
+        "id": "q_vat_2",
+        "category": "VAT",
+        "question": "VAT is generally charged on what?",
+        "options": {"A": "Taxable supply of goods and services", "B": "Employee age", "C": "Company logo", "D": "Only rent receipts"},
+        "answer": "A",
+        "explain": "VAT is charged on taxable supplies of goods and services unless the item is exempt or zero-rated.",
+    },
+    {
+        "id": "q_vat_3",
+        "category": "VAT",
+        "question": "Which agency is mainly responsible for VAT administration in Nigeria?",
+        "options": {"A": "FIRS", "B": "FRSC", "C": "NIMC", "D": "INEC"},
+        "answer": "A",
+        "explain": "VAT is generally administered by the Federal Inland Revenue Service (FIRS).",
+    },
+    {
+        "id": "q_vat_4",
+        "category": "VAT",
+        "question": "Input VAT usually refers to VAT on what?",
+        "options": {"A": "Eligible purchases", "B": "Employee birthdays", "C": "Company name reservation", "D": "Social media followers"},
+        "answer": "A",
+        "explain": "Input VAT is VAT paid on eligible business purchases, which may be offset against output VAT where allowed.",
     },
     {
         "id": "q_cit_1",
@@ -304,6 +352,30 @@ QUIZ_BANK: List[Dict[str, Any]] = [
         "explain": "Company Income Tax is charged on taxable profit after allowable deductions and adjustments, not directly on employee salary.",
     },
     {
+        "id": "q_cit_2",
+        "category": "Company Tax",
+        "question": "Which body mainly administers Company Income Tax in Nigeria?",
+        "options": {"A": "FIRS", "B": "State traffic agency", "C": "Local electricity vendor", "D": "Company receptionist"},
+        "answer": "A",
+        "explain": "Company Income Tax is generally administered by the Federal Inland Revenue Service (FIRS).",
+    },
+    {
+        "id": "q_cit_3",
+        "category": "Company Tax",
+        "question": "For company tax purposes, salary paid to staff is generally treated as what?",
+        "options": {"A": "An expense, if properly documented and allowable", "B": "A shareholder gift only", "C": "VAT output only", "D": "Import duty"},
+        "answer": "A",
+        "explain": "Employee salaries are normally business expenses if properly incurred, documented, and allowable under tax rules.",
+    },
+    {
+        "id": "q_cit_4",
+        "category": "Company Tax",
+        "question": "A company should keep which document for tax filing support?",
+        "options": {"A": "Financial statements and records", "B": "Only staff nicknames", "C": "Only social media posts", "D": "Only office paint color"},
+        "answer": "A",
+        "explain": "Financial statements, accounting records, receipts, invoices, and supporting schedules help support company tax filings.",
+    },
+    {
         "id": "q_wht_1",
         "category": "WHT",
         "question": "Withholding Tax is usually deducted at what point?",
@@ -311,9 +383,66 @@ QUIZ_BANK: List[Dict[str, Any]] = [
         "answer": "A",
         "explain": "WHT is commonly deducted at payment point where the transaction is subject to withholding tax.",
     },
+    {
+        "id": "q_wht_2",
+        "category": "WHT",
+        "question": "WHT deducted from a supplier is generally treated as what for that supplier?",
+        "options": {"A": "A tax credit where applicable", "B": "A birthday gift", "C": "A bank loan", "D": "A visa fee"},
+        "answer": "A",
+        "explain": "Withholding Tax may serve as a credit against the supplier's final tax liability where applicable.",
+    },
+    {
+        "id": "q_wht_3",
+        "category": "WHT",
+        "question": "Before deducting WHT, what should a business confirm?",
+        "options": {"A": "Whether the transaction is subject to WHT and the correct rate", "B": "The supplier's favorite food", "C": "The color of the invoice", "D": "The customer's shoe size"},
+        "answer": "A",
+        "explain": "WHT depends on the transaction type, parties involved, and applicable rate, so these should be confirmed.",
+    },
+    {
+        "id": "q_deadline_1",
+        "category": "Deadlines",
+        "question": "Why should a business track tax filing deadlines?",
+        "options": {"A": "To avoid late filing penalties and interest", "B": "To increase office rent", "C": "To change phone wallpaper", "D": "To avoid keeping records"},
+        "answer": "A",
+        "explain": "Tracking deadlines helps avoid penalties, interest, and compliance problems.",
+    },
+    {
+        "id": "q_deadline_2",
+        "category": "Deadlines",
+        "question": "If a reminder date has already passed, what should the system do?",
+        "options": {"A": "Reject it or suggest a valid reminder period", "B": "Accept it silently", "C": "Delete all reminders", "D": "Charge VAT automatically"},
+        "answer": "A",
+        "explain": "A reminder should only be accepted if the reminder date can still occur in the future or today.",
+    },
+    {
+        "id": "q_records_1",
+        "category": "Records",
+        "question": "Which records are useful for tax compliance?",
+        "options": {"A": "Invoices, receipts, payroll, bank statements, and filings", "B": "Only WhatsApp stickers", "C": "Only office chairs", "D": "Only passwords"},
+        "answer": "A",
+        "explain": "Proper records help support tax calculations, filings, audits, and dispute resolution.",
+    },
+    {
+        "id": "q_records_2",
+        "category": "Records",
+        "question": "Why should a business keep PAYE records?",
+        "options": {"A": "To prove salary payments and tax deductions", "B": "To decorate the office", "C": "To replace CAC documents", "D": "To avoid all tax duties"},
+        "answer": "A",
+        "explain": "PAYE records help show salaries paid, deductions made, and remittances to the relevant tax authority.",
+    },
+    {
+        "id": "q_general_1",
+        "category": "General",
+        "question": "Which statement is most correct?",
+        "options": {"A": "Different taxes may apply to different income or transaction types", "B": "One tax covers everything forever", "C": "VAT is always personal income tax", "D": "PAYE is import duty"},
+        "answer": "A",
+        "explain": "Different taxes apply to different bases, such as salaries, company profits, taxable supplies, or specific transactions.",
+    },
 ]
 
 QUIZ_FREE_DAILY_LIMIT = 12
+
 
 
 # =============================================================================
@@ -1893,13 +2022,17 @@ def _salary_compare(text: str) -> str:
 
 def _quiz_text() -> str:
     return (
-        "🎯 *Tax Quiz Centre*\n\n"
-        "Q1 - Start non-AI quiz\n"
+        "🧠 *Tax Quiz Centre*\n\n"
+        "Q1 - Start mixed quiz\n"
+        "Q1 PAYE - Start PAYE quiz\n"
+        "Q1 VAT - Start VAT quiz\n"
+        "Q1 CIT - Start Company Tax quiz\n"
+        "Q1 WHT - Start WHT quiz\n"
         "Q2 - Choose category\n"
-        "Q3 - Check today's score\n"
-        "Q4 - Review last wrong answer\n"
-        "Q5 - AI explanation for last quiz answer 💎\n\n"
-        "Free users: 12 non-AI quiz attempts daily.\n"
+        "Q3 - Today's score\n"
+        "Q4 - Review last answer\n"
+        "Q5 - AI explanation for last answer 💎\n\n"
+        f"Free users: {QUIZ_FREE_DAILY_LIMIT} non-AI quiz attempts daily.\n"
         "Paid users: unlimited non-AI quiz attempts.\n"
         "Only Q5 uses AI/Usage Credits."
     )
@@ -1907,47 +2040,76 @@ def _quiz_text() -> str:
 
 def _quiz_rules_text() -> str:
     return (
-        "🎯 *Quiz Rules*\n\n"
-        "• Non-AI quiz questions do not consume Usage Credits. ✅\n"
-        "• Free users get 12 attempts daily.\n"
-        "• Paid users get unlimited non-AI quiz attempts.\n"
-        "• Reply A, B, C, or D to answer.\n"
-        "• Reply Q2 to choose a category.\n"
-        "• Reply Q5 for AI explanation of the last quiz answer. 💎\n\n"
-        "Reply 0 for main menu."
+        "🧠 *Quiz Rules*\n\n"
+        "✅ Q1 non-AI quiz questions do not consume Usage Credits.\n"
+        f"✅ Free users get {QUIZ_FREE_DAILY_LIMIT} attempts daily.\n"
+        "✅ Paid users get unlimited non-AI quiz attempts.\n"
+        "✅ Reply A, B, C, or D to answer.\n"
+        "✅ Reply Q2 to choose a category.\n"
+        "💎 Q5 uses AI/Usage Credits only when you ask for deeper explanation.\n\n"
+        "Reply Q1 to start or 0 for main menu."
     )
 
 
+def _quiz_categories() -> List[str]:
+    preferred = ["PAYE", "VAT", "Company Tax", "WHT", "Deadlines", "Records", "General"]
+    available = {str(q.get("category") or "General") for q in QUIZ_BANK}
+    ordered = [cat for cat in preferred if cat in available]
+    ordered.extend(sorted(available.difference(set(ordered))))
+    return ordered
+
+
 def _quiz_category_menu() -> str:
-    categories = sorted({str(q.get("category") or "General") for q in QUIZ_BANK})
-    lines = ["🎯 *Choose Quiz Category*", ""]
+    categories = _quiz_categories()
+    lines = ["🧠 *Choose Quiz Category*", ""]
     for index, category in enumerate(categories, start=1):
-        lines.append(f"Q2 {index} - {category}")
-    lines.extend(["", "You can also type: Q1 PAYE, Q1 VAT, Q1 CIT, or Q1 WHT."])
+        code = "CIT" if category == "Company Tax" else category.upper().replace(" ", "")
+        lines.append(f"Q2 {index} - {category}  |  Q1 {code}")
+    lines.extend([
+        "",
+        "Examples:",
+        "Q1 PAYE",
+        "Q1 VAT",
+        "Q1 CIT",
+        "Q1 WHT",
+        "",
+        "Reply 0 for main menu.",
+    ])
     return "\n".join(lines)
 
 
 def _resolve_quiz_category(text: str) -> str:
     norm = _normalize_text(text)
-    categories = sorted({str(q.get("category") or "General") for q in QUIZ_BANK})
-    if norm in {"q1", "quiz", "start quiz", "tax quiz"}:
+    categories = _quiz_categories()
+
+    if norm in {"q1", "quiz", "start quiz", "tax quiz", "q2", "category", "quiz categories"}:
         return ""
-    if "paye" in norm or "salary" in norm:
+
+    if re.search(r"\\b(paye|salary|personal income|pit)\\b", norm):
         return "PAYE"
-    if "vat" in norm:
+    if re.search(r"\\bvat\\b", norm):
         return "VAT"
-    if "cit" in norm or "company" in norm:
+    if re.search(r"\\b(cit|company tax|company income tax|companies income tax|company)\\b", norm):
         return "Company Tax"
-    if "wht" in norm or "withholding" in norm:
+    if re.search(r"\\b(wht|withholding|withholding tax)\\b", norm):
         return "WHT"
-    m = re.search(r"q[12]\s+(\d+)", norm)
+    if re.search(r"\\b(deadline|deadlines|calendar|reminder)\\b", norm):
+        return "Deadlines"
+    if re.search(r"\\b(record|records|receipt|invoice|payroll)\\b", norm):
+        return "Records"
+    if re.search(r"\\b(general|mixed|all)\\b", norm):
+        return ""
+
+    m = re.search(r"q[12]\\s+(\\d+)", norm)
     if m:
         idx = int(m.group(1)) - 1
         if 0 <= idx < len(categories):
             return categories[idx]
+
     for cat in categories:
         if _normalize_text(cat) in norm:
             return cat
+
     return ""
 
 
@@ -1962,6 +2124,38 @@ def _quiz_attempt_info(state: Dict[str, Any]) -> Tuple[str, int]:
     return today, 0
 
 
+def _quiz_daily_numbers(data: Dict[str, Any]) -> Dict[str, int]:
+    today = datetime.now(timezone.utc).date().isoformat()
+    if data.get("quiz_date") != today:
+        return {"attempts": 0, "correct": 0, "wrong": 0}
+    return {
+        "attempts": int(data.get("quiz_attempts") or 0),
+        "correct": int(data.get("quiz_correct_count") or 0),
+        "wrong": int(data.get("quiz_wrong_count") or 0),
+    }
+
+
+def _select_quiz_question(pool: List[Dict[str, Any]], data: Dict[str, Any], category: str, attempts: int) -> Dict[str, Any]:
+    if not pool:
+        pool = QUIZ_BANK
+
+    seen_key = "quiz_seen_ids_" + (_normalize_text(category or "mixed").replace(" ", "_") or "mixed")
+    seen = data.get(seen_key)
+    if not isinstance(seen, list):
+        seen = []
+
+    available = [q for q in pool if q.get("id") not in set(seen)]
+    if not available:
+        seen = []
+        available = pool
+
+    index = attempts % len(available)
+    quiz = available[index]
+    seen.append(quiz.get("id"))
+    data[seen_key] = seen[-50:]
+    return quiz
+
+
 def _start_quiz(wa_id: str, account_id: str, state: Optional[Dict[str, Any]] = None, category: str = "") -> Dict[str, Any]:
     state = state or _get_session_state(wa_id)
     today, attempts = _quiz_attempt_info(state)
@@ -1969,21 +2163,24 @@ def _start_quiz(wa_id: str, account_id: str, state: Optional[Dict[str, Any]] = N
 
     if not _is_active_paid_subscription(account_id) and attempts >= QUIZ_FREE_DAILY_LIMIT:
         body = (
-            "🎯 Daily quiz limit reached.\n\n"
+            "🔒 *Daily Quiz Limit Reached*\n\n"
             f"Free users can take {QUIZ_FREE_DAILY_LIMIT} non-AI quiz attempts daily.\n"
-            "Reply 4 to upgrade for unlimited non-AI quiz attempts, or reply 0 for main menu."
+            "Paid users get unlimited non-AI quiz attempts.\n\n"
+            "Reply 4 to view plans, Q3 to see score, or 0 for main menu."
         )
         return {"ok": True, "handled": "quiz_limit", "send_result": _send_whatsapp_text(wa_id, body)}
 
+    category = _resolve_quiz_category(category or "")
     pool = [q for q in QUIZ_BANK if not category or _normalize_text(q.get("category")) == _normalize_text(category)]
     if not pool:
         pool = QUIZ_BANK
         category = ""
 
-    index = attempts % len(pool)
-    quiz = pool[index]
+    working_data = dict(old_data)
+    quiz = _select_quiz_question(pool, working_data, category, attempts)
+
     data = {
-        **old_data,
+        **working_data,
         "quiz_date": today,
         "quiz_attempts": attempts,
         "quiz_id": quiz["id"],
@@ -1992,14 +2189,17 @@ def _start_quiz(wa_id: str, account_id: str, state: Optional[Dict[str, Any]] = N
         "quiz_options": quiz.get("options"),
         "correct": quiz["answer"],
         "explain": quiz["explain"],
+        "active_quiz_started_at": _now_iso(),
     }
     _set_session_state(wa_id, "quiz_answer", "tax_quiz", data)
 
-    options = "\n".join([f"{key} - {value}" for key, value in quiz["options"].items()])
+    options = "\n".join([f"{key}. {value}" for key, value in quiz["options"].items()])
+    remaining = "Unlimited" if _is_active_paid_subscription(account_id) else str(max(0, QUIZ_FREE_DAILY_LIMIT - attempts))
     body = (
-        f"🎯 *Tax Quiz* ({quiz['category']})\n\n"
+        f"🧠 *Tax Quiz* ({quiz['category']})\n\n"
         f"Question {attempts + 1}: {quiz['question']}\n\n"
         f"{options}\n\n"
+        f"Remaining today: {remaining}\n\n"
         "Reply A, B, C, or D.\n"
         "Reply CANCEL to stop."
     )
@@ -2008,6 +2208,10 @@ def _start_quiz(wa_id: str, account_id: str, state: Optional[Dict[str, Any]] = N
 
 def _handle_quiz_answer(wa_id: str, account_id: str, text: str, state: Dict[str, Any]) -> Dict[str, Any]:
     answer = _normalize_text(text).upper()
+    if answer in {"CANCEL", "STOP", "END"}:
+        _set_session_state(wa_id, "main", "", state.get("data") if isinstance(state.get("data"), dict) else {})
+        return {"ok": True, "handled": "quiz_cancelled", "send_result": _send_whatsapp_text(wa_id, "Quiz cancelled.\n\nReply Q1 to start again or 0 for menu.")}
+
     if answer not in {"A", "B", "C", "D"}:
         return {
             "ok": True,
@@ -2017,6 +2221,9 @@ def _handle_quiz_answer(wa_id: str, account_id: str, text: str, state: Dict[str,
 
     data = state.get("data") if isinstance(state.get("data"), dict) else {}
     correct = _clean(data.get("correct")).upper()
+    if correct not in {"A", "B", "C", "D"}:
+        correct = "A"
+
     today, attempts = _quiz_attempt_info(state)
     attempts += 1
 
@@ -2026,12 +2233,25 @@ def _handle_quiz_answer(wa_id: str, account_id: str, text: str, state: Dict[str,
     verdict = "✅ Correct!" if passed else f"❌ Not correct. Correct answer: {correct}."
     explain = _clean(data.get("explain"))
 
+    last_quiz = {
+        "id": data.get("quiz_id"),
+        "category": data.get("quiz_category"),
+        "question": data.get("quiz_question"),
+        "options": data.get("quiz_options"),
+        "selected": answer,
+        "correct": correct,
+        "is_correct": passed,
+        "explanation": explain,
+        "answered_at": _now_iso(),
+    }
+
     new_data = {
         **data,
         "quiz_date": today,
         "quiz_attempts": attempts,
         "quiz_correct_count": correct_count,
         "quiz_wrong_count": wrong_count,
+        "last_quiz": last_quiz,
         "last_quiz_answer": answer,
         "last_quiz_correct": correct,
         "last_quiz_passed": passed,
@@ -2041,57 +2261,84 @@ def _handle_quiz_answer(wa_id: str, account_id: str, text: str, state: Dict[str,
 
     remaining = "Unlimited" if _is_active_paid_subscription(account_id) else str(max(0, QUIZ_FREE_DAILY_LIMIT - attempts))
     body = (
-        f"🎯 *Quiz Result*\n\n"
+        f"🧠 *Quiz Result*\n\n"
         f"{verdict}\n\n"
         f"Explanation: {explain}\n\n"
         f"Attempts today: {attempts}\n"
         f"Correct today: {correct_count}\n"
         f"Wrong today: {wrong_count}\n"
         f"Remaining today: {remaining}\n\n"
-        "Reply Q1 for another quiz, Q3 for score, Q5 for AI explanation, or 0 for main menu."
+        "Reply Q1 for another quiz, Q2 for categories, Q3 for score, Q4 to review, Q5 for AI explanation, or 0 for menu."
     )
     return {"ok": True, "handled": "quiz_answer", "send_result": _send_whatsapp_text(wa_id, body)}
 
 
 def _handle_quiz_command(wa_id: str, account_id: str, text: str, state: Dict[str, Any]) -> Dict[str, Any]:
     norm = _normalize_text(text)
-    if norm.startswith("q1") or norm in {"quiz", "start quiz", "tax quiz"}:
+
+    if norm.startswith("q1") or norm in {"quiz", "start quiz", "tax quiz", "quiz me", "take quiz"}:
         return _start_quiz(wa_id, account_id, state, _resolve_quiz_category(text))
+
     if norm.startswith("q2") or "category" in norm:
         category = _resolve_quiz_category(text)
         if category:
             return _start_quiz(wa_id, account_id, state, category)
         return {"ok": True, "handled": "quiz_categories", "send_result": _send_whatsapp_text(wa_id, _quiz_category_menu())}
+
     if norm.startswith("q3") or "score" in norm:
         data = state.get("data") if isinstance(state.get("data"), dict) else {}
-        today, attempts = _quiz_attempt_info(state)
-        correct = int(data.get("quiz_correct_count") or 0) if data.get("quiz_date") == today else 0
-        wrong = int(data.get("quiz_wrong_count") or 0) if data.get("quiz_date") == today else 0
-        remaining = "Unlimited" if _is_active_paid_subscription(account_id) else str(max(0, QUIZ_FREE_DAILY_LIMIT - attempts))
-        body = f"📊 *Today's Quiz Score*\n\nAttempts: {attempts}\nCorrect: {correct}\nWrong: {wrong}\nRemaining: {remaining}\n\nReply Q1 to continue."
+        numbers = _quiz_daily_numbers(data)
+        remaining = "Unlimited" if _is_active_paid_subscription(account_id) else str(max(0, QUIZ_FREE_DAILY_LIMIT - numbers["attempts"]))
+        accuracy = "0%" if numbers["attempts"] <= 0 else f"{round((numbers['correct'] / numbers['attempts']) * 100)}%"
+        body = (
+            "📊 *Today's Quiz Score*\n\n"
+            f"Attempts: {numbers['attempts']}\n"
+            f"Correct: {numbers['correct']}\n"
+            f"Wrong: {numbers['wrong']}\n"
+            f"Accuracy: {accuracy}\n"
+            f"Remaining: {remaining}\n\n"
+            "Reply Q1 to continue, Q2 to choose category, or 0 for menu."
+        )
         return {"ok": True, "handled": "quiz_score", "send_result": _send_whatsapp_text(wa_id, body)}
-    if norm.startswith("q4"):
+
+    if norm.startswith("q4") or "review" in norm:
         data = state.get("data") if isinstance(state.get("data"), dict) else {}
-        if data.get("last_quiz_passed") is False:
-            body = (
-                "📝 *Last Wrong Answer Review*\n\n"
-                f"Question: {data.get('quiz_question', 'Not shown')}\n"
-                f"Your answer: {data.get('last_quiz_answer', 'Not shown')}\n"
-                f"Correct answer: {data.get('last_quiz_correct', 'Not shown')}\n\n"
-                f"Why: {data.get('last_quiz_explain', 'Not shown')}\n\n"
-                "Reply Q1 for another quiz."
-            )
-        else:
-            body = "✅ No wrong answer stored for review yet. Reply Q1 to start a quiz."
-        return {"ok": True, "handled": "quiz_review", "send_result": _send_whatsapp_text(wa_id, body)}
-    if norm.startswith("q5"):
+        last = data.get("last_quiz") if isinstance(data.get("last_quiz"), dict) else None
+        if not last:
+            return {"ok": True, "handled": "quiz_review_empty", "send_result": _send_whatsapp_text(wa_id, "📌 No quiz answer to review yet. Reply Q1 to start a quiz.")}
+        status = "✅ Correct" if last.get("is_correct") else "❌ Not correct"
+        options = last.get("options") if isinstance(last.get("options"), dict) else {}
+        selected_text = options.get(last.get("selected"), "")
+        correct_text = options.get(last.get("correct"), "")
+        body = (
+            "📌 *Last Quiz Review*\n\n"
+            f"Category: {_clean(last.get('category')) or 'General'}\n"
+            f"Question: {_clean(last.get('question'))}\n\n"
+            f"Your answer: {_clean(last.get('selected'))}. {_clean(selected_text)}\n"
+            f"Correct answer: {_clean(last.get('correct'))}. {_clean(correct_text)}\n"
+            f"Status: {status}\n\n"
+            f"Why: {_clean(last.get('explanation'))}\n\n"
+            "Reply Q1 for another quiz or Q5 for AI explanation."
+        )
+        return {"ok": True, "handled": "quiz_review", "send_result": _send_whatsapp_text(wa_id, _clip(body, 3900))}
+
+    if norm.startswith("q5") or "explain" in norm:
         data = state.get("data") if isinstance(state.get("data"), dict) else {}
-        question = _clean(data.get("quiz_question"))
+        last = data.get("last_quiz") if isinstance(data.get("last_quiz"), dict) else None
+        question = _clean((last or {}).get("question") or data.get("quiz_question"))
+        correct = _clean((last or {}).get("correct") or data.get("last_quiz_correct"))
+        explanation = _clean((last or {}).get("explanation") or data.get("last_quiz_explain"))
+
         if not question:
             return {"ok": True, "handled": "quiz_ai_no_context", "send_result": _send_whatsapp_text(wa_id, "No last quiz question found yet. Reply Q1 to start a quiz first.")}
+
         result = ask_guarded({
             "account_id": account_id,
-            "question": f"Explain this Nigerian tax quiz answer in simple terms: {question}. Correct answer: {data.get('last_quiz_correct')}. Explanation: {data.get('last_quiz_explain')}",
+            "question": (
+                "Explain this Nigerian tax quiz answer in simple, beginner-friendly terms. "
+                f"Question: {question}. Correct option: {correct}. Base explanation: {explanation}. "
+                "Keep it practical and concise."
+            ),
             "lang": "en",
             "channel": "whatsapp",
             "provider": "wa",
@@ -2103,7 +2350,10 @@ def _handle_quiz_command(wa_id: str, account_id: str, text: str, state: Dict[str
         credit_note = ""
         if meta.get("usage_charged") is True:
             credit_note = f"\n\n💎 Credit used: {meta.get('credits_consumed') or 1}. Balance: {meta.get('credits_left', 'not shown')}."
-        return {"ok": True, "handled": "quiz_ai_explanation", "send_result": _send_whatsapp_text(wa_id, _clip(answer + credit_note + "\n\nReply Q1 for another quiz or 0 for menu.", 3900))}
+        elif meta.get("usage_charged") is False:
+            credit_note = "\n\n💎 Credit charged: No."
+        return {"ok": True, "handled": "quiz_ai_explanation", "send_result": _send_whatsapp_text(wa_id, _clip("💡 *AI Quiz Explanation*\n\n" + answer + credit_note + "\n\nReply Q1 for another quiz or 0 for menu.", 3900))}
+
     return {"ok": True, "handled": "quiz_menu", "send_result": _send_whatsapp_text(wa_id, _quiz_text())}
 
 
@@ -2225,7 +2475,7 @@ def _view_deadline_reminders(account_id: str) -> str:
     lines = ["📋 *Your Deadline Reminders*", ""]
     for i, row in enumerate(rows, start=1):
         lines.append(_deadline_display_line(row, i))
-    lines.extend(["", "To delete, use D3 plus the reminder number. Example: D3 1", "To update reminder days, use D4 plus number and days. Example: D4 1 3"])
+    lines.extend(["", "To delete, use D3 plus the reminder number. Example: D3 1", "To update, use D4 plus number, days, time and mode. Example: D4 1 3 08:30 whatsapp"])
     return "\n".join(lines)
 
 
@@ -2704,35 +2954,9 @@ def _handle_text_message(msg: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as exc:
             return {"ok": True, "handled": "deadline_settings_error", "send_result": _send_whatsapp_text(wa_id, "⚠️ I could not update that reminder now. Reply D2 to view your reminders, then try again as D4 1 3."), "error": str(exc)[:300] if _debug_enabled() else None}
 
-    # v10: dedicated quiz utility commands.
-    if re.match(r"^Q3\b", upper_text):
-        state = _get_session_state(wa_id)
-        data = _session_data(state)
-        score = data.get("quiz_score") if isinstance(data.get("quiz_score"), dict) else {"correct": 0, "total": 0}
-        body = (
-            "📊 *Your Quiz Score*\n\n"
-            f"Correct: {int(score.get('correct') or 0)}\n"
-            f"Total attempts: {int(score.get('total') or 0)}\n\n"
-            "Reply Q1 for a new quiz or Q4 to review your last answer."
-        )
-        return {"ok": True, "handled": "quiz_score", "send_result": _send_whatsapp_text(wa_id, body)}
-
-    if re.match(r"^Q4\b", upper_text):
-        state = _get_session_state(wa_id)
-        data = _session_data(state)
-        last = data.get("last_quiz") if isinstance(data.get("last_quiz"), dict) else None
-        if not last:
-            return {"ok": True, "handled": "quiz_review_empty", "send_result": _send_whatsapp_text(wa_id, "📌 No quiz answer to review yet. Reply Q1 to start a quiz.")}
-        status = "✅ Correct" if last.get("is_correct") else "❌ Not correct"
-        body = (
-            "📌 *Last Quiz Review*\n\n"
-            f"Question: {_clean(last.get('question'))}\n"
-            f"Your answer: {_clean(last.get('selected'))}\n"
-            f"Correct answer: {_clean(last.get('correct'))}\n"
-            f"Status: {status}\n\n"
-            "Reply Q5 if you want an AI explanation."
-        )
-        return {"ok": True, "handled": "quiz_review", "send_result": _send_whatsapp_text(wa_id, body)}
+    # v15: let the main quiz handler own Q1-Q5 so score/review/explanation stay consistent.
+    if re.match(r"^Q[1-5]\b", upper_text):
+        return _handle_quiz_command(wa_id, account_id, text, state)
 
 
     payment_reference = _extract_payment_reference(text)
