@@ -1892,20 +1892,25 @@ def _parse_deadline_create(text: str) -> Optional[Dict[str, Any]]:
 
 
 def _deadline_table_payload(account_id: str, wa_id: str, parsed: Dict[str, Any]) -> Dict[str, Any]:
+    """Build payload that matches the current public.tax_deadlines schema.
+
+    Current table columns are:
+    id, user_id, tax_type, due_date, reminder_days_before, enabled,
+    created_at, updated_at, last_reminder_sent_at, account_id.
+
+    Do not send title/status/active/source/wa_id because those columns are not
+    present in the current Supabase table and will cause a 400 Bad Request.
+    """
     tax_type = parsed["tax_type"]
     due_date = parsed["due_date"]
     reminder_days = int(parsed.get("reminder_days_before") or 7)
     return {
+        "user_id": account_id,
         "account_id": account_id,
-        "title": f"{tax_type} deadline",
         "tax_type": tax_type,
         "due_date": due_date,
         "reminder_days_before": reminder_days,
-        "status": "active",
-        "active": True,
-        "source": "whatsapp",
-        "wa_id": wa_id,
-        "created_at": _now_iso(),
+        "enabled": True,
         "updated_at": _now_iso(),
     }
 
