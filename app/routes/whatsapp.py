@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta, date
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
@@ -22,7 +22,7 @@ except Exception:  # pragma: no cover
 
 bp = Blueprint("whatsapp", __name__)
 
-WHATSAPP_FLOW_VERSION = "2026-05-19-v11-safe-get-delete-fix"
+WHATSAPP_FLOW_VERSION = "2026-05-19-v12-deadline-validity-guard"
 
 
 # =============================================================================
@@ -556,38 +556,16 @@ def _deadline_display_line(item: Dict[str, Any], index: int) -> str:
     tax_type = _clean(item.get("tax_type") or "Tax").upper()
     due = _clean(item.get("due_date") or "No date")
     days = item.get("reminder_days_before")
-    enabled = item.get("enabled", True)
-    status = "✅" if enabled else "⏸️"
     try:
-        days_text = f"{int(days)} days before"
+        days_int = int(days)
+        days_text = f"{days_int} days before"
     except Exception:
+        days_int = 7
         days_text = "default reminder"
-    return f"{index}. {status} {tax_type} — {due} ({days_text})"
 
-
-
-def _safe_get(table: str, params: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
-    """
-    Safe Supabase SELECT helper used by v10/v11 deadline and quiz utilities.
-    Returns [] on failure so WhatsApp webhook does not crash.
-    """
-    try:
-        if "_supabase_get" in globals():
-            data = _supabase_get(table, params=params or {})
-            if isinstance(data, list):
-                return data
-            if isinstance(data, dict) and isinstance(data.get("data"), list):
-                return data.get("data") or []
-            return []
-
-        url = f"{_supabase_url().rstrip('/')}/rest/v1/{table}"
-        response = requests.get(url, headers=_supabase_headers(), params=params or {}, timeout=25)
-        if response.status_code >= 400:
-            return []
-        data = response.json() if response.text else []
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
+    status = _deadline_status_v12(item)
+    reminder_date = status.get("reminder_date") or "not available"
+    return f"{index}. {status['label']} {tax_type} — due {due} — reminder {days_text} ({reminder_date})"
 
 
 def _get_deadline_list(account_id: str, limit: int = 10) -> List[Dict[str, Any]]:
@@ -2056,26 +2034,168 @@ def _parse_deadline_create(text: str) -> Optional[Dict[str, Any]]:
     return {"tax_type": tax_type, "due_date": due_date, "reminder_days_before": reminder_days}
 
 
-def _deadline_table_payload(account_id: str, wa_id: str, parsed: Dict[str, Any]) -> Dict[str, Any]:
-    """Build payload that matches the current public.tax_deadlines schema.
 
-    Current table columns are:
-    id, user_id, tax_type, due_date, reminder_days_before, enabled,
-    created_at, updated_at, last_reminder_sent_at, account_id.
+def _date_today_v12() -> date:
+    return datetime.now(timezone.utc).date()
 
-    Do not send title/status/active/source/wa_id because those columns are not
-    present in the current Supabase table and will cause a 400 Bad Request.
+
+def _parse_date_v12(value: Any) -> Optional[date]:
+    try:
+        return datetime.strptime(_clean(value), "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
+def _deadline_validation_v12(due_date_text: Any, reminder_days: Any) -> Dict[str, Any]:
     """
+    Validate that a reminder can still happen.
+
+    Example:
+    Today = 2026-05-19
+    Due date = 2026-05-21
+    Reminder = 7 days before
+    Reminder date = 2026-05-14, which has already passed, so reject.
+    """
+    today = _date_today_v12()
+    due_date = _parse_date_v12(due_date_text)
+
+    try:
+        days = int(reminder_days)
+    except Exception:
+        days = 7
+
+    days = max(0, min(365, days))
+
+    if not due_date:
+        return {"ok": False, "reason": "invalid_due_date", "message": "The due date is invalid. Use YYYY-MM-DD, for example 2026-05-29."}
+
+    days_until_due = (due_date - today).days
+    reminder_date = due_date - timedelta(days=days)
+
+    if days_until_due < 0:
+        return {
+            "ok": False,
+            "reason": "due_date_passed",
+            "due_date": due_date.isoformat(),
+            "today": today.isoformat(),
+            "days_until_due": days_until_due,
+            "reminder_date": reminder_date.isoformat(),
+            "max_reminder_days": 0,
+            "message": (
+                f"The due date {due_date.isoformat()} has already passed. "
+                "Please choose a future due date."
+            ),
+        }
+
+    if reminder_date < today:
+        max_days = max(0, days_until_due)
+        suggestion = f"D1 TAXTYPE {due_date.isoformat()} {max_days}"
+        return {
+            "ok": False,
+            "reason": "reminder_date_passed",
+            "due_date": due_date.isoformat(),
+            "today": today.isoformat(),
+            "days_until_due": days_until_due,
+            "reminder_date": reminder_date.isoformat(),
+            "max_reminder_days": max_days,
+            "message": (
+                f"That reminder is no longer possible.\\n\\n"
+                f"Today: {today.isoformat()}\\n"
+                f"Due date: {due_date.isoformat()}\\n"
+                f"Requested reminder: {days} day(s) before\\n"
+                f"Reminder date would be: {reminder_date.isoformat()}\\n\\n"
+                f"Because that reminder date has already passed, use {max_days} day(s) before or choose a later due date.\\n"
+                f"Example: {suggestion}"
+            ),
+        }
+
+    if due_date == today and days > 0:
+        return {
+            "ok": False,
+            "reason": "due_today_with_advance_reminder",
+            "due_date": due_date.isoformat(),
+            "today": today.isoformat(),
+            "days_until_due": days_until_due,
+            "reminder_date": reminder_date.isoformat(),
+            "max_reminder_days": 0,
+            "message": (
+                f"The due date is today ({today.isoformat()}). "
+                "You can only use 0 days before for a same-day reminder."
+            ),
+        }
+
+    return {
+        "ok": True,
+        "due_date": due_date.isoformat(),
+        "today": today.isoformat(),
+        "days_until_due": days_until_due,
+        "reminder_date": reminder_date.isoformat(),
+        "reminder_days": days,
+        "max_reminder_days": max(0, days_until_due),
+    }
+
+
+def _deadline_status_v12(item: Dict[str, Any]) -> Dict[str, Any]:
+    due = _parse_date_v12(item.get("due_date"))
+    try:
+        days = int(item.get("reminder_days_before") or 7)
+    except Exception:
+        days = 7
+
+    today = _date_today_v12()
+    enabled = bool(item.get("enabled", True))
+
+    if not due:
+        return {"label": "⚠️ invalid date", "is_actionable": False, "reason": "invalid_due_date", "reminder_date": ""}
+
+    reminder_date = due - timedelta(days=max(0, days))
+
+    if due < today:
+        return {
+            "label": "⛔ due date passed",
+            "is_actionable": False,
+            "reason": "due_date_passed",
+            "reminder_date": reminder_date.isoformat(),
+        }
+
+    if reminder_date < today:
+        return {
+            "label": "⚠️ reminder date passed",
+            "is_actionable": False,
+            "reason": "reminder_date_passed",
+            "reminder_date": reminder_date.isoformat(),
+        }
+
+    if not enabled:
+        return {
+            "label": "⏸️ inactive",
+            "is_actionable": False,
+            "reason": "disabled",
+            "reminder_date": reminder_date.isoformat(),
+        }
+
+    return {
+        "label": "✅ active",
+        "is_actionable": True,
+        "reason": "active",
+        "reminder_date": reminder_date.isoformat(),
+    }
+
+
+
+def _deadline_table_payload(account_id: str, wa_id: str, parsed: Dict[str, Any]) -> Dict[str, Any]:
+    """Build payload that matches the current public.tax_deadlines schema."""
     tax_type = parsed["tax_type"]
     due_date = parsed["due_date"]
     reminder_days = int(parsed.get("reminder_days_before") or 7)
+    validation = _deadline_validation_v12(due_date, reminder_days)
     return {
         "user_id": account_id,
         "account_id": account_id,
         "tax_type": tax_type,
         "due_date": due_date,
         "reminder_days_before": reminder_days,
-        "enabled": True,
+        "enabled": bool(validation.get("ok")),
         "updated_at": _now_iso(),
     }
 
@@ -2084,26 +2204,41 @@ def _create_deadline_reminder(wa_id: str, account_id: str, text: str) -> str:
     parsed = _parse_deadline_create(text)
     if not parsed:
         return (
-            "🔔 *Create Deadline Reminder*\n\n"
-            "Send it like this:\n"
-            "D1 PAYE 2026-05-29 7\n\n"
-            "Format: D1 tax_type due_date reminder_days_before\n"
+            "🔔 *Create Deadline Reminder*\\n\\n"
+            "Send it like this:\\n"
+            "D1 PAYE 2026-05-29 7\\n\\n"
+            "Format: D1 tax_type due_date reminder_days_before\\n"
             "Supported types: PAYE, VAT, CIT, WHT."
         )
+
+    validation = _deadline_validation_v12(parsed["due_date"], parsed.get("reminder_days_before", 7))
+    if not validation.get("ok"):
+        tax_type = parsed["tax_type"]
+        due = parsed["due_date"]
+        max_days = validation.get("max_reminder_days", 0)
+        message = validation.get("message") or "This deadline reminder is not valid."
+        return (
+            "⚠️ *Reminder Not Created*\\n\\n"
+            f"{message}\\n\\n"
+            f"Try:\\nD1 {tax_type} {due} {max_days}\\n\\n"
+            "Or choose a later due date."
+        )
+
     payload = _deadline_table_payload(account_id, wa_id, parsed)
     result = _safe_insert("tax_deadlines", payload)
     if not result.get("ok"):
         return (
-            "⚠️ Reminder saving is not fully connected yet, but your format is correct.\n\n"
-            f"{parsed['tax_type']} due date: {parsed['due_date']}\n"
-            f"Reminder: {parsed['reminder_days_before']} days before\n\n"
-            "Next backend step: connect the WhatsApp reminder table."
+            "⚠️ Reminder saving failed. Please try again.\\n\\n"
+            f"{parsed['tax_type']} due date: {parsed['due_date']}\\n"
+            f"Reminder: {parsed['reminder_days_before']} days before"
         )
+
     return (
-        "✅ *Deadline Reminder Saved*\n\n"
-        f"Tax type: {parsed['tax_type']}\n"
-        f"Due date: {parsed['due_date']}\n"
-        f"Reminder: {parsed['reminder_days_before']} days before\n\n"
+        "✅ *Deadline Reminder Saved*\\n\\n"
+        f"Tax type: {parsed['tax_type']}\\n"
+        f"Due date: {parsed['due_date']}\\n"
+        f"Reminder: {parsed['reminder_days_before']} days before\\n"
+        f"Reminder date: {validation.get('reminder_date')}\\n\\n"
         "Reply D2 to view reminders or 0 for menu."
     )
 
@@ -2113,13 +2248,26 @@ def _view_deadline_reminders(account_id: str) -> str:
     if err:
         return "📋 Reminder viewing is not fully connected yet. Reply F6 for the general tax calendar or 0 for menu."
     if not rows:
-        return "📋 No saved deadline reminders yet.\n\nCreate one like this:\nD1 PAYE 2026-05-29 7"
+        return "📋 No saved deadline reminders yet.\\n\\nCreate one like this:\\nD1 PAYE 2026-05-29 7"
+
     lines = ["📋 *Your Deadline Reminders*", ""]
+    inactive_count = 0
     for i, row in enumerate(rows, start=1):
-        status = _clean(row.get("status") or ("active" if row.get("active") else "inactive"))
-        lines.append(f"{i}. {row.get('tax_type') or row.get('title') or 'Tax'} - due {row.get('due_date')} - reminder {row.get('reminder_days_before', 7)} days before - {status}")
-    lines.extend(["", "To delete later, use D3 plus the reminder number when backend delete is enabled."])
-    return "\n".join(lines)
+        status = _deadline_status_v12(row)
+        if not status.get("is_actionable"):
+            inactive_count += 1
+        lines.append(_deadline_display_line(row, i))
+
+    if inactive_count:
+        lines.extend([
+            "",
+            "⚠️ Some reminders are no longer actionable because the reminder date or due date has passed.",
+            "Use D3 1 to delete a reminder or D4 1 0 to change reminder days where still possible.",
+        ])
+    else:
+        lines.extend(["", "Use D3 1 to delete, or D4 1 14 to change reminder days."])
+
+    return "\\n".join(lines)
 
 
 def _handle_deadline_command(wa_id: str, account_id: str, text: str) -> Dict[str, Any]:
@@ -2418,12 +2566,27 @@ def _handle_deadline_settings_v10(wa_id: str, account_id: str, text: str) -> Dic
     if not item:
         return {"ok": True, "handled": "deadline_settings_not_found", "send_result": _send_whatsapp_text(wa_id, "I could not find that reminder number. Reply D2 to view your current reminders.")}
 
+    validation = _deadline_validation_v12(item.get("due_date"), days)
+    if not validation.get("ok"):
+        message = validation.get("message") or "That reminder setting is not valid."
+        return {
+            "ok": True,
+            "handled": "deadline_settings_invalid",
+            "send_result": _send_whatsapp_text(
+                wa_id,
+                "⚠️ *Reminder Not Updated*\n\n"
+                f"{message}\n\n"
+                "Reply D2 to view your reminders."
+            ),
+        }
+
     deadline_id = _clean(item.get("id"))
-    payload = {"reminder_days_before": days, "updated_at": _now_iso()}
+    payload = {"reminder_days_before": days, "enabled": True, "updated_at": _now_iso()}
     result = _safe_update("tax_deadlines", payload, id=deadline_id)
 
     item = dict(item)
     item["reminder_days_before"] = days
+    item["enabled"] = True
     body = (
         "⚙️ *Reminder updated*\n\n"
         f"{_deadline_display_line(item, idx)}\n\n"
