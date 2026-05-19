@@ -22,7 +22,7 @@ except Exception:  # pragma: no cover
 
 bp = Blueprint("whatsapp", __name__)
 
-WHATSAPP_FLOW_VERSION = "2026-05-19-v13-deadline-delete-validation-batch"
+WHATSAPP_FLOW_VERSION = "2026-05-19-v14-deadline-delete-time-mode"
 
 
 # =============================================================================
@@ -599,6 +599,46 @@ def _deadline_validation_v13(due_date_text: Any, reminder_days: Any) -> Dict[str
     return {"ok": True, "reason": "valid", "today": today.isoformat(), "due_date": due_date.isoformat(), "reminder_date": reminder_date.isoformat(), "max_days": max(0, days_until_due), "days": days}
 
 
+
+
+def _valid_reminder_time_v14(value: Any) -> str:
+    raw = _clean(value or "09:00")
+    m = re.match(r"^(\d{1,2}):(\d{2})$", raw)
+    if not m:
+        return "09:00"
+    hour = int(m.group(1)); minute = int(m.group(2))
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        return "09:00"
+    return f"{hour:02d}:{minute:02d}"
+
+
+def _valid_reminder_mode_v14(value: Any) -> str:
+    raw = _lower(value or "whatsapp")
+    raw = raw.replace(" ", "")
+    allowed = {"whatsapp", "email", "sms", "whatsapp,email", "whatsapp,sms", "email,sms", "whatsapp,email,sms"}
+    return raw if raw in allowed else "whatsapp"
+
+
+def _deadline_optional_payload_v14(parsed: Dict[str, Any], wa_id: str, account_row: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    mode = _valid_reminder_mode_v14(parsed.get("reminder_mode"))
+    account_row = account_row or {}
+    return {
+        "reminder_time": _valid_reminder_time_v14(parsed.get("reminder_time")),
+        "timezone": _clean(parsed.get("timezone") or "Africa/Lagos"),
+        "reminder_mode": mode,
+        "reminder_email": _clean(account_row.get("email") or "") or None,
+        "reminder_phone": _clean(account_row.get("phone_e164") or account_row.get("phone") or wa_id) or None,
+    }
+
+
+def _delete_deadline_by_id_v14(deadline_id: str) -> Dict[str, Any]:
+    try:
+        res = _sb().table("tax_deadlines").delete().eq("id", deadline_id).execute()
+        return {"ok": True, "data": getattr(res, "data", None)}
+    except Exception as exc:
+        return {"ok": False, "error": f"tax_deadlines: {type(exc).__name__}: {_clip(exc)}"}
+
+
 def _deadline_computed_status_v13(item: Dict[str, Any]) -> str:
     enabled = bool(item.get("enabled", True))
     validation = _deadline_validation_v13(item.get("due_date"), item.get("reminder_days_before", 7))
@@ -614,7 +654,10 @@ def _deadline_display_line(item: Dict[str, Any], index: int) -> str:
     except Exception:
         days_text = "7 days before"
     status = _deadline_computed_status_v13(item)
-    return f"{index}. {tax_type} - due {due} - reminder {days_text} - {status}"
+    time_text = _clean(item.get("reminder_time") or "09:00")
+    mode_text = _clean(item.get("reminder_mode") or "whatsapp")
+    # Keep D2 organized in the current compact style, with time/mode only at the end.
+    return f"{index}. {tax_type} - due {due} - reminder {days_text} - {status} - {time_text} via {mode_text}"
 
 
 def _safe_get(table: str, params: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
@@ -642,16 +685,11 @@ def _safe_get(table: str, params: Optional[Dict[str, str]] = None) -> List[Dict[
 
 
 def _get_deadline_list(account_id: str, limit: int = 10) -> List[Dict[str, Any]]:
-    rows = _safe_get(
-        "tax_deadlines",
-        params={
-            "select": "*",
-            "account_id": f"eq.{account_id}",
-            "order": "created_at.desc",
-            "limit": str(limit),
-        },
-    )
-    return rows if isinstance(rows, list) else []
+    # v14: use the same query path/order as D2 so D3/D4 numbers match the visible list.
+    rows, err = _query_many("tax_deadlines", "*", limit=limit, account_id=account_id)
+    if err:
+        return []
+    return rows
 
 
 def _deadline_by_index(account_id: str, index: int) -> Optional[Dict[str, Any]]:
@@ -2093,18 +2131,27 @@ def _deadline_menu(account_id: str) -> str:
 
 def _parse_deadline_create(text: str) -> Optional[Dict[str, Any]]:
     raw = _clean(text).upper()
-    # D1 PAYE 2026-05-29 7
-    m = re.search(r"\bD1\s+(PAYE|VAT|CIT|WHT)\s+(\d{4}-\d{2}-\d{2})(?:\s+(\d{1,2}))?", raw)
+    # D1 PAYE 2026-05-29 7 09:00 whatsapp
+    m = re.search(r"\bD1\s+(PAYE|VAT|CIT|WHT)\s+(\d{4}-\d{2}-\d{2})(?:\s+(\d{1,3}))?(?:\s+(\d{1,2}:\d{2}))?(?:\s+(WHATSAPP|EMAIL|SMS|WHATSAPP,EMAIL|WHATSAPP,SMS|EMAIL,SMS|WHATSAPP,EMAIL,SMS))?", raw)
     if not m:
         return None
     tax_type = m.group(1)
     due_date = m.group(2)
     reminder_days = int(m.group(3) or 7)
+    reminder_time = _valid_reminder_time_v14(m.group(4) or "09:00")
+    reminder_mode = _valid_reminder_mode_v14(m.group(5) or "whatsapp")
     try:
         datetime.strptime(due_date, "%Y-%m-%d")
     except Exception:
         return None
-    return {"tax_type": tax_type, "due_date": due_date, "reminder_days_before": reminder_days}
+    return {
+        "tax_type": tax_type,
+        "due_date": due_date,
+        "reminder_days_before": reminder_days,
+        "reminder_time": reminder_time,
+        "timezone": "Africa/Lagos",
+        "reminder_mode": reminder_mode,
+    }
 
 
 def _deadline_table_payload(account_id: str, wa_id: str, parsed: Dict[str, Any]) -> Dict[str, Any]:
@@ -2112,7 +2159,7 @@ def _deadline_table_payload(account_id: str, wa_id: str, parsed: Dict[str, Any])
     due_date = parsed["due_date"]
     reminder_days = int(parsed.get("reminder_days_before") or 7)
     validation = _deadline_validation_v13(due_date, reminder_days)
-    return {
+    payload = {
         "user_id": account_id,
         "account_id": account_id,
         "tax_type": tax_type,
@@ -2121,6 +2168,8 @@ def _deadline_table_payload(account_id: str, wa_id: str, parsed: Dict[str, Any])
         "enabled": bool(validation.get("ok")),
         "updated_at": _now_iso(),
     }
+    payload.update(_deadline_optional_payload_v14(parsed, wa_id))
+    return payload
 
 
 def _create_deadline_reminder(wa_id: str, account_id: str, text: str) -> str:
@@ -2129,8 +2178,9 @@ def _create_deadline_reminder(wa_id: str, account_id: str, text: str) -> str:
         return (
             "🔔 *Create Deadline Reminder*\n\n"
             "Send it like this:\n"
-            "D1 PAYE 2026-05-29 7\n\n"
-            "Format: D1 tax_type due_date reminder_days_before\n"
+            "D1 PAYE 2026-05-29 7 09:00 whatsapp\n\n"
+            "Format: D1 tax_type due_date reminder_days_before time mode\n"
+            "Modes: whatsapp, email, sms, whatsapp,email\n"
             "Supported types: PAYE, VAT, CIT, WHT."
         )
     validation = _deadline_validation_v13(parsed["due_date"], parsed.get("reminder_days_before", 7))
@@ -2139,11 +2189,15 @@ def _create_deadline_reminder(wa_id: str, account_id: str, text: str) -> str:
         return (
             "⚠️ *Reminder Not Created*\n\n"
             f"{validation.get('message')}\n\n"
-            f"Try: D1 {parsed['tax_type']} {parsed['due_date']} {max_days}\n"
+            f"Try: D1 {parsed['tax_type']} {parsed['due_date']} {max_days} {_valid_reminder_time_v14(parsed.get('reminder_time'))} {_valid_reminder_mode_v14(parsed.get('reminder_mode'))}\n"
             "Or choose a later due date."
         )
     payload = _deadline_table_payload(account_id, wa_id, parsed)
     result = _safe_insert("tax_deadlines", payload)
+    # If DB does not yet have v14 optional columns, retry with the stable base schema.
+    if not result.get("ok"):
+        base_payload = {k: v for k, v in payload.items() if k in {"user_id", "account_id", "tax_type", "due_date", "reminder_days_before", "enabled", "updated_at"}}
+        result = _safe_insert("tax_deadlines", base_payload)
     if not result.get("ok"):
         return (
             "⚠️ Reminder saving failed. Please try again.\n\n"
@@ -2155,6 +2209,8 @@ def _create_deadline_reminder(wa_id: str, account_id: str, text: str) -> str:
         f"Tax type: {parsed['tax_type']}\n"
         f"Due date: {parsed['due_date']}\n"
         f"Reminder: {parsed['reminder_days_before']} days before\n"
+        f"Time: {_valid_reminder_time_v14(parsed.get('reminder_time'))}\n"
+        f"Mode: {_valid_reminder_mode_v14(parsed.get('reminder_mode'))}\n"
         f"Reminder date: {validation.get('reminder_date')}\n\n"
         "Reply D2 to view reminders or 0 for menu."
     )
@@ -2427,17 +2483,21 @@ def _handle_deadline_delete_v10(wa_id: str, account_id: str, text: str) -> Dict[
         return {"ok": True, "handled": "deadline_delete_help", "send_result": _send_whatsapp_text(wa_id, "🗑️ To delete a reminder, reply like this:\n\nD3 1\n\nUse D2 first to see your reminder numbers.")}
 
     idx = int(match.group(1))
-    item = _deadline_by_index(account_id, idx)
-    if not item:
+    rows = _get_deadline_list(account_id, limit=10)
+    if idx < 1 or idx > len(rows):
         return {"ok": True, "handled": "deadline_delete_not_found", "send_result": _send_whatsapp_text(wa_id, "I could not find that reminder number. Reply D2 to view your current reminders.")}
 
+    item = rows[idx - 1]
     deadline_id = _clean(item.get("id"))
     if not deadline_id:
         return {"ok": True, "handled": "deadline_delete_missing_id", "send_result": _send_whatsapp_text(wa_id, "I found the reminder, but it has no valid ID. Please try D2 again or contact support.")}
 
-    result = _safe_delete_v11("tax_deadlines", id=deadline_id)
+    result = _delete_deadline_by_id_v14(deadline_id)
+    if not result.get("ok"):
+        return {"ok": True, "handled": "deadline_delete_failed", "send_result": _send_whatsapp_text(wa_id, "⚠️ I could not delete that reminder now. Reply D2 and try again, for example D3 1.")}
+
     body = (
-        "🗑️ *Deadline reminder deleted*\n\n"
+        "🗑️ *Deadline Reminder Deleted*\n\n"
         f"{_deadline_display_line(item, idx)}\n\n"
         "Reply D2 to view remaining reminders."
     )
@@ -2451,23 +2511,38 @@ def _handle_deadline_settings_v10(wa_id: str, account_id: str, text: str) -> Dic
             "Reply 4 to view plans, or D2 to view any existing reminders."
         )
         return {"ok": True, "handled": "deadline_settings_blocked", "send_result": _send_whatsapp_text(wa_id, body)}
-    match = re.search(r"\bD4\s+(\d{1,2})\s+(\d{1,3})\b", _clean(text), flags=re.I)
+    match = re.search(r"\bD4\s+(\d{1,2})\s+(\d{1,3})(?:\s+(\d{1,2}:\d{2}))?(?:\s+(WHATSAPP|EMAIL|SMS|WHATSAPP,EMAIL|WHATSAPP,SMS|EMAIL,SMS|WHATSAPP,EMAIL,SMS))?\b", _clean(text), flags=re.I)
     if not match:
-        return {"ok": True, "handled": "deadline_settings_help", "send_result": _send_whatsapp_text(wa_id, "⚙️ To update reminder days, reply like this:\n\nD4 1 3\n\nUse D2 first to see your reminder numbers.")}
+        return {"ok": True, "handled": "deadline_settings_help", "send_result": _send_whatsapp_text(wa_id, "⚙️ To update reminder, reply like this:\n\nD4 1 3 09:00 whatsapp\n\nUse D2 first to see your reminder numbers.")}
     idx = int(match.group(1))
     days = max(0, min(365, int(match.group(2))))
-    item = _deadline_by_index(account_id, idx)
-    if not item:
+    reminder_time = _valid_reminder_time_v14(match.group(3) or "09:00")
+    reminder_mode = _valid_reminder_mode_v14(match.group(4) or "whatsapp")
+    rows = _get_deadline_list(account_id, limit=10)
+    if idx < 1 or idx > len(rows):
         return {"ok": True, "handled": "deadline_settings_not_found", "send_result": _send_whatsapp_text(wa_id, "I could not find that reminder number. Reply D2 to view your current reminders.")}
+    item = rows[idx - 1]
     validation = _deadline_validation_v13(item.get("due_date"), days)
     if not validation.get("ok"):
         return {"ok": True, "handled": "deadline_settings_invalid", "send_result": _send_whatsapp_text(wa_id, "⚠️ *Reminder Not Updated*\n\n" + str(validation.get("message")) + "\n\nReply D2 to view your reminders.")}
     deadline_id = _clean(item.get("id"))
-    result = _safe_update("tax_deadlines", {"reminder_days_before": days, "enabled": True, "updated_at": _now_iso()}, id=deadline_id)
+    payload = {"reminder_days_before": days, "enabled": True, "updated_at": _now_iso(), "reminder_time": reminder_time, "timezone": "Africa/Lagos", "reminder_mode": reminder_mode}
+    result = _safe_update("tax_deadlines", payload, id=deadline_id)
+    if not result.get("ok"):
+        # Retry for databases that have not yet added the optional v14 columns.
+        result = _safe_update("tax_deadlines", {"reminder_days_before": days, "enabled": True, "updated_at": _now_iso()}, id=deadline_id)
+    if not result.get("ok"):
+        return {"ok": True, "handled": "deadline_settings_failed", "send_result": _send_whatsapp_text(wa_id, "⚠️ I could not update that reminder now. Reply D2 and try again.")}
     item = dict(item)
     item["reminder_days_before"] = days
     item["enabled"] = True
-    body = "⚙️ *Reminder updated*\n\n" + _deadline_display_line(item, idx) + "\n\nReply D2 to view all reminders."
+    item["reminder_time"] = reminder_time
+    item["reminder_mode"] = reminder_mode
+    body = (
+        "⚙️ *Reminder Updated*\n\n"
+        f"{_deadline_display_line(item, idx)}\n\n"
+        "Reply D2 to view all reminders."
+    )
     return {"ok": True, "handled": "deadline_settings_updated", "send_result": _send_whatsapp_text(wa_id, body), "update_result": result if _debug_enabled() else None}
 
 
