@@ -484,6 +484,23 @@ def _query_one(table: str, select_cols: str = "*", **eq_filters: Any) -> Tuple[O
         return None, f"{table}: {type(exc).__name__}: {_clip(exc)}"
 
 
+def _query_many(table: str, select_cols: str = "*", limit: int = 20, order_col: str = "created_at", desc: bool = True, **eq_filters: Any) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    try:
+        q = _sb().table(table).select(select_cols)
+        for col, val in eq_filters.items():
+            if val is not None and _clean(val):
+                q = q.eq(col, val)
+        try:
+            q = q.order(order_col, desc=desc)
+        except Exception:
+            pass
+        res = q.limit(limit).execute()
+        rows = getattr(res, "data", None) or []
+        return [r for r in rows if isinstance(r, dict)], None
+    except Exception as exc:
+        return [], f"{table}: {type(exc).__name__}: {_clip(exc)}"
+
+
 def _safe_insert(table: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     try:
         res = _sb().table(table).insert(payload).execute()
@@ -900,12 +917,8 @@ def _recognize(text: str, context: str = "main") -> Dict[str, Any]:
             return {"kind": "tool", "code": code, "action": TOOL_OPTIONS[code]["action"]}
         if code in CALC_OPTIONS:
             return {"kind": "calc", "code": code, "action": CALC_OPTIONS[code]["action"]}
-        if code == "Q1":
-            return {"kind": "calc", "code": "C6", "action": "tax_quiz"}
-        if code == "Q2":
-            return {"kind": "quiz_rules", "action": "quiz_rules"}
-        if code == "Q3":
-            return {"kind": "tool", "code": "F1", "action": "calculator_menu"}
+        if code in {"Q1", "Q2", "Q3", "Q4", "Q5"}:
+            return {"kind": "quiz_action", "code": code, "action": code.lower(), "text": raw}
         if code in {"D1", "D2", "D3", "D4"}:
             return {"kind": "deadline", "action": "deadline", "code": code}
 
@@ -923,11 +936,15 @@ def _recognize(text: str, context: str = "main") -> Dict[str, Any]:
     if norm in {"help", "8"}:
         return {"kind": "main", "action": "help"}
     if norm in {"q1", "start quiz", "quiz me", "take quiz", "tax quiz"}:
-        return {"kind": "calc", "code": "C6", "action": "tax_quiz"}
-    if norm in {"q2", "quiz rules"}:
-        return {"kind": "quiz_rules", "action": "quiz_rules"}
-    if norm in {"q3", "back to calculators", "calculator menu"}:
-        return {"kind": "tool", "code": "F1", "action": "calculator_menu"}
+        return {"kind": "quiz_action", "code": "Q1", "action": "q1", "text": raw}
+    if norm in {"q2", "quiz rules", "quiz categories", "choose quiz category"}:
+        return {"kind": "quiz_action", "code": "Q2", "action": "q2", "text": raw}
+    if norm in {"q3", "quiz score", "score", "my quiz score"}:
+        return {"kind": "quiz_action", "code": "Q3", "action": "q3", "text": raw}
+    if norm in {"q4", "review wrong answers", "wrong answers"}:
+        return {"kind": "quiz_action", "code": "Q4", "action": "q4", "text": raw}
+    if norm in {"q5", "explain quiz", "ai explanation", "explain last quiz"}:
+        return {"kind": "quiz_action", "code": "Q5", "action": "q5", "text": raw}
     if norm in {"d1", "d2", "d3", "d4", "create deadline", "view deadlines", "delete deadline", "deadline reminder", "view reminders", "delete reminder", "reminder settings"}:
         return {"kind": "deadline", "action": "deadline"}
 
@@ -1622,13 +1639,15 @@ def _salary_compare(text: str) -> str:
 
 def _quiz_text() -> str:
     return (
-        "🎯 *Tax Quiz*\n\n"
+        "🎯 *Tax Quiz Centre*\n\n"
         "Q1 - Start non-AI quiz\n"
-        "Q2 - Quiz rules\n"
-        "Q3 - Back to calculators\n\n"
+        "Q2 - Choose category\n"
+        "Q3 - Check today's score\n"
+        "Q4 - Review last wrong answer\n"
+        "Q5 - AI explanation for last quiz answer 💎\n\n"
         "Free users: 12 non-AI quiz attempts daily.\n"
         "Paid users: unlimited non-AI quiz attempts.\n"
-        "AI explanations can be added later and should consume Usage Credits."
+        "Only Q5 uses AI/Usage Credits."
     )
 
 
@@ -1639,9 +1658,43 @@ def _quiz_rules_text() -> str:
         "• Free users get 12 attempts daily.\n"
         "• Paid users get unlimited non-AI quiz attempts.\n"
         "• Reply A, B, C, or D to answer.\n"
-        "• Reply Q1 to start another quiz.\n\n"
+        "• Reply Q2 to choose a category.\n"
+        "• Reply Q5 for AI explanation of the last quiz answer. 💎\n\n"
         "Reply 0 for main menu."
     )
+
+
+def _quiz_category_menu() -> str:
+    categories = sorted({str(q.get("category") or "General") for q in QUIZ_BANK})
+    lines = ["🎯 *Choose Quiz Category*", ""]
+    for index, category in enumerate(categories, start=1):
+        lines.append(f"Q2 {index} - {category}")
+    lines.extend(["", "You can also type: Q1 PAYE, Q1 VAT, Q1 CIT, or Q1 WHT."])
+    return "\n".join(lines)
+
+
+def _resolve_quiz_category(text: str) -> str:
+    norm = _normalize_text(text)
+    categories = sorted({str(q.get("category") or "General") for q in QUIZ_BANK})
+    if norm in {"q1", "quiz", "start quiz", "tax quiz"}:
+        return ""
+    if "paye" in norm or "salary" in norm:
+        return "PAYE"
+    if "vat" in norm:
+        return "VAT"
+    if "cit" in norm or "company" in norm:
+        return "Company Tax"
+    if "wht" in norm or "withholding" in norm:
+        return "WHT"
+    m = re.search(r"q[12]\s+(\d+)", norm)
+    if m:
+        idx = int(m.group(1)) - 1
+        if 0 <= idx < len(categories):
+            return categories[idx]
+    for cat in categories:
+        if _normalize_text(cat) in norm:
+            return cat
+    return ""
 
 
 def _quiz_attempt_info(state: Dict[str, Any]) -> Tuple[str, int]:
@@ -1655,9 +1708,10 @@ def _quiz_attempt_info(state: Dict[str, Any]) -> Tuple[str, int]:
     return today, 0
 
 
-def _start_quiz(wa_id: str, account_id: str, state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def _start_quiz(wa_id: str, account_id: str, state: Optional[Dict[str, Any]] = None, category: str = "") -> Dict[str, Any]:
     state = state or _get_session_state(wa_id)
     today, attempts = _quiz_attempt_info(state)
+    old_data = state.get("data") if isinstance(state.get("data"), dict) else {}
 
     if not _is_active_paid_subscription(account_id) and attempts >= QUIZ_FREE_DAILY_LIMIT:
         body = (
@@ -1667,12 +1721,21 @@ def _start_quiz(wa_id: str, account_id: str, state: Optional[Dict[str, Any]] = N
         )
         return {"ok": True, "handled": "quiz_limit", "send_result": _send_whatsapp_text(wa_id, body)}
 
-    index = attempts % len(QUIZ_BANK)
-    quiz = QUIZ_BANK[index]
+    pool = [q for q in QUIZ_BANK if not category or _normalize_text(q.get("category")) == _normalize_text(category)]
+    if not pool:
+        pool = QUIZ_BANK
+        category = ""
+
+    index = attempts % len(pool)
+    quiz = pool[index]
     data = {
+        **old_data,
         "quiz_date": today,
         "quiz_attempts": attempts,
         "quiz_id": quiz["id"],
+        "quiz_category": quiz.get("category"),
+        "quiz_question": quiz.get("question"),
+        "quiz_options": quiz.get("options"),
         "correct": quiz["answer"],
         "explain": quiz["explain"],
     }
@@ -1704,10 +1767,23 @@ def _handle_quiz_answer(wa_id: str, account_id: str, text: str, state: Dict[str,
     attempts += 1
 
     passed = answer == correct
+    correct_count = int(data.get("quiz_correct_count") or 0) + (1 if passed else 0)
+    wrong_count = int(data.get("quiz_wrong_count") or 0) + (0 if passed else 1)
     verdict = "✅ Correct!" if passed else f"❌ Not correct. Correct answer: {correct}."
     explain = _clean(data.get("explain"))
 
-    _set_session_state(wa_id, "main", "", {"quiz_date": today, "quiz_attempts": attempts})
+    new_data = {
+        **data,
+        "quiz_date": today,
+        "quiz_attempts": attempts,
+        "quiz_correct_count": correct_count,
+        "quiz_wrong_count": wrong_count,
+        "last_quiz_answer": answer,
+        "last_quiz_correct": correct,
+        "last_quiz_passed": passed,
+        "last_quiz_explain": explain,
+    }
+    _set_session_state(wa_id, "main", "", new_data)
 
     remaining = "Unlimited" if _is_active_paid_subscription(account_id) else str(max(0, QUIZ_FREE_DAILY_LIMIT - attempts))
     body = (
@@ -1715,11 +1791,66 @@ def _handle_quiz_answer(wa_id: str, account_id: str, text: str, state: Dict[str,
         f"{verdict}\n\n"
         f"Explanation: {explain}\n\n"
         f"Attempts today: {attempts}\n"
+        f"Correct today: {correct_count}\n"
+        f"Wrong today: {wrong_count}\n"
         f"Remaining today: {remaining}\n\n"
-        "Reply Q1 for another quiz, C1 for PAYE calculator, or 0 for main menu."
+        "Reply Q1 for another quiz, Q3 for score, Q5 for AI explanation, or 0 for main menu."
     )
     return {"ok": True, "handled": "quiz_answer", "send_result": _send_whatsapp_text(wa_id, body)}
 
+
+def _handle_quiz_command(wa_id: str, account_id: str, text: str, state: Dict[str, Any]) -> Dict[str, Any]:
+    norm = _normalize_text(text)
+    if norm.startswith("q1") or norm in {"quiz", "start quiz", "tax quiz"}:
+        return _start_quiz(wa_id, account_id, state, _resolve_quiz_category(text))
+    if norm.startswith("q2") or "category" in norm:
+        category = _resolve_quiz_category(text)
+        if category:
+            return _start_quiz(wa_id, account_id, state, category)
+        return {"ok": True, "handled": "quiz_categories", "send_result": _send_whatsapp_text(wa_id, _quiz_category_menu())}
+    if norm.startswith("q3") or "score" in norm:
+        data = state.get("data") if isinstance(state.get("data"), dict) else {}
+        today, attempts = _quiz_attempt_info(state)
+        correct = int(data.get("quiz_correct_count") or 0) if data.get("quiz_date") == today else 0
+        wrong = int(data.get("quiz_wrong_count") or 0) if data.get("quiz_date") == today else 0
+        remaining = "Unlimited" if _is_active_paid_subscription(account_id) else str(max(0, QUIZ_FREE_DAILY_LIMIT - attempts))
+        body = f"📊 *Today's Quiz Score*\n\nAttempts: {attempts}\nCorrect: {correct}\nWrong: {wrong}\nRemaining: {remaining}\n\nReply Q1 to continue."
+        return {"ok": True, "handled": "quiz_score", "send_result": _send_whatsapp_text(wa_id, body)}
+    if norm.startswith("q4"):
+        data = state.get("data") if isinstance(state.get("data"), dict) else {}
+        if data.get("last_quiz_passed") is False:
+            body = (
+                "📝 *Last Wrong Answer Review*\n\n"
+                f"Question: {data.get('quiz_question', 'Not shown')}\n"
+                f"Your answer: {data.get('last_quiz_answer', 'Not shown')}\n"
+                f"Correct answer: {data.get('last_quiz_correct', 'Not shown')}\n\n"
+                f"Why: {data.get('last_quiz_explain', 'Not shown')}\n\n"
+                "Reply Q1 for another quiz."
+            )
+        else:
+            body = "✅ No wrong answer stored for review yet. Reply Q1 to start a quiz."
+        return {"ok": True, "handled": "quiz_review", "send_result": _send_whatsapp_text(wa_id, body)}
+    if norm.startswith("q5"):
+        data = state.get("data") if isinstance(state.get("data"), dict) else {}
+        question = _clean(data.get("quiz_question"))
+        if not question:
+            return {"ok": True, "handled": "quiz_ai_no_context", "send_result": _send_whatsapp_text(wa_id, "No last quiz question found yet. Reply Q1 to start a quiz first.")}
+        result = ask_guarded({
+            "account_id": account_id,
+            "question": f"Explain this Nigerian tax quiz answer in simple terms: {question}. Correct answer: {data.get('last_quiz_correct')}. Explanation: {data.get('last_quiz_explain')}",
+            "lang": "en",
+            "channel": "whatsapp",
+            "provider": "wa",
+            "provider_user_id": wa_id,
+            "action_code": "quiz_ai_explanation",
+        })
+        answer = _clean(result.get("answer") or result.get("message") or "I could not generate the explanation right now.")
+        meta = result.get("meta") if isinstance(result, dict) and isinstance(result.get("meta"), dict) else {}
+        credit_note = ""
+        if meta.get("usage_charged") is True:
+            credit_note = f"\n\n💎 Credit used: {meta.get('credits_consumed') or 1}. Balance: {meta.get('credits_left', 'not shown')}."
+        return {"ok": True, "handled": "quiz_ai_explanation", "send_result": _send_whatsapp_text(wa_id, _clip(answer + credit_note + "\n\nReply Q1 for another quiz or 0 for menu.", 3900))}
+    return {"ok": True, "handled": "quiz_menu", "send_result": _send_whatsapp_text(wa_id, _quiz_text())}
 
 
 def _deadline_menu(account_id: str) -> str:
@@ -1729,36 +1860,110 @@ def _deadline_menu(account_id: str) -> str:
             "Free users can view the general tax calendar. Custom reminders are available on paid plans.\n\n"
             "D1 - Create reminder 🔔 (paid)\n"
             "D2 - View reminders 📋\n"
-            "D3 - Delete reminder 🗑️\n\n"
+            "D3 - Delete reminder 🗑️\n"
+            "D4 - Reminder settings ⚙️\n\n"
             "Reply 4 to view plans or 0 for main menu."
         )
     return (
         "📅 *Tax Deadline Reminders*\n\n"
         "D1 - Create reminder 🔔\n"
         "D2 - View reminders 📋\n"
-        "D3 - Delete reminder 🗑️\n\n"
+        "D3 - Delete reminder 🗑️\n"
+        "D4 - Reminder settings ⚙️\n\n"
         "Example: D1 PAYE 2026-05-29 7\n"
         "This means PAYE due date is 2026-05-29 and reminder is 7 days before."
     )
 
 
+def _parse_deadline_create(text: str) -> Optional[Dict[str, Any]]:
+    raw = _clean(text).upper()
+    # D1 PAYE 2026-05-29 7
+    m = re.search(r"\bD1\s+(PAYE|VAT|CIT|WHT)\s+(\d{4}-\d{2}-\d{2})(?:\s+(\d{1,2}))?", raw)
+    if not m:
+        return None
+    tax_type = m.group(1)
+    due_date = m.group(2)
+    reminder_days = int(m.group(3) or 7)
+    try:
+        datetime.strptime(due_date, "%Y-%m-%d")
+    except Exception:
+        return None
+    return {"tax_type": tax_type, "due_date": due_date, "reminder_days_before": reminder_days}
+
+
+def _deadline_table_payload(account_id: str, wa_id: str, parsed: Dict[str, Any]) -> Dict[str, Any]:
+    tax_type = parsed["tax_type"]
+    due_date = parsed["due_date"]
+    reminder_days = int(parsed.get("reminder_days_before") or 7)
+    return {
+        "account_id": account_id,
+        "title": f"{tax_type} deadline",
+        "tax_type": tax_type,
+        "due_date": due_date,
+        "reminder_days_before": reminder_days,
+        "status": "active",
+        "active": True,
+        "source": "whatsapp",
+        "wa_id": wa_id,
+        "created_at": _now_iso(),
+        "updated_at": _now_iso(),
+    }
+
+
+def _create_deadline_reminder(wa_id: str, account_id: str, text: str) -> str:
+    parsed = _parse_deadline_create(text)
+    if not parsed:
+        return (
+            "🔔 *Create Deadline Reminder*\n\n"
+            "Send it like this:\n"
+            "D1 PAYE 2026-05-29 7\n\n"
+            "Format: D1 tax_type due_date reminder_days_before\n"
+            "Supported types: PAYE, VAT, CIT, WHT."
+        )
+    payload = _deadline_table_payload(account_id, wa_id, parsed)
+    result = _safe_insert("tax_deadlines", payload)
+    if not result.get("ok"):
+        return (
+            "⚠️ Reminder saving is not fully connected yet, but your format is correct.\n\n"
+            f"{parsed['tax_type']} due date: {parsed['due_date']}\n"
+            f"Reminder: {parsed['reminder_days_before']} days before\n\n"
+            "Next backend step: connect the WhatsApp reminder table."
+        )
+    return (
+        "✅ *Deadline Reminder Saved*\n\n"
+        f"Tax type: {parsed['tax_type']}\n"
+        f"Due date: {parsed['due_date']}\n"
+        f"Reminder: {parsed['reminder_days_before']} days before\n\n"
+        "Reply D2 to view reminders or 0 for menu."
+    )
+
+
+def _view_deadline_reminders(account_id: str) -> str:
+    rows, err = _query_many("tax_deadlines", "*", limit=10, account_id=account_id)
+    if err:
+        return "📋 Reminder viewing is not fully connected yet. Reply F6 for the general tax calendar or 0 for menu."
+    if not rows:
+        return "📋 No saved deadline reminders yet.\n\nCreate one like this:\nD1 PAYE 2026-05-29 7"
+    lines = ["📋 *Your Deadline Reminders*", ""]
+    for i, row in enumerate(rows, start=1):
+        status = _clean(row.get("status") or ("active" if row.get("active") else "inactive"))
+        lines.append(f"{i}. {row.get('tax_type') or row.get('title') or 'Tax'} - due {row.get('due_date')} - reminder {row.get('reminder_days_before', 7)} days before - {status}")
+    lines.extend(["", "To delete later, use D3 plus the reminder number when backend delete is enabled."])
+    return "\n".join(lines)
+
+
 def _handle_deadline_command(wa_id: str, account_id: str, text: str) -> Dict[str, Any]:
     norm = _normalize_text(text)
-    if norm in {"d1", "create deadline", "deadline reminder", "create reminder"}:
+    if norm.startswith("d1") or norm in {"create deadline", "deadline reminder", "create reminder"}:
         if not _is_active_paid_subscription(account_id):
             return {"ok": True, "handled": "deadline_paid_required", "send_result": _send_whatsapp_text(wa_id, _deadline_menu(account_id))}
-        return {
-            "ok": True,
-            "handled": "deadline_create_prompt",
-            "send_result": _send_whatsapp_text(
-                wa_id,
-                "🔔 *Create Deadline Reminder*\n\nSend it like this:\nD1 PAYE 2026-05-29 7\n\nFormat: D1 tax_type due_date reminder_days_before\nSupported types: PAYE, VAT, CIT, WHT.\n\nThis command is reserved for WhatsApp-native reminder saving. If it does not save yet, reply F6 for the calendar or 0 for menu."
-            ),
-        }
-    if norm in {"d2", "view deadlines", "view reminders"}:
-        return {"ok": True, "handled": "deadline_view", "send_result": _send_whatsapp_text(wa_id, "📋 Saved deadline reminder viewing is ready for the next backend connection step.\n\nReply F6 for calendar guidance or 0 for main menu.")}
-    if norm in {"d3", "delete deadline", "delete reminder"}:
-        return {"ok": True, "handled": "deadline_delete", "send_result": _send_whatsapp_text(wa_id, "🗑️ Deadline deletion flow is ready for the next backend connection step.\n\nReply 0 for main menu.")}
+        return {"ok": True, "handled": "deadline_create", "send_result": _send_whatsapp_text(wa_id, _create_deadline_reminder(wa_id, account_id, text))}
+    if norm.startswith("d2") or norm in {"view deadlines", "view reminders"}:
+        return {"ok": True, "handled": "deadline_view", "send_result": _send_whatsapp_text(wa_id, _view_deadline_reminders(account_id))}
+    if norm.startswith("d3") or norm in {"delete deadline", "delete reminder"}:
+        return {"ok": True, "handled": "deadline_delete", "send_result": _send_whatsapp_text(wa_id, "🗑️ Delete reminder flow is prepared. Full delete needs the reminder table ID connection.\n\nReply D2 to view reminders or 0 for menu.")}
+    if norm.startswith("d4") or norm in {"reminder settings", "deadline settings"}:
+        return {"ok": True, "handled": "deadline_settings", "send_result": _send_whatsapp_text(wa_id, "⚙️ *Reminder Settings*\n\nDefault reminder: 7 days before due date.\nSupported reminder days: 1-30.\nExample: D1 VAT 2026-06-21 3\n\nReply D1 to create a reminder.")}
     return {"ok": True, "handled": "deadline_menu", "send_result": _send_whatsapp_text(wa_id, _deadline_menu(account_id))}
 
 
@@ -1984,7 +2189,7 @@ def _handle_text_message(msg: Dict[str, Any]) -> Dict[str, Any]:
     # This prevents values like C3 985000 or C3985000 from being queried as link codes,
     # and prevents free calculators from falling through to AI credit deduction.
     recognition = _recognize(text, context)
-    is_command_like = recognition.get("kind") in {"global", "main", "plan", "topup", "tool", "calc", "ambiguous", "invalid_menu"}
+    is_command_like = recognition.get("kind") in {"global", "main", "plan", "topup", "tool", "calc", "quiz_action", "deadline", "ambiguous", "invalid_menu"}
 
     # Only attempt link-code lookup when the user is in the link flow, or when the input
     # is not already recognized as a command/calculator/plan/top-up/tool.
@@ -2063,6 +2268,9 @@ def _handle_text_message(msg: Dict[str, Any]) -> Dict[str, Any]:
             _set_session_state(wa_id, "main")
             return {"ok": True, "handled": "cancel", "send_result": _send_whatsapp_text(wa_id, "Current flow cancelled.\n\n" + _main_menu())}
 
+    if recognition.get("kind") == "quiz_action":
+        return _handle_quiz_command(wa_id, account_id, text, state)
+
     if recognition.get("kind") == "quiz_rules":
         return {"ok": True, "handled": "quiz_rules", "send_result": _send_whatsapp_text(wa_id, _quiz_rules_text())}
 
@@ -2073,7 +2281,7 @@ def _handle_text_message(msg: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "ok": True,
             "handled": "invalid_menu_option",
-            "send_result": _send_whatsapp_text(wa_id, "⚠️ That code/menu option is not available yet, so no AI credit was used.\n\nReply 0 for main menu, F1 for calculators, Q1 for quiz, or type your Nigerian tax question in words."),
+            "send_result": _send_whatsapp_text(wa_id, "⚠️ That code/menu option is not available yet, so no AI credit was used.\n\nReply 0 for main menu, F1 for calculators, Q1 for quiz, D1 for reminders, or type your Nigerian tax question in words."),
         }
 
     if recognition["kind"] == "ambiguous":
