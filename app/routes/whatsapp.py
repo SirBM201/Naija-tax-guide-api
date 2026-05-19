@@ -22,7 +22,7 @@ except Exception:  # pragma: no cover
 
 bp = Blueprint("whatsapp", __name__)
 
-WHATSAPP_FLOW_VERSION = "2026-05-19-v10-deadline-quiz-polish"
+WHATSAPP_FLOW_VERSION = "2026-05-19-v11-safe-get-delete-fix"
 
 
 # =============================================================================
@@ -563,6 +563,31 @@ def _deadline_display_line(item: Dict[str, Any], index: int) -> str:
     except Exception:
         days_text = "default reminder"
     return f"{index}. {status} {tax_type} — {due} ({days_text})"
+
+
+
+def _safe_get(table: str, params: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
+    """
+    Safe Supabase SELECT helper used by v10/v11 deadline and quiz utilities.
+    Returns [] on failure so WhatsApp webhook does not crash.
+    """
+    try:
+        if "_supabase_get" in globals():
+            data = _supabase_get(table, params=params or {})
+            if isinstance(data, list):
+                return data
+            if isinstance(data, dict) and isinstance(data.get("data"), list):
+                return data.get("data") or []
+            return []
+
+        url = f"{_supabase_url().rstrip('/')}/rest/v1/{table}"
+        response = requests.get(url, headers=_supabase_headers(), params=params or {}, timeout=25)
+        if response.status_code >= 400:
+            return []
+        data = response.json() if response.text else []
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
 
 
 def _get_deadline_list(account_id: str, limit: int = 10) -> List[Dict[str, Any]]:
@@ -2316,6 +2341,28 @@ def _handle_topup_selection(wa_id: str, account: Dict[str, Any], account_id: str
 
 
 
+
+# v11 override: safe deadline delete helper that does not depend on missing helpers.
+def _safe_delete_v11(table: str, **filters: Any) -> Dict[str, Any]:
+    try:
+        params = {}
+        for key, value in filters.items():
+            if value is not None and _clean(value):
+                params[key] = f"eq.{_clean(value)}"
+        url = f"{_supabase_url().rstrip('/')}/rest/v1/{table}"
+        headers = _supabase_headers()
+        headers["Prefer"] = "return=representation"
+        response = requests.delete(url, headers=headers, params=params, timeout=25)
+        try:
+            data = response.json() if response.text else []
+        except Exception:
+            data = response.text
+        return {"ok": response.status_code < 400, "status_code": response.status_code, "data": data}
+    except Exception as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {str(exc)[:500]}"}
+
+
+
 def _handle_deadline_delete_v10(wa_id: str, account_id: str, text: str) -> Dict[str, Any]:
     if not _deadline_allowed_for_account(account_id):
         body = (
@@ -2337,7 +2384,7 @@ def _handle_deadline_delete_v10(wa_id: str, account_id: str, text: str) -> Dict[
     if not deadline_id:
         return {"ok": True, "handled": "deadline_delete_missing_id", "send_result": _send_whatsapp_text(wa_id, "I found the reminder, but it has no valid ID. Please try D2 again or contact support.")}
 
-    result = _safe_delete("tax_deadlines", id=deadline_id)
+    result = _safe_delete_v11("tax_deadlines", id=deadline_id)
     body = (
         "🗑️ *Deadline reminder deleted*\n\n"
         f"{_deadline_display_line(item, idx)}\n\n"
