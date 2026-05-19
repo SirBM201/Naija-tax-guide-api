@@ -2,336 +2,614 @@
 from __future__ import annotations
 
 import logging
-import uuid
-from flask import Blueprint, request, jsonify
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
-from app.core.supabase_client import supabase_client as supabase
+from flask import Blueprint, jsonify, request
+
+from app.core.supabase_client import supabase
+from app.services.account_entitlements_service import (
+    count_workspace_members,
+    enforce_workspace_member_limit,
+    get_account_entitlements,
+)
 from app.services.auth_service import get_current_user
+
+try:
+    from app.services.web_auth_service import get_account_id_from_request
+except Exception:  # pragma: no cover - keeps the route boot-safe if web auth service changes
+    get_account_id_from_request = None  # type: ignore
 
 logger = logging.getLogger(__name__)
 
-bp = Blueprint("workspace", __name__)  # REMOVED url_prefix - handled by __init__.py
+# Do NOT add url_prefix here. app/__init__.py registers this blueprint with /api.
+bp = Blueprint("workspace", __name__)
 
 
-def _get_account_id_from_auth_user(auth_user_id: str) -> str | None:
-    """Get accounts.id from auth_user_id"""
-    if not auth_user_id:
+# -----------------------------------------------------------------------------
+# Small helpers
+# -----------------------------------------------------------------------------
+
+
+def _sb():
+    return supabase() if callable(supabase) else supabase
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _clean(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _clean_email(value: Any) -> str:
+    return _clean(value).lower()
+
+
+def _clip(value: Any, n: int = 500) -> str:
+    s = str(value or "")
+    return s if len(s) <= n else s[:n] + "...<truncated>"
+
+
+def _json_error(
+    message: str,
+    status: int,
+    *,
+    reason: Optional[str] = None,
+    fix: Optional[str] = None,
+    root_cause: Optional[Any] = None,
+    debug: Optional[Any] = None,
+    details: Optional[Any] = None,
+):
+    payload: Dict[str, Any] = {
+        "ok": False,
+        "error": reason or message,
+        "message": message,
+    }
+    if reason:
+        payload["reason"] = reason
+    if fix:
+        payload["fix"] = fix
+    if root_cause is not None:
+        payload["root_cause"] = root_cause
+    if debug is not None:
+        payload["debug"] = debug
+    if details is not None:
+        payload["details"] = details
+    return jsonify(payload), status
+
+
+def _account_select() -> str:
+    # Keep this list conservative. Selecting a non-existing column can break Supabase queries.
+    return "id,account_id,email,provider,provider_user_id,display_name,created_at,updated_at"
+
+
+def _workspace_select() -> str:
+    return "id,owner_account_id,member_account_id,role,status,created_at,updated_at"
+
+
+def _normalize_account(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not row:
         return None
-    
+    out = dict(row)
+    if not _clean(out.get("account_id")) and _clean(out.get("id")):
+        out["account_id"] = _clean(out.get("id"))
+    return out
+
+
+def _query_one(table: str, select_cols: str, column: str, value: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    value = _clean(value)
+    if not value:
+        return None, None
     try:
-        result = supabase.table("accounts")\
-            .select("id")\
-            .eq("auth_user_id", auth_user_id)\
-            .maybe_single()\
+        res = (
+            _sb()
+            .table(table)
+            .select(select_cols)
+            .eq(column, value)
+            .limit(1)
             .execute()
-        
-        if result.data:
-            return result.data.get("id")
-    except Exception as e:
-        logger.error(f"Failed to get account_id: {e}")
-    
+        )
+        rows = getattr(res, "data", None) or []
+        return (rows[0] if rows else None), None
+    except Exception as exc:
+        return None, f"{table}.{column}: {type(exc).__name__}: {_clip(exc)}"
+
+
+def _get_account_by_any(value: str) -> Tuple[Optional[Dict[str, Any]], List[str]]:
+    """
+    Resolve an account from any identifier used by the current codebase.
+
+    Current web login sometimes stores accounts.account_id in Flask session.user_id.
+    Older route code treated session.user_id as auth_user_id. This function supports both
+    so workspace does not fail after a valid login.
+    """
+    value = _clean(value)
+    errors: List[str] = []
+    if not value:
+        return None, errors
+
+    for column in ("account_id", "id", "auth_user_id", "supabase_user_id", "provider_user_id", "email"):
+        row, err = _query_one("accounts", _account_select(), column, value)
+        if row:
+            return _normalize_account(row), errors
+        if err:
+            # Missing legacy columns such as auth_user_id/supabase_user_id should not fail the route.
+            errors.append(err)
+
+    return None, errors
+
+
+def _get_account_by_email(email: str) -> Optional[Dict[str, Any]]:
+    email = _clean_email(email)
+    if not email:
+        return None
+
+    for column in ("email", "provider_user_id"):
+        row, _err = _query_one("accounts", _account_select(), column, email)
+        if row:
+            return _normalize_account(row)
+
     return None
 
 
-@bp.get("/limits")
-def get_workspace_limits():
-    """Get workspace limits for the current user"""
-    current_user = get_current_user()
-    
-    if not current_user:
-        logger.warning("Workspace limits: unauthorized")
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
-    
-    auth_user_id = current_user.get("id")
-    account_id = _get_account_id_from_auth_user(auth_user_id)
-    
-    if not account_id:
-        return jsonify({"ok": False, "error": "account not found"}), 404
-    
+def _resolve_current_account() -> Tuple[Optional[str], Optional[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Resolve the current logged-in account.
+
+    Primary path: Flask session via app.services.auth_service.get_current_user().
+    This is the path already proven by /api/me and /api/link/status in the current logs.
+
+    Secondary path: plain-token web session via get_account_id_from_request(), kept for
+    compatibility with older/newer login flows.
+    """
+    debug: Dict[str, Any] = {
+        "resolver": "workspace_v2",
+        "flask_session_user_found": False,
+        "web_token_checked": False,
+    }
+
+    # 1) Current working website session path.
     try:
-        sub_result = supabase.table("user_subscriptions")\
-            .select("plan_code, plan_family, status, is_active")\
-            .eq("account_id", account_id)\
-            .eq("is_active", True)\
-            .maybe_single()\
-            .execute()
-        
-        plan_code = "free"
-        plan_family = "free"
-        max_workspace_users = 1
-        max_linked_web_accounts = 1
-        max_total_channels = 5
-        max_whatsapp_channels = 1
-        max_telegram_channels = 1
-        
-        if sub_result and sub_result.data:
-            plan_code = sub_result.data.get("plan_code", "free")
-            plan_family = sub_result.data.get("plan_family", "free")
-            
-            if plan_family in ["pro", "business"] or plan_code in ["pro", "business"]:
-                max_workspace_users = 10
-                max_linked_web_accounts = 10
-                max_total_channels = 100
-                max_whatsapp_channels = 10
-                max_telegram_channels = 10
-            elif plan_family == "team" or plan_code == "team":
-                max_workspace_users = 5
-                max_linked_web_accounts = 5
-                max_total_channels = 50
-                max_whatsapp_channels = 5
-                max_telegram_channels = 5
-        
-        members_result = supabase.table("workspace_members")\
-            .select("id")\
-            .eq("owner_account_id", account_id)\
-            .execute()
-        
-        member_count = len(members_result.data) if members_result.data else 0
-        
-        return jsonify({
-            "ok": True,
-            "account_id": account_id,
-            "counts": {
-                "active_members_only": max(0, member_count - 1),
-                "owner_included_total": member_count,
-            },
-            "entitlements": {
-                "ok": True,
-                "plan_code": plan_code,
-                "plan_family": plan_family,
-                "plan": {
-                    "name": plan_family.capitalize(),
-                    "code": plan_code,
-                    "plan_family": plan_family,
-                },
-                "workspace_limits": {
-                    "max_workspace_users": max_workspace_users,
-                    "max_linked_web_accounts": max_linked_web_accounts,
-                },
-                "channel_limits": {
-                    "max_total_channels": max_total_channels,
-                    "max_whatsapp_channels": max_whatsapp_channels,
-                    "max_telegram_channels": max_telegram_channels,
-                }
-            }
-        })
-        
-    except Exception as e:
-        logger.exception("Failed to get workspace limits")
-        return jsonify({"ok": False, "error": str(e)}), 500
+        user = get_current_user()
+    except Exception as exc:
+        user = None
+        debug["flask_session_error"] = f"{type(exc).__name__}: {_clip(exc)}"
+
+    if user:
+        debug["flask_session_user_found"] = True
+        debug["flask_session_user_keys"] = sorted(list(user.keys()))
+
+        candidate_values = [
+            _clean(user.get("account_id")),
+            _clean(user.get("id")),
+            _clean(user.get("email")),
+        ]
+
+        lookup_errors: List[str] = []
+        for candidate in candidate_values:
+            if not candidate:
+                continue
+            account, errors = _get_account_by_any(candidate)
+            lookup_errors.extend(errors)
+            if account:
+                account_id = _clean(account.get("account_id")) or _clean(account.get("id")) or candidate
+                debug["account_source"] = "flask_session"
+                debug["account_lookup_candidate"] = candidate
+                if lookup_errors:
+                    debug["non_fatal_lookup_errors"] = lookup_errors[:6]
+                return account_id, account, debug
+
+        # If the session itself already carries a UUID-like account id, keep the page usable.
+        # The entitlement service can still return free fallback, and member queries will expose
+        # any table issue clearly instead of returning unauthorized.
+        fallback_id = _clean(user.get("account_id")) or _clean(user.get("id"))
+        if fallback_id:
+            debug["account_source"] = "flask_session_fallback_id"
+            if lookup_errors:
+                debug["non_fatal_lookup_errors"] = lookup_errors[:8]
+            return fallback_id, None, debug
+
+    # 2) Compatibility path for token-in-cookie/bearer flows.
+    if get_account_id_from_request is not None:
+        try:
+            debug["web_token_checked"] = True
+            token_account_id, token_debug = get_account_id_from_request(request)  # type: ignore[misc]
+            debug["web_token_debug"] = token_debug
+            token_account_id = _clean(token_account_id)
+            if token_account_id:
+                account, errors = _get_account_by_any(token_account_id)
+                if errors:
+                    debug["web_token_lookup_errors"] = errors[:6]
+                debug["account_source"] = "web_token"
+                return token_account_id, account, debug
+        except Exception as exc:
+            debug["web_token_error"] = f"{type(exc).__name__}: {_clip(exc)}"
+
+    debug["root_cause"] = "No valid Flask session account or web-session token was resolved."
+    return None, None, debug
 
 
-@bp.get("/members")
-def list_workspace_members():
-    """List all members in the user's workspace"""
-    current_user = get_current_user()
-    
-    if not current_user:
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
-    
-    auth_user_id = current_user.get("id")
-    account_id = _get_account_id_from_auth_user(auth_user_id)
-    
-    if not account_id:
-        return jsonify({"ok": False, "error": "account not found"}), 404
-    
-    try:
-        owner_result = supabase.table("accounts")\
-            .select("id, account_id, display_name, email, created_at, updated_at, provider, provider_user_id")\
-            .eq("id", account_id)\
-            .maybe_single()\
-            .execute()
-        
-        owner = owner_result.data if owner_result.data else None
-        
-        members_result = supabase.table("workspace_members")\
-            .select("id, owner_account_id, member_account_id, role, status, created_at, updated_at")\
-            .eq("owner_account_id", account_id)\
-            .execute()
-        
-        members = []
-        if members_result.data:
-            for m in members_result.data:
-                member_acc = supabase.table("accounts")\
-                    .select("display_name, email, provider, provider_user_id, account_id")\
-                    .eq("id", m.get("member_account_id"))\
-                    .maybe_single()\
-                    .execute()
-                
-                member_data = member_acc.data if member_acc.data else {}
-                
-                members.append({
-                    "id": m.get("id"),
-                    "owner_account_id": m.get("owner_account_id"),
-                    "member_account_id": m.get("member_account_id"),
-                    "role": m.get("role", "member"),
-                    "status": m.get("status", "active"),
-                    "created_at": m.get("created_at"),
-                    "updated_at": m.get("updated_at"),
-                    "member_email": member_data.get("email"),
-                    "member_display_name": member_data.get("display_name"),
-                    "member_provider": member_data.get("provider"),
-                    "member_provider_user_id": member_data.get("provider_user_id"),
-                })
-        
-        return jsonify({
-            "ok": True,
-            "account_id": account_id,
-            "owner": owner,
-            "members": members,
-            "count": len(members)
-        })
-        
-    except Exception as e:
-        logger.exception("Failed to list workspace members")
-        return jsonify({"ok": False, "error": str(e)}), 500
+def _normalize_role(role: Any) -> str:
+    role = _clean(role).lower()
+    return role if role in {"admin", "member", "viewer"} else "member"
 
 
-@bp.post("/members/add")
-def add_workspace_member():
-    """Add a member to the workspace by email"""
-    current_user = get_current_user()
-    
-    if not current_user:
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
-    
-    auth_user_id = current_user.get("id")
-    owner_account_id = _get_account_id_from_auth_user(auth_user_id)
-    
-    if not owner_account_id:
-        return jsonify({"ok": False, "error": "account not found"}), 404
-    
-    data = request.get_json() or {}
-    member_email = (data.get("member_email") or "").strip().lower()
-    role = data.get("role", "member")
-    
-    if not member_email:
-        return jsonify({"ok": False, "error": "member_email required"}), 400
-    
-    member_account = None
-    try:
-        result = supabase.table("accounts")\
-            .select("id, account_id, email")\
-            .eq("email", member_email)\
-            .maybe_single()\
-            .execute()
-        
-        if result.data:
-            member_account = result.data
-    except Exception as e:
-        logger.error(f"Failed to lookup account by email: {e}")
-    
-    if not member_account:
-        return jsonify({
-            "ok": False,
-            "error": "No account found with this email. User must sign up first."
-        }), 404
-    
-    try:
-        existing = supabase.table("workspace_members")\
-            .select("id")\
-            .eq("owner_account_id", owner_account_id)\
-            .eq("member_account_id", member_account["id"])\
-            .maybe_single()\
-            .execute()
-        
-        if existing.data:
-            return jsonify({"ok": False, "error": "User is already a member"}), 409
-    except Exception as e:
-        logger.error(f"Failed to check existing membership: {e}")
-    
-    sub_result = supabase.table("user_subscriptions")\
-        .select("plan_family")\
-        .eq("account_id", owner_account_id)\
-        .eq("is_active", True)\
-        .maybe_single()\
+def _active_member_rows(owner_account_id: str) -> List[Dict[str, Any]]:
+    res = (
+        _sb()
+        .table("workspace_members")
+        .select(_workspace_select())
+        .eq("owner_account_id", owner_account_id)
+        .order("created_at", desc=False)
         .execute()
-    
-    max_workspace_users = 1
-    if sub_result and sub_result.data:
-        plan_family = sub_result.data.get("plan_family", "free")
-        if plan_family in ["pro", "business"]:
-            max_workspace_users = 10
-        elif plan_family == "team":
-            max_workspace_users = 5
-    
-    count_result = supabase.table("workspace_members")\
-        .select("id", count="exact")\
-        .eq("owner_account_id", owner_account_id)\
-        .execute()
-    
-    current_count = len(count_result.data) if count_result.data else 0
-    
-    if current_count >= max_workspace_users:
-        return jsonify({
-            "ok": False,
-            "error": f"Workspace limit reached (max {max_workspace_users} members)."
-        }), 403
-    
-    try:
-        insert_data = {
-            "owner_account_id": owner_account_id,
-            "member_account_id": member_account["id"],
-            "role": role,
-            "status": "active"
+    )
+    rows = getattr(res, "data", None) or []
+    active: List[Dict[str, Any]] = []
+    for row in rows:
+        status = _clean((row or {}).get("status")).lower() or "active"
+        if status in {"active", "invited"}:
+            active.append(row)
+    return active
+
+
+def _enrich_member(row: Dict[str, Any]) -> Dict[str, Any]:
+    member_account_id = _clean(row.get("member_account_id"))
+    member, _errors = _get_account_by_any(member_account_id)
+
+    out = dict(row)
+    out["role"] = _normalize_role(out.get("role"))
+    out["status"] = _clean(out.get("status")) or "active"
+
+    if member:
+        out["member_account_id"] = _clean(member.get("account_id")) or member_account_id
+        out["member_email"] = member.get("email")
+        out["member_display_name"] = member.get("display_name")
+        out["member_provider"] = member.get("provider")
+        out["member_provider_user_id"] = member.get("provider_user_id")
+    else:
+        out.setdefault("member_email", None)
+        out.setdefault("member_display_name", None)
+        out.setdefault("member_provider", None)
+        out.setdefault("member_provider_user_id", None)
+
+    return out
+
+
+def _workspace_payload(account_id: str, owner: Optional[Dict[str, Any]], debug: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    entitlements = get_account_entitlements(account_id)
+    service_counts = count_workspace_members(account_id) or {}
+    rows = _active_member_rows(account_id)
+    members = [_enrich_member(row) for row in rows]
+
+    counts = {
+        "active_members_only": len(members),
+        "owner_included_total": 1 + len(members),
+        **service_counts,
+    }
+    counts["active_members_only"] = len(members)
+    counts["owner_included_total"] = 1 + len(members)
+
+    return {
+        "ok": True,
+        "account_id": account_id,
+        "owner": owner,
+        "members": members,
+        "count": len(members),
+        "counts": counts,
+        "entitlements": entitlements,
+        "debug": debug or {},
+    }
+
+
+# -----------------------------------------------------------------------------
+# Routes
+# -----------------------------------------------------------------------------
+
+
+@bp.get("/workspace/health")
+def workspace_health():
+    account_id, owner, debug = _resolve_current_account()
+    return jsonify(
+        {
+            "ok": True,
+            "status": "healthy",
+            "route": "/api/workspace/health",
+            "authenticated": bool(account_id),
+            "account_id": account_id,
+            "owner_found": bool(owner),
+            "debug": debug,
         }
-        
-        result = supabase.table("workspace_members").insert(insert_data).execute()
-        
-        if result.data:
-            return jsonify({
-                "ok": True,
-                "message": f"Successfully added {member_email} to workspace."
-            })
-        else:
-            return jsonify({"ok": False, "error": "Failed to add member"}), 500
-            
-    except Exception as e:
-        logger.exception("Failed to add workspace member")
-        return jsonify({"ok": False, "error": str(e)}), 500
+    ), 200
 
 
-@bp.post("/members/remove")
-def remove_workspace_member():
-    """Remove a member from the workspace"""
-    current_user = get_current_user()
-    
-    if not current_user:
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
-    
-    auth_user_id = current_user.get("id")
-    owner_account_id = _get_account_id_from_auth_user(auth_user_id)
-    
-    if not owner_account_id:
-        return jsonify({"ok": False, "error": "account not found"}), 404
-    
-    data = request.get_json() or {}
-    member_account_id = data.get("member_account_id") or data.get("member_id")
-    
-    if not member_account_id:
-        return jsonify({"ok": False, "error": "member_account_id required"}), 400
-    
-    if member_account_id == owner_account_id:
-        return jsonify({"ok": False, "error": "Cannot remove workspace owner"}), 403
-    
+@bp.get("/workspace/limits")
+def workspace_limits():
+    account_id, owner, debug = _resolve_current_account()
+    if not account_id:
+        return _json_error(
+            "Please sign in again before opening the workspace.",
+            401,
+            reason="unauthorized",
+            fix="Login again from the website so the ntg_session Flask session cookie can be refreshed.",
+            debug=debug,
+        )
+
     try:
-        supabase.table("workspace_members")\
-            .delete()\
-            .eq("owner_account_id", owner_account_id)\
-            .eq("member_account_id", member_account_id)\
+        entitlements = get_account_entitlements(account_id)
+        counts = count_workspace_members(account_id) or {}
+        if int(counts.get("owner_included_total") or 0) < 1:
+            counts = {"active_members_only": 0, "owner_included_total": 1}
+
+        return jsonify(
+            {
+                "ok": True,
+                "account_id": account_id,
+                "owner": owner,
+                "counts": counts,
+                "entitlements": entitlements,
+                "debug": debug,
+            }
+        ), 200
+    except Exception as exc:
+        logger.exception("Workspace limits failed")
+        return _json_error(
+            "Workspace limits could not be loaded.",
+            500,
+            reason="workspace_limits_failed",
+            root_cause=f"{type(exc).__name__}: {_clip(exc)}",
+            fix="Confirm workspace_members, accounts, user_subscriptions, and plans are available in Supabase.",
+            debug=debug,
+        )
+
+
+@bp.get("/workspace/members")
+def workspace_members_list():
+    account_id, owner, debug = _resolve_current_account()
+    if not account_id:
+        return _json_error(
+            "Please sign in again before opening workspace members.",
+            401,
+            reason="unauthorized",
+            fix="Login again from the website so the ntg_session Flask session cookie can be refreshed.",
+            debug=debug,
+        )
+
+    try:
+        return jsonify(_workspace_payload(account_id, owner, debug)), 200
+    except Exception as exc:
+        logger.exception("Workspace members list failed")
+        return _json_error(
+            "Workspace members could not be loaded.",
+            500,
+            reason="workspace_members_list_failed",
+            root_cause=f"{type(exc).__name__}: {_clip(exc)}",
+            fix="Confirm workspace_members exists and stores owner_account_id/member_account_id using canonical accounts.account_id values.",
+            debug=debug,
+        )
+
+
+@bp.post("/workspace/members/add")
+def workspace_members_add():
+    account_id, owner, debug = _resolve_current_account()
+    if not account_id:
+        return _json_error(
+            "Please sign in again before adding a workspace member.",
+            401,
+            reason="unauthorized",
+            fix="Login again from the website so the ntg_session Flask session cookie can be refreshed.",
+            debug=debug,
+        )
+
+    body = request.get_json(silent=True) or {}
+    member_email = _clean_email(body.get("member_email"))
+    member_account_id = _clean(body.get("member_account_id"))
+    role = _normalize_role(body.get("role") or "member")
+
+    if not member_email and not member_account_id:
+        return _json_error(
+            "Enter the member email address or member account ID.",
+            400,
+            reason="member_identifier_required",
+            fix="Send member_email for an existing web account, or member_account_id for an existing account row.",
+            debug=debug,
+        )
+
+    try:
+        member: Optional[Dict[str, Any]] = None
+        if member_account_id:
+            member, _errors = _get_account_by_any(member_account_id)
+        if not member and member_email:
+            member = _get_account_by_email(member_email)
+
+        if not member:
+            return _json_error(
+                "No existing web account was found for this member.",
+                404,
+                reason="member_account_not_found",
+                fix="Ask the member to sign in to Naija Tax Guide once, then add the same email again.",
+                debug=debug,
+                details={"member_email": member_email or None, "member_account_id": member_account_id or None},
+            )
+
+        target_account_id = _clean(member.get("account_id")) or _clean(member.get("id"))
+        if not target_account_id:
+            return _json_error(
+                "The member account exists but has no canonical account_id.",
+                409,
+                reason="member_account_id_missing",
+                fix="Repair the accounts row so account_id is populated. For this system, account_id should normally equal id for web users.",
+                debug=debug,
+                details={"member": member},
+            )
+
+        if target_account_id == account_id:
+            return _json_error(
+                "The owner is already part of this workspace.",
+                409,
+                reason="cannot_add_owner_as_member",
+                fix="Add another user email, not the owner email.",
+                debug=debug,
+            )
+
+        existing = (
+            _sb()
+            .table("workspace_members")
+            .select(_workspace_select())
+            .eq("owner_account_id", account_id)
+            .eq("member_account_id", target_account_id)
+            .limit(1)
             .execute()
-        
-        return jsonify({
-            "ok": True,
-            "message": "Member removed successfully."
-        })
-        
-    except Exception as e:
-        logger.exception("Failed to remove workspace member")
-        return jsonify({"ok": False, "error": str(e)}), 500
+        )
+        existing_rows = getattr(existing, "data", None) or []
+        if existing_rows:
+            existing_status = _clean(existing_rows[0].get("status")).lower() or "active"
+            if existing_status in {"active", "invited"}:
+                return _json_error(
+                    "This user is already a member of the workspace.",
+                    409,
+                    reason="member_already_linked",
+                    fix="Choose another user or remove this member first.",
+                    debug=debug,
+                    details={"member": _enrich_member(existing_rows[0])},
+                )
+
+            updated = (
+                _sb()
+                .table("workspace_members")
+                .update({"status": "active", "role": role, "updated_at": _now_iso()})
+                .eq("id", existing_rows[0].get("id"))
+                .execute()
+            )
+            row = (getattr(updated, "data", None) or existing_rows)[0]
+            return jsonify(
+                {
+                    "ok": True,
+                    "account_id": account_id,
+                    "message": f"Successfully reactivated {member.get('email') or target_account_id} in this workspace.",
+                    "member": _enrich_member(row),
+                    "workspace": _workspace_payload(account_id, owner, debug),
+                    "debug": debug,
+                }
+            ), 200
+
+        limit_check = enforce_workspace_member_limit(account_id)
+        if not limit_check.get("ok"):
+            return jsonify({"account_id": account_id, "debug": debug, **limit_check}), 403
+
+        insert_data = {
+            "owner_account_id": account_id,
+            "member_account_id": target_account_id,
+            "role": role,
+            "status": "active",
+        }
+
+        created = _sb().table("workspace_members").insert(insert_data).execute()
+        created_rows = getattr(created, "data", None) or []
+        created_row = created_rows[0] if created_rows else insert_data
+
+        return jsonify(
+            {
+                "ok": True,
+                "account_id": account_id,
+                "message": f"Successfully added {member.get('email') or target_account_id} to this workspace.",
+                "member": _enrich_member(created_row),
+                "workspace": _workspace_payload(account_id, owner, debug),
+                "debug": debug,
+            }
+        ), 200
+
+    except Exception as exc:
+        logger.exception("Workspace member add failed")
+        return _json_error(
+            "Workspace member could not be added.",
+            500,
+            reason="workspace_member_add_failed",
+            root_cause=f"{type(exc).__name__}: {_clip(exc)}",
+            fix="Check accounts lookup, workspace_members insert policy, and unique constraints.",
+            debug=debug,
+        )
 
 
-@bp.get("/health")
-def health():
-    """Health check endpoint"""
-    return jsonify({"ok": True, "status": "healthy"})
+@bp.post("/workspace/members/remove")
+def workspace_members_remove():
+    account_id, owner, debug = _resolve_current_account()
+    if not account_id:
+        return _json_error(
+            "Please sign in again before removing a workspace member.",
+            401,
+            reason="unauthorized",
+            fix="Login again from the website so the ntg_session Flask session cookie can be refreshed.",
+            debug=debug,
+        )
+
+    body = request.get_json(silent=True) or {}
+    member_account_id = _clean(body.get("member_account_id") or body.get("member_id"))
+
+    if not member_account_id:
+        return _json_error(
+            "member_account_id is required.",
+            400,
+            reason="member_account_id_required",
+            fix="Send the member_account_id shown on the workspace members list.",
+            debug=debug,
+        )
+
+    if member_account_id == account_id:
+        return _json_error(
+            "The workspace owner cannot be removed.",
+            403,
+            reason="cannot_remove_owner",
+            fix="Only additional members can be removed from this page.",
+            debug=debug,
+        )
+
+    try:
+        existing = (
+            _sb()
+            .table("workspace_members")
+            .select(_workspace_select())
+            .eq("owner_account_id", account_id)
+            .eq("member_account_id", member_account_id)
+            .limit(1)
+            .execute()
+        )
+        rows = getattr(existing, "data", None) or []
+        if not rows:
+            return jsonify(
+                {
+                    "ok": True,
+                    "account_id": account_id,
+                    "removed": False,
+                    "message": "This member was not found or has already been removed.",
+                    "workspace": _workspace_payload(account_id, owner, debug),
+                    "debug": debug,
+                }
+            ), 200
+
+        row_id = rows[0].get("id")
+        _sb().table("workspace_members").delete().eq("id", row_id).execute()
+
+        return jsonify(
+            {
+                "ok": True,
+                "account_id": account_id,
+                "removed": True,
+                "member_account_id": member_account_id,
+                "message": "Member removed successfully.",
+                "workspace": _workspace_payload(account_id, owner, debug),
+                "debug": debug,
+            }
+        ), 200
+
+    except Exception as exc:
+        logger.exception("Workspace member remove failed")
+        return _json_error(
+            "Workspace member could not be removed.",
+            500,
+            reason="workspace_member_remove_failed",
+            root_cause=f"{type(exc).__name__}: {_clip(exc)}",
+            fix="Check workspace_members delete access and confirm the member_account_id belongs to this owner.",
+            debug=debug,
+        )
