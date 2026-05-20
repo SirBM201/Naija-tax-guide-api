@@ -83,3 +83,4 @@ def supabase_admin() -> Client:
 
 def supabase_anon() -> Client:
     return get_supabase_client(admin=False)
+
