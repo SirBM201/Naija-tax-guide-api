@@ -22,7 +22,7 @@ except Exception:  # pragma: no cover
 
 bp = Blueprint("whatsapp", __name__)
 
-WHATSAPP_FLOW_VERSION = "2026-05-19-v16-q5-paid-short-ai"
+WHATSAPP_FLOW_VERSION = "2026-05-19-v17-q5-hard-credit-debit"
 
 
 # =============================================================================
@@ -1177,6 +1177,71 @@ def _credit_balance(account_id: str) -> int:
     return 0
 
 
+
+def _detect_credit_column(row: Dict[str, Any]) -> str:
+    for col in ("balance", "credits", "credit_balance"):
+        if col in row:
+            return col
+    return "balance"
+
+
+def _debit_q5_usage_credit(account_id: str) -> Dict[str, Any]:
+    """
+    Hard debit for WhatsApp Q5.
+
+    Reason:
+    ask_guarded may call OpenAI successfully without reducing the WhatsApp-visible
+    ai_credit_balances row. Q5 must never be free, so this helper checks balance
+    and deducts 1 credit before the AI call.
+    """
+    try:
+        row, err = _query_one("ai_credit_balances", "*", account_id=account_id)
+        if err:
+            return {"ok": False, "error": err, "mode": "balance_lookup_failed"}
+        if not row:
+            return {"ok": False, "error": "credit_balance_not_found", "mode": "no_balance_row"}
+
+        col = _detect_credit_column(row)
+        before = int(row.get(col) or 0)
+        if before < 1:
+            return {"ok": False, "error": "insufficient_credits", "before": before, "after": before, "column": col}
+
+        after = before - 1
+        payload = {col: after, "updated_at": _now_iso()}
+        update = _safe_update("ai_credit_balances", payload, account_id=account_id)
+        if not update.get("ok"):
+            return {
+                "ok": False,
+                "error": update.get("error") or "credit_update_failed",
+                "before": before,
+                "after": before,
+                "column": col,
+            }
+
+        return {"ok": True, "before": before, "after": after, "column": col, "credits_consumed": 1}
+    except Exception as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {_clip(exc)}", "mode": "exception"}
+
+
+def _refund_q5_usage_credit(account_id: str, debit: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Refund only if Q5 was pre-debited but the AI explanation failed before delivery.
+    """
+    try:
+        if not debit or not debit.get("ok"):
+            return {"ok": False, "error": "no_successful_debit_to_refund"}
+        row, err = _query_one("ai_credit_balances", "*", account_id=account_id)
+        if err or not row:
+            return {"ok": False, "error": err or "balance_row_not_found"}
+        col = _clean(debit.get("column") or _detect_credit_column(row))
+        current = int(row.get(col) or 0)
+        payload = {col: current + int(debit.get("credits_consumed") or 1), "updated_at": _now_iso()}
+        update = _safe_update("ai_credit_balances", payload, account_id=account_id)
+        return {"ok": bool(update.get("ok")), "data": update}
+    except Exception as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {_clip(exc)}"}
+
+
 def _plan_label(account_id: str) -> str:
     sub = _get_subscription(account_id)
     if not sub:
@@ -2031,10 +2096,10 @@ def _quiz_text() -> str:
         "Q2 - Choose category\n"
         "Q3 - Today's score\n"
         "Q4 - Review last answer\n"
-        "Q5 - Short AI explanation for last answer 💎\n\n"
+        "Q5 - Short paid AI explanation for last answer 💎\n\n"
         f"Free users: {QUIZ_FREE_DAILY_LIMIT} non-AI quiz attempts daily.\n"
         "Paid users: unlimited non-AI quiz attempts.\n"
-        "Only Q5 uses AI and costs 1 Usage Credit."
+        "Q5 costs 1 Usage Credit and returns a short AI explanation only."
     )
 
 
@@ -2333,21 +2398,34 @@ def _handle_quiz_command(wa_id: str, account_id: str, text: str, state: Dict[str
             return {
                 "ok": True,
                 "handled": "quiz_ai_no_context",
-                "send_result": _send_whatsapp_text(
-                    wa_id,
-                    "No last quiz question found yet. Reply Q1 to start a quiz first."
-                ),
+                "send_result": _send_whatsapp_text(wa_id, "No last quiz question found yet. Reply Q1 to start a quiz first."),
             }
 
-        # v16: Q5 is never free. It requires an active paid plan and must deduct Usage Credits.
+        # v17: Q5 is never free. Block free/no-plan users before any OpenAI call.
         if not _is_active_paid_subscription(account_id):
             body = (
-                "🔒 *Q5 AI Explanation is a paid feature*\\n\\n"
-                "Q1–Q4 remain free/non-AI according to your plan limits.\\n"
-                "Q5 uses AI and costs 1 Usage Credit because it calls the AI explanation engine.\\n\\n"
+                "🔒 *Q5 AI Explanation is a paid feature*\n\n"
+                "Q1–Q4 remain non-AI according to your plan limits.\n"
+                "Q5 costs 1 Usage Credit because it calls the AI explanation engine.\n\n"
                 "Reply 4 to view plans or Q4 to review the normal non-AI explanation."
             )
             return {"ok": True, "handled": "quiz_ai_paid_required", "send_result": _send_whatsapp_text(wa_id, body)}
+
+        # v17: pre-debit the WhatsApp-visible balance before calling OpenAI.
+        debit = _debit_q5_usage_credit(account_id)
+        if not debit.get("ok"):
+            body = (
+                "🔒 *Q5 AI Explanation not available*\n\n"
+                "Q5 costs 1 Usage Credit, but your credit balance could not be charged.\n"
+                "No AI explanation was generated.\n\n"
+                "Reply 3 to check your plan/credits, 4 to view plans, or Q4 for the normal non-AI review."
+            )
+            return {
+                "ok": True,
+                "handled": "quiz_ai_debit_failed",
+                "send_result": _send_whatsapp_text(wa_id, body),
+                "debit_error": debit if _debug_enabled() else None,
+            }
 
         result = ask_guarded({
             "account_id": account_id,
@@ -2360,38 +2438,38 @@ def _handle_quiz_command(wa_id: str, account_id: str, text: str, state: Dict[str
             "channel": "whatsapp",
             "provider": "wa",
             "provider_user_id": wa_id,
-            "action_code": "quiz_ai_explanation",
-            "credits_required": 1,
-            "force_usage_charge": True,
+            "action_code": "quiz_ai_explanation_q5_manual_credit",
             "max_words": 90,
             "max_output_tokens": 180,
         })
 
-        answer = _clean(result.get("answer") or result.get("message") or "I could not generate the explanation right now.")
-        answer = _clip(answer, 700)
+        answer = _clean(result.get("answer") or result.get("message") or "")
+        result_ok = bool(isinstance(result, dict) and (result.get("ok") is True or answer))
 
-        meta = result.get("meta") if isinstance(result, dict) and isinstance(result.get("meta"), dict) else {}
-        usage_charged = meta.get("usage_charged")
-        credits_consumed = meta.get("credits_consumed") or 1
-        credits_left = meta.get("credits_left", "not shown")
-
-        # Safety: if the AI call did not charge usage, do not present it as free.
-        if usage_charged is False:
+        if not result_ok:
+            _refund_q5_usage_credit(account_id, debit)
             body = (
-                "⚠️ *Q5 could not be charged*\\n\\n"
-                "Q5 is not free because it uses AI. Please check your Usage Credits or try again later.\\n\\n"
-                "Reply 2 to check balance, 6 to buy add-ons, or Q4 for the normal non-AI review."
+                "⚠️ *Q5 AI Explanation failed*\n\n"
+                "The AI explanation could not be generated, so the Usage Credit was returned.\n\n"
+                "Reply Q5 to try again, Q4 for normal review, or 0 for menu."
             )
-            return {"ok": True, "handled": "quiz_ai_not_charged_blocked", "send_result": _send_whatsapp_text(wa_id, body)}
+            return {"ok": True, "handled": "quiz_ai_failed_refunded", "send_result": _send_whatsapp_text(wa_id, body)}
 
-        credit_note = f"\\n\\n💎 Usage Credit deducted: {credits_consumed}\\nBalance: {credits_left}"
+        answer = _clip(answer, 650)
         body = (
-            "💡 *Q5 Short AI Explanation*\\n\\n"
-            f"{answer}"
-            f"{credit_note}\\n\\n"
+            "💡 *Q5 Short AI Explanation*\n\n"
+            f"{answer}\n\n"
+            f"💎 Usage Credit deducted: 1\n"
+            f"Balance: {debit.get('after')}\n\n"
             "Reply Q1 for another quiz, Q3 for score, or 0 for menu."
         )
-        return {"ok": True, "handled": "quiz_ai_explanation_paid_short", "send_result": _send_whatsapp_text(wa_id, _clip(body, 1300))}
+        return {
+            "ok": True,
+            "handled": "quiz_ai_explanation_paid_short_manual_debit",
+            "send_result": _send_whatsapp_text(wa_id, _clip(body, 1300)),
+            "credits_consumed": 1,
+            "credits_left": debit.get("after"),
+        }
 
     return {"ok": True, "handled": "quiz_menu", "send_result": _send_whatsapp_text(wa_id, _quiz_text())}
 
