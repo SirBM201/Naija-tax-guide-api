@@ -1,4 +1,4 @@
-﻿# app/core/supabase_client.py
+# app/core/supabase_client.py
 from __future__ import annotations
 
 import os
@@ -25,6 +25,7 @@ def _get_supabase_url() -> str:
 
 
 def _get_service_key() -> str:
+    # Prefer service role for backend writes
     return (
         _env("SUPABASE_SERVICE_ROLE_KEY")
         or _env("SUPABASE_SERVICE_KEY")
@@ -65,17 +66,20 @@ def get_supabase_client(admin: bool = True) -> Client:
     return _client_anon
 
 
-# Create the client instance
-_supabase_instance: Client = get_supabase_client(admin=True)
+# -------- Backwards-compatible exports --------
 
-# Make supabase callable for compatibility with blueprints that expect a function
-def supabase() -> Client:
-    """Returns the Supabase client instance (callable for blueprint compatibility)"""
-    return _supabase_instance
+# Many routes/services expect a module-level `supabase` object.
+# Provide it as an ADMIN client by default.
+supabase: Client = get_supabase_client(admin=True)
 
 
-# Also export as a client for direct use
-supabase_client = _supabase_instance
+def get_supabase() -> Client:
+    return get_supabase_client(admin=True)
 
-# Backwards compatibility - supabase can be used both as callable and directly
-# But to avoid confusion, we'll export both
+
+def supabase_admin() -> Client:
+    return get_supabase_client(admin=True)
+
+
+def supabase_anon() -> Client:
+    return get_supabase_client(admin=False)
