@@ -27,7 +27,7 @@ except Exception:  # pragma: no cover
 
 bp = Blueprint("whatsapp", __name__)
 
-WHATSAPP_FLOW_VERSION = "2026-05-23-v19-channel-identity-schema-safe"
+WHATSAPP_FLOW_VERSION = "2026-05-23-v20-accounts-auth-user-link-fallback"
 
 
 # =============================================================================
@@ -1066,6 +1066,62 @@ def _account_id_from_row(row: Optional[Dict[str, Any]]) -> str:
     return _clean(row.get("account_id") or row.get("id"))
 
 
+def _linked_owner_account_from_channel_account(row: Dict[str, Any], debug: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    If a WhatsApp/Telegram shell account has been linked to a website account,
+    use the website owner's account_id for subscription, credits, history and
+    dashboard logic.
+
+    This is the production-safe fallback for environments where RLS blocks
+    writes to channel_identities but allows the channel shell account to store
+    auth_user_id.
+    """
+    if not isinstance(row, dict):
+        return None
+
+    channel_account_id = _account_id_from_row(row)
+    owner_account_id = _clean(
+        row.get("auth_user_id")
+        or row.get("owner_account_id")
+        or row.get("linked_account_id")
+        or row.get("web_account_id")
+    )
+
+    if not owner_account_id or owner_account_id == channel_account_id:
+        return None
+
+    owner, err = _query_one("accounts", _account_select_cols(), account_id=owner_account_id)
+    debug["steps"].append(
+        {
+            "table": "accounts",
+            "via": "channel_account_auth_user_id",
+            "owner_account_id": owner_account_id,
+            "channel_account_id": channel_account_id,
+            "error": err,
+            "found": bool(owner),
+        }
+    )
+
+    if owner:
+        merged = dict(owner)
+        merged["linked_channel_account_id"] = channel_account_id
+        merged["channel_provider"] = row.get("provider")
+        merged["channel_provider_user_id"] = row.get("provider_user_id")
+        merged["channel_phone"] = row.get("phone_e164") or row.get("phone")
+        return merged
+
+    return {
+        "account_id": owner_account_id,
+        "id": owner_account_id,
+        "provider": "web",
+        "provider_user_id": owner_account_id,
+        "linked_channel_account_id": channel_account_id,
+        "channel_provider": row.get("provider"),
+        "channel_provider_user_id": row.get("provider_user_id"),
+        "channel_phone": row.get("phone_e164") or row.get("phone"),
+    }
+
+
 def _find_account_by_wa(wa_id: str) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
     wa_id = _normalize_phone(wa_id)
     debug: Dict[str, Any] = {"wa_id": wa_id, "steps": []}
@@ -1077,14 +1133,16 @@ def _find_account_by_wa(wa_id: str) -> Tuple[Optional[Dict[str, Any]], Dict[str,
         row, err = _query_one("accounts", _account_select_cols(), provider=provider, provider_user_id=wa_id)
         debug["steps"].append({"table": "accounts", "provider": provider, "error": err, "found": bool(row)})
         if row:
-            return row, debug
+            owner = _linked_owner_account_from_channel_account(row, debug)
+            return (owner or row), debug
 
     for column in ("phone_e164", "phone"):
         for value in (_display_phone(wa_id), wa_id):
             row, err = _query_one("accounts", _account_select_cols(), **{column: value})
             debug["steps"].append({"table": "accounts", "column": column, "error": err, "found": bool(row)})
             if row:
-                return row, debug
+                owner = _linked_owner_account_from_channel_account(row, debug)
+                return (owner or row), debug
 
     for channel_type in ("whatsapp", "wa"):
         identity, err = _query_one("channel_identities", "*", channel_type=channel_type, provider_user_id=wa_id)
@@ -1681,12 +1739,121 @@ def _mark_link_token_used_schema_safe(
             return
 
 
+def _link_wa_account_to_owner_fallback(
+    *,
+    account_id: str,
+    wa_id: str,
+    profile_name: str = "",
+    wa_account_id: Optional[str] = None,
+    previous_error: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Fallback link store when channel_identities insert/update is blocked by RLS.
+
+    Current production logs show channel_identities INSERT can return 401 even
+    though accounts PATCH succeeds. To keep linking reliable, we store the web
+    account owner on the WhatsApp shell account using auth_user_id.
+    
+    Other routes in this batch also read this fallback link, so the channel
+    appears linked in the website even without a channel_identities row.
+    """
+    acct = _clean(account_id)
+    clean_wa = _normalize_phone(wa_id)
+    name = _clean(profile_name) or _display_phone(clean_wa)
+    if not acct or not clean_wa:
+        return {"ok": False, "error": "accounts_fallback_missing_account_or_wa", "previous_error": previous_error}
+
+    target_account_id = _clean(wa_account_id)
+    if not target_account_id:
+        for provider in ("wa", "whatsapp"):
+            row, _err = _query_one("accounts", _account_select_cols(), provider=provider, provider_user_id=clean_wa)
+            if row:
+                target_account_id = _account_id_from_row(row)
+                break
+
+    if not target_account_id:
+        # Last resort: create/update the shell account then locate it.
+        upsert = _safe_upsert(
+            "accounts",
+            {
+                "provider": "wa",
+                "provider_user_id": clean_wa,
+                "display_name": name,
+                "phone": _display_phone(clean_wa),
+                "phone_e164": _display_phone(clean_wa),
+                "auth_user_id": acct,
+                "updated_at": _now_iso(),
+            },
+            on_conflict="provider,provider_user_id",
+        )
+        row, _err = _query_one("accounts", _account_select_cols(), provider="wa", provider_user_id=clean_wa)
+        target_account_id = _account_id_from_row(row)
+        if not target_account_id and not upsert.get("ok"):
+            return {"ok": False, "error": "accounts_fallback_shell_create_failed", "write_error": upsert.get("error"), "previous_error": previous_error}
+
+    payloads: List[Dict[str, Any]] = [
+        {
+            "auth_user_id": acct,
+            "provider": "wa",
+            "provider_user_id": clean_wa,
+            "display_name": name,
+            "phone": _display_phone(clean_wa),
+            "phone_e164": _display_phone(clean_wa),
+            "updated_at": _now_iso(),
+        },
+        {
+            "auth_user_id": acct,
+            "provider": "wa",
+            "provider_user_id": clean_wa,
+            "updated_at": _now_iso(),
+        },
+        {
+            "auth_user_id": acct,
+            "updated_at": _now_iso(),
+        },
+    ]
+
+    last_error = None
+    for payload in payloads:
+        if target_account_id:
+            result = _safe_update("accounts", payload, account_id=target_account_id)
+        else:
+            result = _safe_update("accounts", payload, provider="wa", provider_user_id=clean_wa)
+        if result.get("ok"):
+            return {
+                "ok": True,
+                "channel_identity": {
+                    "account_id": acct,
+                    "channel_type": "whatsapp",
+                    "provider_user_id": clean_wa,
+                    "is_verified": True,
+                    "metadata": {
+                        "display_name": name,
+                        "source": "accounts.auth_user_id_fallback",
+                        "linked_at": _now_iso(),
+                    },
+                },
+                "fallback": "accounts_auth_user_id",
+                "wa_account_id": target_account_id,
+                "previous_error": previous_error,
+            }
+        last_error = result.get("error")
+
+    return {
+        "ok": False,
+        "error": "accounts_auth_user_id_link_failed",
+        "write_error": last_error,
+        "previous_error": previous_error,
+    }
+
+
 def _write_channel_identity_schema_safe(
     *,
     account_id: str,
     wa_id: str,
     profile_name: str = "",
     token_row: Optional[Dict[str, Any]] = None,
+    wa_account_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create/update the WhatsApp channel identity using the production schema.
@@ -1758,7 +1925,13 @@ def _write_channel_identity_schema_safe(
             updated = _safe_update("channel_identities", payload, id=existing.get("id"))
             if updated.get("ok"):
                 return {"ok": True, "channel_identity": (updated.get("data") or [payload])[0] if isinstance(updated.get("data"), list) and updated.get("data") else {**existing, **payload}, "fallback": True}
-            return {"ok": False, "error": "channel_identity_update_failed", "service_error": service_error, "write_error": updated.get("error")}
+            return _link_wa_account_to_owner_fallback(
+                account_id=acct,
+                wa_id=clean_wa,
+                profile_name=name,
+                wa_account_id=wa_account_id,
+                previous_error={"error": "channel_identity_update_failed", "service_error": service_error, "write_error": updated.get("error")},
+            )
 
         insert_payload = {**payload, "first_seen_at": now_iso}
         try:
@@ -1766,9 +1939,21 @@ def _write_channel_identity_schema_safe(
             rows = getattr(created, "data", None) or []
             return {"ok": True, "channel_identity": rows[0] if rows else insert_payload, "fallback": True}
         except Exception as exc:
-            return {"ok": False, "error": "channel_identity_insert_failed", "service_error": service_error, "write_error": f"{type(exc).__name__}: {_clip(exc)}"}
+            return _link_wa_account_to_owner_fallback(
+                account_id=acct,
+                wa_id=clean_wa,
+                profile_name=name,
+                wa_account_id=wa_account_id,
+                previous_error={"error": "channel_identity_insert_failed", "service_error": service_error, "write_error": f"{type(exc).__name__}: {_clip(exc)}"},
+            )
     except Exception as exc:
-        return {"ok": False, "error": "channel_identity_fallback_failed", "service_error": service_error, "write_error": f"{type(exc).__name__}: {_clip(exc)}"}
+        return _link_wa_account_to_owner_fallback(
+            account_id=acct,
+            wa_id=clean_wa,
+            profile_name=name,
+            wa_account_id=wa_account_id,
+            previous_error={"error": "channel_identity_fallback_failed", "service_error": service_error, "write_error": f"{type(exc).__name__}: {_clip(exc)}"},
+        )
 
 
 def _try_link_code(wa_id: str, text: str, profile_name: str = "") -> Optional[str]:
@@ -1841,6 +2026,7 @@ def _try_link_code(wa_id: str, text: str, profile_name: str = "") -> Optional[st
         wa_id=wa_id,
         profile_name=profile_name,
         token_row=token_row,
+        wa_account_id=wa_account_id,
     )
 
     if not identity_result.get("ok"):
