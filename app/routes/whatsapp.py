@@ -14,6 +14,11 @@ from app.core.supabase_client import supabase
 from app.services.ask_service import ask_guarded
 
 try:
+    from app.services.channel_identity_service import create_or_update_channel_identity
+except Exception:  # pragma: no cover
+    create_or_update_channel_identity = None  # type: ignore
+
+try:
     from app.services.paystack_service import create_reference, initialize_transaction
 except Exception:  # pragma: no cover
     create_reference = None  # type: ignore
@@ -22,7 +27,7 @@ except Exception:  # pragma: no cover
 
 bp = Blueprint("whatsapp", __name__)
 
-WHATSAPP_FLOW_VERSION = "2026-05-23-v18-link-token-auth-user-id-owner-fix"
+WHATSAPP_FLOW_VERSION = "2026-05-23-v19-channel-identity-schema-safe"
 
 
 # =============================================================================
@@ -1628,6 +1633,144 @@ def _ambiguous_message(recognition: Dict[str, Any]) -> str:
 # Link code
 # =============================================================================
 
+def _mark_link_token_used_schema_safe(
+    *,
+    token_table: str,
+    token_row: Dict[str, Any],
+    wa_id: str,
+    wa_account_id: Optional[str] = None,
+) -> None:
+    """
+    Mark a link token as consumed without assuming every historical column exists.
+
+    Current production `link_tokens` has shown that some older columns such as
+    `used` are not available. This helper tries the richest update first and
+    falls back to smaller payloads so successful linking is not blocked by
+    non-essential audit columns.
+    """
+    token_id = _clean(token_row.get("id"))
+    if not token_table or not token_id:
+        return
+
+    now_iso = _now_iso()
+    clean_wa = _normalize_phone(wa_id)
+    payloads: List[Dict[str, Any]] = [
+        {
+            "status": "used",
+            "used_at": now_iso,
+            "provider_user_id": clean_wa,
+            "channel_account_id": wa_account_id or None,
+        },
+        {
+            "used_at": now_iso,
+            "provider_user_id": clean_wa,
+            "channel_account_id": wa_account_id or None,
+        },
+        {
+            "used_at": now_iso,
+            "provider_user_id": clean_wa,
+        },
+        {
+            "used_at": now_iso,
+        },
+    ]
+
+    for payload in payloads:
+        result = _safe_update(token_table, payload, id=token_id)
+        if result.get("ok"):
+            return
+
+
+def _write_channel_identity_schema_safe(
+    *,
+    account_id: str,
+    wa_id: str,
+    profile_name: str = "",
+    token_row: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Create/update the WhatsApp channel identity using the production schema.
+
+    The earlier Batch 9 direct upsert used extra columns such as provider,
+    phone, status, is_connected, verified, linked_at and an on_conflict value
+    that may not exist as a Supabase unique constraint. This version delegates
+    to the existing channel identity service first because that service already
+    matches the current schema. If unavailable, it falls back to minimal
+    insert/update using only proven channel_identities columns.
+    """
+    acct = _clean(account_id)
+    clean_wa = _normalize_phone(wa_id)
+    name = _clean(profile_name) or _display_phone(clean_wa)
+    referral_code = _clean((token_row or {}).get("referral_code")) or None
+    guest_session_id = _clean((token_row or {}).get("guest_session_id")) or None
+
+    if not acct or not clean_wa:
+        return {"ok": False, "error": "account_id_or_wa_id_missing"}
+
+    if create_or_update_channel_identity is not None:
+        try:
+            return create_or_update_channel_identity(  # type: ignore[misc]
+                account_id=acct,
+                channel_type="whatsapp",
+                provider_user_id=clean_wa,
+                display_name=name,
+                referral_code=referral_code,
+                guest_session_id=guest_session_id,
+            )
+        except Exception as exc:
+            # Fall through to minimal direct write.
+            service_error = f"{type(exc).__name__}: {_clip(exc)}"
+        else:
+            service_error = ""
+    else:
+        service_error = "create_or_update_channel_identity_unavailable"
+
+    now_iso = _now_iso()
+    metadata = {
+        "display_name": name,
+        "verified_via_link_code": True,
+        "verified_at": now_iso,
+        "created_from": "whatsapp_link_code_v19_fallback",
+    }
+
+    try:
+        existing = None
+        try:
+            existing = get_channel_identity(channel_type="whatsapp", provider_user_id=clean_wa)
+        except Exception:
+            existing = None
+
+        payload = {
+            "account_id": acct,
+            "channel_type": "whatsapp",
+            "provider_user_id": clean_wa,
+            "last_seen_at": now_iso,
+            "is_verified": True,
+            "metadata": {**((existing or {}).get("metadata") or {}), **metadata} if isinstance((existing or {}).get("metadata"), dict) else metadata,
+        }
+        if referral_code:
+            payload["referral_code"] = referral_code
+            payload["referral_locked"] = True
+        if guest_session_id:
+            payload["guest_session_id"] = guest_session_id
+
+        if existing and existing.get("id"):
+            updated = _safe_update("channel_identities", payload, id=existing.get("id"))
+            if updated.get("ok"):
+                return {"ok": True, "channel_identity": (updated.get("data") or [payload])[0] if isinstance(updated.get("data"), list) and updated.get("data") else {**existing, **payload}, "fallback": True}
+            return {"ok": False, "error": "channel_identity_update_failed", "service_error": service_error, "write_error": updated.get("error")}
+
+        insert_payload = {**payload, "first_seen_at": now_iso}
+        try:
+            created = _sb().table("channel_identities").insert(insert_payload).execute()
+            rows = getattr(created, "data", None) or []
+            return {"ok": True, "channel_identity": rows[0] if rows else insert_payload, "fallback": True}
+        except Exception as exc:
+            return {"ok": False, "error": "channel_identity_insert_failed", "service_error": service_error, "write_error": f"{type(exc).__name__}: {_clip(exc)}"}
+    except Exception as exc:
+        return {"ok": False, "error": "channel_identity_fallback_failed", "service_error": service_error, "write_error": f"{type(exc).__name__}: {_clip(exc)}"}
+
+
 def _try_link_code(wa_id: str, text: str, profile_name: str = "") -> Optional[str]:
     code = _clean(text).upper().replace(" ", "")
     if not re.fullmatch(r"[A-Z0-9]{5,12}", code):
@@ -1661,8 +1804,7 @@ def _try_link_code(wa_id: str, text: str, profile_name: str = "") -> Optional[st
 
     # Link tokens created by the web Channels page may store ownership under
     # different column names depending on which migration created the row.
-    # The current production link_tokens table uses auth_user_id, while older
-    # channel_link_tokens versions may use account_id / owner_account_id.
+    # The current production link_tokens table uses auth_user_id.
     account_id = _clean(
         token_row.get("account_id")
         or token_row.get("owner_account_id")
@@ -1690,36 +1832,26 @@ def _try_link_code(wa_id: str, text: str, profile_name: str = "") -> Optional[st
             # Do not block linking only because an old row has a non-standard date format.
             pass
 
-    now_iso = _now_iso()
     wa_id = _normalize_phone(wa_id)
     account_row, _debug = _create_or_update_wa_account(wa_id, profile_name=profile_name)
     wa_account_id = _account_id_from_row(account_row)
 
-    identity_payload = {
-        "account_id": account_id,
-        "channel_type": "whatsapp",
-        "provider": "wa",
-        "provider_user_id": wa_id,
-        "display_name": profile_name or _display_phone(wa_id),
-        "phone": _display_phone(wa_id),
-        "status": "connected",
-        "is_connected": True,
-        "verified": True,
-        "linked_at": now_iso,
-        "updated_at": now_iso,
-    }
-
-    identity_result = _safe_upsert("channel_identities", identity_payload, on_conflict="account_id,channel_type,provider_user_id")
-
-    if token_table and token_row.get("id"):
-        _safe_update(
-            token_table,
-            {"status": "used", "used_at": now_iso, "provider_user_id": wa_id, "channel_account_id": wa_account_id or None},
-            id=token_row.get("id"),
-        )
+    identity_result = _write_channel_identity_schema_safe(
+        account_id=account_id,
+        wa_id=wa_id,
+        profile_name=profile_name,
+        token_row=token_row,
+    )
 
     if not identity_result.get("ok"):
         return "I found your link code, but linking failed. Please contact support with this message: channel_identity_write_failed"
+
+    _mark_link_token_used_schema_safe(
+        token_table=token_table,
+        token_row=token_row,
+        wa_id=wa_id,
+        wa_account_id=wa_account_id,
+    )
 
     return "✅ WhatsApp linked successfully.\n\nYou can now ask Nigeria tax questions here. Reply 0 for main menu."
 
