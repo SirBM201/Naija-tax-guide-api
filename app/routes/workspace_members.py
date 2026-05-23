@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify as _flask_jsonify, request
 
 from app.services.web_auth_service import get_account_id_from_request
 from app.services.account_entitlements_service import (
@@ -14,6 +14,20 @@ from app.services.workspace_members_service import (
 )
 
 bp = Blueprint("workspace_members", __name__, url_prefix="/workspace")
+
+
+try:
+    from app.core.response_safety import sanitize_response_payload
+except Exception:  # pragma: no cover
+    def sanitize_response_payload(payload, request_obj=None):
+        return payload
+
+
+def jsonify(*args, **kwargs):
+    """Local safe jsonify wrapper that strips debug/internal payload keys in production."""
+    if len(args) == 1 and isinstance(args[0], (dict, list)) and not kwargs:
+        return _flask_jsonify(sanitize_response_payload(args[0], request))
+    return _flask_jsonify(*args, **kwargs)
 
 
 def _safe_json():
