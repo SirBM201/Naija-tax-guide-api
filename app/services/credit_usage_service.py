@@ -22,6 +22,7 @@ def _clean(value: Any) -> str:
     return str(value or "").strip()
 
 
+
 def _lower(value: Any) -> str:
     return _clean(value).lower()
 
