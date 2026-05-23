@@ -1,9 +1,12 @@
+# app/services/qa_library_service.py
 from __future__ import annotations
 
 import re
 from typing import Optional, Dict, Any, List
 
 from app.core.supabase_client import supabase
+
+QA_LIBRARY_SERVICE_VERSION = "2026-05-23-v2-library-compatible"
 
 
 def _sb():
@@ -31,30 +34,27 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
-def _language_answer_field(lang: str) -> str:
+def _language_answer_fields(lang: str) -> List[str]:
     code = (lang or "en").strip().lower()
 
     mapping = {
-        "en": "answer_en",
-        "pcm": "answer_pcm",
-        "pidgin": "answer_pidgin",
-        "yo": "answer_yo",
-        "yoruba": "answer_yoruba",
-        "ig": "answer_ig",
-        "igbo": "answer_igbo",
-        "ha": "answer_ha",
-        "hausa": "answer_hausa",
+        "en": ["answer_en", "answer"],
+        "pcm": ["answer_pcm", "answer_pidgin", "answer_en", "answer"],
+        "pidgin": ["answer_pidgin", "answer_pcm", "answer_en", "answer"],
+        "yo": ["answer_yo", "answer_yoruba", "answer_en", "answer"],
+        "yoruba": ["answer_yoruba", "answer_yo", "answer_en", "answer"],
+        "ig": ["answer_ig", "answer_igbo", "answer_en", "answer"],
+        "igbo": ["answer_igbo", "answer_ig", "answer_en", "answer"],
+        "ha": ["answer_ha", "answer_hausa", "answer_en", "answer"],
+        "hausa": ["answer_hausa", "answer_ha", "answer_en", "answer"],
     }
-    return mapping.get(code, "answer_en")
+    return mapping.get(code, ["answer_en", "answer"])
 
 
 def _row_best_answer(row: Dict[str, Any], lang: str) -> str:
-    preferred_field = _language_answer_field(lang)
-    preferred = str(row.get(preferred_field) or "").strip()
-    if preferred:
-        return preferred
-
-    fallback_order = [
+    checked: set[str] = set()
+    fallback_order = _language_answer_fields(lang) + [
+        "resolved_answer",
         "answer_en",
         "answer_pcm",
         "answer_yo",
@@ -65,8 +65,15 @@ def _row_best_answer(row: Dict[str, Any], lang: str) -> str:
         "answer_igbo",
         "answer_hausa",
         "answer",
+        "response",
+        "content",
+        "body",
+        "text",
     ]
     for key in fallback_order:
+        if key in checked:
+            continue
+        checked.add(key)
         value = str(row.get(key) or "").strip()
         if value:
             return value
@@ -76,7 +83,7 @@ def _row_best_answer(row: Dict[str, Any], lang: str) -> str:
 def _row_terms(row: Dict[str, Any]) -> List[str]:
     terms: List[str] = []
 
-    for key in ["question", "normalized_question", "canonical_key", "category", "source"]:
+    for key in ["question", "normalized_question", "canonical_key", "category", "source", "topic", "intent_type"]:
         value = str(row.get(key) or "").strip()
         if value:
             terms.append(value)
@@ -86,6 +93,16 @@ def _row_terms(row: Dict[str, Any]) -> List[str]:
         terms.extend(str(tag).strip() for tag in tags if str(tag).strip())
 
     return [_normalize_text(term) for term in terms if _normalize_text(term)]
+
+
+def _row_enabled(row: Dict[str, Any]) -> bool:
+    enabled = row.get("enabled")
+    if enabled is not None and str(enabled).strip().lower() in {"false", "0", "no", "off"}:
+        return False
+    status = str(row.get("status") or row.get("review_status") or "approved").strip().lower()
+    if status and status not in {"approved", "active", "published", "ok", "enabled"}:
+        return False
+    return True
 
 
 def _score_row(
@@ -107,34 +124,34 @@ def _score_row(
     row_tokens = set(_tokenize(" ".join(row_terms)))
 
     if ck and row_ck and ck == row_ck:
-        score += 200
-        reasons.append("canonical_key_exact:+200")
+        score += 220
+        reasons.append("canonical_key_exact:+220")
 
     if nq and row_nq and nq == row_nq:
-        score += 180
-        reasons.append("normalized_question_exact:+180")
+        score += 200
+        reasons.append("normalized_question_exact:+200")
 
     if nq and row_question and nq == row_question:
-        score += 120
-        reasons.append("question_exact:+120")
+        score += 150
+        reasons.append("question_exact:+150")
 
     if nq and row_nq and (nq in row_nq or row_nq in nq):
-        score += 50
-        reasons.append("normalized_phrase_overlap:+50")
+        score += 60
+        reasons.append("normalized_phrase_overlap:+60")
 
     if ck and ck in row_terms:
-        score += 40
-        reasons.append("canonical_key_term_hit:+40")
+        score += 50
+        reasons.append("canonical_key_term_hit:+50")
 
     overlap = len(q_tokens.intersection(row_tokens))
     if overlap > 0:
-        bonus = min(30, overlap * 6)
+        bonus = min(40, overlap * 8)
         score += bonus
         reasons.append(f"token_overlap:+{bonus}")
 
     priority = _safe_int(row.get("priority"), 0)
     if priority > 0:
-        bonus = min(20, priority)
+        bonus = min(25, priority)
         score += bonus
         reasons.append(f"priority:+{bonus}")
 
@@ -142,6 +159,15 @@ def _score_row(
         "score": score,
         "reasons": reasons,
     }
+
+
+def _select_enabled_query(table: str):
+    q = _sb().table(table).select("*")
+    try:
+        q = q.eq("enabled", True)
+    except Exception:
+        pass
+    return q
 
 
 def find_library_candidates(
@@ -157,15 +183,7 @@ def find_library_candidates(
         return []
 
     try:
-        res = (
-            _sb()
-            .table("qa_library")
-            .select("*")
-            .eq("enabled", True)
-            .order("priority", desc=True)
-            .limit(400)
-            .execute()
-        )
+        res = _select_enabled_query("qa_library").order("priority", desc=True).limit(400).execute()
         rows = getattr(res, "data", None) or []
     except Exception:
         return []
@@ -175,6 +193,8 @@ def find_library_candidates(
 
     scored: List[Dict[str, Any]] = []
     for row in rows:
+        if not isinstance(row, dict) or not _row_enabled(row):
+            continue
         score_info = _score_row(nq, ck, row)
         if score_info["score"] <= 0:
             continue
@@ -209,36 +229,30 @@ def find_library_answer(
 
     try:
         if ck:
-            res = (
-                _sb()
-                .table("qa_library")
-                .select("*")
-                .eq("enabled", True)
-                .eq("canonical_key", ck)
-                .order("priority", desc=True)
-                .limit(1)
-                .execute()
-            )
+            q = _select_enabled_query("qa_library").eq("canonical_key", ck)
+            try:
+                q = q.order("priority", desc=True)
+            except Exception:
+                pass
+            res = q.limit(1).execute()
             if getattr(res, "data", None):
                 row = dict(res.data[0])
-                row["resolved_answer"] = _row_best_answer(row, lang)
-                return row
+                if _row_enabled(row):
+                    row["resolved_answer"] = _row_best_answer(row, lang)
+                    return row
 
         if nq:
-            res = (
-                _sb()
-                .table("qa_library")
-                .select("*")
-                .eq("enabled", True)
-                .eq("normalized_question", nq)
-                .order("priority", desc=True)
-                .limit(1)
-                .execute()
-            )
+            q = _select_enabled_query("qa_library").eq("normalized_question", nq)
+            try:
+                q = q.order("priority", desc=True)
+            except Exception:
+                pass
+            res = q.limit(1).execute()
             if getattr(res, "data", None):
                 row = dict(res.data[0])
-                row["resolved_answer"] = _row_best_answer(row, lang)
-                return row
+                if _row_enabled(row):
+                    row["resolved_answer"] = _row_best_answer(row, lang)
+                    return row
     except Exception:
         pass
 
@@ -256,3 +270,29 @@ def find_library_answer(
         return None
 
     return best
+
+
+def get_library_answer_by_canonical(canonical_key: str, lang: str = "en") -> Optional[Dict[str, Any]]:
+    """
+    Compatibility function required by app.services.qa_resolver.
+    """
+    ck = _normalize_text(canonical_key)
+    if not ck:
+        return None
+
+    row = find_library_answer(normalized_question="", lang=lang, canonical_key=ck)
+    if not row:
+        return None
+
+    answer = str(row.get("resolved_answer") or _row_best_answer(row, lang) or "").strip()
+    if not answer:
+        return None
+
+    return {
+        "ok": True,
+        "answer": answer,
+        "lang_used": lang,
+        "canonical_key": row.get("canonical_key") or ck,
+        "row": row,
+        "source": "qa_library",
+    }
