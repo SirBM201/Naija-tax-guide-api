@@ -6,7 +6,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from flask import Blueprint, jsonify, redirect, request
+from flask import Blueprint, jsonify as _flask_jsonify, redirect, request
 
 from app.core.supabase_client import supabase
 from app.services.credits_service import (
@@ -48,6 +48,22 @@ except Exception:  # pragma: no cover
 
 
 bp = Blueprint("billing", __name__)
+
+
+try:
+    from app.core.response_safety import sanitize_response_payload
+except Exception:  # pragma: no cover
+    def sanitize_response_payload(payload, request_obj=None):
+        return payload
+
+
+def jsonify(*args, **kwargs):
+    """Local safe jsonify wrapper that strips debug/internal payload keys in production."""
+    if len(args) == 1 and isinstance(args[0], (dict, list)) and not kwargs:
+        return _flask_jsonify(sanitize_response_payload(args[0], request))
+    return _flask_jsonify(*args, **kwargs)
+
+
 logger = logging.getLogger(__name__)
 
 BILLING_ROUTE_VERSION = "2026-05-23-v2-web-paystack-topup-channel-safe"
