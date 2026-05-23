@@ -181,6 +181,41 @@ def _identity_payload(identity: Optional[Dict[str, Any]], channel_type: str) -> 
     }
 
 
+def _account_link_fallback_identity(account_id: str, channel_type: str) -> Optional[Dict[str, Any]]:
+    provider = "wa" if channel_type == "whatsapp" else "tg" if channel_type == "telegram" else ""
+    if not account_id or not provider:
+        return None
+    try:
+        res = (
+            _sb()
+            .table("accounts")
+            .select("id,account_id,provider,provider_user_id,auth_user_id,display_name,phone,phone_e164,email,updated_at,created_at")
+            .eq("auth_user_id", account_id)
+            .eq("provider", provider)
+            .limit(1)
+            .execute()
+        )
+        rows = getattr(res, "data", None) or []
+        if not rows:
+            return None
+        row = rows[0]
+        provider_user_id = _clean(row.get("provider_user_id") or row.get("phone_e164") or row.get("phone"))
+        display_name = _clean(row.get("display_name")) or provider_user_id
+        return {
+            "account_id": account_id,
+            "channel_type": channel_type,
+            "provider_user_id": provider_user_id,
+            "is_verified": True,
+            "last_seen_at": row.get("updated_at") or row.get("created_at"),
+            "created_at": row.get("created_at"),
+            "updated_at": row.get("updated_at"),
+            "metadata": {"display_name": display_name, "source": "accounts.auth_user_id_fallback"},
+            "raw_account": row,
+        }
+    except Exception:
+        return None
+
+
 def _status_for_account(account_id: str) -> Tuple[Dict[str, Any], int]:
     errors: Dict[str, str] = {}
     wa = None
@@ -195,6 +230,11 @@ def _status_for_account(account_id: str) -> Tuple[Dict[str, Any], int]:
         tg = get_channel_identity_by_account(account_id=account_id, channel_type="telegram")
     except Exception as exc:
         errors["telegram"] = f"{type(exc).__name__}: {exc}"
+
+    if not wa:
+        wa = _account_link_fallback_identity(account_id, "whatsapp")
+    if not tg:
+        tg = _account_link_fallback_identity(account_id, "telegram")
 
     whatsapp = _identity_payload(wa, "whatsapp")
     telegram = _identity_payload(tg, "telegram")
@@ -309,7 +349,18 @@ def _safe_unlink_identity(account_id: str, channel_type: str, provider: str) -> 
         }
 
     if not identity:
-        return {"ok": True, "unlinked": False, "reason": "not_linked", "provider": provider}
+        try:
+            (
+                _sb()
+                .table("accounts")
+                .update({"auth_user_id": None, "updated_at": _now_iso()})
+                .eq("auth_user_id", account_id)
+                .eq("provider", provider)
+                .execute()
+            )
+        except Exception:
+            pass
+        return {"ok": True, "unlinked": False, "reason": "not_linked_or_accounts_fallback_cleared", "provider": provider}
 
     provider_user_id = _clean(identity.get("provider_user_id"))
 
@@ -329,6 +380,18 @@ def _safe_unlink_identity(account_id: str, channel_type: str, provider: str) -> 
             "root_cause": f"{type(exc).__name__}: {exc}",
         }
 
+    try:
+        (
+            _sb()
+            .table("accounts")
+            .update({"auth_user_id": None, "updated_at": _now_iso()})
+            .eq("auth_user_id", account_id)
+            .eq("provider", provider)
+            .execute()
+        )
+    except Exception:
+        pass
+
     _expire_previous_tokens(account_id, provider)
 
     return {
@@ -342,7 +405,7 @@ def _safe_unlink_identity(account_id: str, channel_type: str, provider: str) -> 
 
 @bp.get("/channel/health")
 def channel_health():
-    return jsonify({"ok": True, "service": "channel", "version": "safe_client_v4"}), 200
+    return jsonify({"ok": True, "service": "channel", "version": "safe_client_v5-accounts-fallback"}), 200
 
 
 @bp.get("/channel/status")
