@@ -24,18 +24,37 @@ def _safe_dt(v: Any) -> Optional[datetime]:
     try:
         if not v:
             return None
-        return datetime.fromisoformat(str(v).replace("Z", "+00:00")).astimezone(timezone.utc)
+        dt = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
     except Exception:
         return None
 
 
+def _normalize_bool(v: Any) -> Optional[bool]:
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    s = str(v).strip().lower()
+    if s in {"1", "true", "yes", "y", "on", "active"}:
+        return True
+    if s in {"0", "false", "no", "n", "off", "inactive"}:
+        return False
+    return bool(v)
+
+
 def _normalize_sub_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    raw_is_active = row.get("is_active")
     return {
         "id": row.get("id"),
         "account_id": row.get("account_id"),
         "plan_code": (row.get("plan_code") or "").strip().lower() or None,
         "status": (row.get("status") or "").strip().lower(),
-        "is_active": bool(row.get("is_active")),
+        "is_active": _normalize_bool(raw_is_active),
         "started_at": row.get("started_at"),
         "expires_at": row.get("expires_at"),
         "trial_until": row.get("trial_until"),
@@ -83,13 +102,21 @@ def _get_subscription_row(account_id: str) -> Tuple[Optional[Dict[str, Any]], Op
         }
 
 
+def _expiry_dt(sub: Optional[Dict[str, Any]]) -> Optional[datetime]:
+    if not sub:
+        return None
+    return _safe_dt(sub.get("expires_at") or sub.get("current_period_end"))
+
+
 def _subscription_is_active_now(sub: Optional[Dict[str, Any]]) -> bool:
     if not sub:
         return False
 
     status = str(sub.get("status") or "").strip().lower()
-    is_active = bool(sub.get("is_active"))
-    expires_at = _safe_dt(sub.get("expires_at"))
+    raw_is_active = sub.get("is_active")
+    is_active = True if raw_is_active is None else bool(raw_is_active)
+
+    expires_at = _expiry_dt(sub)
     grace_until = _safe_dt(sub.get("grace_until"))
     now = _now_utc()
 
@@ -100,10 +127,13 @@ def _subscription_is_active_now(sub: Optional[Dict[str, Any]]) -> bool:
     if status in {"grace", "past_due"}:
         return bool(grace_until and now < grace_until)
 
-    if status == "cancelled":
+    if status in {"cancelled", "canceled"}:
         return bool(expires_at and now < expires_at)
 
-    if not is_active or status != "active":
+    if status and status != "active":
+        return False
+
+    if not is_active:
         return False
 
     if expires_at and now < expires_at:
@@ -112,6 +142,7 @@ def _subscription_is_active_now(sub: Optional[Dict[str, Any]]) -> bool:
     if grace_until and now < grace_until:
         return True
 
+    # If the row is explicitly active and no expiry column exists, keep access enabled.
     return expires_at is None
 
 
@@ -125,17 +156,18 @@ def _build_access(sub: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         }
 
     now = _now_utc()
-    expires_at = _safe_dt(sub.get("expires_at"))
+    expires_at = _expiry_dt(sub)
     trial_until = _safe_dt(sub.get("trial_until"))
     grace_until = _safe_dt(sub.get("grace_until"))
 
     status = (sub.get("status") or "").strip().lower()
-    is_active = bool(sub.get("is_active"))
+    raw_is_active = sub.get("is_active")
+    is_active = True if raw_is_active is None else bool(raw_is_active)
 
     allowed = False
     reason = "inactive_subscription"
 
-    if is_active and status == "active":
+    if is_active and (status == "active" or not status):
         if expires_at is None or now < expires_at:
             allowed = True
             reason = "active"
@@ -162,7 +194,7 @@ def _build_access(sub: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     elif status == "inactive":
         allowed = False
         reason = "inactive"
-    elif status == "cancelled":
+    elif status in {"cancelled", "canceled"}:
         if expires_at and now < expires_at:
             allowed = True
             reason = "active_until_period_end"
