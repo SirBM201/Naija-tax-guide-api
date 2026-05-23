@@ -22,7 +22,7 @@ except Exception:  # pragma: no cover
 
 bp = Blueprint("whatsapp", __name__)
 
-WHATSAPP_FLOW_VERSION = "2026-05-19-v17-q5-hard-credit-debit"
+WHATSAPP_FLOW_VERSION = "2026-05-23-v18-link-token-auth-user-id-owner-fix"
 
 
 # =============================================================================
@@ -1659,9 +1659,36 @@ def _try_link_code(wa_id: str, text: str, profile_name: str = "") -> Optional[st
     if not token_row:
         return None
 
-    account_id = _clean(token_row.get("account_id") or token_row.get("owner_account_id") or token_row.get("app_user_id") or token_row.get("user_account_id"))
+    # Link tokens created by the web Channels page may store ownership under
+    # different column names depending on which migration created the row.
+    # The current production link_tokens table uses auth_user_id, while older
+    # channel_link_tokens versions may use account_id / owner_account_id.
+    account_id = _clean(
+        token_row.get("account_id")
+        or token_row.get("owner_account_id")
+        or token_row.get("auth_user_id")
+        or token_row.get("app_user_id")
+        or token_row.get("user_account_id")
+        or token_row.get("user_id")
+    )
     if not account_id:
         return "The link code was found, but it is missing account ownership. Please generate a new code from the website."
+
+    # Reject already-used/expired tokens where the table exposes those fields.
+    if token_row.get("used") is True or _clean(token_row.get("used_at")) or _lower(token_row.get("status")) in {"used", "expired"}:
+        return "This link code has already been used or expired. Please generate a new code from the website."
+
+    expires_at_raw = _clean(token_row.get("expires_at"))
+    if expires_at_raw:
+        try:
+            expires_at = datetime.fromisoformat(expires_at_raw.replace("Z", "+00:00"))
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            if expires_at < datetime.now(timezone.utc):
+                return "This link code has expired. Please generate a new code from the website."
+        except Exception:
+            # Do not block linking only because an old row has a non-standard date format.
+            pass
 
     now_iso = _now_iso()
     wa_id = _normalize_phone(wa_id)
