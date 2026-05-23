@@ -10,11 +10,27 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import quote
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify as _flask_jsonify, request
 
 from app.core.supabase_client import supabase
 from app.services.auth_service import get_current_user
 from app.services.channel_identity_runtime_service import get_channel_identity_by_account
+
+
+
+try:
+    from app.core.response_safety import sanitize_response_payload
+except Exception:  # pragma: no cover
+    def sanitize_response_payload(payload, request_obj=None):
+        return payload
+
+
+def jsonify(*args, **kwargs):
+    """Local safe jsonify wrapper that strips debug/internal payload keys in production."""
+    if len(args) == 1 and isinstance(args[0], (dict, list)) and not kwargs:
+        return _flask_jsonify(sanitize_response_payload(args[0], request))
+    return _flask_jsonify(*args, **kwargs)
+
 
 logger = logging.getLogger(__name__)
 
