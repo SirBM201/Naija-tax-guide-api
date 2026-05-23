@@ -3,7 +3,22 @@ from __future__ import annotations
 
 from typing import Any, Optional, Tuple
 
-from flask import Blueprint, g, jsonify, request, session
+from flask import Blueprint, g, jsonify as _flask_jsonify, request, session
+
+try:
+    from app.core.response_safety import sanitize_response_payload
+except Exception:  # pragma: no cover
+    def sanitize_response_payload(payload, request_obj=None):
+        return payload
+
+
+def jsonify(*args, **kwargs):
+    """Local safe jsonify wrapper that strips debug/internal payload keys in production."""
+    if len(args) == 1 and isinstance(args[0], (dict, list)) and not kwargs:
+        return _flask_jsonify(sanitize_response_payload(args[0], request))
+    return _flask_jsonify(*args, **kwargs)
+
+
 
 from app.services.history_service import (
     HistoryServiceError,
