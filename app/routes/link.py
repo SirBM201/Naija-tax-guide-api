@@ -16,9 +16,13 @@ except Exception:
     get_supabase_client = None  # type: ignore
 
 
-bp = Blueprint("link", __name__, url_prefix="/link")
+# IMPORTANT:
+# Do NOT set url_prefix="/link" here because app/__init__.py registers
+# all blueprints with url_prefix="/api", which overrides blueprint-level
+# prefixes. Therefore routes below include /link directly.
+bp = Blueprint("link", __name__)
 
-LINK_ROUTE_VERSION = "generate_alias_safe_v6a-used-at-only-browser-safe"
+LINK_ROUTE_VERSION = "generate_alias_safe_v6b-used-at-only-api-link-path"
 CODE_LENGTH = int(os.getenv("LINK_CODE_LENGTH", "8"))
 CODE_TTL_MINUTES = int(os.getenv("LINK_CODE_TTL_MINUTES", "30"))
 CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
@@ -77,13 +81,6 @@ def _first(resp: Any) -> Optional[dict[str, Any]]:
 
 
 def _client(admin: bool = True):
-    """
-    Return Supabase client.
-
-    This backend route prefers the service-role/admin client because link
-    generation, unlinking, and status aggregation are trusted server-side
-    operations.
-    """
     if get_supabase_client is None:
         raise RuntimeError("get_supabase_client is unavailable")
 
@@ -131,13 +128,6 @@ def _extract_account_id(value: Any) -> Optional[str]:
 
 
 def _resolve_account_id() -> Optional[str]:
-    """
-    Resolve the logged-in web account.
-
-    This route supports several auth styles because the project has used
-    multiple web-token/session resolver patterns during development.
-    """
-
     # 1. Flask globals
     for key in ("account_id", "user_id", "auth_user_id"):
         val = getattr(g, key, None)
@@ -344,12 +334,6 @@ def _build_status(account_id: str) -> dict[str, Any]:
 # -----------------------------------------------------------------------------
 
 def _expire_open_tokens(db: Any, account_id: str, provider: str) -> None:
-    """
-    Expire previous unused tokens using the current schema: used_at only.
-
-    This intentionally does not reference the removed legacy boolean `used`
-    column, preventing recurring PGRST204 warnings in Koyeb logs.
-    """
     payload = {
         "used_at": _iso(_utc_now()),
     }
@@ -388,8 +372,6 @@ def _insert_link_token(
         "used_by_provider_user_id": None,
     }
 
-    # Defensive fallbacks for possible older/staging schemas.
-    # None of these attempts uses the removed legacy `used` column.
     attempts = [
         common,
         {
@@ -454,7 +436,7 @@ def _whatsapp_open_url(code: str) -> Optional[str]:
 # Routes
 # -----------------------------------------------------------------------------
 
-@bp.route("/health", methods=["GET", "POST", "HEAD", "OPTIONS"])
+@bp.route("/link/health", methods=["GET", "POST", "HEAD", "OPTIONS"])
 def health():
     return jsonify(
         {
@@ -462,11 +444,12 @@ def health():
             "service": "link",
             "version": LINK_ROUTE_VERSION,
             "token_schema": "used_at_only",
+            "route_mount": "/api/link/*",
         }
     )
 
 
-@bp.route("/status", methods=["GET", "POST", "HEAD", "OPTIONS"])
+@bp.route("/link/status", methods=["GET", "POST", "HEAD", "OPTIONS"])
 def status():
     account_id, error = _get_account_or_401()
 
@@ -477,7 +460,7 @@ def status():
     return jsonify(_build_status(account_id))
 
 
-@bp.route("/generate", methods=["POST", "OPTIONS"])
+@bp.route("/link/generate", methods=["POST", "OPTIONS"])
 def generate_link_code():
     account_id, error = _get_account_or_401()
 
@@ -542,7 +525,7 @@ def generate_link_code():
     )
 
 
-@bp.route("/unlink", methods=["POST", "OPTIONS"])
+@bp.route("/link/unlink", methods=["POST", "OPTIONS"])
 def unlink_channel():
     account_id, error = _get_account_or_401()
 
@@ -588,8 +571,6 @@ def unlink_channel():
             if del_ok:
                 removed += 1
 
-    # Clear accounts fallback links for this web owner/provider.
-    # This does not delete the WhatsApp/Telegram shell account.
     _safe_exec(
         db.table("accounts")
         .update(
@@ -602,7 +583,6 @@ def unlink_channel():
         .eq("provider", provider)
     )
 
-    # Expire open link code for this provider.
     _expire_open_tokens(db, account_id, provider)
 
     return jsonify(
@@ -618,12 +598,11 @@ def unlink_channel():
     )
 
 
-# Backward-compatible aliases that some frontend builds may call.
-@bp.route("/generate-code", methods=["POST", "OPTIONS"])
+@bp.route("/link/generate-code", methods=["POST", "OPTIONS"])
 def generate_link_code_alias():
     return generate_link_code()
 
 
-@bp.route("/me", methods=["GET", "POST", "HEAD", "OPTIONS"])
+@bp.route("/link/me", methods=["GET", "POST", "HEAD", "OPTIONS"])
 def me_alias():
     return status()
