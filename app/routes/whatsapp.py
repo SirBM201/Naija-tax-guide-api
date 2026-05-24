@@ -1,3 +1,4 @@
+
 # app/routes/whatsapp.py
 from __future__ import annotations
 
@@ -27,7 +28,7 @@ except Exception:  # pragma: no cover
 
 bp = Blueprint("whatsapp", __name__)
 
-WHATSAPP_FLOW_VERSION = "2026-05-23-v20-accounts-auth-user-link-fallback"
+WHATSAPP_FLOW_VERSION = "2026-05-24-v21-link-fallback-success-best-effort-identity"
 
 
 # =============================================================================
@@ -1856,14 +1857,18 @@ def _write_channel_identity_schema_safe(
     wa_account_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Create/update the WhatsApp channel identity using the production schema.
+    Link WhatsApp to the website account in a way that does not fail when
+    channel_identities insert/update is blocked by RLS.
 
-    The earlier Batch 9 direct upsert used extra columns such as provider,
-    phone, status, is_connected, verified, linked_at and an on_conflict value
-    that may not exist as a Supabase unique constraint. This version delegates
-    to the existing channel identity service first because that service already
-    matches the current schema. If unavailable, it falls back to minimal
-    insert/update using only proven channel_identities columns.
+    Production finding:
+    - link_tokens lookup works.
+    - accounts PATCH works.
+    - channel_identities POST may return 401 after anon policies are tightened.
+
+    Therefore, accounts.auth_user_id is the primary durable link store for the
+    webhook path. The channel_identities row is now a best-effort mirror only.
+    Other route files in the current batch read the accounts fallback, so a
+    successful accounts fallback must be treated as successful linking.
     """
     acct = _clean(account_id)
     clean_wa = _normalize_phone(wa_id)
@@ -1874,9 +1879,36 @@ def _write_channel_identity_schema_safe(
     if not acct or not clean_wa:
         return {"ok": False, "error": "account_id_or_wa_id_missing"}
 
+    # ----------------------------------------------------------------------
+    # Primary durable link store.
+    # ----------------------------------------------------------------------
+    # This is intentionally first. Once this succeeds, linking is successful.
+    # The channel_identities table is only a mirror because it can be blocked
+    # by RLS depending on which Supabase key the webhook process is using.
+    accounts_fallback = _link_wa_account_to_owner_fallback(
+        account_id=acct,
+        wa_id=clean_wa,
+        profile_name=name,
+        wa_account_id=wa_account_id,
+        previous_error={"note": "primary_accounts_auth_user_id_link"},
+    )
+
+    if not accounts_fallback.get("ok"):
+        return {
+            "ok": False,
+            "error": "accounts_auth_user_id_link_failed",
+            "fallback_error": accounts_fallback,
+        }
+
+    # ----------------------------------------------------------------------
+    # Best-effort channel_identities mirror.
+    # ----------------------------------------------------------------------
+    # Failure here must never make the WhatsApp link fail, because the website
+    # can already detect the link through accounts.auth_user_id.
+    service_error = ""
     if create_or_update_channel_identity is not None:
         try:
-            return create_or_update_channel_identity(  # type: ignore[misc]
+            service_result = create_or_update_channel_identity(  # type: ignore[misc]
                 account_id=acct,
                 channel_type="whatsapp",
                 provider_user_id=clean_wa,
@@ -1884,11 +1916,13 @@ def _write_channel_identity_schema_safe(
                 referral_code=referral_code,
                 guest_session_id=guest_session_id,
             )
+            if isinstance(service_result, dict) and service_result.get("ok"):
+                service_result["accounts_fallback"] = accounts_fallback
+                service_result["link_store"] = "accounts_auth_user_id_plus_channel_identity"
+                return service_result
+            service_error = _clip((service_result or {}).get("error") if isinstance(service_result, dict) else service_result)
         except Exception as exc:
-            # Fall through to minimal direct write.
             service_error = f"{type(exc).__name__}: {_clip(exc)}"
-        else:
-            service_error = ""
     else:
         service_error = "create_or_update_channel_identity_unavailable"
 
@@ -1897,13 +1931,13 @@ def _write_channel_identity_schema_safe(
         "display_name": name,
         "verified_via_link_code": True,
         "verified_at": now_iso,
-        "created_from": "whatsapp_link_code_v19_fallback",
+        "created_from": "whatsapp_link_code_v21_best_effort_identity",
     }
 
     try:
         existing = None
         try:
-            existing = get_channel_identity(channel_type="whatsapp", provider_user_id=clean_wa)
+            existing = get_channel_identity(channel_type="whatsapp", provider_user_id=clean_wa)  # type: ignore[name-defined]
         except Exception:
             existing = None
 
@@ -1924,36 +1958,46 @@ def _write_channel_identity_schema_safe(
         if existing and existing.get("id"):
             updated = _safe_update("channel_identities", payload, id=existing.get("id"))
             if updated.get("ok"):
-                return {"ok": True, "channel_identity": (updated.get("data") or [payload])[0] if isinstance(updated.get("data"), list) and updated.get("data") else {**existing, **payload}, "fallback": True}
-            return _link_wa_account_to_owner_fallback(
-                account_id=acct,
-                wa_id=clean_wa,
-                profile_name=name,
-                wa_account_id=wa_account_id,
-                previous_error={"error": "channel_identity_update_failed", "service_error": service_error, "write_error": updated.get("error")},
-            )
+                return {
+                    "ok": True,
+                    "channel_identity": (updated.get("data") or [payload])[0] if isinstance(updated.get("data"), list) and updated.get("data") else {**existing, **payload},
+                    "accounts_fallback": accounts_fallback,
+                    "link_store": "accounts_auth_user_id_plus_channel_identity_update",
+                }
+            accounts_fallback["best_effort_channel_identity_error"] = {
+                "stage": "update",
+                "service_error": service_error,
+                "write_error": updated.get("error"),
+            }
+            accounts_fallback["link_store"] = "accounts_auth_user_id_only"
+            return accounts_fallback
 
         insert_payload = {**payload, "first_seen_at": now_iso}
         try:
             created = _sb().table("channel_identities").insert(insert_payload).execute()
             rows = getattr(created, "data", None) or []
-            return {"ok": True, "channel_identity": rows[0] if rows else insert_payload, "fallback": True}
+            return {
+                "ok": True,
+                "channel_identity": rows[0] if rows else insert_payload,
+                "accounts_fallback": accounts_fallback,
+                "link_store": "accounts_auth_user_id_plus_channel_identity_insert",
+            }
         except Exception as exc:
-            return _link_wa_account_to_owner_fallback(
-                account_id=acct,
-                wa_id=clean_wa,
-                profile_name=name,
-                wa_account_id=wa_account_id,
-                previous_error={"error": "channel_identity_insert_failed", "service_error": service_error, "write_error": f"{type(exc).__name__}: {_clip(exc)}"},
-            )
+            accounts_fallback["best_effort_channel_identity_error"] = {
+                "stage": "insert",
+                "service_error": service_error,
+                "write_error": f"{type(exc).__name__}: {_clip(exc)}",
+            }
+            accounts_fallback["link_store"] = "accounts_auth_user_id_only"
+            return accounts_fallback
     except Exception as exc:
-        return _link_wa_account_to_owner_fallback(
-            account_id=acct,
-            wa_id=clean_wa,
-            profile_name=name,
-            wa_account_id=wa_account_id,
-            previous_error={"error": "channel_identity_fallback_failed", "service_error": service_error, "write_error": f"{type(exc).__name__}: {_clip(exc)}"},
-        )
+        accounts_fallback["best_effort_channel_identity_error"] = {
+            "stage": "outer",
+            "service_error": service_error,
+            "write_error": f"{type(exc).__name__}: {_clip(exc)}",
+        }
+        accounts_fallback["link_store"] = "accounts_auth_user_id_only"
+        return accounts_fallback
 
 
 def _try_link_code(wa_id: str, text: str, profile_name: str = "") -> Optional[str]:
@@ -3653,3 +3697,4 @@ def whatsapp_test_reply():
     data = _safe_json()
     result = _send_whatsapp_text(_normalize_phone(data.get("to")), _clean(data.get("text") or "Naija Tax Guide WhatsApp test message."))
     return jsonify(result), 200 if result.get("ok") else 400
+
