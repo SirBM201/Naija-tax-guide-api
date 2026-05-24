@@ -12,6 +12,16 @@ import requests
 from flask import Blueprint, jsonify, request
 
 from app.core.supabase_client import supabase
+
+try:
+    from app.core.supabase_client import get_supabase_client
+except Exception:  # pragma: no cover
+    get_supabase_client = None  # type: ignore
+
+try:
+    from supabase import create_client as _create_supabase_client
+except Exception:  # pragma: no cover
+    _create_supabase_client = None  # type: ignore
 from app.services.ask_service import ask_guarded
 
 try:
@@ -28,7 +38,7 @@ except Exception:  # pragma: no cover
 
 bp = Blueprint("whatsapp", __name__)
 
-WHATSAPP_FLOW_VERSION = "2026-05-24-v21-link-fallback-success-best-effort-identity"
+WHATSAPP_FLOW_VERSION = "2026-05-24-v22-service-role-channel-identity-write"
 
 
 # =============================================================================
@@ -457,6 +467,78 @@ QUIZ_FREE_DAILY_LIMIT = 12
 
 def _sb():
     return supabase() if callable(supabase) else supabase
+
+
+_ADMIN_SUPABASE_CLIENT = None
+
+
+def _admin_sb():
+    """
+    Return a Supabase service-role client for backend webhook writes.
+
+    Why this exists:
+    normal route reads can work with the shared client, but the WhatsApp webhook
+    must write channel_identities after RLS tightening. If the shared client is
+    accidentally anon/public, channel_identities INSERT returns 401.
+    """
+    global _ADMIN_SUPABASE_CLIENT
+
+    if _ADMIN_SUPABASE_CLIENT is not None:
+        return _ADMIN_SUPABASE_CLIENT
+
+    try:
+        if get_supabase_client is not None:  # type: ignore[truthy-function]
+            _ADMIN_SUPABASE_CLIENT = get_supabase_client(admin=True)  # type: ignore[misc]
+            return _ADMIN_SUPABASE_CLIENT
+    except Exception:
+        pass
+
+    url = _clean(os.getenv("SUPABASE_URL"))
+    key = _clean(os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_SERVICE_ROLE"))
+    if url and key and _create_supabase_client is not None:
+        try:
+            _ADMIN_SUPABASE_CLIENT = _create_supabase_client(url, key)
+            return _ADMIN_SUPABASE_CLIENT
+        except Exception:
+            pass
+
+    # Last resort. This may be anon if env is misconfigured; callers will expose
+    # the write error in logs rather than crashing the webhook.
+    return _sb()
+
+
+def _query_one_admin(table: str, select_cols: str = "*", **eq_filters: Any) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    try:
+        q = _admin_sb().table(table).select(select_cols)
+        for col, val in eq_filters.items():
+            if val is not None and _clean(val):
+                q = q.eq(col, val)
+        res = q.limit(1).execute()
+        rows = getattr(res, "data", None) or []
+        if rows and isinstance(rows[0], dict):
+            return rows[0], None
+        return None, None
+    except Exception as exc:
+        return None, f"{table}: {type(exc).__name__}: {_clip(exc)}"
+
+
+def _safe_update_admin(table: str, payload: Dict[str, Any], **eq_filters: Any) -> Dict[str, Any]:
+    try:
+        q = _admin_sb().table(table).update(payload)
+        for col, val in eq_filters.items():
+            q = q.eq(col, val)
+        res = q.execute()
+        return {"ok": True, "data": getattr(res, "data", None)}
+    except Exception as exc:
+        return {"ok": False, "error": f"{table}: {type(exc).__name__}: {_clip(exc)}"}
+
+
+def _safe_insert_admin(table: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        res = _admin_sb().table(table).insert(payload).execute()
+        return {"ok": True, "data": getattr(res, "data", None)}
+    except Exception as exc:
+        return {"ok": False, "error": f"{table}: {type(exc).__name__}: {_clip(exc)}"}
 
 
 def _now_iso() -> str:
@@ -1735,7 +1817,7 @@ def _mark_link_token_used_schema_safe(
     ]
 
     for payload in payloads:
-        result = _safe_update(token_table, payload, id=token_id)
+        result = _safe_update_admin(token_table, payload, id=token_id)
         if result.get("ok"):
             return
 
@@ -1857,18 +1939,16 @@ def _write_channel_identity_schema_safe(
     wa_account_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Link WhatsApp to the website account in a way that does not fail when
-    channel_identities insert/update is blocked by RLS.
+    Link WhatsApp to the website account using service-role writes.
 
-    Production finding:
+    Production finding after RLS hardening:
     - link_tokens lookup works.
-    - accounts PATCH works.
-    - channel_identities POST may return 401 after anon policies are tightened.
+    - public/anon channel_identities insert correctly returns 401.
+    - accounts.auth_user_id fallback can conflict with unique constraints.
 
-    Therefore, accounts.auth_user_id is the primary durable link store for the
-    webhook path. The channel_identities row is now a best-effort mirror only.
-    Other route files in the current batch read the accounts fallback, so a
-    successful accounts fallback must be treated as successful linking.
+    Therefore, the correct durable store is channel_identities written through a
+    service-role/admin Supabase client. accounts.auth_user_id is no longer the
+    primary path; it is only a non-blocking mirror attempt.
     """
     acct = _clean(account_id)
     clean_wa = _normalize_phone(wa_id)
@@ -1879,125 +1959,106 @@ def _write_channel_identity_schema_safe(
     if not acct or not clean_wa:
         return {"ok": False, "error": "account_id_or_wa_id_missing"}
 
-    # ----------------------------------------------------------------------
-    # Primary durable link store.
-    # ----------------------------------------------------------------------
-    # This is intentionally first. Once this succeeds, linking is successful.
-    # The channel_identities table is only a mirror because it can be blocked
-    # by RLS depending on which Supabase key the webhook process is using.
-    accounts_fallback = _link_wa_account_to_owner_fallback(
-        account_id=acct,
-        wa_id=clean_wa,
-        profile_name=name,
-        wa_account_id=wa_account_id,
-        previous_error={"note": "primary_accounts_auth_user_id_link"},
-    )
-
-    if not accounts_fallback.get("ok"):
-        return {
-            "ok": False,
-            "error": "accounts_auth_user_id_link_failed",
-            "fallback_error": accounts_fallback,
-        }
-
-    # ----------------------------------------------------------------------
-    # Best-effort channel_identities mirror.
-    # ----------------------------------------------------------------------
-    # Failure here must never make the WhatsApp link fail, because the website
-    # can already detect the link through accounts.auth_user_id.
-    service_error = ""
-    if create_or_update_channel_identity is not None:
-        try:
-            service_result = create_or_update_channel_identity(  # type: ignore[misc]
-                account_id=acct,
-                channel_type="whatsapp",
-                provider_user_id=clean_wa,
-                display_name=name,
-                referral_code=referral_code,
-                guest_session_id=guest_session_id,
-            )
-            if isinstance(service_result, dict) and service_result.get("ok"):
-                service_result["accounts_fallback"] = accounts_fallback
-                service_result["link_store"] = "accounts_auth_user_id_plus_channel_identity"
-                return service_result
-            service_error = _clip((service_result or {}).get("error") if isinstance(service_result, dict) else service_result)
-        except Exception as exc:
-            service_error = f"{type(exc).__name__}: {_clip(exc)}"
-    else:
-        service_error = "create_or_update_channel_identity_unavailable"
-
     now_iso = _now_iso()
     metadata = {
         "display_name": name,
         "verified_via_link_code": True,
         "verified_at": now_iso,
-        "created_from": "whatsapp_link_code_v21_best_effort_identity",
+        "created_from": "whatsapp_link_code_v22_service_role_channel_identity",
     }
 
-    try:
-        existing = None
-        try:
-            existing = get_channel_identity(channel_type="whatsapp", provider_user_id=clean_wa)  # type: ignore[name-defined]
-        except Exception:
-            existing = None
+    # Prefer existing row for this WhatsApp number so the same phone is not
+    # linked to multiple accounts.
+    existing, existing_err = _query_one_admin(
+        "channel_identities",
+        "*",
+        channel_type="whatsapp",
+        provider_user_id=clean_wa,
+    )
 
-        payload = {
-            "account_id": acct,
-            "channel_type": "whatsapp",
-            "provider_user_id": clean_wa,
-            "last_seen_at": now_iso,
-            "is_verified": True,
-            "metadata": {**((existing or {}).get("metadata") or {}), **metadata} if isinstance((existing or {}).get("metadata"), dict) else metadata,
-        }
-        if referral_code:
-            payload["referral_code"] = referral_code
-            payload["referral_locked"] = True
-        if guest_session_id:
-            payload["guest_session_id"] = guest_session_id
+    # If the number row does not exist, also check whether the owner already has
+    # a WhatsApp identity row and update it instead of creating duplicates.
+    if not existing:
+        existing_by_owner, _owner_err = _query_one_admin(
+            "channel_identities",
+            "*",
+            account_id=acct,
+            channel_type="whatsapp",
+        )
+        if existing_by_owner:
+            existing = existing_by_owner
 
-        if existing and existing.get("id"):
-            updated = _safe_update("channel_identities", payload, id=existing.get("id"))
-            if updated.get("ok"):
-                return {
-                    "ok": True,
-                    "channel_identity": (updated.get("data") or [payload])[0] if isinstance(updated.get("data"), list) and updated.get("data") else {**existing, **payload},
-                    "accounts_fallback": accounts_fallback,
-                    "link_store": "accounts_auth_user_id_plus_channel_identity_update",
-                }
-            accounts_fallback["best_effort_channel_identity_error"] = {
-                "stage": "update",
-                "service_error": service_error,
-                "write_error": updated.get("error"),
-            }
-            accounts_fallback["link_store"] = "accounts_auth_user_id_only"
-            return accounts_fallback
+    payload: Dict[str, Any] = {
+        "account_id": acct,
+        "channel_type": "whatsapp",
+        "provider_user_id": clean_wa,
+        "is_verified": True,
+        "linked_at": now_iso,
+        "last_seen_at": now_iso,
+        "metadata": {**((existing or {}).get("metadata") or {}), **metadata} if isinstance((existing or {}).get("metadata"), dict) else metadata,
+    }
 
-        insert_payload = {**payload, "first_seen_at": now_iso}
-        try:
-            created = _sb().table("channel_identities").insert(insert_payload).execute()
-            rows = getattr(created, "data", None) or []
+    if referral_code:
+        payload["referral_code"] = referral_code
+        payload["referral_locked"] = True
+    if guest_session_id:
+        payload["guest_session_id"] = guest_session_id
+
+    if existing and existing.get("id"):
+        updated = _safe_update_admin("channel_identities", payload, id=existing.get("id"))
+        if updated.get("ok"):
+            rows = updated.get("data") or []
             return {
                 "ok": True,
-                "channel_identity": rows[0] if rows else insert_payload,
-                "accounts_fallback": accounts_fallback,
-                "link_store": "accounts_auth_user_id_plus_channel_identity_insert",
+                "channel_identity": rows[0] if isinstance(rows, list) and rows else {**existing, **payload},
+                "link_store": "channel_identities_service_role_update",
+                "service_role_write": True,
+                "previous_lookup_error": existing_err,
             }
-        except Exception as exc:
-            accounts_fallback["best_effort_channel_identity_error"] = {
-                "stage": "insert",
-                "service_error": service_error,
-                "write_error": f"{type(exc).__name__}: {_clip(exc)}",
-            }
-            accounts_fallback["link_store"] = "accounts_auth_user_id_only"
-            return accounts_fallback
-    except Exception as exc:
-        accounts_fallback["best_effort_channel_identity_error"] = {
-            "stage": "outer",
-            "service_error": service_error,
-            "write_error": f"{type(exc).__name__}: {_clip(exc)}",
+        # If update failed because a row has conflicting unique fields, try an
+        # insert only as a secondary path.
+        update_error = updated.get("error")
+    else:
+        update_error = None
+
+    insert_payload = {**payload, "first_seen_at": now_iso}
+    inserted = _safe_insert_admin("channel_identities", insert_payload)
+    if inserted.get("ok"):
+        rows = inserted.get("data") or []
+        return {
+            "ok": True,
+            "channel_identity": rows[0] if isinstance(rows, list) and rows else insert_payload,
+            "link_store": "channel_identities_service_role_insert",
+            "service_role_write": True,
+            "previous_update_error": update_error,
+            "previous_lookup_error": existing_err,
         }
-        accounts_fallback["link_store"] = "accounts_auth_user_id_only"
-        return accounts_fallback
+
+    # Last resort: try account fallback, but do not rely on it first because
+    # auth_user_id can be uniquely constrained on the web account row.
+    fallback = _link_wa_account_to_owner_fallback(
+        account_id=acct,
+        wa_id=clean_wa,
+        profile_name=name,
+        wa_account_id=wa_account_id,
+        previous_error={
+            "channel_identity_insert_error": inserted.get("error"),
+            "channel_identity_update_error": update_error,
+            "lookup_error": existing_err,
+        },
+    )
+    if fallback.get("ok"):
+        fallback["link_store"] = "accounts_auth_user_id_last_resort"
+        return fallback
+
+    return {
+        "ok": False,
+        "error": "channel_identity_service_role_write_failed",
+        "channel_identity_insert_error": inserted.get("error"),
+        "channel_identity_update_error": update_error,
+        "lookup_error": existing_err,
+        "accounts_fallback_error": fallback,
+    }
 
 
 def _try_link_code(wa_id: str, text: str, profile_name: str = "") -> Optional[str]:
