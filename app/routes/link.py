@@ -1,542 +1,622 @@
-# app/routes/link.py
 from __future__ import annotations
 
 import hashlib
-import logging
 import os
-import secrets
-import uuid
+import random
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional, Tuple
-from urllib.parse import quote
+from typing import Any, Optional, Tuple
+from uuid import uuid4
+from urllib.parse import quote_plus
 
-from flask import Blueprint, jsonify as _flask_jsonify, request
-
-from app.core.supabase_client import supabase
-from app.services.auth_service import get_current_user
-from app.services.channel_identity_runtime_service import get_channel_identity_by_account
+from flask import Blueprint, jsonify, request, session, g
 
 try:
-    from app.services.web_auth_service import get_account_id_from_request
-except Exception:  # pragma: no cover
-    get_account_id_from_request = None  # type: ignore
+    from app.core.supabase_client import get_supabase_client
+except Exception:  # boot compatibility fallback
+    get_supabase_client = None  # type: ignore
 
 
+bp = Blueprint("link", __name__, url_prefix="/link")
 
-try:
-    from app.core.response_safety import sanitize_response_payload
-except Exception:  # pragma: no cover
-    def sanitize_response_payload(payload, request_obj=None):
-        return payload
-
-
-def jsonify(*args, **kwargs):
-    """Local safe jsonify wrapper that strips debug/internal payload keys in production."""
-    if len(args) == 1 and isinstance(args[0], (dict, list)) and not kwargs:
-        return _flask_jsonify(sanitize_response_payload(args[0], request))
-    return _flask_jsonify(*args, **kwargs)
+LINK_ROUTE_VERSION = "generate_alias_safe_v6-used-at-only"
+CODE_LENGTH = int(os.getenv("LINK_CODE_LENGTH", "8"))
+CODE_TTL_MINUTES = int(os.getenv("LINK_CODE_TTL_MINUTES", "30"))
+CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
 
-logger = logging.getLogger(__name__)
+# -----------------------------------------------------------------------------
+# Generic helpers
+# -----------------------------------------------------------------------------
 
-# app/__init__.py registers this blueprint with /api.
-bp = Blueprint("link", __name__)
-
-TOKEN_LENGTH = int(os.getenv("LINK_TOKEN_LENGTH", "8") or "8")
-TOKEN_EXPIRY_MINUTES = int(os.getenv("LINK_TOKEN_EXPIRY_MINUTES", "30") or "30")
-SAFE_CODE_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
-
-WHATSAPP_TEST_LINE_E164 = (os.getenv("WHATSAPP_TEST_LINE_E164") or "").strip()
-WHATSAPP_DEEP_LINK = (os.getenv("WHATSAPP_DEEP_LINK") or "").strip()
-TELEGRAM_BOT_USERNAME = (os.getenv("TELEGRAM_BOT_USERNAME") or "").strip().lstrip("@")
-TELEGRAM_BOT_URL = (os.getenv("TELEGRAM_BOT_URL") or "").strip()
-
-
-def _sb():
-    return supabase() if callable(supabase) else supabase
-
-
-def _clean(value: Any) -> str:
-    return str(value or "").strip()
-
-
-def _utcnow() -> datetime:
+def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _now_iso() -> str:
-    return _utcnow().isoformat()
+def _iso(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).isoformat()
 
 
-def _sha256_hex(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+def _normalize_provider(provider: Optional[str]) -> Tuple[str, str, str]:
+    raw = (provider or "wa").strip().lower()
+
+    if raw in {"wa", "whatsapp", "whats_app", "whats-app"}:
+        return "wa", "whatsapp", "WhatsApp"
+
+    if raw in {"tg", "telegram"}:
+        return "tg", "telegram", "Telegram"
+
+    return raw, raw, raw.title()
+
+
+def _random_code(length: int = CODE_LENGTH) -> str:
+    return "".join(random.choice(CODE_ALPHABET) for _ in range(max(6, length)))
+
+
+def _hash_code(code: str) -> str:
+    return hashlib.sha256(code.strip().upper().encode("utf-8")).hexdigest()
+
+
+def _rows(resp: Any) -> list[dict[str, Any]]:
+    data = getattr(resp, "data", None)
+
+    if data is None:
+        return []
+
+    if isinstance(data, list):
+        return [x for x in data if isinstance(x, dict)]
+
+    if isinstance(data, dict):
+        return [data]
+
+    return []
+
+
+def _first(resp: Any) -> Optional[dict[str, Any]]:
+    rows = _rows(resp)
+    return rows[0] if rows else None
+
+
+def _client(admin: bool = True):
+    """
+    Return Supabase client.
+
+    This backend route intentionally prefers the service-role/admin client
+    because link generation, unlinking, and channel status aggregation are
+    trusted server-side operations.
+    """
+    if get_supabase_client is None:
+        raise RuntimeError("get_supabase_client is unavailable")
+
+    try:
+        return get_supabase_client(admin=admin)  # type: ignore[misc]
+    except TypeError:
+        return get_supabase_client()  # type: ignore[operator]
+
+
+def _safe_exec(builder: Any) -> tuple[bool, Any, Optional[str]]:
+    try:
+        resp = builder.execute()
+        return True, resp, None
+    except Exception as exc:
+        return False, None, str(exc)
 
 
 def _json_error(message: str, status: int = 400, **extra: Any):
-    payload: Dict[str, Any] = {"ok": False, "error": message}
-    if extra:
-        payload.update(extra)
+    payload: dict[str, Any] = {
+        "ok": False,
+        "error": message,
+    }
+    payload.update(extra)
     return jsonify(payload), status
 
 
-def _normalize_provider(raw: Any) -> str:
-    v = _clean(raw).lower()
-    if v in {"wa", "whatsapp", "waba"}:
-        return "wa"
-    if v in {"tg", "telegram"}:
-        return "tg"
-    return v
+# -----------------------------------------------------------------------------
+# Auth/account resolution
+# -----------------------------------------------------------------------------
 
+def _extract_account_id(value: Any) -> Optional[str]:
+    if not value:
+        return None
 
-def _channel_type(provider: Any) -> Optional[str]:
-    provider = _normalize_provider(provider)
-    if provider == "wa":
-        return "whatsapp"
-    if provider == "tg":
-        return "telegram"
-    return None
+    if isinstance(value, str):
+        return value.strip() or None
 
-
-def _requested_provider() -> str:
-    body = request.get_json(silent=True) or {}
-    provider_from_query = _normalize_provider(request.args.get("provider") or "")
-    provider_from_body = _normalize_provider(body.get("provider") or "")
-
-    if provider_from_query and provider_from_body and provider_from_query != provider_from_body:
-        return "__mismatch__"
-
-    return provider_from_query or provider_from_body
-
-
-def _generate_code(length: int = TOKEN_LENGTH) -> str:
-    length = max(6, min(int(length or TOKEN_LENGTH), 12))
-    return "".join(secrets.choice(SAFE_CODE_ALPHABET) for _ in range(length))
-
-
-def _build_whatsapp_link(code: str) -> str:
-    message = quote(code)
-
-    if WHATSAPP_DEEP_LINK:
-        separator = "&" if "?" in WHATSAPP_DEEP_LINK else "?"
-        if "text=" in WHATSAPP_DEEP_LINK:
-            return WHATSAPP_DEEP_LINK
-        return f"{WHATSAPP_DEEP_LINK}{separator}text={message}"
-
-    phone = "".join(ch for ch in WHATSAPP_TEST_LINE_E164 if ch.isdigit())
-    if phone:
-        return f"https://wa.me/{phone}?text={message}"
-
-    return f"https://wa.me/?text={message}"
-
-
-def _build_telegram_link(code: str) -> Optional[str]:
-    message = quote(code)
-
-    if TELEGRAM_BOT_URL:
-        separator = "&" if "?" in TELEGRAM_BOT_URL else "?"
-        if "start=" in TELEGRAM_BOT_URL or "text=" in TELEGRAM_BOT_URL:
-            return TELEGRAM_BOT_URL
-        return f"{TELEGRAM_BOT_URL}{separator}text={message}"
-
-    if TELEGRAM_BOT_USERNAME:
-        return f"https://t.me/{TELEGRAM_BOT_USERNAME}?start={message}"
+    if isinstance(value, dict):
+        for key in ("account_id", "id", "user_id", "auth_user_id"):
+            val = value.get(key)
+            if val:
+                return str(val)
 
     return None
 
 
-def _resolve_account_id() -> Tuple[Optional[str], Dict[str, Any]]:
-    debug: Dict[str, Any] = {
-        "resolver": "link_generate_alias_safe_v4",
-        "flask_session_checked": True,
-        "flask_session_user_found": False,
-        "web_token_checked": False,
-    }
+def _resolve_account_id() -> Optional[str]:
+    """
+    Resolve the logged-in web account using the same app auth helpers.
 
-    try:
-        user = get_current_user()
-    except Exception as exc:
-        user = None
-        debug["flask_session_error"] = f"{type(exc).__name__}: {exc}"
+    Defensive by design because the project has had multiple auth helper names
+    over time. This does not trust arbitrary query parameters for account
+    ownership.
+    """
 
-    if user:
-        debug["flask_session_user_found"] = True
-        debug["flask_session_user_keys"] = sorted(list(user.keys()))
-        account_id = _clean(user.get("account_id")) or _clean(user.get("id"))
+    # 1. Flask globals populated by auth middleware
+    for key in ("account_id", "user_id", "auth_user_id"):
+        val = getattr(g, key, None)
+        account_id = _extract_account_id(val)
         if account_id:
-            debug["account_source"] = "flask_session"
-            return account_id, debug
+            return account_id
 
-    if get_account_id_from_request is not None:
-        try:
-            debug["web_token_checked"] = True
-            account_id, token_debug = get_account_id_from_request(request)  # type: ignore[misc]
-            account_id = _clean(account_id)
-            debug["web_token_debug"] = token_debug
-            if account_id:
-                debug["account_source"] = "web_token"
-                return account_id, debug
-        except Exception as exc:
-            debug["web_token_error"] = f"{type(exc).__name__}: {exc}"
+    # 2. Flask session
+    for key in ("account_id", "user_id", "auth_user_id"):
+        account_id = _extract_account_id(session.get(key))
+        if account_id:
+            return account_id
 
-    debug["root_cause"] = "No logged-in account was resolved from ntg_session or web token."
-    return None, debug
-
-
-def _identity_payload(identity: Optional[Dict[str, Any]], channel_type: str) -> Dict[str, Any]:
-    if not identity:
-        return {
-            "linked": False,
-            "is_verified": False,
-            "verified": False,
-            "provider_user_id": None,
-            "display_name": None,
-            "value": None,
-            "phone": None,
-            "username": None,
-            "updated_at": None,
-            "last_seen_at": None,
-        }
-
-    metadata = identity.get("metadata") or {}
-    if not isinstance(metadata, dict):
-        metadata = {}
-
-    provider_user_id = _clean(identity.get("provider_user_id")) or None
-    display_name = _clean(metadata.get("display_name") or identity.get("display_name")) or None
-    verified = bool(identity.get("is_verified") or identity.get("verified"))
-    updated_at = identity.get("last_seen_at") or identity.get("updated_at") or identity.get("created_at")
-
-    return {
-        "linked": True,
-        "is_verified": verified,
-        "verified": verified,
-        "provider_user_id": provider_user_id,
-        "display_name": display_name,
-        "value": display_name or provider_user_id,
-        "phone": provider_user_id if channel_type == "whatsapp" else None,
-        "username": (display_name or provider_user_id) if channel_type == "telegram" else None,
-        "updated_at": updated_at,
-        "last_seen_at": identity.get("last_seen_at"),
-        "raw": identity,
-    }
-
-
-def _account_link_fallback_identity(account_id: str, channel_type: str) -> Optional[Dict[str, Any]]:
-    """Read channel link fallback stored on accounts.auth_user_id."""
-    provider = "wa" if channel_type == "whatsapp" else "tg" if channel_type == "telegram" else ""
-    if not account_id or not provider:
-        return None
+    # 3. Web auth service used by current web-token cookie flow
     try:
-        res = (
-            _sb()
-            .table("accounts")
-            .select("id,account_id,provider,provider_user_id,auth_user_id,display_name,phone,phone_e164,email,updated_at,created_at")
-            .eq("auth_user_id", account_id)
-            .eq("provider", provider)
-            .limit(1)
-            .execute()
-        )
-        rows = getattr(res, "data", None) or []
-        if not rows:
-            return None
-        row = rows[0]
-        provider_user_id = _clean(row.get("provider_user_id") or row.get("phone_e164") or row.get("phone"))
-        display_name = _clean(row.get("display_name")) or provider_user_id
-        return {
-            "account_id": account_id,
-            "channel_type": channel_type,
-            "provider_user_id": provider_user_id,
-            "is_verified": True,
-            "last_seen_at": row.get("updated_at") or row.get("created_at"),
-            "created_at": row.get("created_at"),
-            "updated_at": row.get("updated_at"),
-            "metadata": {"display_name": display_name, "source": "accounts.auth_user_id_fallback"},
-            "raw_account": row,
-        }
-    except Exception:
-        return None
+        from app.services import web_auth_service  # type: ignore
 
+        for name in (
+            "get_account_id_from_request",
+            "resolve_account_id_from_request",
+            "get_current_account_id",
+        ):
+            fn = getattr(web_auth_service, name, None)
 
-def _safe_insert_link_token(payloads: list[Dict[str, Any]]):
-    last_error: Optional[Exception] = None
-    for payload in payloads:
-        try:
-            return _sb().table("link_tokens").insert(payload).execute()
-        except Exception as exc:
-            last_error = exc
-            logger.warning("Link token insert fallback after error: %r", exc)
-            continue
-    if last_error:
-        raise last_error
-    raise RuntimeError("No link token payload supplied")
+            if callable(fn):
+                try:
+                    account_id = _extract_account_id(fn(request))
+                except TypeError:
+                    account_id = _extract_account_id(fn())
 
-
-def _expire_previous_tokens(account_id: str, provider: str) -> None:
-    """
-    Mark previous unused link tokens for this account/provider as used/expired.
-    Non-fatal because older databases may use either used_at or used.
-    """
-    now_iso = _now_iso()
-    try:
-        (
-            _sb()
-            .table("link_tokens")
-            .update({"used_at": now_iso})
-            .eq("auth_user_id", account_id)
-            .eq("provider", provider)
-            .is_("used_at", "null")
-            .execute()
-        )
-    except Exception as exc:
-        logger.info("Previous link token used_at expiry skipped: %r", exc)
-
-    try:
-        (
-            _sb()
-            .table("link_tokens")
-            .update({"used": True})
-            .eq("auth_user_id", account_id)
-            .eq("provider", provider)
-            .eq("used", False)
-            .execute()
-        )
-    except Exception as exc:
-        logger.info("Previous link token used expiry skipped: %r", exc)
-
-
-def _create_link_token(account_id: str, provider: str, code: str, expires_at: datetime) -> None:
-    now = _utcnow()
-    code_hash = _sha256_hex(code)
-    base_payload = {
-        "id": str(uuid.uuid4()),
-        "auth_user_id": account_id,
-        "provider": provider,
-        "code": code,
-        "code_hash": code_hash,
-        "expires_at": expires_at.isoformat(),
-        "used_at": None,
-        "used": False,
-        "provider_user_id": None,
-        "created_at": now.isoformat(),
-    }
-
-    _safe_insert_link_token(
-        [
-            base_payload,
-            {k: v for k, v in base_payload.items() if k not in {"used"}},
-            {k: v for k, v in base_payload.items() if k not in {"code_hash", "used"}},
-            {k: v for k, v in base_payload.items() if k not in {"id", "code_hash", "used", "provider_user_id"}},
-            {
-                "auth_user_id": account_id,
-                "provider": provider,
-                "code": code,
-                "expires_at": expires_at.isoformat(),
-                "created_at": now.isoformat(),
-                "used": False,
-            },
-        ]
-    )
-
-
-def _safe_unlink_identity(account_id: str, channel_type: str, provider: str) -> Dict[str, Any]:
-    """
-    Unlink only the current user's selected channel.
-    This intentionally avoids deleting all link_tokens for a provider globally.
-    """
-    try:
-        identity = get_channel_identity_by_account(account_id=account_id, channel_type=channel_type)
-    except Exception as exc:
-        return {
-            "ok": False,
-            "error": "identity_lookup_failed",
-            "root_cause": f"{type(exc).__name__}: {exc}",
-        }
-
-    if not identity:
-        try:
-            (
-                _sb()
-                .table("accounts")
-                .update({"auth_user_id": None, "updated_at": _now_iso()})
-                .eq("auth_user_id", account_id)
-                .eq("provider", provider)
-                .execute()
-            )
-        except Exception:
-            pass
-        return {"ok": True, "unlinked": False, "reason": "not_linked_or_accounts_fallback_cleared", "provider": provider}
-
-    provider_user_id = _clean(identity.get("provider_user_id"))
-
-    try:
-        (
-            _sb()
-            .table("channel_identities")
-            .delete()
-            .eq("account_id", account_id)
-            .eq("channel_type", channel_type)
-            .execute()
-        )
-    except Exception as exc:
-        return {
-            "ok": False,
-            "error": "identity_delete_failed",
-            "root_cause": f"{type(exc).__name__}: {exc}",
-        }
-
-    try:
-        (
-            _sb()
-            .table("accounts")
-            .update({"auth_user_id": None, "updated_at": _now_iso()})
-            .eq("auth_user_id", account_id)
-            .eq("provider", provider)
-            .execute()
-        )
+                if account_id:
+                    return account_id
     except Exception:
         pass
 
-    _expire_previous_tokens(account_id, provider)
+    # 4. Middleware fallback, if present
+    try:
+        from app.middleware import web_auth  # type: ignore
+
+        for name in ("get_account_id_from_request", "resolve_account_id"):
+            fn = getattr(web_auth, name, None)
+
+            if callable(fn):
+                try:
+                    account_id = _extract_account_id(fn(request))
+                except TypeError:
+                    account_id = _extract_account_id(fn())
+
+                if account_id:
+                    return account_id
+    except Exception:
+        pass
+
+    return None
+
+
+def _get_account_or_401() -> tuple[Optional[str], Optional[Any]]:
+    account_id = _resolve_account_id()
+
+    if not account_id:
+        return None, _json_error("Authentication required.", 401)
+
+    return account_id, None
+
+
+# -----------------------------------------------------------------------------
+# Channel status helpers
+# -----------------------------------------------------------------------------
+
+def _identity_for_channel(
+    db: Any,
+    account_id: str,
+    channel_type: str,
+) -> Optional[dict[str, Any]]:
+    ok, resp, _ = _safe_exec(
+        db.table("channel_identities")
+        .select("*")
+        .eq("account_id", account_id)
+        .eq("channel_type", channel_type)
+        .limit(1)
+    )
+
+    if ok:
+        row = _first(resp)
+        if row:
+            return row
+
+    return None
+
+
+def _fallback_account_for_channel(
+    db: Any,
+    account_id: str,
+    provider: str,
+) -> Optional[dict[str, Any]]:
+    ok, resp, _ = _safe_exec(
+        db.table("accounts")
+        .select(
+            "id,account_id,provider,provider_user_id,auth_user_id,"
+            "display_name,phone,phone_e164,email,updated_at,created_at"
+        )
+        .eq("auth_user_id", account_id)
+        .eq("provider", provider)
+        .limit(1)
+    )
+
+    if ok:
+        return _first(resp)
+
+    return None
+
+
+def _status_object(
+    db: Any,
+    account_id: str,
+    provider: str,
+    channel_type: str,
+) -> dict[str, Any]:
+    row = _identity_for_channel(db, account_id, channel_type)
+
+    if row:
+        provider_user_id = row.get("provider_user_id")
+        metadata = row.get("metadata") or {}
+
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        verified = bool(row.get("is_verified") or row.get("verified"))
+        updated_at = row.get("last_seen_at") or row.get("linked_at") or row.get("updated_at")
+
+        return {
+            "linked": True,
+            "verified": verified,
+            "is_verified": verified,
+            "value": provider_user_id,
+            "provider_user_id": provider_user_id,
+            "phone": provider_user_id if channel_type == "whatsapp" else metadata.get("phone"),
+            "username": metadata.get("username")
+            or (provider_user_id if channel_type == "telegram" else None),
+            "display_name": metadata.get("display_name"),
+            "updated_at": updated_at,
+            "last_seen_at": row.get("last_seen_at"),
+        }
+
+    fallback = _fallback_account_for_channel(db, account_id, provider)
+
+    if fallback and fallback.get("provider_user_id"):
+        provider_user_id = fallback.get("provider_user_id")
+        updated_at = fallback.get("updated_at") or fallback.get("created_at")
+
+        return {
+            "linked": True,
+            "verified": True,
+            "is_verified": True,
+            "value": provider_user_id,
+            "provider_user_id": provider_user_id,
+            "phone": fallback.get("phone_e164") or fallback.get("phone") or provider_user_id,
+            "username": provider_user_id if channel_type == "telegram" else None,
+            "display_name": fallback.get("display_name"),
+            "updated_at": updated_at,
+            "last_seen_at": updated_at,
+        }
 
     return {
-        "ok": True,
-        "unlinked": True,
-        "provider": provider,
-        "channel_type": channel_type,
-        "provider_user_id": provider_user_id,
+        "linked": False,
+        "verified": False,
+        "is_verified": False,
+        "value": None,
+        "provider_user_id": None,
+        "phone": None,
+        "username": None,
+        "display_name": None,
+        "updated_at": None,
+        "last_seen_at": None,
     }
 
 
-@bp.get("/link/health")
-def link_health():
-    return jsonify({"ok": True, "service": "link", "version": "generate_alias_safe_v5-accounts-fallback"}), 200
+def _build_status(account_id: str) -> dict[str, Any]:
+    db = _client(admin=True)
+
+    whatsapp = _status_object(db, account_id, "wa", "whatsapp")
+    telegram = _status_object(db, account_id, "tg", "telegram")
+
+    return {
+        "ok": True,
+        "account_id": account_id,
+
+        "whatsapp": whatsapp,
+        "whatsapp_linked": bool(whatsapp.get("linked")),
+        "whatsapp_verified": bool(whatsapp.get("verified")),
+        "whatsapp_number": whatsapp.get("phone") or whatsapp.get("provider_user_id"),
+        "whatsapp_updated_at": whatsapp.get("updated_at"),
+
+        "telegram": telegram,
+        "telegram_linked": bool(telegram.get("linked")),
+        "telegram_verified": bool(telegram.get("verified")),
+        "telegram_username": telegram.get("username") or telegram.get("provider_user_id"),
+        "telegram_updated_at": telegram.get("updated_at"),
+    }
 
 
-@bp.get("/link/status")
-def get_link_status():
-    account_id, debug = _resolve_account_id()
-    if not account_id:
-        logger.warning("Link status unauthorized: %s", debug)
-        return jsonify({"ok": False, "error": "unauthorized", "debug": debug}), 401
+# -----------------------------------------------------------------------------
+# Link-code helpers
+# -----------------------------------------------------------------------------
 
-    wa_identity = None
-    tg_identity = None
-    errors: Dict[str, str] = {}
+def _expire_open_tokens(db: Any, account_id: str, provider: str) -> None:
+    """
+    Expire previous unused tokens using the real schema: used_at only.
 
-    try:
-        wa_identity = get_channel_identity_by_account(account_id=account_id, channel_type="whatsapp")
-    except Exception as exc:
-        errors["whatsapp"] = f"{type(exc).__name__}: {exc}"
+    Important:
+    Do not reference the removed legacy boolean `used` column. This removes
+    the recurring Supabase PGRST204 noise in Koyeb logs.
+    """
+    payload = {
+        "used_at": _iso(_utc_now()),
+    }
 
-    try:
-        tg_identity = get_channel_identity_by_account(account_id=account_id, channel_type="telegram")
-    except Exception as exc:
-        errors["telegram"] = f"{type(exc).__name__}: {exc}"
+    _safe_exec(
+        db.table("link_tokens")
+        .update(payload)
+        .eq("auth_user_id", account_id)
+        .eq("provider", provider)
+        .is_("used_at", "null")
+    )
 
-    if not wa_identity:
-        wa_identity = _account_link_fallback_identity(account_id, "whatsapp")
-    if not tg_identity:
-        tg_identity = _account_link_fallback_identity(account_id, "telegram")
 
-    whatsapp = _identity_payload(wa_identity, "whatsapp")
-    telegram = _identity_payload(tg_identity, "telegram")
+def _insert_link_token(
+    db: Any,
+    account_id: str,
+    provider: str,
+    code: str,
+    expires_at: datetime,
+) -> dict[str, Any]:
+    now = _utc_now()
+
+    common = {
+        "id": str(uuid4()),
+        "auth_user_id": account_id,
+        "account_id": account_id,
+        "provider": provider,
+        "code": code,
+        "token": code,
+        "code_hash": _hash_code(code),
+        "expires_at": _iso(expires_at),
+        "created_at": _iso(now),
+        "used_at": None,
+        "provider_user_id": None,
+        "used_by_channel_type": None,
+        "used_by_provider_user_id": None,
+    }
+
+    # The current table supports all fields above. Fallbacks are defensive for
+    # older/staging databases, but none references the removed legacy `used` field.
+    attempts = [
+        common,
+        {
+            k: v
+            for k, v in common.items()
+            if k not in {"account_id", "token", "used_by_channel_type", "used_by_provider_user_id"}
+        },
+        {
+            "auth_user_id": account_id,
+            "provider": provider,
+            "code": code,
+            "code_hash": _hash_code(code),
+            "expires_at": _iso(expires_at),
+            "created_at": _iso(now),
+            "used_at": None,
+        },
+    ]
+
+    last_error: Optional[str] = None
+
+    for payload in attempts:
+        ok, resp, err = _safe_exec(
+            db.table("link_tokens").insert(payload)
+        )
+
+        if ok:
+            row = _first(resp)
+            if row:
+                return row
+
+            return payload
+
+        last_error = err
+
+    raise RuntimeError(last_error or "link_token_insert_failed")
+
+
+def _whatsapp_open_url(code: str) -> Optional[str]:
+    phone = (
+        os.getenv("WHATSAPP_OFFICIAL_NUMBER")
+        or os.getenv("WHATSAPP_PHONE_NUMBER")
+        or os.getenv("META_WHATSAPP_PHONE_NUMBER")
+        or os.getenv("WA_PHONE_NUMBER")
+        or ""
+    )
+
+    digits = "".join(ch for ch in phone if ch.isdigit())
+
+    if not digits:
+        return None
+
+    text = quote_plus(code)
+    return f"https://wa.me/{digits}?text={text}"
+
+
+# -----------------------------------------------------------------------------
+# Routes
+# -----------------------------------------------------------------------------
+
+@bp.get("/health")
+def health():
+    return jsonify(
+        {
+            "ok": True,
+            "service": "link",
+            "version": LINK_ROUTE_VERSION,
+            "token_schema": "used_at_only",
+        }
+    )
+
+
+@bp.get("/status")
+def status():
+    account_id, error = _get_account_or_401()
+
+    if error:
+        return error
+
+    assert account_id is not None
+    return jsonify(_build_status(account_id))
+
+
+@bp.post("/generate")
+def generate_link_code():
+    account_id, error = _get_account_or_401()
+
+    if error:
+        return error
+
+    assert account_id is not None
+
+    provider_value = request.args.get("provider")
+
+    if request.is_json and isinstance(request.json, dict):
+        provider_value = provider_value or request.json.get("provider")
+
+    provider, channel_type, label = _normalize_provider(provider_value)
+
+    if provider not in {"wa", "tg"}:
+        return _json_error("Unsupported provider.", 400, provider=provider)
+
+    db = _client(admin=True)
+
+    _expire_open_tokens(db, account_id, provider)
+
+    expires_at = _utc_now() + timedelta(minutes=CODE_TTL_MINUTES)
+    last_error: Optional[str] = None
+    row: Optional[dict[str, Any]] = None
+    code = ""
+
+    for _ in range(6):
+        code = _random_code()
+
+        try:
+            row = _insert_link_token(db, account_id, provider, code, expires_at)
+            break
+        except Exception as exc:
+            last_error = str(exc)
+            row = None
+
+    if row is None:
+        return _json_error(
+            "Could not generate link code.",
+            500,
+            reason=last_error or "insert_failed",
+        )
+
+    open_url = _whatsapp_open_url(code) if provider == "wa" else None
 
     return jsonify(
         {
             "ok": True,
-            "account_id": account_id,
-            "whatsapp": whatsapp,
-            "telegram": telegram,
-            "whatsapp_linked": bool(whatsapp.get("linked")),
-            "telegram_linked": bool(telegram.get("linked")),
-            "whatsapp_verified": bool(whatsapp.get("is_verified")),
-            "telegram_verified": bool(telegram.get("is_verified")),
-            "whatsapp_number": whatsapp.get("phone") or whatsapp.get("provider_user_id"),
-            "telegram_username": telegram.get("username") or telegram.get("provider_user_id"),
-            "whatsapp_updated_at": whatsapp.get("updated_at"),
-            "telegram_updated_at": telegram.get("updated_at"),
-            "debug": debug,
-            "non_fatal_errors": errors,
+            "provider": provider,
+            "channel_type": channel_type,
+            "channel_label": label,
+            "code": code,
+            "link_code": code,
+            "token": code,
+            "expires_at": row.get("expires_at") or _iso(expires_at),
+            "expires_in_minutes": CODE_TTL_MINUTES,
+            "open_url": open_url,
+            "whatsapp_url": open_url,
+            "route_version": LINK_ROUTE_VERSION,
         }
-    ), 200
+    )
 
 
-# Frontend compatibility:
-# - POST /api/link/generate?provider=wa|tg
-# - GET  /api/link/generate?provider=wa|tg
-# - POST /api/link/generate-code?provider=wa|tg
-@bp.route("/link/generate", methods=["POST", "GET"])
-@bp.route("/link/generate-code", methods=["POST", "GET"])
-def generate_link_code():
-    account_id, debug = _resolve_account_id()
-    if not account_id:
-        return _json_error("Unauthorized", 401, debug=debug)
+@bp.post("/unlink")
+def unlink_channel():
+    account_id, error = _get_account_or_401()
 
-    provider = _requested_provider()
-    if provider == "__mismatch__":
-        return _json_error("Provider mismatch between query and body", 400)
+    if error:
+        return error
+
+    assert account_id is not None
+
+    provider, channel_type, label = _normalize_provider(
+        request.args.get("provider") or request.form.get("provider") or "wa"
+    )
+
     if provider not in {"wa", "tg"}:
-        return _json_error("Invalid provider. Use wa or tg.", 400)
+        return _json_error("Unsupported provider.", 400, provider=provider)
 
-    code = _generate_code()
-    expires_at = _utcnow() + timedelta(minutes=TOKEN_EXPIRY_MINUTES)
+    db = _client(admin=True)
+    removed = 0
 
-    try:
-        _expire_previous_tokens(account_id, provider)
-        _create_link_token(account_id, provider, code, expires_at)
+    ok, resp, _ = _safe_exec(
+        db.table("channel_identities")
+        .select("id")
+        .eq("account_id", account_id)
+        .eq("channel_type", channel_type)
+    )
 
-        whatsapp_url = _build_whatsapp_link(code) if provider == "wa" else None
-        telegram_url = _build_telegram_link(code) if provider == "tg" else None
-        deep_link = whatsapp_url if provider == "wa" else telegram_url
+    if ok:
+        for row in _rows(resp):
+            row_id = row.get("id")
 
-        return jsonify(
+            if not row_id:
+                continue
+
+            del_ok, _, _ = _safe_exec(
+                db.table("channel_identities")
+                .delete()
+                .eq("id", row_id)
+            )
+
+            if del_ok:
+                removed += 1
+
+    # Clear accounts fallback links for this web owner/provider.
+    # This does not delete the WhatsApp shell account; it only removes ownership binding.
+    _safe_exec(
+        db.table("accounts")
+        .update(
             {
-                "ok": True,
-                "account_id": account_id,
-                "provider": provider,
-                "channel_type": _channel_type(provider),
-                "code": code,
-                "expires_in_minutes": TOKEN_EXPIRY_MINUTES,
-                "expires_at": expires_at.isoformat(),
-                "deep_link": deep_link,
-                "link_url": deep_link,
-                "whatsapp_url": whatsapp_url,
-                "telegram_url": telegram_url,
-                "bot_url": telegram_url,
-                "message": f"Send this code to the {'WhatsApp' if provider == 'wa' else 'Telegram'} bot to link your account.",
-                "debug": debug,
+                "auth_user_id": None,
+                "updated_at": _iso(_utc_now()),
             }
-        ), 200
-    except Exception as exc:
-        logger.exception("Generate link code failed")
-        return _json_error(
-            "Failed to generate link code",
-            500,
-            root_cause=f"{type(exc).__name__}: {exc}",
-            account_id=account_id,
-            provider=provider,
-            debug=debug,
         )
+        .eq("auth_user_id", account_id)
+        .eq("provider", provider)
+    )
+
+    # Expire any open link code for this provider.
+    _expire_open_tokens(db, account_id, provider)
+
+    return jsonify(
+        {
+            "ok": True,
+            "provider": provider,
+            "channel_type": channel_type,
+            "channel_label": label,
+            "unlinked": True,
+            "removed_identities": removed,
+            "route_version": LINK_ROUTE_VERSION,
+        }
+    )
 
 
-@bp.route("/link/unlink", methods=["POST", "DELETE"])
-def unlink_linked_channel():
-    account_id, debug = _resolve_account_id()
-    if not account_id:
-        return _json_error("Unauthorized", 401, debug=debug)
+# Backward-compatible aliases that some frontend builds may call.
+@bp.post("/generate-code")
+def generate_link_code_alias():
+    return generate_link_code()
 
-    provider = _requested_provider()
-    if provider == "__mismatch__":
-        return _json_error("Provider mismatch between query and body", 400)
-    if provider not in {"wa", "tg"}:
-        return _json_error("Invalid provider. Use wa or tg.", 400)
 
-    channel_type = _channel_type(provider)
-    if not channel_type:
-        return _json_error("Invalid provider. Use wa or tg.", 400)
-
-    result = _safe_unlink_identity(account_id, channel_type, provider)
-    if not result.get("ok"):
-        return _json_error("Failed to unlink channel", 400, details=result)
-
-    return jsonify(result), 200
+@bp.get("/me")
+def me_alias():
+    return status()
