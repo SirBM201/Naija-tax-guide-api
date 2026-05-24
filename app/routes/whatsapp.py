@@ -38,7 +38,7 @@ except Exception:  # pragma: no cover
 
 bp = Blueprint("whatsapp", __name__)
 
-WHATSAPP_FLOW_VERSION = "2026-05-24-v22-service-role-channel-identity-write"
+WHATSAPP_FLOW_VERSION = "2026-05-24-v23-dynamic-link-unlink-menu"
 
 
 # =============================================================================
@@ -536,6 +536,17 @@ def _safe_update_admin(table: str, payload: Dict[str, Any], **eq_filters: Any) -
 def _safe_insert_admin(table: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     try:
         res = _admin_sb().table(table).insert(payload).execute()
+        return {"ok": True, "data": getattr(res, "data", None)}
+    except Exception as exc:
+        return {"ok": False, "error": f"{table}: {type(exc).__name__}: {_clip(exc)}"}
+
+
+def _safe_delete_admin(table: str, **eq_filters: Any) -> Dict[str, Any]:
+    try:
+        q = _admin_sb().table(table).delete()
+        for col, val in eq_filters.items():
+            q = q.eq(col, val)
+        res = q.execute()
         return {"ok": True, "data": getattr(res, "data", None)}
     except Exception as exc:
         return {"ok": False, "error": f"{table}: {type(exc).__name__}: {_clip(exc)}"}
@@ -1565,6 +1576,11 @@ def _recognize(text: str, context: str = "main") -> Dict[str, Any]:
         "connect": "link_instruction",
         "connect website": "link_instruction",
         "link account": "link_instruction",
+        "unlink": "link_instruction",
+        "unlink whatsapp": "link_instruction",
+        "unlink account": "link_instruction",
+        "disconnect": "link_instruction",
+        "disconnect whatsapp": "link_instruction",
         "6": "topup_menu",
         "topup": "topup_menu",
         "top up": "topup_menu",
@@ -1634,11 +1650,102 @@ def _recognize(text: str, context: str = "main") -> Dict[str, Any]:
     return {"kind": "question", "action": "ask_question"}
 
 
+
+# =============================================================================
+# Dynamic WhatsApp link state helpers
+# =============================================================================
+
+def _whatsapp_link_identity(wa_id: str = "", account_id: str = "") -> Optional[Dict[str, Any]]:
+    """
+    Return the active WhatsApp channel identity for this WhatsApp number/account.
+
+    This reads through the admin/service-role client so the WhatsApp menu can
+    reflect the real link state even after production RLS tightening.
+    """
+    clean_wa = _normalize_phone(wa_id)
+    acct = _clean(account_id)
+
+    lookups: List[Dict[str, Any]] = []
+    if clean_wa:
+        lookups.append({"channel_type": "whatsapp", "provider_user_id": clean_wa})
+    if acct:
+        lookups.append({"account_id": acct, "channel_type": "whatsapp"})
+
+    for filters in lookups:
+        row, _err = _query_one_admin("channel_identities", "*", **filters)
+        if not row:
+            continue
+        if row.get("is_verified") is False or row.get("verified") is False:
+            continue
+        return row
+
+    # Legacy fallback only. The durable source is now channel_identities.
+    if clean_wa:
+        row, _err = _query_one_admin("accounts", _account_select_cols(), provider="wa", provider_user_id=clean_wa)
+        if row and _clean(row.get("auth_user_id")):
+            return {
+                "account_id": _clean(row.get("auth_user_id")),
+                "channel_type": "whatsapp",
+                "provider_user_id": clean_wa,
+                "is_verified": True,
+                "metadata": {"source": "accounts.auth_user_id_fallback"},
+            }
+
+    return None
+
+
+def _is_whatsapp_linked(wa_id: str = "", account_id: str = "") -> bool:
+    return bool(_whatsapp_link_identity(wa_id=wa_id, account_id=account_id))
+
+
+def _unlink_whatsapp_channel(wa_id: str, account_id: str = "") -> Dict[str, Any]:
+    """
+    Unlink only the current WhatsApp channel.
+
+    The website remains the main place to manage channels, but WhatsApp menu item
+    5 now correctly changes to unlink when already linked. This helper supports
+    that action without touching unrelated Telegram records or other users.
+    """
+    clean_wa = _normalize_phone(wa_id)
+    acct = _clean(account_id)
+    identity = _whatsapp_link_identity(wa_id=clean_wa, account_id=acct)
+
+    delete_result: Dict[str, Any] = {"ok": True, "data": []}
+    if identity and identity.get("id"):
+        delete_result = _safe_delete_admin("channel_identities", id=identity.get("id"))
+        if not delete_result.get("ok"):
+            return {
+                "ok": False,
+                "error": "channel_identity_delete_failed",
+                "detail": delete_result.get("error"),
+            }
+
+    # Clear old accounts.auth_user_id fallback rows for this WhatsApp number.
+    try:
+        wa_account, _err = _query_one_admin("accounts", _account_select_cols(), provider="wa", provider_user_id=clean_wa)
+        wa_account_id = _account_id_from_row(wa_account)
+        if wa_account_id:
+            _safe_update_admin("accounts", {"auth_user_id": None, "updated_at": _now_iso()}, account_id=wa_account_id)
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "unlinked": bool(identity),
+        "provider_user_id": clean_wa,
+        "account_id": acct,
+        "delete_result": delete_result if _debug_enabled() else None,
+    }
+
+
 # =============================================================================
 # Menus + descriptions
 # =============================================================================
 
-def _main_menu() -> str:
+def _main_menu(wa_id: str = "", account_id: str = "") -> str:
+    linked = _is_whatsapp_linked(wa_id=wa_id, account_id=account_id) if (wa_id or account_id) else False
+    option_5 = "5️⃣ Unlink website account 🔓" if linked else "5️⃣ Link website account 🔗"
+
     return (
         "🇳🇬 *Naija Tax Guide*\n\n"
         "Reply with:\n"
@@ -1646,7 +1753,7 @@ def _main_menu() -> str:
         "2️⃣ Check Usage Credits 💎\n"
         "3️⃣ Check current plan 📌\n"
         "4️⃣ View subscription plans 🛒\n"
-        "5️⃣ Link website account 🔗\n"
+        f"{option_5}\n"
         "6️⃣ Buy Usage Credit add-ons 💳\n"
         "7️⃣ Tax tools, filing & quiz 🧰\n"
         "8️⃣ Help / Menu ℹ️\n\n"
@@ -3499,6 +3606,48 @@ def _handle_text_message(msg: Dict[str, Any]) -> Dict[str, Any]:
             "send_result": _send_whatsapp_text(wa_id, "✅ Email saved successfully.\n\nReply 4 for plans or 6 for Usage Credit add-ons."),
         }
 
+    if context == "unlink_confirm":
+        normalized = _normalize_text(text)
+        if normalized in {"yes", "yes unlink", "unlink", "confirm", "confirm unlink", "disconnect"}:
+            unlink_result = _unlink_whatsapp_channel(wa_id=wa_id, account_id=account_id)
+            _set_session_state(wa_id, "main")
+            if unlink_result.get("ok"):
+                return {
+                    "ok": True,
+                    "handled": "whatsapp_unlinked",
+                    "send_result": _send_whatsapp_text(
+                        wa_id,
+                        "✅ WhatsApp has been unlinked from the website account.\n\n"
+                        + _main_menu(wa_id, account_id),
+                    ),
+                }
+            return {
+                "ok": True,
+                "handled": "whatsapp_unlink_failed",
+                "send_result": _send_whatsapp_text(
+                    wa_id,
+                    "⚠️ I could not unlink this WhatsApp account now. Please use the Channels page on the website or contact support.\n\nReply 0 for main menu.",
+                ),
+                "debug": unlink_result if _debug_enabled() else None,
+            }
+
+        if normalized in {"no", "cancel", "back", "*", "0", "menu", "main menu"}:
+            _set_session_state(wa_id, "main")
+            return {
+                "ok": True,
+                "handled": "whatsapp_unlink_cancelled",
+                "send_result": _send_whatsapp_text(wa_id, "Unlink cancelled.\n\n" + _main_menu(wa_id, account_id)),
+            }
+
+        return {
+            "ok": True,
+            "handled": "whatsapp_unlink_confirm_prompt",
+            "send_result": _send_whatsapp_text(
+                wa_id,
+                "Reply YES UNLINK to unlink this WhatsApp number from the website account, or reply 0 to cancel.",
+            ),
+        }
+
     if context == "quiz_answer":
         return _handle_quiz_answer(wa_id, account_id, text, state)
 
@@ -3542,13 +3691,13 @@ def _handle_text_message(msg: Dict[str, Any]) -> Dict[str, Any]:
         action = recognition["action"]
         if action == "main_menu":
             _set_session_state(wa_id, "main")
-            return {"ok": True, "handled": "main_menu", "send_result": _send_whatsapp_text(wa_id, _main_menu())}
+            return {"ok": True, "handled": "main_menu", "send_result": _send_whatsapp_text(wa_id, _main_menu(wa_id, account_id))}
         if action == "back":
             _set_session_state(wa_id, "main")
-            return {"ok": True, "handled": "back_main", "send_result": _send_whatsapp_text(wa_id, _main_menu())}
+            return {"ok": True, "handled": "back_main", "send_result": _send_whatsapp_text(wa_id, _main_menu(wa_id, account_id))}
         if action == "cancel":
             _set_session_state(wa_id, "main")
-            return {"ok": True, "handled": "cancel", "send_result": _send_whatsapp_text(wa_id, "Current flow cancelled.\n\n" + _main_menu())}
+            return {"ok": True, "handled": "cancel", "send_result": _send_whatsapp_text(wa_id, "Current flow cancelled.\n\n" + _main_menu(wa_id, account_id))}
 
     if recognition.get("kind") == "quiz_action":
         return _handle_quiz_command(wa_id, account_id, text, state)
@@ -3582,8 +3731,29 @@ def _handle_text_message(msg: Dict[str, Any]) -> Dict[str, Any]:
             _set_session_state(wa_id, "plans")
             return {"ok": True, "handled": "plans_menu", "send_result": _send_whatsapp_text(wa_id, _plans_menu())}
         if action == "link_instruction":
+            if _is_whatsapp_linked(wa_id=wa_id, account_id=account_id):
+                _set_session_state(wa_id, "unlink_confirm")
+                return {
+                    "ok": True,
+                    "handled": "unlink_instruction",
+                    "send_result": _send_whatsapp_text(
+                        wa_id,
+                        "🔓 This WhatsApp number is already linked to a website account.\n\n"
+                        "Reply YES UNLINK to unlink it, or reply 0 to keep it linked and return to the main menu.",
+                    ),
+                }
+
             _set_session_state(wa_id, "link")
-            return {"ok": True, "handled": "link_instruction", "send_result": _send_whatsapp_text(wa_id, "🔗 Send your WhatsApp link code here if you already generated one.\n\nIf you have not generated a code yet, open Channels once from your website account and copy the WhatsApp code here. After linking, you can continue using WhatsApp normally.\n\nReply 0 for main menu.")}
+            return {
+                "ok": True,
+                "handled": "link_instruction",
+                "send_result": _send_whatsapp_text(
+                    wa_id,
+                    "🔗 Send your WhatsApp link code here if you already generated one.\n\n"
+                    "If you have not generated a code yet, open Channels once from your website account and copy the WhatsApp code here. "
+                    "After linking, you can continue using WhatsApp normally.\n\nReply 0 for main menu.",
+                ),
+            }
         if action == "topup_menu":
             _set_session_state(wa_id, "topup")
             return {"ok": True, "handled": "topup_menu", "send_result": _send_whatsapp_text(wa_id, _topup_menu())}
@@ -3609,7 +3779,7 @@ def _handle_text_message(msg: Dict[str, Any]) -> Dict[str, Any]:
             return {"ok": True, "handled": "calculator_menu", "send_result": _send_whatsapp_text(wa_id, _calc_menu())}
         if action == "main_menu":
             _set_session_state(wa_id, "main")
-            return {"ok": True, "handled": "main_menu", "send_result": _send_whatsapp_text(wa_id, _main_menu())}
+            return {"ok": True, "handled": "main_menu", "send_result": _send_whatsapp_text(wa_id, _main_menu(wa_id, account_id))}
         if action == "deadlines":
             return _handle_deadline_command(wa_id, account_id, text)
         return {"ok": True, "handled": action, "send_result": _send_whatsapp_text(wa_id, _guide(str(action)))}
@@ -3758,4 +3928,5 @@ def whatsapp_test_reply():
     data = _safe_json()
     result = _send_whatsapp_text(_normalize_phone(data.get("to")), _clean(data.get("text") or "Naija Tax Guide WhatsApp test message."))
     return jsonify(result), 200 if result.get("ok") else 400
+
 
