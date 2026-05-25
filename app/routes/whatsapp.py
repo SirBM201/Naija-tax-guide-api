@@ -38,7 +38,7 @@ except Exception:  # pragma: no cover
 
 bp = Blueprint("whatsapp", __name__)
 
-WHATSAPP_FLOW_VERSION = "2026-05-24-v23-dynamic-link-unlink-menu"
+WHATSAPP_FLOW_VERSION = "2026-05-24-v24-history-h1-h2-used-at-cleanup"
 
 
 # =============================================================================
@@ -1511,7 +1511,7 @@ def _recognize(text: str, context: str = "main") -> Dict[str, Any]:
     # Exact/prefix command recognition must run before natural question fallback.
     # This guarantees "C1 986000", "D1 PAYE ...", and "Q1" are handled as
     # structured WhatsApp commands, not link codes and not AI questions.
-    prefix_match = re.match(r"^(s[1-3]|p[1-3]|b[1-3]|t(?:10|50|100|500)|f[1-8]|c[1-8]|q[1-5]|d[1-4])\b", norm)
+    prefix_match = re.match(r"^(s[1-3]|p[1-3]|b[1-3]|t(?:10|50|100|500)|f[1-8]|c[1-8]|q[1-5]|d[1-4]|h[1-2])\b", norm)
     if prefix_match:
         code = prefix_match.group(1).upper()
         if code in PLAN_OPTIONS:
@@ -1526,10 +1526,12 @@ def _recognize(text: str, context: str = "main") -> Dict[str, Any]:
             return {"kind": "quiz_action", "code": code, "action": code.lower(), "text": raw}
         if code in {"D1", "D2", "D3", "D4"}:
             return {"kind": "deadline", "action": "deadline", "code": code}
+        if code in {"H1", "H2"}:
+            return {"kind": "history", "action": code.lower(), "code": code}
 
     # Invalid command-like inputs should not consume AI credits.
     # Examples: C9, F11, Q9, D9, S9, T20.
-    if re.match(r"^(?:s|p|b|t|f|c|q|d)\d+\b", norm):
+    if re.match(r"^(?:s|p|b|t|f|c|q|d|h)\d+\b", norm):
         return {"kind": "invalid_menu", "action": "invalid_command", "value": raw}
 
     if norm in {"0", "menu", "main", "main menu", "start", "hello", "hi"}:
@@ -1552,6 +1554,10 @@ def _recognize(text: str, context: str = "main") -> Dict[str, Any]:
         return {"kind": "quiz_action", "code": "Q5", "action": "q5", "text": raw}
     if norm in {"d1", "d2", "d3", "d4", "create deadline", "view deadlines", "delete deadline", "deadline reminder", "view reminders", "delete reminder", "reminder settings"}:
         return {"kind": "deadline", "action": "deadline"}
+    if norm in {"h1", "history", "my history", "recent history", "recent tax history", "view history"}:
+        return {"kind": "history", "action": "h1", "code": "H1"}
+    if norm in {"h2", "last answer", "last tax answer", "last history", "latest answer", "latest tax answer"}:
+        return {"kind": "history", "action": "h2", "code": "H2"}
 
     main_map = {
         "1": "ask_prompt",
@@ -1758,6 +1764,8 @@ def _main_menu(wa_id: str = "", account_id: str = "") -> str:
         "7️⃣ Tax tools, filing & quiz 🧰\n"
         "8️⃣ Help / Menu ℹ️\n\n"
         "Quick commands:\n"
+        "H1 - Recent tax history 🕘\n"
+        "H2 - Last tax answer 📌\n"
         "0 or MENU - Main menu 🏠\n"
         "* or BACK - Go back ↩️\n"
         "CANCEL - Cancel current flow ❌\n\n"
@@ -1833,7 +1841,8 @@ def _help_text() -> str:
     return (
         "ℹ️ *Help - Naija Tax Guide*\n\n"
         "• Main menu uses numbers 1–8.\n"
-        "• Submenus use short codes like S1, T50, F1, C1, Q1, and D1.\n"
+        "• Submenus use short codes like S1, T50, F1, C1, Q1, D1, H1, and H2.\n"
+        "• Use H1 for recent history and H2 for your last tax answer.\n"
         "• You can type natural words too, e.g. Starter Monthly or VAT calculator.\n"
         "• Basic calculators are free. 🧮\n"
         "• Database/cache answers may be served without credit charge. ✅\n"
@@ -1889,12 +1898,15 @@ def _mark_link_token_used_schema_safe(
     wa_account_id: Optional[str] = None,
 ) -> None:
     """
-    Mark a link token as consumed without assuming every historical column exists.
+    Mark a WhatsApp link token as consumed using the confirmed production schema.
 
-    Current production `link_tokens` has shown that some older columns such as
-    `used` are not available. This helper tries the richest update first and
-    falls back to smaller payloads so successful linking is not blocked by
-    non-essential audit columns.
+    Batch 17 includes the Batch 16 cleanup:
+    - The active production link_tokens table uses used_at.
+    - provider_user_id is supported and useful for audit.
+    - Avoid old/non-confirmed fields such as used, status, channel_account_id,
+      used_by_channel_type, and used_by_provider_user_id because they can create
+      harmless but noisy Supabase 400 responses.
+    - Linking must never fail because token audit update fails.
     """
     token_id = _clean(token_row.get("id"))
     if not token_table or not token_id:
@@ -1902,31 +1914,19 @@ def _mark_link_token_used_schema_safe(
 
     now_iso = _now_iso()
     clean_wa = _normalize_phone(wa_id)
-    payloads: List[Dict[str, Any]] = [
-        {
-            "status": "used",
-            "used_at": now_iso,
-            "provider_user_id": clean_wa,
-            "channel_account_id": wa_account_id or None,
-        },
-        {
-            "used_at": now_iso,
-            "provider_user_id": clean_wa,
-            "channel_account_id": wa_account_id or None,
-        },
-        {
-            "used_at": now_iso,
-            "provider_user_id": clean_wa,
-        },
-        {
-            "used_at": now_iso,
-        },
-    ]
 
-    for payload in payloads:
-        result = _safe_update_admin(token_table, payload, id=token_id)
-        if result.get("ok"):
-            return
+    payload = {
+        "used_at": now_iso,
+        "provider_user_id": clean_wa,
+    }
+
+    result = _safe_update_admin(token_table, payload, id=token_id)
+    if result.get("ok"):
+        return
+
+    # Backward-safe fallback for any legacy token table that has used_at
+    # but does not expose provider_user_id.
+    _safe_update_admin(token_table, {"used_at": now_iso}, id=token_id)
 
 
 def _link_wa_account_to_owner_fallback(
@@ -3250,6 +3250,133 @@ def _log_whatsapp_history(*, account_id: str, question: str, answer: str, result
     return {"ok": False, "error": "whatsapp_history_insert_failed", "errors": errors[:3]}
 
 
+
+
+def _history_date_label(value: Any) -> str:
+    raw = _clean(value)
+    if not raw:
+        return "date not shown"
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        return raw[:19]
+
+
+def _history_excerpt(value: Any, limit: int = 220) -> str:
+    text = re.sub(r"\s+", " ", _clean(value))
+    if not text:
+        return "Not shown"
+    return text if len(text) <= limit else text[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _history_rows(account_id: str, limit: int = 5) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """
+    Read the user's Q&A history from the confirmed qa_history table.
+
+    Confirmed columns include:
+    account_id, question, answer, source, provider, created_at,
+    credits_consumed, usage_charged, and channel.
+    """
+    return _query_many(
+        "qa_history",
+        "id,question,answer,source,provider,channel,created_at,credits_consumed,usage_charged",
+        limit=max(1, min(limit, 10)),
+        order_col="created_at",
+        desc=True,
+        account_id=account_id,
+    )
+
+
+def _history_recent_text(account_id: str, limit: int = 5) -> str:
+    rows, err = _history_rows(account_id, limit=limit)
+    if err:
+        return (
+            "⚠️ I could not load your tax history right now.\n\n"
+            "Please try again shortly or use the History page on the website.\n\n"
+            "Reply 0 for main menu."
+        )
+
+    if not rows:
+        return (
+            "🕘 *Recent Tax History*\n\n"
+            "No tax history found yet.\n\n"
+            "Ask a tax question here or on the website, then reply H1 again."
+        )
+
+    lines = ["🕘 *Recent Tax History*", ""]
+    for index, row in enumerate(rows, start=1):
+        question = _history_excerpt(row.get("question"), 110)
+        source = _clean(row.get("channel") or row.get("provider") or row.get("source") or "app")
+        created = _history_date_label(row.get("created_at"))
+        try:
+            credits = int(row.get("credits_consumed") or 0)
+        except Exception:
+            credits = 0
+        credit_text = f" | credits: {credits}" if credits else ""
+        lines.append(f"{index}. {question}")
+        lines.append(f"   {created} | {source}{credit_text}")
+
+    lines.extend(["", "Reply H2 to view your last tax answer, or 0 for main menu."])
+    return _clip("\n".join(lines), 3900)
+
+
+def _history_last_answer_text(account_id: str) -> str:
+    rows, err = _history_rows(account_id, limit=1)
+    if err:
+        return (
+            "⚠️ I could not load your last tax answer right now.\n\n"
+            "Please try again shortly or use the History page on the website.\n\n"
+            "Reply 0 for main menu."
+        )
+
+    if not rows:
+        return (
+            "📌 *Last Tax Answer*\n\n"
+            "No saved tax answer found yet.\n\n"
+            "Ask a tax question first, then reply H2 again."
+        )
+
+    row = rows[0]
+    question = _history_excerpt(row.get("question"), 500)
+    answer = _history_excerpt(row.get("answer"), 2500)
+    created = _history_date_label(row.get("created_at"))
+    source = _clean(row.get("channel") or row.get("provider") or row.get("source") or "app")
+    try:
+        credits = int(row.get("credits_consumed") or 0)
+    except Exception:
+        credits = 0
+
+    credit_line = f"\nCredits used: {credits}" if credits else "\nCredits used: 0 or not charged"
+    body = (
+        "📌 *Last Tax Answer*\n\n"
+        f"Date: {created}\n"
+        f"Source: {source}"
+        f"{credit_line}\n\n"
+        f"Question:\n{question}\n\n"
+        f"Answer:\n{answer}\n\n"
+        "Reply H1 for recent history or 0 for main menu."
+    )
+    return _clip(body, 3900)
+
+
+def _handle_history_command(wa_id: str, account_id: str, text: str) -> Dict[str, Any]:
+    norm = _normalize_text(text)
+    if norm in {"h2", "last answer", "last tax answer", "last history", "latest answer", "latest tax answer"}:
+        return {
+            "ok": True,
+            "handled": "history_last_answer",
+            "send_result": _send_whatsapp_text(wa_id, _history_last_answer_text(account_id)),
+        }
+
+    return {
+        "ok": True,
+        "handled": "history_recent",
+        "send_result": _send_whatsapp_text(wa_id, _history_recent_text(account_id, limit=5)),
+    }
+
 # =============================================================================
 # Core action handlers
 # =============================================================================
@@ -3554,7 +3681,7 @@ def _handle_text_message(msg: Dict[str, Any]) -> Dict[str, Any]:
     # This prevents values like C3 985000 or C3985000 from being queried as link codes,
     # and prevents free calculators from falling through to AI credit deduction.
     recognition = _recognize(text, context)
-    is_command_like = recognition.get("kind") in {"global", "main", "plan", "topup", "tool", "calc", "quiz_action", "deadline", "ambiguous", "invalid_menu"}
+    is_command_like = recognition.get("kind") in {"global", "main", "plan", "topup", "tool", "calc", "quiz_action", "deadline", "history", "ambiguous", "invalid_menu"}
 
     # Only attempt link-code lookup when the user is in the link flow, or when the input
     # is not already recognized as a command/calculator/plan/top-up/tool.
@@ -3708,11 +3835,14 @@ def _handle_text_message(msg: Dict[str, Any]) -> Dict[str, Any]:
     if recognition.get("kind") == "deadline":
         return _handle_deadline_command(wa_id, account_id, text)
 
+    if recognition.get("kind") == "history":
+        return _handle_history_command(wa_id, account_id, text)
+
     if recognition["kind"] == "invalid_menu":
         return {
             "ok": True,
             "handled": "invalid_menu_option",
-            "send_result": _send_whatsapp_text(wa_id, "⚠️ That code/menu option is not available yet, so no AI credit was used.\n\nReply 0 for main menu, F1 for calculators, Q1 for quiz, D1 for reminders, or type your Nigerian tax question in words."),
+            "send_result": _send_whatsapp_text(wa_id, "⚠️ That code/menu option is not available yet, so no AI credit was used.\n\nReply 0 for main menu, F1 for calculators, Q1 for quiz, D1 for reminders, H1 for history, or type your Nigerian tax question in words."),
         }
 
     if recognition["kind"] == "ambiguous":
@@ -3928,5 +4058,4 @@ def whatsapp_test_reply():
     data = _safe_json()
     result = _send_whatsapp_text(_normalize_phone(data.get("to")), _clean(data.get("text") or "Naija Tax Guide WhatsApp test message."))
     return jsonify(result), 200 if result.get("ok") else 400
-
 
