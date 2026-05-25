@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import uuid
 from datetime import datetime, timezone, date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
@@ -38,7 +39,7 @@ except Exception:  # pragma: no cover
 
 bp = Blueprint("whatsapp", __name__)
 
-WHATSAPP_FLOW_VERSION = "2026-05-24-v24-history-h1-h2-used-at-cleanup"
+WHATSAPP_FLOW_VERSION = "2026-05-25-v25-support-basic-history-clean"
 
 
 # =============================================================================
@@ -1511,9 +1512,11 @@ def _recognize(text: str, context: str = "main") -> Dict[str, Any]:
     # Exact/prefix command recognition must run before natural question fallback.
     # This guarantees "C1 986000", "D1 PAYE ...", and "Q1" are handled as
     # structured WhatsApp commands, not link codes and not AI questions.
-    prefix_match = re.match(r"^(s[1-3]|p[1-3]|b[1-3]|t(?:10|50|100|500)|f[1-8]|c[1-8]|q[1-5]|d[1-4]|h[1-2])\b", norm)
+    prefix_match = re.match(r"^(sup[1236]|s[1-3]|p[1-3]|b[1-3]|t(?:10|50|100|500)|f[1-8]|c[1-8]|q[1-5]|d[1-4]|h[1-2])\b", norm)
     if prefix_match:
         code = prefix_match.group(1).upper()
+        if code in {"SUP1", "SUP2", "SUP3", "SUP6"}:
+            return {"kind": "support", "action": code.lower(), "code": code, "text": raw}
         if code in PLAN_OPTIONS:
             return {"kind": "plan", "code": code}
         if code in TOPUP_OPTIONS:
@@ -1530,7 +1533,9 @@ def _recognize(text: str, context: str = "main") -> Dict[str, Any]:
             return {"kind": "history", "action": code.lower(), "code": code}
 
     # Invalid command-like inputs should not consume AI credits.
-    # Examples: C9, F11, Q9, D9, S9, T20.
+    # Examples: C9, F11, Q9, D9, S9, T20, SUP4 before support replies are enabled.
+    if re.match(r"^sup\d+\b", norm):
+        return {"kind": "invalid_menu", "action": "invalid_command", "value": raw}
     if re.match(r"^(?:s|p|b|t|f|c|q|d|h)\d+\b", norm):
         return {"kind": "invalid_menu", "action": "invalid_command", "value": raw}
 
@@ -1558,6 +1563,16 @@ def _recognize(text: str, context: str = "main") -> Dict[str, Any]:
         return {"kind": "history", "action": "h1", "code": "H1"}
     if norm in {"h2", "last answer", "last tax answer", "last history", "latest answer", "latest tax answer"}:
         return {"kind": "history", "action": "h2", "code": "H2"}
+    if norm in {"support", "help support", "support menu", "customer support", "contact support"}:
+        return {"kind": "support", "action": "menu", "code": "SUP", "text": raw}
+    if norm in {"sup1", "create ticket", "open ticket", "new ticket", "support ticket"}:
+        return {"kind": "support", "action": "sup1", "code": "SUP1", "text": raw}
+    if norm in {"sup2", "my tickets", "view tickets", "support tickets"}:
+        return {"kind": "support", "action": "sup2", "code": "SUP2", "text": raw}
+    if norm in {"sup3", "latest ticket", "last ticket", "recent ticket"}:
+        return {"kind": "support", "action": "sup3", "code": "SUP3", "text": raw}
+    if norm in {"sup6", "support email", "contact email", "email support"}:
+        return {"kind": "support", "action": "sup6", "code": "SUP6", "text": raw}
 
     main_map = {
         "1": "ask_prompt",
@@ -1766,6 +1781,8 @@ def _main_menu(wa_id: str = "", account_id: str = "") -> str:
         "Quick commands:\n"
         "H1 - Recent tax history 🕘\n"
         "H2 - Last tax answer 📌\n"
+        "SUP1 - Create support ticket 🛟\n"
+        "SUP2 - View support tickets 🎫\n"
         "0 or MENU - Main menu 🏠\n"
         "* or BACK - Go back ↩️\n"
         "CANCEL - Cancel current flow ❌\n\n"
@@ -1841,8 +1858,9 @@ def _help_text() -> str:
     return (
         "ℹ️ *Help - Naija Tax Guide*\n\n"
         "• Main menu uses numbers 1–8.\n"
-        "• Submenus use short codes like S1, T50, F1, C1, Q1, D1, H1, and H2.\n"
+        "• Submenus use short codes like S1, T50, F1, C1, Q1, D1, H1, H2, and SUP1.\n"
         "• Use H1 for recent history and H2 for your last tax answer.\n"
+        "• Use SUP1 for support, SUP2 for tickets, SUP3 for latest ticket, and SUP6 for support email.\n"
         "• You can type natural words too, e.g. Starter Monthly or VAT calculator.\n"
         "• Basic calculators are free. 🧮\n"
         "• Database/cache answers may be served without credit charge. ✅\n"
@@ -3377,6 +3395,336 @@ def _handle_history_command(wa_id: str, account_id: str, text: str) -> Dict[str,
         "send_result": _send_whatsapp_text(wa_id, _history_recent_text(account_id, limit=5)),
     }
 
+
+# =============================================================================
+# WhatsApp Support helpers
+# =============================================================================
+
+def _support_to_email() -> str:
+    return (
+        _clean(os.getenv("SUPPORT_TO_EMAIL"))
+        or _clean(os.getenv("SUPPORT_EMAIL"))
+        or _clean(os.getenv("MAIL_FROM_EMAIL"))
+        or _clean(os.getenv("SMTP_FROM"))
+        or _clean(os.getenv("MAIL_USER"))
+        or _clean(os.getenv("SMTP_USER"))
+        or "support@naijataxguides.com"
+    )
+
+
+def _support_ticket_id() -> str:
+    return f"NTG-WA-{str(uuid.uuid4()).split('-')[0].upper()}"
+
+
+def _support_category_from_text(value: Any) -> str:
+    text = _normalize_text(value)
+    if any(word in text for word in ("pay", "paid", "payment", "paystack", "subscription", "subscribe", "billing", "plan", "renew")):
+        return "billing"
+    if any(word in text for word in ("credit", "credits", "balance", "deduct", "deducted", "topup", "top up", "usage")):
+        return "credits"
+    if any(word in text for word in ("link", "unlink", "whatsapp", "telegram", "channel", "connect")):
+        return "channels"
+    if any(word in text for word in ("login", "otp", "password", "account", "cookie", "session")):
+        return "login"
+    if any(word in text for word in ("bug", "error", "not working", "failed", "technical", "server")):
+        return "technical"
+    return "general"
+
+
+def _support_priority_from_text(value: Any) -> str:
+    text = _normalize_text(value)
+    if any(word in text for word in ("urgent", "emergency", "critical", "immediately")):
+        return "urgent"
+    if any(word in text for word in ("failed", "cannot", "can't", "blocked", "stuck", "payment")):
+        return "high"
+    return "normal"
+
+
+def _support_subject_from_message(value: Any) -> str:
+    text = " ".join(_clean(value).split())
+    if not text:
+        return "WhatsApp support request"
+    # Remove the command prefix if the user wrote: SUP1 my issue...
+    text = re.sub(r"^SUP1\b[:\-\s]*", "", text, flags=re.I).strip()
+    if not text:
+        return "WhatsApp support request"
+    first_sentence = re.split(r"[\n\r.!?]", text, maxsplit=1)[0].strip()
+    subject = first_sentence or text
+    return subject[:120] if len(subject) > 120 else subject
+
+
+def _support_message_from_command(text: Any) -> str:
+    raw = _clean(text)
+    return re.sub(r"^SUP1\b[:\-\s]*", "", raw, flags=re.I).strip()
+
+
+def _support_menu() -> str:
+    return (
+        "🛟 *Support Centre*\n\n"
+        "SUP1 - Create support ticket\n"
+        "SUP2 - View my support tickets\n"
+        "SUP3 - View latest ticket\n"
+        "SUP6 - Contact support email\n\n"
+        "Quick example:\n"
+        "SUP1 I paid but my plan has not updated. Reference NTG-...\n\n"
+        "Reply 0 for main menu."
+    )
+
+
+def _support_contact_text() -> str:
+    email = _support_to_email()
+    return (
+        "📧 *Contact Support*\n\n"
+        f"Email: {email}\n\n"
+        "For faster help, include your phone number, payment reference if any, and a short description of the issue.\n\n"
+        "You can also reply SUP1 here to create a support ticket directly from WhatsApp."
+    )
+
+
+def _support_ticket_line(ticket: Dict[str, Any], index: int) -> str:
+    ticket_id = _clean(ticket.get("ticket_id") or ticket.get("id") or "Ticket")
+    status = _clean(ticket.get("status") or "open")
+    category = _clean(ticket.get("category") or ticket.get("issue_type") or "general")
+    subject = _clip(_clean(ticket.get("subject") or ticket.get("last_message_preview") or "Support request"), 80)
+    created = _history_date_label(ticket.get("created_at"))
+    return f"{index}. {ticket_id} - {status}\n   {category} | {created}\n   {subject}"
+
+
+def _support_tickets_for_account(account_id: str, limit: int = 5) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    try:
+        q = (
+            _admin_sb()
+            .table("support_tickets")
+            .select("*")
+            .eq("account_id", account_id)
+            .order("created_at", desc=True)
+            .limit(max(1, min(limit, 10)))
+        )
+        res = q.execute()
+        rows = getattr(res, "data", None) or []
+        return [row for row in rows if isinstance(row, dict)], None
+    except Exception as exc:
+        return [], f"support_tickets: {type(exc).__name__}: {_clip(exc)}"
+
+
+def _support_list_text(account_id: str, limit: int = 5) -> str:
+    rows, err = _support_tickets_for_account(account_id, limit=limit)
+    if err:
+        return (
+            "⚠️ I could not load your support tickets right now.\n\n"
+            "Please try again shortly or email support.\n\n"
+            f"Support email: {_support_to_email()}"
+        )
+    if not rows:
+        return (
+            "🎫 *My Support Tickets*\n\n"
+            "No support ticket found yet.\n\n"
+            "Reply SUP1 to create a ticket, or SUP6 for the support email."
+        )
+    lines = ["🎫 *My Support Tickets*", ""]
+    for index, ticket in enumerate(rows, start=1):
+        lines.append(_support_ticket_line(ticket, index))
+    lines.extend(["", "Reply SUP3 to view the latest ticket, SUP1 to create a new ticket, or 0 for main menu."])
+    return _clip("\n".join(lines), 3900)
+
+
+def _support_latest_text(account_id: str) -> str:
+    rows, err = _support_tickets_for_account(account_id, limit=1)
+    if err:
+        return (
+            "⚠️ I could not load your latest support ticket right now.\n\n"
+            f"Support email: {_support_to_email()}"
+        )
+    if not rows:
+        return (
+            "🎫 *Latest Support Ticket*\n\n"
+            "No support ticket found yet.\n\n"
+            "Reply SUP1 to create one."
+        )
+
+    ticket = rows[0]
+    ticket_id = _clean(ticket.get("ticket_id") or ticket.get("id") or "Ticket")
+    status = _clean(ticket.get("status") or "open")
+    category = _clean(ticket.get("category") or ticket.get("issue_type") or "general")
+    priority = _clean(ticket.get("priority") or "normal")
+    subject = _clean(ticket.get("subject") or "Support request")
+    message = _clean(ticket.get("message") or ticket.get("last_message_preview") or "No message preview.")
+    created = _history_date_label(ticket.get("created_at"))
+    updated = _history_date_label(ticket.get("updated_at"))
+
+    body = (
+        "🎫 *Latest Support Ticket*\n\n"
+        f"Ticket ID: {ticket_id}\n"
+        f"Status: {status}\n"
+        f"Category: {category}\n"
+        f"Priority: {priority}\n"
+        f"Created: {created}\n"
+        f"Updated: {updated}\n\n"
+        f"Subject:\n{_clip(subject, 300)}\n\n"
+        f"Message:\n{_clip(message, 1400)}\n\n"
+        "Reply SUP2 for all tickets, SUP1 to create a new ticket, or 0 for main menu."
+    )
+    return _clip(body, 3900)
+
+
+def _create_support_ticket_from_message(
+    *,
+    wa_id: str,
+    account_id: str,
+    account: Optional[Dict[str, Any]],
+    message: str,
+    profile_name: str = "",
+) -> Dict[str, Any]:
+    clean_message = _support_message_from_command(message)
+    if len(clean_message) < 10:
+        _set_session_state(wa_id, context="support_create", pending_action="support_create", data={})
+        return {
+            "ok": True,
+            "handled": "support_create_prompt",
+            "send_result": _send_whatsapp_text(
+                wa_id,
+                "🛟 *Create Support Ticket*\n\n"
+                "Please type your issue in one clear message.\n\n"
+                "Example:\n"
+                "I paid for Starter Monthly but my plan has not updated. Reference NTG-...\n\n"
+                "Reply CANCEL to stop.",
+            ),
+        }
+
+    now = _now_iso()
+    ticket_id = _support_ticket_id()
+    category = _support_category_from_text(clean_message)
+    priority = _support_priority_from_text(clean_message)
+    subject = _support_subject_from_message(clean_message)
+    preview = " ".join(clean_message.split())[:200]
+    account = account or {}
+    email = _clean(account.get("email"))
+    display_name = _clean(profile_name or account.get("display_name") or _display_phone(wa_id))
+    plan_code = _current_plan_code(account_id)
+    plan_name = _plan_label(account_id).split("\n", 1)[0]
+    balance = _credit_balance(account_id)
+
+    metadata = {
+        "created_from": "whatsapp",
+        "wa_id": _normalize_phone(wa_id),
+        "profile_name": profile_name or None,
+        "flow_version": WHATSAPP_FLOW_VERSION,
+    }
+
+    rich_payload = {
+        "ticket_id": ticket_id,
+        "account_id": account_id,
+        "account_email": email or None,
+        "account_name": display_name or None,
+        "category": category,
+        "priority": priority,
+        "subject": subject,
+        "message": clean_message,
+        "plan_name": plan_name,
+        "credit_balance": balance,
+        "channel_state": "whatsapp",
+        "status": "open",
+        "created_at": now,
+        "updated_at": now,
+        "last_reply_at": now,
+        "last_reply_by": "user",
+        "last_message_preview": preview,
+        "issue_type": category,
+        "channel": "whatsapp",
+        "source": "whatsapp",
+        "plan_code": plan_code,
+        "metadata": metadata,
+    }
+
+    mid_payload = {
+        "ticket_id": ticket_id,
+        "account_id": account_id,
+        "category": category,
+        "priority": priority,
+        "subject": subject,
+        "message": clean_message,
+        "status": "open",
+        "created_at": now,
+        "updated_at": now,
+        "last_message_preview": preview,
+        "issue_type": category,
+        "channel": "whatsapp",
+        "source": "whatsapp",
+    }
+
+    minimal_payload = {
+        "ticket_id": ticket_id,
+        "account_id": account_id,
+        "subject": subject,
+        "message": clean_message,
+        "category": category,
+        "status": "open",
+        "created_at": now,
+        "updated_at": now,
+    }
+
+    insert_result = None
+    last_error = ""
+    for payload in (rich_payload, mid_payload, minimal_payload):
+        insert_result = _safe_insert_admin("support_tickets", payload)
+        if insert_result.get("ok"):
+            break
+        last_error = _clean(insert_result.get("error"))
+
+    _set_session_state(wa_id, context="main", pending_action="", data={})
+
+    if not insert_result or not insert_result.get("ok"):
+        return {
+            "ok": True,
+            "handled": "support_create_failed",
+            "send_result": _send_whatsapp_text(
+                wa_id,
+                "⚠️ I could not create the support ticket right now.\n\n"
+                f"Please email: {_support_to_email()}\n\n"
+                "Include your issue and payment reference if any.",
+            ),
+            "debug": {"error": last_error} if _debug_enabled() else None,
+        }
+
+    body = (
+        "✅ *Support ticket created successfully*\n\n"
+        f"Ticket ID: {ticket_id}\n"
+        f"Category: {category}\n"
+        f"Priority: {priority}\n"
+        f"Status: open\n\n"
+        f"Subject:\n{subject}\n\n"
+        "Our support team can review it from the support dashboard.\n\n"
+        "Reply SUP2 to view your tickets, SUP3 for the latest ticket, or 0 for main menu."
+    )
+    return {"ok": True, "handled": "support_ticket_created", "send_result": _send_whatsapp_text(wa_id, _clip(body, 3900))}
+
+
+def _handle_support_command(
+    wa_id: str,
+    account_id: str,
+    text: str,
+    account: Optional[Dict[str, Any]] = None,
+    profile_name: str = "",
+) -> Dict[str, Any]:
+    norm = _normalize_text(text)
+    if norm in {"support", "help support", "support menu", "customer support", "contact support"}:
+        return {"ok": True, "handled": "support_menu", "send_result": _send_whatsapp_text(wa_id, _support_menu())}
+    if norm.startswith("sup1"):
+        return _create_support_ticket_from_message(
+            wa_id=wa_id,
+            account_id=account_id,
+            account=account,
+            message=text,
+            profile_name=profile_name,
+        )
+    if norm in {"sup2", "my tickets", "view tickets", "support tickets"}:
+        return {"ok": True, "handled": "support_tickets", "send_result": _send_whatsapp_text(wa_id, _support_list_text(account_id, limit=5))}
+    if norm in {"sup3", "latest ticket", "last ticket", "recent ticket"}:
+        return {"ok": True, "handled": "support_latest", "send_result": _send_whatsapp_text(wa_id, _support_latest_text(account_id))}
+    if norm in {"sup6", "support email", "contact email", "email support"}:
+        return {"ok": True, "handled": "support_contact", "send_result": _send_whatsapp_text(wa_id, _support_contact_text())}
+    return {"ok": True, "handled": "support_menu", "send_result": _send_whatsapp_text(wa_id, _support_menu())}
+
 # =============================================================================
 # Core action handlers
 # =============================================================================
@@ -3681,11 +4029,11 @@ def _handle_text_message(msg: Dict[str, Any]) -> Dict[str, Any]:
     # This prevents values like C3 985000 or C3985000 from being queried as link codes,
     # and prevents free calculators from falling through to AI credit deduction.
     recognition = _recognize(text, context)
-    is_command_like = recognition.get("kind") in {"global", "main", "plan", "topup", "tool", "calc", "quiz_action", "deadline", "history", "ambiguous", "invalid_menu"}
+    is_command_like = recognition.get("kind") in {"global", "main", "plan", "topup", "tool", "calc", "quiz_action", "deadline", "history", "support", "ambiguous", "invalid_menu"}
 
     # Only attempt link-code lookup when the user is in the link flow, or when the input
     # is not already recognized as a command/calculator/plan/top-up/tool.
-    if context == "link" or not is_command_like:
+    if context == "link" or (not is_command_like and context not in {"support_create"}):
         link_reply = _try_link_code(wa_id, text, profile_name=profile_name)
         if link_reply:
             _set_session_state(wa_id, "main")
@@ -3732,6 +4080,23 @@ def _handle_text_message(msg: Dict[str, Any]) -> Dict[str, Any]:
             "handled": "email_saved",
             "send_result": _send_whatsapp_text(wa_id, "✅ Email saved successfully.\n\nReply 4 for plans or 6 for Usage Credit add-ons."),
         }
+
+    if context == "support_create":
+        normalized = _normalize_text(text)
+        if normalized in {"cancel", "stop", "end", "0", "menu", "main", "main menu", "back"}:
+            _set_session_state(wa_id, "main")
+            return {
+                "ok": True,
+                "handled": "support_create_cancelled",
+                "send_result": _send_whatsapp_text(wa_id, "Support ticket creation cancelled.\n\n" + _main_menu(wa_id, account_id)),
+            }
+        return _create_support_ticket_from_message(
+            wa_id=wa_id,
+            account_id=account_id,
+            account=account,
+            message=text,
+            profile_name=profile_name,
+        )
 
     if context == "unlink_confirm":
         normalized = _normalize_text(text)
@@ -3838,11 +4203,14 @@ def _handle_text_message(msg: Dict[str, Any]) -> Dict[str, Any]:
     if recognition.get("kind") == "history":
         return _handle_history_command(wa_id, account_id, text)
 
+    if recognition.get("kind") == "support":
+        return _handle_support_command(wa_id, account_id, text, account=account, profile_name=profile_name)
+
     if recognition["kind"] == "invalid_menu":
         return {
             "ok": True,
             "handled": "invalid_menu_option",
-            "send_result": _send_whatsapp_text(wa_id, "⚠️ That code/menu option is not available yet, so no AI credit was used.\n\nReply 0 for main menu, F1 for calculators, Q1 for quiz, D1 for reminders, H1 for history, or type your Nigerian tax question in words."),
+            "send_result": _send_whatsapp_text(wa_id, "⚠️ That code/menu option is not available yet, so no AI credit was used.\n\nReply 0 for main menu, F1 for calculators, Q1 for quiz, D1 for reminders, H1 for history, SUP1 for support, or type your Nigerian tax question in words."),
         }
 
     if recognition["kind"] == "ambiguous":
