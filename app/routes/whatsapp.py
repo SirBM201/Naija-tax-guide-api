@@ -57,7 +57,7 @@ except Exception:  # pragma: no cover
 
 bp = Blueprint("whatsapp", __name__)
 
-WHATSAPP_FLOW_VERSION = "2026-05-25-v33b-q5-explanation-copy-cleanup"
+WHATSAPP_FLOW_VERSION = "2026-05-25-v33d-quiz-q5-value-separation"
 
 
 # =============================================================================
@@ -3059,7 +3059,7 @@ def _quiz_usage_text() -> str:
         "Q2 - choose category\n"
         "Q3 - today's score\n"
         "Q4 - review last answer\n"
-        "Q5 - detailed saved explanation for last quiz answer 💎\n\n"
+        "Q5 - detailed explanation for last quiz answer 💎\n\n"
         "Reply A, B, C, or D after a question. Questions and options are shuffled. "
         "Free users get 12 non-AI quiz attempts daily. Paid users get unlimited non-AI quiz attempts."
     )
@@ -3070,6 +3070,88 @@ def _quiz_static_premium_explanation(question: Dict[str, Any]) -> str:
     if not base:
         return "Review the correct answer and apply it based on the tax type involved."
     return _clip(base, 900)
+
+
+def _strip_quiz_generic_lines(text: Any) -> str:
+    """Remove generic Q5 boilerplate stored in older quiz explanations."""
+    value = _clean(text)
+    if not value:
+        return ""
+    lines: List[str] = []
+    for raw_line in value.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = raw_line.strip()
+        plain = re.sub(r"^[•\-\*]\s*", "", line).strip()
+        norm = _normalize_text(plain)
+        if not plain:
+            lines.append("")
+            continue
+        if norm.startswith("category:"):
+            continue
+        if "the point of this question" in norm:
+            continue
+        if norm.startswith("this answer is educational guidance"):
+            continue
+        lines.append(plain)
+    cleaned = "\n".join(lines)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned
+
+
+def _q5_value_explanation(last: Dict[str, Any], raw_explanation: Any) -> str:
+    """Return a paid Q5 explanation that is more useful than the free quiz result."""
+    base = _strip_quiz_generic_lines(raw_explanation)
+    short = _strip_quiz_generic_lines(last.get("explanation")) if isinstance(last, dict) else ""
+    category = _clean(last.get("category") if isinstance(last, dict) else "") or "General"
+    question = _clean(last.get("question") if isinstance(last, dict) else "")
+
+    if not base:
+        base = short or "This question tests how the tax rule applies in a practical Nigerian tax situation."
+
+    # If the stored premium explanation is still the same as the free short note,
+    # expand it safely without calling live AI.
+    if _normalize_text(base) == _normalize_text(short) or len(base) <= max(120, len(short) + 30):
+        norm_cat = _normalize_text(category)
+        if "paye" in norm_cat:
+            extra = (
+                "Practical use: PAYE applies when an employer pays salaries or wages. The employer deducts tax before paying the employee and remits it to the relevant State Internal Revenue Service.\n\n"
+                "Why it matters: Keeping proper PAYE records helps prove that salaries were paid, tax was deducted, and remittance obligations were followed."
+            )
+        elif "vat" in norm_cat:
+            extra = (
+                "Practical use: VAT applies to taxable supplies of goods and services. A registered business should charge VAT where required, keep records, and remit according to the applicable filing deadline.\n\n"
+                "Why it matters: VAT records help support sales figures, input/output VAT calculations, and compliance during review or audit."
+            )
+        elif "wht" in norm_cat or "withholding" in norm_cat:
+            extra = (
+                "Practical use: Withholding Tax is deducted at source on qualifying payments and remitted to the relevant tax authority.\n\n"
+                "Why it matters: Correct WHT handling helps prevent double taxation disputes, supports tax credit claims, and reduces compliance risk."
+            )
+        elif "company" in norm_cat or "cit" in norm_cat:
+            extra = (
+                "Practical use: Company Income Tax applies to taxable company profits after allowable adjustments. Good records support the computation and filing position.\n\n"
+                "Why it matters: Accurate CIT handling helps a company avoid underpayment, penalties, and weak documentation during tax review."
+            )
+        elif "deadline" in norm_cat:
+            extra = (
+                "Practical use: Deadline rules help decide when a filing, payment, or reminder should happen. Expired or invalid dates should be rejected or corrected before submission.\n\n"
+                "Why it matters: Good deadline control helps prevent late filing, penalties, missed reminders, and wrong compliance advice."
+            )
+        elif "record" in norm_cat:
+            extra = (
+                "Practical use: Tax records should support the figures reported, the deductions made, and the payments/remittances completed.\n\n"
+                "Why it matters: Proper records make it easier to answer tax authority questions and defend filings during review or audit."
+            )
+        else:
+            extra = (
+                "Practical use: Apply this rule by identifying the tax type, the taxpayer involved, the relevant authority, and the correct deadline or document requirement.\n\n"
+                "Why it matters: This helps avoid wrong filing decisions, missed payments, and unnecessary penalties."
+            )
+        base = f"{base}\n\n{extra}"
+
+    if question and _normalize_text(question) not in _normalize_text(base):
+        # Do not repeat the full question; keep the response focused.
+        pass
+    return _clip(base, 1200)
 
 
 def _quiz_question_from_db_row(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -3500,15 +3582,19 @@ def _handle_quiz_answer(wa_id: str, account_id: str, text: str, state: Dict[str,
     _set_session_state(wa_id, "main", "", new_data)
 
     remaining = "Unlimited" if _is_active_paid_subscription(account_id) else str(max(0, QUIZ_FREE_DAILY_LIMIT - attempts))
+    options_map = data.get("quiz_options") if isinstance(data.get("quiz_options"), dict) else {}
+    selected_text = _clean(options_map.get(answer))
+    correct_text = _clean(options_map.get(correct))
     body = (
         f"🧠 *Quiz Result*\n\n"
         f"{verdict}\n\n"
-        f"Explanation: {explain}\n\n"
+        f"Your answer: {answer}. {selected_text}\n"
+        f"Correct answer: {correct}. {correct_text}\n\n"
         f"Attempts today: {attempts}\n"
         f"Correct today: {correct_count}\n"
         f"Wrong today: {wrong_count}\n"
         f"Remaining today: {remaining}\n\n"
-        "Reply Q1 for another random quiz, Q2 for categories, Q3 for score, Q4 to review, Q5 for detailed saved explanation, or 0 for menu."
+        "Reply Q5 for the detailed explanation, Q4 to review, Q1 for another quiz, or 0 for menu."
     )
     return {"ok": True, "handled": "quiz_answer_randomized", "send_result": _send_whatsapp_text(wa_id, body)}
 
@@ -3557,8 +3643,7 @@ def _handle_quiz_command(wa_id: str, account_id: str, text: str, state: Dict[str
             f"Your answer: {_clean(last.get('selected'))}. {_clean(selected_text)}\n"
             f"Correct answer: {_clean(last.get('correct'))}. {_clean(correct_text)}\n"
             f"Status: {status}\n\n"
-            f"Why: {_clean(last.get('explanation'))}\n\n"
-            "Reply Q1 for another quiz or Q5 for the detailed saved explanation."
+            "Reply Q5 for the detailed explanation, Q1 for another quiz, or 0 for menu."
         )
         return {"ok": True, "handled": "quiz_review", "send_result": _send_whatsapp_text(wa_id, _clip(body, 3900))}
 
@@ -3621,7 +3706,7 @@ def _handle_quiz_command(wa_id: str, account_id: str, text: str, state: Dict[str
             }
 
         _log_quiz_q5_used(attempt_id, debit)
-        answer = _clip(explanation, 900)
+        answer = _q5_value_explanation(last or {}, explanation)
         body = (
             "💡 *Q5 Detailed Explanation*\n\n"
             f"{answer}\n\n"
