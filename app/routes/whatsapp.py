@@ -36,10 +36,27 @@ except Exception:  # pragma: no cover
     create_reference = None  # type: ignore
     initialize_transaction = None  # type: ignore
 
+try:
+    from app.services.referral_service import (
+        ensure_referral_profile,
+        get_referral_summary,
+        list_referrals_for_referrer,
+        list_rewards_for_account,
+        list_payouts_for_account,
+        build_referral_link,
+    )
+except Exception:  # pragma: no cover
+    ensure_referral_profile = None  # type: ignore
+    get_referral_summary = None  # type: ignore
+    list_referrals_for_referrer = None  # type: ignore
+    list_rewards_for_account = None  # type: ignore
+    list_payouts_for_account = None  # type: ignore
+    build_referral_link = None  # type: ignore
+
 
 bp = Blueprint("whatsapp", __name__)
 
-WHATSAPP_FLOW_VERSION = "2026-05-25-v27-support-reply-close-credit-history"
+WHATSAPP_FLOW_VERSION = "2026-05-25-v28-referrals-support-clean-credit-history"
 
 
 # =============================================================================
@@ -1512,13 +1529,15 @@ def _recognize(text: str, context: str = "main") -> Dict[str, Any]:
     # Exact/prefix command recognition must run before natural question fallback.
     # This guarantees "C1 986000", "D1 PAYE ...", and "Q1" are handled as
     # structured WhatsApp commands, not link codes and not AI questions.
-    prefix_match = re.match(r"^(sup[1-6]|cr[1-4]|s[1-3]|p[1-3]|b[1-3]|t(?:10|50|100|500)|f[1-8]|c[1-8]|q[1-5]|d[1-4]|h[1-2])\b", norm)
+    prefix_match = re.match(r"^(sup[1-6]|cr[1-4]|r[1-6]|s[1-3]|p[1-3]|b[1-3]|t(?:10|50|100|500)|f[1-8]|c[1-8]|q[1-5]|d[1-4]|h[1-2])\b", norm)
     if prefix_match:
         code = prefix_match.group(1).upper()
         if code in {"SUP1", "SUP2", "SUP3", "SUP4", "SUP5", "SUP6"}:
             return {"kind": "support", "action": code.lower(), "code": code, "text": raw}
         if code in {"CR1", "CR2", "CR3", "CR4"}:
             return {"kind": "credit_activity", "action": code.lower(), "code": code, "text": raw}
+        if code in {"R1", "R2", "R3", "R4", "R5", "R6"}:
+            return {"kind": "referral", "action": code.lower(), "code": code, "text": raw}
         if code in PLAN_OPTIONS:
             return {"kind": "plan", "code": code}
         if code in TOPUP_OPTIONS:
@@ -1538,7 +1557,7 @@ def _recognize(text: str, context: str = "main") -> Dict[str, Any]:
     # Examples: C9, F11, Q9, D9, S9, T20, or unsupported SUP commands.
     if re.match(r"^sup\d+\b", norm):
         return {"kind": "invalid_menu", "action": "invalid_command", "value": raw}
-    if re.match(r"^(?:s|p|b|t|f|c|q|d|h|cr)\d+\b", norm):
+    if re.match(r"^(?:s|p|b|t|f|c|q|d|h|cr|r)\d+\b", norm):
         return {"kind": "invalid_menu", "action": "invalid_command", "value": raw}
 
     if norm in {"0", "menu", "main", "main menu", "start", "hello", "hi"}:
@@ -1575,6 +1594,20 @@ def _recognize(text: str, context: str = "main") -> Dict[str, Any]:
         return {"kind": "credit_activity", "action": "cr3", "code": "CR3", "text": raw}
     if norm in {"cr4", "credit additions", "topup history", "top-up history", "credit topups", "credit top-ups"}:
         return {"kind": "credit_activity", "action": "cr4", "code": "CR4", "text": raw}
+    if norm in {"referral", "referrals", "referral menu", "invite", "invite friends", "affiliate", "affiliates"}:
+        return {"kind": "referral", "action": "menu", "code": "R", "text": raw}
+    if norm in {"r1", "my referral code", "referral code", "my code"}:
+        return {"kind": "referral", "action": "r1", "code": "R1", "text": raw}
+    if norm in {"r2", "my referral link", "referral link", "my link"}:
+        return {"kind": "referral", "action": "r2", "code": "R2", "text": raw}
+    if norm in {"r3", "share referral", "share invite", "share invitation", "invite message"}:
+        return {"kind": "referral", "action": "r3", "code": "R3", "text": raw}
+    if norm in {"r4", "referral stats", "referral statistics", "my referral stats", "referral summary"}:
+        return {"kind": "referral", "action": "r4", "code": "R4", "text": raw}
+    if norm in {"r5", "referral rewards", "my rewards", "rewards"}:
+        return {"kind": "referral", "action": "r5", "code": "R5", "text": raw}
+    if norm in {"r6", "payout status", "referral payout", "referral payouts", "payouts"}:
+        return {"kind": "referral", "action": "r6", "code": "R6", "text": raw}
     if norm in {"support", "help support", "support menu", "customer support", "contact support"}:
         return {"kind": "support", "action": "menu", "code": "SUP", "text": raw}
     if norm in {"sup1", "create ticket", "open ticket", "new ticket", "support ticket"}:
@@ -1799,8 +1832,8 @@ def _main_menu(wa_id: str = "", account_id: str = "") -> str:
         "H2 - Last tax answer 📌\n"
         "SUP1 - Create support ticket 🛟\n"
         "SUP2 - View support tickets 🎫\n"
-        "SUP4 - Reply to support ticket ✍️\n"
-        "SUP5 - Close support ticket 🔒\n"
+        "R1 - My referral code/link 🤝\n"
+        "R4 - Referral statistics 📊\n"
         "0 or MENU - Main menu 🏠\n"
         "* or BACK - Go back ↩️\n"
         "CANCEL - Cancel current flow ❌\n\n"
@@ -1876,9 +1909,10 @@ def _help_text() -> str:
     return (
         "ℹ️ *Help - Naija Tax Guide*\n\n"
         "• Main menu uses numbers 1–8.\n"
-        "• Submenus use short codes like S1, T50, F1, C1, Q1, D1, H1, H2, and SUP1.\n"
+        "• Submenus use short codes like S1, T50, F1, C1, Q1, D1, H1, H2, SUP1, CR1, and R1.\n"
         "• Use H1 for recent history and H2 for your last tax answer.\n"
         "• Use SUP1 for support, SUP2 for tickets, SUP3 for latest ticket, SUP4 to reply, SUP5 to close, and SUP6 for support email.\n"
+        "• Use R1 for referral code, R2 for referral link, R3 to share invitation, R4 for stats, R5 for rewards, and R6 for payout status.\n"
         "• You can type natural words too, e.g. Starter Monthly or VAT calculator.\n"
         "• Basic calculators are free. 🧮\n"
         "• Database/cache answers may be served without credit charge. ✅\n"
@@ -3784,6 +3818,14 @@ def _insert_support_reply_row(
     wa_id: str,
     sender_type: str = "user",
 ) -> Dict[str, Any]:
+    """
+    Save a support-ticket reply using the confirmed Batch 20 table schema.
+
+    Batch 21 cleanup:
+    - Avoid ticket_row_id in the first payload because older support_tickets.id
+      values may not be UUIDs, while support_ticket_replies.ticket_row_id is UUID.
+    - This prevents the harmless 400 -> 201 fallback noise seen in Koyeb logs.
+    """
     now = _now_iso()
     ticket_id = _support_ticket_ref(ticket)
     metadata = {
@@ -3792,9 +3834,8 @@ def _insert_support_reply_row(
         "support_ticket_row_id": _clean(ticket.get("id")) or None,
     }
 
-    rich_payload = {
+    clean_payload = {
         "ticket_id": ticket_id,
-        "ticket_row_id": _clean(ticket.get("id")) or None,
         "account_id": account_id,
         "message": message,
         "sender_type": sender_type,
@@ -3803,6 +3844,7 @@ def _insert_support_reply_row(
         "metadata": metadata,
         "created_at": now,
     }
+
     mid_payload = {
         "ticket_id": ticket_id,
         "account_id": account_id,
@@ -3812,6 +3854,7 @@ def _insert_support_reply_row(
         "source": "whatsapp",
         "created_at": now,
     }
+
     minimal_payload = {
         "ticket_id": ticket_id,
         "account_id": account_id,
@@ -3820,7 +3863,7 @@ def _insert_support_reply_row(
     }
 
     last: Dict[str, Any] = {"ok": False, "error": "not_attempted"}
-    for payload in (rich_payload, mid_payload, minimal_payload):
+    for payload in (clean_payload, mid_payload, minimal_payload):
         last = _safe_insert_admin("support_ticket_replies", payload)
         if last.get("ok"):
             return last
@@ -4236,6 +4279,368 @@ def _handle_credit_activity_command(wa_id: str, account_id: str, text: str) -> D
     return {"ok": True, "handled": "credit_activity_menu", "send_result": _send_whatsapp_text(wa_id, _credit_activity_menu())}
 
 
+
+# =============================================================================
+# WhatsApp Referral helpers
+# =============================================================================
+
+def _referral_menu() -> str:
+    return (
+        "🤝 *Referral Centre*\n\n"
+        "R1 - My referral code\n"
+        "R2 - My referral link\n"
+        "R3 - Share referral invitation\n"
+        "R4 - Referral statistics\n"
+        "R5 - Referral rewards\n"
+        "R6 - Payout status\n\n"
+        "Reply with R1, R2, R3, R4, R5, or R6.\n"
+        "Reply 0 for main menu."
+    )
+
+
+def _referral_fallback_code(account_id: str) -> str:
+    clean_id = _clean(account_id).replace("-", "")
+    prefix = (clean_id[:8] or "USER").upper()
+    return f"NTG-{prefix}"
+
+
+def _referral_link_for_code(code: str) -> str:
+    clean_code = _clean(code)
+    if not clean_code:
+        return ""
+    if callable(build_referral_link):
+        try:
+            link = _clean(build_referral_link(clean_code))  # type: ignore[misc]
+            if link:
+                if link.startswith("/"):
+                    return f"{_base_url()}{link}"
+                return link
+        except Exception:
+            pass
+    return f"{_base_url()}/signup?ref={quote(clean_code)}"
+
+
+def _referral_profile_data(account_id: str) -> Tuple[Dict[str, Any], Optional[str]]:
+    """
+    Get or create the user's referral profile through the same web referral service.
+
+    If the web referral service is unavailable, return a display-safe fallback.
+    The fallback keeps WhatsApp usable but the real referral service should remain
+    the source of truth when deployed.
+    """
+    if callable(ensure_referral_profile):
+        try:
+            profile = ensure_referral_profile(account_id)  # type: ignore[misc]
+            if isinstance(profile, dict):
+                return profile, None
+        except Exception as exc:
+            fallback_code = _referral_fallback_code(account_id)
+            return {
+                "account_id": account_id,
+                "referral_code": fallback_code,
+                "referral_link": _referral_link_for_code(fallback_code),
+                "is_active": False,
+                "fallback": True,
+            }, f"ensure_referral_profile: {type(exc).__name__}: {_clip(exc)}"
+
+    fallback_code = _referral_fallback_code(account_id)
+    return {
+        "account_id": account_id,
+        "referral_code": fallback_code,
+        "referral_link": _referral_link_for_code(fallback_code),
+        "is_active": False,
+        "fallback": True,
+    }, "referral_service_unavailable"
+
+
+def _referral_profile_code_link(account_id: str) -> Tuple[str, str, Optional[str]]:
+    profile, err = _referral_profile_data(account_id)
+    code = _clean(profile.get("referral_code")) or _referral_fallback_code(account_id)
+    link = _clean(profile.get("referral_link")) or _referral_link_for_code(code)
+    if link.startswith("/"):
+        link = f"{_base_url()}{link}"
+    return code, link, err
+
+
+def _referral_summary_data(account_id: str) -> Tuple[Dict[str, Any], Optional[str]]:
+    if callable(get_referral_summary):
+        try:
+            summary = get_referral_summary(account_id)  # type: ignore[misc]
+            if isinstance(summary, dict):
+                return summary, None
+        except Exception as exc:
+            return {}, f"get_referral_summary: {type(exc).__name__}: {_clip(exc)}"
+    return {}, "referral_summary_service_unavailable"
+
+
+def _referral_number(value: Any, default: int = 0) -> int:
+    try:
+        if value is None or value == "":
+            return default
+        return int(float(str(value)))
+    except Exception:
+        return default
+
+
+def _referral_amount(value: Any) -> float:
+    try:
+        if value is None or value == "":
+            return 0.0
+        return float(str(value))
+    except Exception:
+        return 0.0
+
+
+def _referral_money(value: Any, currency: str = "NGN") -> str:
+    amount = _referral_amount(value)
+    currency = _clean(currency or "NGN").upper()
+    if currency == "NGN":
+        return f"₦{amount:,.0f}"
+    return f"{currency} {amount:,.2f}"
+
+
+def _referral_totals(summary: Dict[str, Any]) -> Dict[str, Any]:
+    totals = summary.get("totals")
+    if isinstance(totals, dict):
+        return totals
+
+    # Backward-safe fallback if a future summary shape places totals top-level.
+    return {
+        "total_referrals": summary.get("total_referrals", 0),
+        "qualified_referrals": summary.get("qualified_referrals", 0),
+        "pending_referrals": summary.get("pending_referrals", 0),
+        "pending_rewards": summary.get("pending_rewards", 0),
+        "approved_rewards": summary.get("approved_rewards", 0),
+        "paid_rewards": summary.get("paid_rewards", 0),
+        "available_balance": summary.get("available_balance", 0),
+        "currency": summary.get("currency", "NGN"),
+    }
+
+
+def _referral_code_text(account_id: str) -> str:
+    code, link, err = _referral_profile_code_link(account_id)
+    warning = ""
+    if err and _debug_enabled():
+        warning = f"\n\nDebug note: {_clip(err, 300)}"
+
+    return (
+        "🤝 *My Referral Code*\n\n"
+        f"Code: {code}\n"
+        f"Link: {link}\n\n"
+        "Share this code or link with someone who wants to use Naija Tax Guide.\n"
+        "Referral rewards apply according to the active referral policy after successful paid subscription.\n\n"
+        "Reply R3 to get a ready-to-share invitation message, R4 for referral stats, or 0 for main menu."
+        f"{warning}"
+    )
+
+
+def _referral_link_text(account_id: str) -> str:
+    code, link, err = _referral_profile_code_link(account_id)
+    warning = ""
+    if err and _debug_enabled():
+        warning = f"\n\nDebug note: {_clip(err, 300)}"
+
+    return (
+        "🔗 *My Referral Link*\n\n"
+        f"{link}\n\n"
+        f"Referral code: {code}\n\n"
+        "Copy and share the link with friends, colleagues, small business owners, or tax learners.\n\n"
+        "Reply R3 for a ready-to-share invitation message."
+        f"{warning}"
+    )
+
+
+def _referral_share_text(account_id: str) -> str:
+    code, link, _err = _referral_profile_code_link(account_id)
+    return (
+        "📣 *Share Referral Invitation*\n\n"
+        "You can copy and forward this message:\n\n"
+        "Hi, I use Naija Tax Guide for Nigerian tax questions, calculators, filing guidance, and reminders.\n\n"
+        f"Join with my referral link:\n{link}\n\n"
+        f"Referral code: {code}\n\n"
+        "After signup, you can use the web app and supported chat channels."
+    )
+
+
+def _referral_stats_text(account_id: str) -> str:
+    summary, err = _referral_summary_data(account_id)
+    code, link, profile_err = _referral_profile_code_link(account_id)
+    if err and not summary:
+        return (
+            "⚠️ I could not load your referral statistics right now.\n\n"
+            f"Your referral code: {code}\n"
+            f"Your referral link: {link}\n\n"
+            "Please try again shortly or use the Referrals page on the website.\n\n"
+            "Reply R1 for your referral code or 0 for main menu."
+        )
+
+    totals = _referral_totals(summary)
+    currency = _clean(totals.get("currency") or "NGN").upper()
+    config = summary.get("config") if isinstance(summary.get("config"), dict) else {}
+    hold_days = config.get("hold_days", "not shown")
+
+    body = (
+        "📊 *Referral Statistics*\n\n"
+        f"Referral code: {code}\n"
+        f"Total referrals: {_referral_number(totals.get('total_referrals'))}\n"
+        f"Qualified/rewarded referrals: {_referral_number(totals.get('qualified_referrals'))}\n"
+        f"Pending referrals: {_referral_number(totals.get('pending_referrals'))}\n\n"
+        "Rewards:\n"
+        f"Pending: {_referral_money(totals.get('pending_rewards'), currency)}\n"
+        f"Approved/available: {_referral_money(totals.get('approved_rewards') or totals.get('available_balance'), currency)}\n"
+        f"Paid: {_referral_money(totals.get('paid_rewards'), currency)}\n"
+        f"Reversed: {_referral_money(totals.get('reversed_rewards'), currency)}\n\n"
+        f"Reward hold period: {hold_days} day(s)\n\n"
+        "Reply R5 for reward details, R6 for payout status, or 0 for main menu."
+    )
+
+    if (err or profile_err) and _debug_enabled():
+        body += f"\n\nDebug note: {_clip(err or profile_err, 300)}"
+
+    return _clip(body, 3900)
+
+
+def _referral_rewards_rows(account_id: str, limit: int = 5) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    if not callable(list_rewards_for_account):
+        return [], "list_rewards_for_account_unavailable"
+    try:
+        rows = list_rewards_for_account(account_id, limit=limit)  # type: ignore[misc]
+        if isinstance(rows, list):
+            return [row for row in rows if isinstance(row, dict)], None
+        return [], None
+    except Exception as exc:
+        return [], f"list_rewards_for_account: {type(exc).__name__}: {_clip(exc)}"
+
+
+def _referral_reward_line(row: Dict[str, Any], index: int) -> str:
+    reward_type = _clean(row.get("reward_type") or "reward").replace("_", " ").title()
+    status = _clean(row.get("status") or "pending")
+    currency = _clean(row.get("currency") or "NGN").upper()
+    amount = _referral_money(row.get("reward_amount"), currency)
+    created = _history_date_label(row.get("created_at") or row.get("earned_at"))
+    plan = _clean(row.get("plan_code"))
+    plan_text = f" | plan: {plan}" if plan else ""
+    return f"{index}. {amount} - {status}\n   {reward_type} | {created}{plan_text}"
+
+
+def _referral_rewards_text(account_id: str) -> str:
+    rows, err = _referral_rewards_rows(account_id, limit=10)
+    if err:
+        return (
+            "⚠️ I could not load your referral rewards right now.\n\n"
+            "Please try again shortly or use the Referrals page on the website.\n\n"
+            "Reply R4 for referral statistics or 0 for main menu."
+        )
+
+    if not rows:
+        return (
+            "🎁 *Referral Rewards*\n\n"
+            "No referral reward found yet.\n\n"
+            "Share your link with R3. Rewards will appear here after referred users qualify according to the referral policy.\n\n"
+            "Reply R1 for your code/link or 0 for main menu."
+        )
+
+    lines = ["🎁 *Referral Rewards*", ""]
+    for index, row in enumerate(rows[:5], start=1):
+        lines.append(_referral_reward_line(row, index))
+
+    lines.extend(["", "Reply R4 for statistics, R6 for payout status, or 0 for main menu."])
+    return _clip("\n".join(lines), 3900)
+
+
+def _referral_payout_rows(account_id: str, limit: int = 5) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    if not callable(list_payouts_for_account):
+        return [], "list_payouts_for_account_unavailable"
+    try:
+        rows = list_payouts_for_account(account_id, limit=limit)  # type: ignore[misc]
+        if isinstance(rows, list):
+            return [row for row in rows if isinstance(row, dict)], None
+        return [], None
+    except Exception as exc:
+        return [], f"list_payouts_for_account: {type(exc).__name__}: {_clip(exc)}"
+
+
+def _referral_payout_line(row: Dict[str, Any], index: int) -> str:
+    status = _clean(row.get("status") or "pending")
+    currency = _clean(row.get("currency") or "NGN").upper()
+    amount = _referral_money(row.get("amount") or row.get("payout_amount") or row.get("total_amount"), currency)
+    created = _history_date_label(row.get("created_at") or row.get("requested_at"))
+    provider = _clean(row.get("provider") or "payout")
+    reference = _clean(row.get("provider_reference") or row.get("reference") or row.get("id"))
+    ref_text = f"\n   Ref: {_clip(reference, 80)}" if reference else ""
+    return f"{index}. {amount} - {status}\n   {provider} | {created}{ref_text}"
+
+
+def _referral_payout_status_text(account_id: str) -> str:
+    summary, _summary_err = _referral_summary_data(account_id)
+    totals = _referral_totals(summary) if summary else {}
+    currency = _clean(totals.get("currency") or "NGN").upper()
+    available = totals.get("available_balance") or totals.get("approved_rewards") or 0
+    pending = totals.get("pending_rewards") or 0
+    paid = totals.get("paid_rewards") or 0
+
+    rows, err = _referral_payout_rows(account_id, limit=10)
+    if err:
+        return (
+            "⚠️ I could not load your referral payout status right now.\n\n"
+            f"Approved/available rewards: {_referral_money(available, currency)}\n"
+            f"Pending rewards: {_referral_money(pending, currency)}\n\n"
+            "Please try again shortly or use the Referrals page on the website."
+        )
+
+    lines = [
+        "🏦 *Referral Payout Status*",
+        "",
+        f"Approved/available rewards: {_referral_money(available, currency)}",
+        f"Pending rewards: {_referral_money(pending, currency)}",
+        f"Paid rewards: {_referral_money(paid, currency)}",
+        "",
+    ]
+
+    if rows:
+        lines.append("Recent payouts:")
+        for index, row in enumerate(rows[:5], start=1):
+            lines.append(_referral_payout_line(row, index))
+    else:
+        lines.append("No referral payout request found yet.")
+
+    lines.extend([
+        "",
+        "Payout requests and payout account setup should still be completed from the secure web Referrals page for now.",
+        "",
+        "Reply R5 for rewards, R4 for statistics, or 0 for main menu.",
+    ])
+
+    return _clip("\n".join(lines), 3900)
+
+
+def _handle_referral_command(wa_id: str, account_id: str, text: str) -> Dict[str, Any]:
+    norm = _normalize_text(text)
+
+    if norm in {"referral", "referrals", "referral menu", "invite", "invite friends", "affiliate", "affiliates"}:
+        return {"ok": True, "handled": "referral_menu", "send_result": _send_whatsapp_text(wa_id, _referral_menu())}
+
+    if norm in {"r1", "my referral code", "referral code", "my code"}:
+        return {"ok": True, "handled": "referral_code", "send_result": _send_whatsapp_text(wa_id, _referral_code_text(account_id))}
+
+    if norm in {"r2", "my referral link", "referral link", "my link"}:
+        return {"ok": True, "handled": "referral_link", "send_result": _send_whatsapp_text(wa_id, _referral_link_text(account_id))}
+
+    if norm in {"r3", "share referral", "share invite", "share invitation", "invite message"}:
+        return {"ok": True, "handled": "referral_share", "send_result": _send_whatsapp_text(wa_id, _referral_share_text(account_id))}
+
+    if norm in {"r4", "referral stats", "referral statistics", "my referral stats", "referral summary"}:
+        return {"ok": True, "handled": "referral_stats", "send_result": _send_whatsapp_text(wa_id, _referral_stats_text(account_id))}
+
+    if norm in {"r5", "referral rewards", "my rewards", "rewards"}:
+        return {"ok": True, "handled": "referral_rewards", "send_result": _send_whatsapp_text(wa_id, _referral_rewards_text(account_id))}
+
+    if norm in {"r6", "payout status", "referral payout", "referral payouts", "payouts"}:
+        return {"ok": True, "handled": "referral_payout_status", "send_result": _send_whatsapp_text(wa_id, _referral_payout_status_text(account_id))}
+
+    return {"ok": True, "handled": "referral_menu", "send_result": _send_whatsapp_text(wa_id, _referral_menu())}
+
+
 # =============================================================================
 # Core action handlers
 # =============================================================================
@@ -4540,7 +4945,7 @@ def _handle_text_message(msg: Dict[str, Any]) -> Dict[str, Any]:
     # This prevents values like C3 985000 or C3985000 from being queried as link codes,
     # and prevents free calculators from falling through to AI credit deduction.
     recognition = _recognize(text, context)
-    is_command_like = recognition.get("kind") in {"global", "main", "plan", "topup", "tool", "calc", "quiz_action", "deadline", "history", "support", "credit_activity", "ambiguous", "invalid_menu"}
+    is_command_like = recognition.get("kind") in {"global", "main", "plan", "topup", "tool", "calc", "quiz_action", "deadline", "history", "support", "credit_activity", "referral", "ambiguous", "invalid_menu"}
 
     # Only attempt link-code lookup when the user is in the link flow, or when the input
     # is not already recognized as a command/calculator/plan/top-up/tool.
@@ -4755,6 +5160,9 @@ def _handle_text_message(msg: Dict[str, Any]) -> Dict[str, Any]:
 
     if recognition.get("kind") == "credit_activity":
         return _handle_credit_activity_command(wa_id, account_id, text)
+
+    if recognition.get("kind") == "referral":
+        return _handle_referral_command(wa_id, account_id, text)
 
     if recognition["kind"] == "invalid_menu":
         return {
