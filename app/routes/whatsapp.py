@@ -56,7 +56,7 @@ except Exception:  # pragma: no cover
 
 bp = Blueprint("whatsapp", __name__)
 
-WHATSAPP_FLOW_VERSION = "2026-05-25-v29-billing-history-referrals-support"
+WHATSAPP_FLOW_VERSION = "2026-05-25-v30-account-settings-billing-referrals"
 
 
 # =============================================================================
@@ -1529,7 +1529,7 @@ def _recognize(text: str, context: str = "main") -> Dict[str, Any]:
     # Exact/prefix command recognition must run before natural question fallback.
     # This guarantees "C1 986000", "D1 PAYE ...", and "Q1" are handled as
     # structured WhatsApp commands, not link codes and not AI questions.
-    prefix_match = re.match(r"^(sup[1-6]|cr[1-4]|pay[1-6]|r[1-6]|s[1-3]|p[1-3]|b[1-3]|t(?:10|50|100|500)|f[1-8]|c[1-8]|q[1-5]|d[1-4]|h[1-2])\b", norm)
+    prefix_match = re.match(r"^(acc[1-3]|set[1-3]|sup[1-6]|cr[1-4]|pay[1-6]|r[1-6]|s[1-3]|p[1-3]|b[1-3]|t(?:10|50|100|500)|f[1-8]|c[1-8]|q[1-5]|d[1-4]|h[1-2])\b", norm)
     if prefix_match:
         code = prefix_match.group(1).upper()
         if code in {"SUP1", "SUP2", "SUP3", "SUP4", "SUP5", "SUP6"}:
@@ -1540,6 +1540,10 @@ def _recognize(text: str, context: str = "main") -> Dict[str, Any]:
             return {"kind": "referral", "action": code.lower(), "code": code, "text": raw}
         if code in {"PAY1", "PAY2", "PAY3", "PAY4", "PAY5", "PAY6"}:
             return {"kind": "billing_history", "action": code.lower(), "code": code, "text": raw}
+        if code in {"ACC1", "ACC2", "ACC3"}:
+            return {"kind": "account_profile", "action": code.lower(), "code": code, "text": raw}
+        if code in {"SET1", "SET2", "SET3"}:
+            return {"kind": "settings", "action": code.lower(), "code": code, "text": raw}
         if code in PLAN_OPTIONS:
             return {"kind": "plan", "code": code}
         if code in TOPUP_OPTIONS:
@@ -1559,7 +1563,7 @@ def _recognize(text: str, context: str = "main") -> Dict[str, Any]:
     # Examples: C9, F11, Q9, D9, S9, T20, or unsupported SUP commands.
     if re.match(r"^sup\d+\b", norm):
         return {"kind": "invalid_menu", "action": "invalid_command", "value": raw}
-    if re.match(r"^(?:s|p|b|t|f|c|q|d|h|cr|r|pay)\d+\b", norm):
+    if re.match(r"^(?:s|p|b|t|f|c|q|d|h|cr|r|pay|acc|set)\d+\b", norm):
         return {"kind": "invalid_menu", "action": "invalid_command", "value": raw}
 
     if norm in {"0", "menu", "main", "main menu", "start", "hello", "hi"}:
@@ -1624,6 +1628,22 @@ def _recognize(text: str, context: str = "main") -> Dict[str, Any]:
         return {"kind": "billing_history", "action": "pay5", "code": "PAY5", "text": raw}
     if norm in {"pay6", "renewal", "expiry", "expiry date", "renewal date", "plan expiry", "subscription expiry"}:
         return {"kind": "billing_history", "action": "pay6", "code": "PAY6", "text": raw}
+    if norm in {"account", "my account", "account menu", "profile", "my profile", "profile menu"}:
+        return {"kind": "account_profile", "action": "menu", "code": "ACC", "text": raw}
+    if norm in {"acc1", "account profile", "my account profile", "my profile details", "profile details"}:
+        return {"kind": "account_profile", "action": "acc1", "code": "ACC1", "text": raw}
+    if norm in {"acc2", "linked channels", "my linked channels", "channel status", "my channels"}:
+        return {"kind": "account_profile", "action": "acc2", "code": "ACC2", "text": raw}
+    if norm in {"acc3", "account summary", "subscription account summary", "my account summary"}:
+        return {"kind": "account_profile", "action": "acc3", "code": "ACC3", "text": raw}
+    if norm in {"settings", "setting", "settings menu", "my settings", "preferences"}:
+        return {"kind": "settings", "action": "menu", "code": "SET", "text": raw}
+    if norm in {"set1", "notification settings", "notifications", "my notifications"}:
+        return {"kind": "settings", "action": "set1", "code": "SET1", "text": raw}
+    if norm in {"set2", "timezone settings", "time settings", "reminder settings", "default reminder settings"}:
+        return {"kind": "settings", "action": "set2", "code": "SET2", "text": raw}
+    if norm in {"set3", "privacy settings", "privacy", "data options", "data privacy", "delete data"}:
+        return {"kind": "settings", "action": "set3", "code": "SET3", "text": raw}
     if norm in {"support", "help support", "support menu", "customer support", "contact support"}:
         return {"kind": "support", "action": "menu", "code": "SUP", "text": raw}
     if norm in {"sup1", "create ticket", "open ticket", "new ticket", "support ticket"}:
@@ -1852,6 +1872,8 @@ def _main_menu(wa_id: str = "", account_id: str = "") -> str:
         "PAY2 - Payment history 🧾\n"
         "R1 - My referral code/link 🤝\n"
         "R4 - Referral statistics 📊\n"
+        "ACC1 - My account profile 👤\n"
+        "SET1 - Notification settings ⚙️\n"
         "0 or MENU - Main menu 🏠\n"
         "* or BACK - Go back ↩️\n"
         "CANCEL - Cancel current flow ❌\n\n"
@@ -1927,11 +1949,13 @@ def _help_text() -> str:
     return (
         "ℹ️ *Help - Naija Tax Guide*\n\n"
         "• Main menu uses numbers 1–8.\n"
-        "• Submenus use short codes like S1, T50, F1, C1, Q1, D1, H1, H2, SUP1, CR1, R1, and PAY1.\n"
+        "• Submenus use short codes like S1, T50, F1, C1, Q1, D1, H1, H2, SUP1, CR1, R1, PAY1, ACC1, and SET1.\n"
         "• Use H1 for recent history and H2 for your last tax answer.\n"
         "• Use SUP1 for support, SUP2 for tickets, SUP3 for latest ticket, SUP4 to reply, SUP5 to close, and SUP6 for support email.\n"
         "• Use R1 for referral code, R2 for referral link, R3 to share invitation, R4 for stats, R5 for rewards, and R6 for payout status.\n"
         "• Use PAY1 for billing summary, PAY2 for payment history, PAY3 for latest payment, PAY4 to verify a reference, PAY5 for pending plan change, and PAY6 for renewal/expiry.\n"
+        "• Use ACC1 for profile, ACC2 for linked channels, and ACC3 for account summary.\n"
+        "• Use SET1 for notifications, SET2 for reminder timezone defaults, and SET3 for privacy/data options.\n"
         "• You can type natural words too, e.g. Starter Monthly or VAT calculator.\n"
         "• Basic calculators are free. 🧮\n"
         "• Database/cache answers may be served without credit charge. ✅\n"
@@ -5047,6 +5071,274 @@ def _handle_billing_history_command(wa_id: str, account_id: str, text: str) -> D
     return {"ok": True, "handled": "billing_menu", "send_result": _send_whatsapp_text(wa_id, _billing_menu())}
 
 
+
+# =============================================================================
+# Account/Profile and Settings helpers
+# =============================================================================
+
+def _account_menu() -> str:
+    return (
+        "👤 *Account & Profile*\n\n"
+        "ACC1 - My account profile\n"
+        "ACC2 - My linked channels\n"
+        "ACC3 - Account/subscription summary\n\n"
+        "Sensitive changes such as email changes, payout details, or account deletion should be completed securely on the website.\n\n"
+        "Reply with ACC1, ACC2, or ACC3."
+    )
+
+
+def _settings_menu() -> str:
+    return (
+        "⚙️ *Settings*\n\n"
+        "SET1 - Notification settings\n"
+        "SET2 - Reminder timezone/defaults\n"
+        "SET3 - Privacy/data options\n\n"
+        "For security, WhatsApp shows safe settings and guidance. Sensitive account changes should be completed on the website.\n\n"
+        "Reply with SET1, SET2, or SET3."
+    )
+
+
+def _account_row(account_id: str, wa_id: str = "") -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    account_id = _clean(account_id)
+    wa_id = _normalize_phone(wa_id)
+    errors: List[str] = []
+
+    if account_id:
+        for column in ("account_id", "id"):
+            row, err = _query_one("accounts", "*", **{column: account_id})
+            if row:
+                return row, None
+            if err:
+                errors.append(err)
+
+    if wa_id:
+        row, err = _query_one("accounts", "*", provider="wa", provider_user_id=wa_id)
+        if row:
+            return row, None
+        if err:
+            errors.append(err)
+
+    return None, "; ".join(errors[:3]) if errors else None
+
+
+def _profile_value(value: Any, fallback: str = "Not shown") -> str:
+    text = _clean(value)
+    return text if text else fallback
+
+
+def _masked_account_id(account_id: Any) -> str:
+    text = _clean(account_id)
+    if len(text) <= 12:
+        return text or "Not shown"
+    return f"{text[:8]}...{text[-4:]}"
+
+
+def _account_profile_text(wa_id: str, account_id: str) -> str:
+    account, err = _account_row(account_id, wa_id)
+    channel_row, channel_err = _query_one(
+        "channel_identities",
+        "*",
+        channel_type="whatsapp",
+        provider_user_id=_normalize_phone(wa_id),
+    )
+
+    email = _profile_value((account or {}).get("email"))
+    display_name = _profile_value((account or {}).get("display_name") or (account or {}).get("name"))
+    phone = _display_phone((account or {}).get("phone_e164") or (account or {}).get("phone") or wa_id) or "Not shown"
+    provider = _profile_value((account or {}).get("provider"), "web/whatsapp")
+    created_at = _history_date_label((account or {}).get("created_at"))
+    updated_at = _history_date_label((account or {}).get("updated_at"))
+    linked = bool(channel_row and _clean(channel_row.get("account_id")))
+    verified = _truthy((channel_row or {}).get("is_verified")) or _truthy((channel_row or {}).get("verified"))
+
+    lines = [
+        "👤 *My Account Profile*",
+        "",
+        f"Account ID: {_masked_account_id(account_id or (account or {}).get('account_id') or (account or {}).get('id'))}",
+        f"Name: {display_name}",
+        f"Email: {email}",
+        f"Phone: {phone}",
+        f"Provider: {provider}",
+        f"WhatsApp linked: {'Yes' if linked else 'No'}",
+        f"WhatsApp verified: {'Yes' if verified else 'No'}",
+        f"Created: {created_at}",
+        f"Last updated: {updated_at}",
+    ]
+
+    if err and _debug_enabled():
+        lines.extend(["", f"Debug: {err}"])
+    if channel_err and _debug_enabled():
+        lines.extend(["", f"Channel debug: {channel_err}"])
+
+    lines.extend([
+        "",
+        "For email/profile changes, use the website account page for stronger security.",
+        "Reply ACC2 for linked channels, ACC3 for account summary, or 0 for main menu.",
+    ])
+    return "\n".join(lines)
+
+
+def _channel_line(row: Dict[str, Any], index: int) -> str:
+    channel = _clean(row.get("channel_type") or row.get("provider") or "channel").title()
+    provider_user_id = _clean(row.get("provider_user_id") or row.get("value") or row.get("phone") or row.get("username"))
+    verified = _truthy(row.get("is_verified")) or _truthy(row.get("verified"))
+    updated = _history_date_label(row.get("updated_at") or row.get("linked_at") or row.get("created_at"))
+    value = _display_phone(provider_user_id) if channel.lower() == "whatsapp" else provider_user_id or "Not shown"
+    return f"{index}. {channel}: {value} | {'verified' if verified else 'not verified'} | {updated}"
+
+
+def _linked_channels_text(account_id: str, wa_id: str = "") -> str:
+    rows, err = _query_many("channel_identities", "*", limit=10, order_col="updated_at", desc=True, account_id=account_id)
+
+    # Fallback by current WhatsApp number when account_id does not return rows.
+    if not rows and wa_id:
+        row, channel_err = _query_one(
+            "channel_identities",
+            "*",
+            channel_type="whatsapp",
+            provider_user_id=_normalize_phone(wa_id),
+        )
+        if row:
+            rows = [row]
+            err = None
+        elif channel_err and not err:
+            err = channel_err
+
+    if not rows:
+        body = "🔗 *My Linked Channels*\n\nNo linked WhatsApp/Telegram channel was found for this account yet."
+        if err and _debug_enabled():
+            body += f"\n\nDebug: {err}"
+        return body + "\n\nOpen the website Channels page to link WhatsApp or Telegram. Reply 0 for main menu."
+
+    lines = ["🔗 *My Linked Channels*", ""]
+    for idx, row in enumerate(rows[:10], start=1):
+        lines.append(_channel_line(row, idx))
+    lines.extend(["", "Reply ACC1 for profile, ACC3 for account summary, or 0 for main menu."])
+    return "\n".join(lines)
+
+
+def _account_summary_text(wa_id: str, account_id: str) -> str:
+    sub, _err = _query_one("user_subscriptions", "*", account_id=account_id)
+    plan_code = _clean((sub or {}).get("plan_code") or _current_plan_code(account_id) or "free")
+    status = _clean((sub or {}).get("status") or _subscription_status(account_id) or "active")
+    expiry = _clean(
+        (sub or {}).get("current_period_end")
+        or (sub or {}).get("expires_at")
+        or _subscription_expiry(account_id)
+    )
+    pending = _clean((sub or {}).get("pending_plan_code"))
+    linked = _is_whatsapp_linked(wa_id=wa_id, account_id=account_id)
+    credits = _credit_balance(account_id)
+
+    lines = [
+        "📌 *Account Summary*",
+        "",
+        f"Plan: {_plan_label(account_id)}",
+        f"Plan code: {plan_code}",
+        f"Status: {status}",
+        f"Usage Credits: {credits}",
+        f"Renewal/expiry: {expiry[:10] if expiry else 'Not shown'}",
+        f"Pending plan change: {pending or 'None'}",
+        f"WhatsApp linked: {'Yes' if linked else 'No'}",
+        "",
+        "Useful commands:",
+        "PAY1 - Billing summary",
+        "CR1 - Credit balance",
+        "R4 - Referral statistics",
+        "ACC2 - Linked channels",
+        "",
+        "Reply 0 for main menu.",
+    ]
+    return "\n".join(lines)
+
+
+def _settings_notifications_text(wa_id: str, account_id: str) -> str:
+    linked = _is_whatsapp_linked(wa_id=wa_id, account_id=account_id)
+    deadline_rows, _err = _query_many("tax_deadlines", "*", limit=5, order_col="due_date", desc=False, account_id=account_id)
+    active_deadlines = [r for r in deadline_rows if _clean(r.get("status") or "active").lower() not in {"deleted", "inactive", "disabled"}]
+
+    lines = [
+        "⚙️ *Notification Settings*",
+        "",
+        f"WhatsApp account alerts: {'Enabled' if linked else 'Not linked'}",
+        "Payment confirmations: Enabled for WhatsApp-originated payments",
+        "Support ticket updates: Enabled in this chat",
+        f"Deadline reminders found: {len(active_deadlines)} shown from recent reminders",
+        "",
+        "To manage deadline reminders:",
+        "D1 - Create reminder",
+        "D2 - List reminders",
+        "D4 - Update reminder time/mode",
+        "",
+        "For broader notification preferences, use the website Settings/Channels page.",
+        "Reply SET2 for reminder timezone/defaults or 0 for main menu.",
+    ]
+    return "\n".join(lines)
+
+
+def _settings_timezone_text(account_id: str) -> str:
+    rows, _err = _query_many("tax_deadlines", "*", limit=1, order_col="updated_at", desc=True, account_id=account_id)
+    row = rows[0] if rows else {}
+    timezone_text = _clean(row.get("timezone") or "Africa/Lagos")
+    reminder_time = _clean(row.get("reminder_time") or "09:00")
+    reminder_mode = _clean(row.get("reminder_mode") or "whatsapp")
+
+    return (
+        "🕒 *Reminder Timezone / Defaults*\n\n"
+        f"Default timezone used for reminders: {timezone_text}\n"
+        f"Latest/default reminder time: {reminder_time}\n"
+        f"Latest/default reminder mode: {reminder_mode}\n\n"
+        "Reminder commands:\n"
+        "D1 PAYE 2026-06-10 7 09:00 whatsapp\n"
+        "D4 1 3 08:30 whatsapp,email\n\n"
+        "The current WhatsApp flow manages reminder time/mode per deadline. A global settings page can later be added on the website.\n\n"
+        "Reply SET1 for notifications or 0 for main menu."
+    )
+
+
+def _settings_privacy_text() -> str:
+    return (
+        "🔐 *Privacy / Data Options*\n\n"
+        "WhatsApp can safely show account, history, support, billing, credit, and referral summaries.\n\n"
+        "Available safe commands:\n"
+        "H1 - View recent history\n"
+        "H2 - View last answer\n"
+        "SUP1 - Create support ticket\n"
+        "ACC1 - View profile\n\n"
+        "For sensitive actions such as deleting data, changing email, changing payout details, or full account deletion, please use the website Privacy/Data page so stronger verification can protect your account.\n\n"
+        "Reply 0 for main menu."
+    )
+
+
+def _handle_account_command(wa_id: str, account_id: str, text: str) -> Dict[str, Any]:
+    norm = _normalize_text(text)
+
+    if norm in {"account", "my account", "account menu", "profile", "my profile", "profile menu"}:
+        return {"ok": True, "handled": "account_menu", "send_result": _send_whatsapp_text(wa_id, _account_menu())}
+    if norm in {"acc1", "account profile", "my account profile", "my profile details", "profile details"}:
+        return {"ok": True, "handled": "account_profile", "send_result": _send_whatsapp_text(wa_id, _account_profile_text(wa_id, account_id))}
+    if norm in {"acc2", "linked channels", "my linked channels", "channel status", "my channels"}:
+        return {"ok": True, "handled": "linked_channels", "send_result": _send_whatsapp_text(wa_id, _linked_channels_text(account_id, wa_id))}
+    if norm in {"acc3", "account summary", "subscription account summary", "my account summary"}:
+        return {"ok": True, "handled": "account_summary", "send_result": _send_whatsapp_text(wa_id, _account_summary_text(wa_id, account_id))}
+
+    return {"ok": True, "handled": "account_menu", "send_result": _send_whatsapp_text(wa_id, _account_menu())}
+
+
+def _handle_settings_command(wa_id: str, account_id: str, text: str) -> Dict[str, Any]:
+    norm = _normalize_text(text)
+
+    if norm in {"settings", "setting", "settings menu", "my settings", "preferences"}:
+        return {"ok": True, "handled": "settings_menu", "send_result": _send_whatsapp_text(wa_id, _settings_menu())}
+    if norm in {"set1", "notification settings", "notifications", "my notifications"}:
+        return {"ok": True, "handled": "notification_settings", "send_result": _send_whatsapp_text(wa_id, _settings_notifications_text(wa_id, account_id))}
+    if norm in {"set2", "timezone settings", "time settings", "reminder settings", "default reminder settings"}:
+        return {"ok": True, "handled": "timezone_settings", "send_result": _send_whatsapp_text(wa_id, _settings_timezone_text(account_id))}
+    if norm in {"set3", "privacy settings", "privacy", "data options", "data privacy", "delete data"}:
+        return {"ok": True, "handled": "privacy_settings", "send_result": _send_whatsapp_text(wa_id, _settings_privacy_text())}
+
+    return {"ok": True, "handled": "settings_menu", "send_result": _send_whatsapp_text(wa_id, _settings_menu())}
+
 # =============================================================================
 # Core action handlers
 # =============================================================================
@@ -5573,11 +5865,17 @@ def _handle_text_message(msg: Dict[str, Any]) -> Dict[str, Any]:
     if recognition.get("kind") == "billing_history":
         return _handle_billing_history_command(wa_id, account_id, text)
 
+    if recognition.get("kind") == "account_profile":
+        return _handle_account_command(wa_id, account_id, text)
+
+    if recognition.get("kind") == "settings":
+        return _handle_settings_command(wa_id, account_id, text)
+
     if recognition["kind"] == "invalid_menu":
         return {
             "ok": True,
             "handled": "invalid_menu_option",
-            "send_result": _send_whatsapp_text(wa_id, "⚠️ That code/menu option is not available yet, so no AI credit was used.\n\nReply 0 for main menu, F1 for calculators, Q1 for quiz, D1 for reminders, H1 for history, CR1 for credits, SUP1 for support, PAY1 for billing, or type your Nigerian tax question in words."),
+            "send_result": _send_whatsapp_text(wa_id, "⚠️ That code/menu option is not available yet, so no AI credit was used.\n\nReply 0 for main menu, F1 for calculators, Q1 for quiz, D1 for reminders, H1 for history, CR1 for credits, SUP1 for support, PAY1 for billing, ACC1 for account, SET1 for settings, or type your Nigerian tax question in words."),
         }
 
     if recognition["kind"] == "ambiguous":
