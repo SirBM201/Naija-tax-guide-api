@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import random
 import uuid
 from datetime import datetime, timezone, date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -56,7 +57,7 @@ except Exception:  # pragma: no cover
 
 bp = Blueprint("whatsapp", __name__)
 
-WHATSAPP_FLOW_VERSION = "2026-05-25-v31-file-tax-account-cleanup"
+WHATSAPP_FLOW_VERSION = "2026-05-25-v32-dynamic-quiz-cached-q5"
 
 
 # =============================================================================
@@ -760,7 +761,7 @@ def _quiz_usage_text() -> str:
         "Q2 - choose category\n"
         "Q3 - view score\n"
         "Q4 - review last answer\n"
-        "Q5 - AI explanation for last quiz answer\n\n"
+        "Q5 - detailed saved explanation for last quiz answer\n\n"
         "Reply A, B, C, or D after a question. Free users get 12 non-AI quiz attempts daily. Paid users get unlimited non-AI quiz attempts."
     )
 
@@ -1365,9 +1366,9 @@ def _debit_q5_usage_credit(account_id: str) -> Dict[str, Any]:
     Hard debit for WhatsApp Q5.
 
     Reason:
-    ask_guarded may call OpenAI successfully without reducing the WhatsApp-visible
-    ai_credit_balances row. Q5 must never be free, so this helper checks balance
-    and deducts 1 credit before the AI call.
+    Q5 must never be free, so this helper checks the WhatsApp-visible
+    ai_credit_balances row, deducts 1 credit, and logs the credit activity.
+    Batch 25 uses saved quiz explanations, not live AI, for fixed quiz content.
     """
     try:
         row, err = _query_one("ai_credit_balances", "*", account_id=account_id)
@@ -1393,6 +1394,21 @@ def _debit_q5_usage_credit(account_id: str) -> Dict[str, Any]:
                 "column": col,
             }
 
+        _safe_insert(
+            "credit_usage_logs",
+            {
+                "account_id": account_id,
+                "reference": f"Q5-{uuid.uuid4().hex[:12].upper()}",
+                "action_code": "quiz_q5_saved_explanation",
+                "description": "Q5 detailed saved quiz explanation",
+                "channel": "whatsapp",
+                "credits_delta": -1,
+                "balance_after": after,
+                "metadata": {"source": "whatsapp_quiz", "live_ai_called": False},
+                "created_at": _now_iso(),
+            },
+        )
+
         return {"ok": True, "before": before, "after": after, "column": col, "credits_consumed": 1}
     except Exception as exc:
         return {"ok": False, "error": f"{type(exc).__name__}: {_clip(exc)}", "mode": "exception"}
@@ -1400,7 +1416,7 @@ def _debit_q5_usage_credit(account_id: str) -> Dict[str, Any]:
 
 def _refund_q5_usage_credit(account_id: str, debit: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Refund only if Q5 was pre-debited but the AI explanation failed before delivery.
+    Refund only if Q5 was pre-debited but the explanation failed before delivery.
     """
     try:
         if not debit or not debit.get("ok"):
@@ -2781,21 +2797,23 @@ def _salary_compare(text: str) -> str:
     )
 
 
+
 def _quiz_text() -> str:
     return (
         "🧠 *Tax Quiz Centre*\n\n"
-        "Q1 - Start mixed quiz\n"
-        "Q1 PAYE - Start PAYE quiz\n"
-        "Q1 VAT - Start VAT quiz\n"
-        "Q1 CIT - Start Company Tax quiz\n"
-        "Q1 WHT - Start WHT quiz\n"
-        "Q2 - Choose category\n"
+        "Q1 - Start random mixed quiz\n"
+        "Q1 PAYE - Start random PAYE quiz\n"
+        "Q1 VAT - Start random VAT quiz\n"
+        "Q1 CIT - Start random Company Tax quiz\n"
+        "Q1 WHT - Start random WHT quiz\n"
+        "Q2 - Choose quiz category\n"
         "Q3 - Today's score\n"
         "Q4 - Review last answer\n"
-        "Q5 - Short paid AI explanation for last answer 💎\n\n"
+        "Q5 - Detailed saved explanation for last answer 💎\n\n"
         f"Free users: {QUIZ_FREE_DAILY_LIMIT} non-AI quiz attempts daily.\n"
         "Paid users: unlimited non-AI quiz attempts.\n"
-        "Q5 costs 1 Usage Credit and returns a short AI explanation only."
+        "Questions and answer positions are shuffled each time.\n"
+        "Q5 costs 1 Usage Credit but uses a saved explanation, not live AI."
     )
 
 
@@ -2805,166 +2823,399 @@ def _quiz_rules_text() -> str:
         "✅ Q1 non-AI quiz questions do not consume Usage Credits.\n"
         f"✅ Free users get {QUIZ_FREE_DAILY_LIMIT} attempts daily.\n"
         "✅ Paid users get unlimited non-AI quiz attempts.\n"
+        "✅ Questions are randomly selected from the quiz bank.\n"
+        "✅ Answer options are shuffled, so A/B/C/D may change each time.\n"
         "✅ Reply A, B, C, or D to answer.\n"
-        "✅ Reply Q2 to choose a category.\n"
-        "💎 Q5 costs 1 Usage Credit and returns a short AI explanation only.\n\n"
+        "✅ Q4 reviews your last answer.\n"
+        "💎 Q5 costs 1 Usage Credit and returns the saved detailed explanation.\n"
+        "💰 Q5 does not call live AI for fixed quiz explanations, helping keep the platform cost stable.\n\n"
         "Reply Q1 to start or 0 for main menu."
     )
 
 
+def _quiz_usage_text() -> str:
+    return (
+        "🧠 *Tax Quiz Centre*\n\n"
+        "Q1 - start a random quiz\n"
+        "Q2 - choose category\n"
+        "Q3 - today's score\n"
+        "Q4 - review last answer\n"
+        "Q5 - detailed saved explanation for last quiz answer 💎\n\n"
+        "Reply A, B, C, or D after a question. Questions and options are shuffled. "
+        "Free users get 12 non-AI quiz attempts daily. Paid users get unlimited non-AI quiz attempts."
+    )
+
+
+def _quiz_static_premium_explanation(question: Dict[str, Any]) -> str:
+    base = _clean(question.get("premium_explanation") or question.get("explain") or question.get("short_explanation"))
+    category = _clean(question.get("category") or "General")
+    if not base:
+        return "This quiz item is part of the Nigerian tax compliance learning bank. Review the correct option and apply it based on the tax type involved."
+    return _clip(
+        "• " + base + "\n"
+        f"• Category: {category}. This matters because different Nigerian taxes apply to different income, transaction, filing, or compliance situations.\n"
+        "• Use the correct answer as a guide, but confirm current filing dates, rates, and obligations for the exact taxpayer or business case.",
+        900,
+    )
+
+
+def _quiz_question_from_db_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "source": "db",
+        "db_id": _clean(row.get("id")),
+        "id": _clean(row.get("question_code") or row.get("id")),
+        "question_code": _clean(row.get("question_code") or row.get("id")),
+        "category": _clean(row.get("category") or "General"),
+        "difficulty": _clean(row.get("difficulty") or "basic"),
+        "question": _clean(row.get("question")),
+        "explain": _clean(row.get("short_explanation") or row.get("explain")),
+        "short_explanation": _clean(row.get("short_explanation") or row.get("explain")),
+        "premium_explanation": _clean(row.get("premium_explanation") or row.get("short_explanation") or row.get("explain")),
+        "source_reference": _clean(row.get("source_reference") or "Naija Tax Guide quiz bank"),
+        "law_year": _clean(row.get("law_year") or ""),
+    }
+
+
+def _static_quiz_question(row: Dict[str, Any]) -> Dict[str, Any]:
+    item = dict(row)
+    item["source"] = "static"
+    item["db_id"] = ""
+    item["question_code"] = _clean(item.get("id"))
+    item["short_explanation"] = _clean(item.get("explain"))
+    item["premium_explanation"] = _quiz_static_premium_explanation(item)
+    item["source_reference"] = "Naija Tax Guide built-in quiz bank"
+    return item
+
+
 def _quiz_categories() -> List[str]:
-    preferred = ["PAYE", "VAT", "Company Tax", "WHT", "Deadlines", "Records", "General"]
-    available = {str(q.get("category") or "General") for q in QUIZ_BANK}
-    ordered = [cat for cat in preferred if cat in available]
-    ordered.extend(sorted(available.difference(set(ordered))))
-    return ordered
+    categories = set()
+    try:
+        res = _sb().table("tax_quiz_questions").select("category").eq("is_active", True).limit(200).execute()
+        rows = getattr(res, "data", None) or []
+        for row in rows:
+            if isinstance(row, dict):
+                category = _clean(row.get("category"))
+                if category:
+                    categories.add(category)
+    except Exception:
+        pass
+    for q in QUIZ_BANK:
+        category = _clean(q.get("category") or "General")
+        if category:
+            categories.add(category)
+    return sorted(categories or {"General"})
 
 
 def _quiz_category_menu() -> str:
     categories = _quiz_categories()
     lines = ["🧠 *Choose Quiz Category*", ""]
     for index, category in enumerate(categories, start=1):
-        code = "CIT" if category == "Company Tax" else category.upper().replace(" ", "")
+        code = category.upper().replace("COMPANY TAX", "CIT")
         lines.append(f"Q2 {index} - {category}  |  Q1 {code}")
-    lines.extend([
-        "",
-        "Examples:",
-        "Q1 PAYE",
-        "Q1 VAT",
-        "Q1 CIT",
-        "Q1 WHT",
-        "",
-        "Reply 0 for main menu.",
-    ])
+    lines.append("")
+    lines.append("Examples:")
+    lines.append("Q1 PAYE")
+    lines.append("Q1 VAT")
+    lines.append("Q1 CIT")
+    lines.append("Q1 WHT")
+    lines.append("")
+    lines.append("Questions and answer positions are shuffled each time.")
     return "\n".join(lines)
 
 
-def _resolve_quiz_category(text: str) -> str:
-    norm = _normalize_text(text)
-    categories = _quiz_categories()
+def _normalize_quiz_category_name(value: Any) -> str:
+    norm = _normalize_text(value)
+    if not norm:
+        return ""
+    aliases = {
+        "cit": "Company Tax",
+        "company": "Company Tax",
+        "company tax": "Company Tax",
+        "company income tax": "Company Tax",
+        "paye": "PAYE",
+        "pay as you earn": "PAYE",
+        "vat": "VAT",
+        "wht": "WHT",
+        "withholding": "WHT",
+        "withholding tax": "WHT",
+        "deadline": "Deadlines",
+        "deadlines": "Deadlines",
+        "record": "Records",
+        "records": "Records",
+        "general": "General",
+    }
+    if norm in aliases:
+        return aliases[norm]
+    for category in _quiz_categories():
+        if norm == _normalize_text(category):
+            return category
+    return ""
 
+
+def _resolve_quiz_category(text: str) -> str:
+    raw = _clean(text)
+    norm = _normalize_text(raw)
+    categories = _quiz_categories()
     if norm in {"q1", "quiz", "start quiz", "tax quiz", "q2", "category", "quiz categories"}:
         return ""
 
-    if re.search(r"\\b(paye|salary|personal income|pit)\\b", norm):
-        return "PAYE"
-    if re.search(r"\\bvat\\b", norm):
-        return "VAT"
-    if re.search(r"\\b(cit|company tax|company income tax|companies income tax|company)\\b", norm):
-        return "Company Tax"
-    if re.search(r"\\b(wht|withholding|withholding tax)\\b", norm):
-        return "WHT"
-    if re.search(r"\\b(deadline|deadlines|calendar|reminder)\\b", norm):
-        return "Deadlines"
-    if re.search(r"\\b(record|records|receipt|invoice|payroll)\\b", norm):
-        return "Records"
-    if re.search(r"\\b(general|mixed|all)\\b", norm):
-        return ""
-
-    m = re.search(r"q[12]\\s+(\\d+)", norm)
+    m = re.match(r"^q[12]\s+(\d{1,2})$", norm)
     if m:
         idx = int(m.group(1)) - 1
         if 0 <= idx < len(categories):
             return categories[idx]
+        return ""
 
-    for cat in categories:
-        if _normalize_text(cat) in norm:
-            return cat
-
-    return ""
-
-
-def _quiz_attempt_info(state: Dict[str, Any]) -> Tuple[str, int]:
-    today = datetime.now(timezone.utc).date().isoformat()
-    data = state.get("data") if isinstance(state.get("data"), dict) else {}
-    if data.get("quiz_date") == today:
-        try:
-            return today, int(data.get("quiz_attempts") or 0)
-        except Exception:
-            return today, 0
-    return today, 0
+    cleaned = re.sub(r"^q[12]\s+", "", norm).strip()
+    if cleaned in {"mixed", "random", "all", "general all"}:
+        return ""
+    return _normalize_quiz_category_name(cleaned)
 
 
-def _quiz_daily_numbers(data: Dict[str, Any]) -> Dict[str, int]:
-    today = datetime.now(timezone.utc).date().isoformat()
-    if data.get("quiz_date") != today:
-        return {"attempts": 0, "correct": 0, "wrong": 0}
+def _load_quiz_questions(category: str = "") -> List[Dict[str, Any]]:
+    category = _clean(category)
+    db_rows: List[Dict[str, Any]] = []
+    try:
+        q = _sb().table("tax_quiz_questions").select(
+            "id,question_code,category,difficulty,question,short_explanation,premium_explanation,source_reference,law_year,is_active,created_at"
+        ).eq("is_active", True)
+        if category:
+            q = q.eq("category", category)
+        res = q.limit(120).execute()
+        raw_rows = getattr(res, "data", None) or []
+        db_rows = [row for row in raw_rows if isinstance(row, dict)]
+    except Exception:
+        db_rows = []
+
+    questions = [_quiz_question_from_db_row(row) for row in db_rows if _clean(row.get("question"))]
+    if questions:
+        return questions
+
+    static_rows = [_static_quiz_question(q) for q in QUIZ_BANK]
+    if category:
+        wanted = _normalize_text(category)
+        filtered = [q for q in static_rows if _normalize_text(q.get("category")) == wanted]
+        return filtered or static_rows
+    return static_rows
+
+
+def _load_db_quiz_options(question: Dict[str, Any]) -> List[Dict[str, Any]]:
+    db_id = _clean(question.get("db_id"))
+    if not db_id:
+        return []
+    try:
+        res = _sb().table("tax_quiz_options").select(
+            "id,option_code,option_text,is_correct,created_at"
+        ).eq("question_id", db_id).limit(20).execute()
+        rows = [row for row in (getattr(res, "data", None) or []) if isinstance(row, dict)]
+    except Exception:
+        rows = []
+    options: List[Dict[str, Any]] = []
+    for row in rows:
+        text = _clean(row.get("option_text"))
+        if not text:
+            continue
+        options.append({
+            "option_id": _clean(row.get("id") or row.get("option_code") or text),
+            "option_text": text,
+            "is_correct": bool(row.get("is_correct")),
+            "source_code": _clean(row.get("option_code")),
+        })
+    return options
+
+
+def _load_static_quiz_options(question: Dict[str, Any]) -> List[Dict[str, Any]]:
+    options = question.get("options") if isinstance(question.get("options"), dict) else {}
+    correct = _clean(question.get("answer") or question.get("correct")).upper()[:1]
+    out: List[Dict[str, Any]] = []
+    for key, value in options.items():
+        option_key = _clean(key).upper()[:1]
+        out.append({
+            "option_id": f"{_clean(question.get('id') or question.get('question_code'))}_{option_key}",
+            "option_text": _clean(value),
+            "is_correct": option_key == correct,
+            "source_code": option_key,
+        })
+    return [o for o in out if o.get("option_text")]
+
+
+def _randomized_quiz_payload(question: Dict[str, Any]) -> Dict[str, Any]:
+    options = _load_db_quiz_options(question) if question.get("source") == "db" else []
+    if not options:
+        options = _load_static_quiz_options(question)
+    if not options:
+        options = [
+            {"option_id": f"{_clean(question.get('id'))}_A", "option_text": "True", "is_correct": True, "source_code": "A"},
+            {"option_id": f"{_clean(question.get('id'))}_B", "option_text": "False", "is_correct": False, "source_code": "B"},
+        ]
+
+    rng = random.SystemRandom()
+    shuffled = list(options)
+    rng.shuffle(shuffled)
+    labels = ["A", "B", "C", "D"]
+    display_options: Dict[str, str] = {}
+    option_order: Dict[str, str] = {}
+    correct_label = ""
+    correct_option_id = ""
+
+    for label, opt in zip(labels, shuffled[:4]):
+        option_id = _clean(opt.get("option_id") or opt.get("source_code") or label)
+        display_options[label] = _clean(opt.get("option_text"))
+        option_order[label] = option_id
+        if bool(opt.get("is_correct")):
+            correct_label = label
+            correct_option_id = option_id
+
+    if not correct_label and display_options:
+        correct_label = next(iter(display_options.keys()))
+        correct_option_id = option_order.get(correct_label, correct_label)
+
+    premium = _clean(question.get("premium_explanation")) or _quiz_static_premium_explanation(question)
+    short = _clean(question.get("short_explanation") or question.get("explain")) or premium
+
     return {
-        "attempts": int(data.get("quiz_attempts") or 0),
-        "correct": int(data.get("quiz_correct_count") or 0),
-        "wrong": int(data.get("quiz_wrong_count") or 0),
+        **question,
+        "options": display_options,
+        "option_order": option_order,
+        "correct": correct_label,
+        "answer": correct_label,
+        "correct_option_id": correct_option_id,
+        "explain": short,
+        "short_explanation": short,
+        "premium_explanation": premium,
     }
 
 
 def _select_quiz_question(pool: List[Dict[str, Any]], data: Dict[str, Any], category: str, attempts: int) -> Dict[str, Any]:
     if not pool:
-        pool = QUIZ_BANK
-
+        pool = [_static_quiz_question(q) for q in QUIZ_BANK]
     seen_key = "quiz_seen_ids_" + (_normalize_text(category or "mixed").replace(" ", "_") or "mixed")
     seen = data.get(seen_key)
     if not isinstance(seen, list):
         seen = []
 
-    available = [q for q in pool if q.get("id") not in set(seen)]
+    def qid(q: Dict[str, Any]) -> str:
+        return _clean(q.get("id") or q.get("question_code") or q.get("db_id") or q.get("question"))
+
+    available = [q for q in pool if qid(q) not in seen]
     if not available:
         seen = []
-        available = pool
+        available = list(pool)
 
-    index = attempts % len(available)
-    quiz = available[index]
-    seen.append(quiz.get("id"))
-    data[seen_key] = seen[-50:]
+    rng = random.SystemRandom()
+    quiz = dict(rng.choice(available))
+    current_id = qid(quiz)
+    if current_id:
+        seen.append(current_id)
+    data[seen_key] = seen[-60:]
     return quiz
+
+
+def _log_quiz_attempt_started(account_id: str, wa_id: str, quiz: Dict[str, Any]) -> str:
+    payload = {
+        "account_id": account_id,
+        "wa_id": wa_id,
+        "question_id": _clean(quiz.get("db_id")) or None,
+        "question_code": _clean(quiz.get("question_code") or quiz.get("id")) or None,
+        "category": _clean(quiz.get("category") or "General"),
+        "displayed_option_order": quiz.get("option_order") if isinstance(quiz.get("option_order"), dict) else {},
+        "correct_option_id": _clean(quiz.get("correct_option_id")) or None,
+        "status": "started",
+        "created_at": _now_iso(),
+        "updated_at": _now_iso(),
+        "metadata": {"source": _clean(quiz.get("source") or "static")},
+    }
+    result = _safe_insert("tax_quiz_attempts", payload)
+    rows = result.get("data") if isinstance(result.get("data"), list) else []
+    if rows and isinstance(rows[0], dict):
+        return _clean(rows[0].get("id"))
+    return ""
+
+
+def _log_quiz_attempt_answered(attempt_id: str, answer: str, selected_option_id: str, passed: bool) -> None:
+    if not _clean(attempt_id):
+        return
+    _safe_update(
+        "tax_quiz_attempts",
+        {
+            "selected_label": _clean(answer).upper()[:1],
+            "selected_option_id": _clean(selected_option_id) or None,
+            "is_correct": bool(passed),
+            "status": "answered",
+            "answered_at": _now_iso(),
+            "updated_at": _now_iso(),
+        },
+        id=attempt_id,
+    )
+
+
+def _log_quiz_q5_used(attempt_id: str, debit: Dict[str, Any]) -> None:
+    if not _clean(attempt_id):
+        return
+    _safe_update(
+        "tax_quiz_attempts",
+        {
+            "q5_explanation_used": True,
+            "credits_charged": int(debit.get("credits_consumed") or 1),
+            "q5_explained_at": _now_iso(),
+            "updated_at": _now_iso(),
+        },
+        id=attempt_id,
+    )
 
 
 def _start_quiz(wa_id: str, account_id: str, state: Optional[Dict[str, Any]] = None, category: str = "") -> Dict[str, Any]:
     state = state or _get_session_state(wa_id)
     today, attempts = _quiz_attempt_info(state)
-    old_data = state.get("data") if isinstance(state.get("data"), dict) else {}
 
     if not _is_active_paid_subscription(account_id) and attempts >= QUIZ_FREE_DAILY_LIMIT:
         body = (
             "🔒 *Daily Quiz Limit Reached*\n\n"
             f"Free users can take {QUIZ_FREE_DAILY_LIMIT} non-AI quiz attempts daily.\n"
             "Paid users get unlimited non-AI quiz attempts.\n\n"
-            "Reply 4 to view plans, Q3 to see score, or 0 for main menu."
+            "Reply 4 to view plans or 0 for menu."
         )
         return {"ok": True, "handled": "quiz_limit", "send_result": _send_whatsapp_text(wa_id, body)}
 
     category = _resolve_quiz_category(category or "")
-    pool = [q for q in QUIZ_BANK if not category or _normalize_text(q.get("category")) == _normalize_text(category)]
-    if not pool:
-        pool = QUIZ_BANK
-        category = ""
-
-    working_data = dict(old_data)
-    quiz = _select_quiz_question(pool, working_data, category, attempts)
+    pool = _load_quiz_questions(category)
+    working_data = state.get("data") if isinstance(state.get("data"), dict) else {}
+    quiz_base = _select_quiz_question(pool, working_data, category, attempts)
+    quiz = _randomized_quiz_payload(quiz_base)
+    attempt_id = _log_quiz_attempt_started(account_id, wa_id, quiz)
 
     data = {
         **working_data,
         "quiz_date": today,
         "quiz_attempts": attempts,
-        "quiz_id": quiz["id"],
+        "quiz_id": quiz.get("id"),
+        "quiz_db_id": quiz.get("db_id"),
+        "quiz_attempt_id": attempt_id,
         "quiz_category": quiz.get("category"),
         "quiz_question": quiz.get("question"),
         "quiz_options": quiz.get("options"),
-        "correct": quiz["answer"],
-        "explain": quiz["explain"],
+        "quiz_option_order": quiz.get("option_order"),
+        "correct": quiz.get("correct"),
+        "correct_option_id": quiz.get("correct_option_id"),
+        "explain": quiz.get("short_explanation") or quiz.get("explain"),
+        "premium_explain": quiz.get("premium_explanation"),
+        "source_reference": quiz.get("source_reference"),
         "active_quiz_started_at": _now_iso(),
     }
     _set_session_state(wa_id, "quiz_answer", "tax_quiz", data)
 
-    options = "\n".join([f"{key}. {value}" for key, value in quiz["options"].items()])
+    options = "\n".join([f"{key}. {value}" for key, value in (quiz.get("options") or {}).items()])
     remaining = "Unlimited" if _is_active_paid_subscription(account_id) else str(max(0, QUIZ_FREE_DAILY_LIMIT - attempts))
     body = (
-        f"🧠 *Tax Quiz* ({quiz['category']})\n\n"
-        f"Question {attempts + 1}: {quiz['question']}\n\n"
+        f"🧠 *Tax Quiz* ({quiz.get('category') or 'General'})\n\n"
+        f"Question {attempts + 1}: {quiz.get('question')}\n\n"
         f"{options}\n\n"
+        "Note: question and answer positions are shuffled each time.\n"
         f"Remaining today: {remaining}\n\n"
         "Reply A, B, C, or D.\n"
         "Reply CANCEL to stop."
     )
-    return {"ok": True, "handled": "quiz_start", "send_result": _send_whatsapp_text(wa_id, body)}
+    return {"ok": True, "handled": "quiz_start_randomized", "send_result": _send_whatsapp_text(wa_id, body)}
 
 
 def _handle_quiz_answer(wa_id: str, account_id: str, text: str, state: Dict[str, Any]) -> Dict[str, Any]:
@@ -2985,24 +3236,38 @@ def _handle_quiz_answer(wa_id: str, account_id: str, text: str, state: Dict[str,
     if correct not in {"A", "B", "C", "D"}:
         correct = "A"
 
+    option_order = data.get("quiz_option_order") if isinstance(data.get("quiz_option_order"), dict) else {}
+    selected_option_id = _clean(option_order.get(answer) or answer)
+    correct_option_id = _clean(data.get("correct_option_id") or option_order.get(correct) or correct)
+
     today, attempts = _quiz_attempt_info(state)
     attempts += 1
 
-    passed = answer == correct
+    passed = bool(selected_option_id and correct_option_id and selected_option_id == correct_option_id) if option_order else answer == correct
     correct_count = int(data.get("quiz_correct_count") or 0) + (1 if passed else 0)
     wrong_count = int(data.get("quiz_wrong_count") or 0) + (0 if passed else 1)
     verdict = "✅ Correct!" if passed else f"❌ Not correct. Correct answer: {correct}."
     explain = _clean(data.get("explain"))
+    premium = _clean(data.get("premium_explain") or explain)
+    attempt_id = _clean(data.get("quiz_attempt_id"))
+    _log_quiz_attempt_answered(attempt_id, answer, selected_option_id, passed)
 
     last_quiz = {
         "id": data.get("quiz_id"),
+        "db_id": data.get("quiz_db_id"),
+        "attempt_id": attempt_id,
         "category": data.get("quiz_category"),
         "question": data.get("quiz_question"),
         "options": data.get("quiz_options"),
+        "option_order": option_order,
         "selected": answer,
+        "selected_option_id": selected_option_id,
         "correct": correct,
+        "correct_option_id": correct_option_id,
         "is_correct": passed,
         "explanation": explain,
+        "premium_explanation": premium,
+        "source_reference": data.get("source_reference"),
         "answered_at": _now_iso(),
     }
 
@@ -3017,6 +3282,8 @@ def _handle_quiz_answer(wa_id: str, account_id: str, text: str, state: Dict[str,
         "last_quiz_correct": correct,
         "last_quiz_passed": passed,
         "last_quiz_explain": explain,
+        "last_quiz_premium_explain": premium,
+        "last_quiz_attempt_id": attempt_id,
     }
     _set_session_state(wa_id, "main", "", new_data)
 
@@ -3029,9 +3296,9 @@ def _handle_quiz_answer(wa_id: str, account_id: str, text: str, state: Dict[str,
         f"Correct today: {correct_count}\n"
         f"Wrong today: {wrong_count}\n"
         f"Remaining today: {remaining}\n\n"
-        "Reply Q1 for another quiz, Q2 for categories, Q3 for score, Q4 to review, Q5 for AI explanation, or 0 for menu."
+        "Reply Q1 for another random quiz, Q2 for categories, Q3 for score, Q4 to review, Q5 for detailed saved explanation, or 0 for menu."
     )
-    return {"ok": True, "handled": "quiz_answer", "send_result": _send_whatsapp_text(wa_id, body)}
+    return {"ok": True, "handled": "quiz_answer_randomized", "send_result": _send_whatsapp_text(wa_id, body)}
 
 
 def _handle_quiz_command(wa_id: str, account_id: str, text: str, state: Dict[str, Any]) -> Dict[str, Any]:
@@ -3079,7 +3346,7 @@ def _handle_quiz_command(wa_id: str, account_id: str, text: str, state: Dict[str
             f"Correct answer: {_clean(last.get('correct'))}. {_clean(correct_text)}\n"
             f"Status: {status}\n\n"
             f"Why: {_clean(last.get('explanation'))}\n\n"
-            "Reply Q1 for another quiz or Q5 for AI explanation."
+            "Reply Q1 for another quiz or Q5 for the detailed saved explanation."
         )
         return {"ok": True, "handled": "quiz_review", "send_result": _send_whatsapp_text(wa_id, _clip(body, 3900))}
 
@@ -3087,73 +3354,55 @@ def _handle_quiz_command(wa_id: str, account_id: str, text: str, state: Dict[str
         data = state.get("data") if isinstance(state.get("data"), dict) else {}
         last = data.get("last_quiz") if isinstance(data.get("last_quiz"), dict) else None
         question = _clean((last or {}).get("question") or data.get("quiz_question"))
-        correct = _clean((last or {}).get("correct") or data.get("last_quiz_correct"))
-        explanation = _clean((last or {}).get("explanation") or data.get("last_quiz_explain"))
+        explanation = _clean((last or {}).get("premium_explanation") or data.get("last_quiz_premium_explain") or (last or {}).get("explanation") or data.get("last_quiz_explain"))
+        attempt_id = _clean((last or {}).get("attempt_id") or data.get("last_quiz_attempt_id") or data.get("quiz_attempt_id"))
 
         if not question:
             return {
                 "ok": True,
-                "handled": "quiz_ai_no_context",
+                "handled": "quiz_q5_no_context",
                 "send_result": _send_whatsapp_text(wa_id, "No last quiz question found yet. Reply Q1 to start a quiz first."),
             }
 
-        # v17: Q5 is never free. Block free/no-plan users before any OpenAI call.
+        if not explanation:
+            return {
+                "ok": True,
+                "handled": "quiz_q5_no_cached_explanation",
+                "send_result": _send_whatsapp_text(
+                    wa_id,
+                    "⚠️ A saved detailed explanation is not available for this quiz question yet.\n\nReply Q4 for the normal review, Q1 for another quiz, or 0 for menu.",
+                ),
+            }
+
         if not _is_active_paid_subscription(account_id):
             body = (
-                "🔒 *Q5 AI Explanation is a paid feature*\n\n"
+                "🔒 *Q5 Detailed Explanation is a paid feature*\n\n"
                 "Q1–Q4 remain non-AI according to your plan limits.\n"
-                "Q5 costs 1 Usage Credit because it calls the AI explanation engine.\n\n"
-                "Reply 4 to view plans or Q4 to review the normal non-AI explanation."
+                "Q5 costs 1 Usage Credit because it unlocks the saved detailed explanation.\n"
+                "It does not call live AI for fixed quiz content.\n\n"
+                "Reply 4 to view plans or Q4 to review the normal explanation."
             )
-            return {"ok": True, "handled": "quiz_ai_paid_required", "send_result": _send_whatsapp_text(wa_id, body)}
+            return {"ok": True, "handled": "quiz_q5_paid_required", "send_result": _send_whatsapp_text(wa_id, body)}
 
-        # v17: pre-debit the WhatsApp-visible balance before calling OpenAI.
         debit = _debit_q5_usage_credit(account_id)
         if not debit.get("ok"):
             body = (
-                "🔒 *Q5 AI Explanation not available*\n\n"
+                "🔒 *Q5 Detailed Explanation not available*\n\n"
                 "Q5 costs 1 Usage Credit, but your credit balance could not be charged.\n"
-                "No AI explanation was generated.\n\n"
-                "Reply 3 to check your plan/credits, 4 to view plans, or Q4 for the normal non-AI review."
+                "No detailed explanation was unlocked.\n\n"
+                "Reply 3 to check your plan/credits, 4 to view plans, or Q4 for the normal review."
             )
             return {
                 "ok": True,
-                "handled": "quiz_ai_debit_failed",
+                "handled": "quiz_q5_debit_failed",
                 "send_result": _send_whatsapp_text(wa_id, body),
                 "debit_error": debit if _debug_enabled() else None,
             }
 
-        result = ask_guarded({
-            "account_id": account_id,
-            "question": (
-                "Give a very short Nigerian tax quiz explanation in 2 to 4 simple bullet points only. "
-                "Maximum 90 words. Do not add long disclaimers. "
-                f"Question: {question}. Correct option: {correct}. Base explanation: {explanation}."
-            ),
-            "lang": "en",
-            "channel": "whatsapp",
-            "provider": "wa",
-            "provider_user_id": wa_id,
-            "action_code": "quiz_ai_explanation_q5_manual_credit",
-            "max_words": 90,
-            "max_output_tokens": 180,
-        })
-
-        answer = _clean(result.get("answer") or result.get("message") or "")
-        result_ok = bool(isinstance(result, dict) and (result.get("ok") is True or answer))
-
-        if not result_ok:
-            _refund_q5_usage_credit(account_id, debit)
-            body = (
-                "⚠️ *Q5 AI Explanation failed*\n\n"
-                "The AI explanation could not be generated, so the Usage Credit was returned.\n\n"
-                "Reply Q5 to try again, Q4 for normal review, or 0 for menu."
-            )
-            return {"ok": True, "handled": "quiz_ai_failed_refunded", "send_result": _send_whatsapp_text(wa_id, body)}
-
-        answer = _clip(answer, 650)
+        _log_quiz_q5_used(attempt_id, debit)
+        answer = _clip(explanation, 900)
         body = (
-            "💡 *Q5 Short AI Explanation*\n\n"
+            "💡 *Q5 Detailed Saved Explanation*\n\n"
             f"{answer}\n\n"
             f"💎 Usage Credit deducted: 1\n"
             f"Balance: {debit.get('after')}\n\n"
@@ -3161,8 +3410,8 @@ def _handle_quiz_command(wa_id: str, account_id: str, text: str, state: Dict[str
         )
         return {
             "ok": True,
-            "handled": "quiz_ai_explanation_paid_short_manual_debit",
-            "send_result": _send_whatsapp_text(wa_id, _clip(body, 1300)),
+            "handled": "quiz_q5_cached_explanation_paid",
+            "send_result": _send_whatsapp_text(wa_id, _clip(body, 1500)),
             "credits_consumed": 1,
             "credits_left": debit.get("after"),
         }
@@ -5958,7 +6207,7 @@ def _handle_quiz_answer_v10(wa_id: str, account_id: str, text: str) -> Optional[
         f"{verdict}\n\n"
         f"Score: {score['correct']}/{score['total']}\n"
         f"Today's free attempts used: {attempts_text}\n\n"
-        "Reply Q1 for another quiz, Q4 to review last answer, or Q5 for AI explanation."
+        "Reply Q1 for another quiz, Q4 to review last answer, or Q5 for the detailed saved explanation."
     )
     return {"ok": True, "handled": "quiz_answer", "send_result": _send_whatsapp_text(wa_id, body)}
 
