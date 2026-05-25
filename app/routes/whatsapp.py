@@ -56,7 +56,7 @@ except Exception:  # pragma: no cover
 
 bp = Blueprint("whatsapp", __name__)
 
-WHATSAPP_FLOW_VERSION = "2026-05-25-v28-referrals-support-clean-credit-history"
+WHATSAPP_FLOW_VERSION = "2026-05-25-v29-billing-history-referrals-support"
 
 
 # =============================================================================
@@ -1529,7 +1529,7 @@ def _recognize(text: str, context: str = "main") -> Dict[str, Any]:
     # Exact/prefix command recognition must run before natural question fallback.
     # This guarantees "C1 986000", "D1 PAYE ...", and "Q1" are handled as
     # structured WhatsApp commands, not link codes and not AI questions.
-    prefix_match = re.match(r"^(sup[1-6]|cr[1-4]|r[1-6]|s[1-3]|p[1-3]|b[1-3]|t(?:10|50|100|500)|f[1-8]|c[1-8]|q[1-5]|d[1-4]|h[1-2])\b", norm)
+    prefix_match = re.match(r"^(sup[1-6]|cr[1-4]|pay[1-6]|r[1-6]|s[1-3]|p[1-3]|b[1-3]|t(?:10|50|100|500)|f[1-8]|c[1-8]|q[1-5]|d[1-4]|h[1-2])\b", norm)
     if prefix_match:
         code = prefix_match.group(1).upper()
         if code in {"SUP1", "SUP2", "SUP3", "SUP4", "SUP5", "SUP6"}:
@@ -1538,6 +1538,8 @@ def _recognize(text: str, context: str = "main") -> Dict[str, Any]:
             return {"kind": "credit_activity", "action": code.lower(), "code": code, "text": raw}
         if code in {"R1", "R2", "R3", "R4", "R5", "R6"}:
             return {"kind": "referral", "action": code.lower(), "code": code, "text": raw}
+        if code in {"PAY1", "PAY2", "PAY3", "PAY4", "PAY5", "PAY6"}:
+            return {"kind": "billing_history", "action": code.lower(), "code": code, "text": raw}
         if code in PLAN_OPTIONS:
             return {"kind": "plan", "code": code}
         if code in TOPUP_OPTIONS:
@@ -1557,7 +1559,7 @@ def _recognize(text: str, context: str = "main") -> Dict[str, Any]:
     # Examples: C9, F11, Q9, D9, S9, T20, or unsupported SUP commands.
     if re.match(r"^sup\d+\b", norm):
         return {"kind": "invalid_menu", "action": "invalid_command", "value": raw}
-    if re.match(r"^(?:s|p|b|t|f|c|q|d|h|cr|r)\d+\b", norm):
+    if re.match(r"^(?:s|p|b|t|f|c|q|d|h|cr|r|pay)\d+\b", norm):
         return {"kind": "invalid_menu", "action": "invalid_command", "value": raw}
 
     if norm in {"0", "menu", "main", "main menu", "start", "hello", "hi"}:
@@ -1608,6 +1610,20 @@ def _recognize(text: str, context: str = "main") -> Dict[str, Any]:
         return {"kind": "referral", "action": "r5", "code": "R5", "text": raw}
     if norm in {"r6", "payout status", "referral payout", "referral payouts", "payouts"}:
         return {"kind": "referral", "action": "r6", "code": "R6", "text": raw}
+    if norm in {"billing", "billing menu", "payment", "payments", "payment menu"}:
+        return {"kind": "billing_history", "action": "menu", "code": "PAY", "text": raw}
+    if norm in {"pay1", "billing summary", "payment summary", "my billing"}:
+        return {"kind": "billing_history", "action": "pay1", "code": "PAY1", "text": raw}
+    if norm in {"pay2", "payment history", "billing history", "my payment history", "payments history"}:
+        return {"kind": "billing_history", "action": "pay2", "code": "PAY2", "text": raw}
+    if norm in {"pay3", "latest payment", "latest payment status", "last payment", "last payment status"}:
+        return {"kind": "billing_history", "action": "pay3", "code": "PAY3", "text": raw}
+    if norm in {"pay4", "verify payment", "verify reference", "check reference", "verify payment reference"}:
+        return {"kind": "billing_history", "action": "pay4", "code": "PAY4", "text": raw}
+    if norm in {"pay5", "pending plan", "pending plan change", "plan change", "pending change"}:
+        return {"kind": "billing_history", "action": "pay5", "code": "PAY5", "text": raw}
+    if norm in {"pay6", "renewal", "expiry", "expiry date", "renewal date", "plan expiry", "subscription expiry"}:
+        return {"kind": "billing_history", "action": "pay6", "code": "PAY6", "text": raw}
     if norm in {"support", "help support", "support menu", "customer support", "contact support"}:
         return {"kind": "support", "action": "menu", "code": "SUP", "text": raw}
     if norm in {"sup1", "create ticket", "open ticket", "new ticket", "support ticket"}:
@@ -1832,6 +1848,8 @@ def _main_menu(wa_id: str = "", account_id: str = "") -> str:
         "H2 - Last tax answer 📌\n"
         "SUP1 - Create support ticket 🛟\n"
         "SUP2 - View support tickets 🎫\n"
+        "PAY1 - Billing summary 💳\n"
+        "PAY2 - Payment history 🧾\n"
         "R1 - My referral code/link 🤝\n"
         "R4 - Referral statistics 📊\n"
         "0 or MENU - Main menu 🏠\n"
@@ -1909,10 +1927,11 @@ def _help_text() -> str:
     return (
         "ℹ️ *Help - Naija Tax Guide*\n\n"
         "• Main menu uses numbers 1–8.\n"
-        "• Submenus use short codes like S1, T50, F1, C1, Q1, D1, H1, H2, SUP1, CR1, and R1.\n"
+        "• Submenus use short codes like S1, T50, F1, C1, Q1, D1, H1, H2, SUP1, CR1, R1, and PAY1.\n"
         "• Use H1 for recent history and H2 for your last tax answer.\n"
         "• Use SUP1 for support, SUP2 for tickets, SUP3 for latest ticket, SUP4 to reply, SUP5 to close, and SUP6 for support email.\n"
         "• Use R1 for referral code, R2 for referral link, R3 to share invitation, R4 for stats, R5 for rewards, and R6 for payout status.\n"
+        "• Use PAY1 for billing summary, PAY2 for payment history, PAY3 for latest payment, PAY4 to verify a reference, PAY5 for pending plan change, and PAY6 for renewal/expiry.\n"
         "• You can type natural words too, e.g. Starter Monthly or VAT calculator.\n"
         "• Basic calculators are free. 🧮\n"
         "• Database/cache answers may be served without credit charge. ✅\n"
@@ -4641,6 +4660,393 @@ def _handle_referral_command(wa_id: str, account_id: str, text: str) -> Dict[str
     return {"ok": True, "handled": "referral_menu", "send_result": _send_whatsapp_text(wa_id, _referral_menu())}
 
 
+
+# =============================================================================
+# WhatsApp Billing / Payment History helpers
+# =============================================================================
+
+def _billing_menu() -> str:
+    return (
+        "💳 *Billing & Payment Centre*\n\n"
+        "PAY1 - Billing summary\n"
+        "PAY2 - Payment history\n"
+        "PAY3 - Latest payment status\n"
+        "PAY4 - Verify payment reference\n"
+        "PAY5 - Pending plan change\n"
+        "PAY6 - Renewal / expiry date\n\n"
+        "For PAY4, send the command with the reference, for example:\n"
+        "PAY4 NTG-WA-ABC123\n\n"
+        "Reply with PAY1, PAY2, PAY3, PAY4, PAY5, or PAY6.\n"
+        "Reply 0 for main menu."
+    )
+
+
+def _billing_plan_display_name(plan_code: Any) -> str:
+    code = _lower(plan_code)
+    if not code:
+        return "Free Forever"
+    for item in PLAN_OPTIONS.values():
+        if _lower(item.get("plan_code")) == code:
+            return _clean(item.get("name")) or code.replace("_", " ").title()
+    return code.replace("_", " ").title()
+
+
+def _billing_status_label(value: Any) -> str:
+    status = _clean(value or "unknown")
+    return status.replace("_", " ").title()
+
+
+def _billing_money_from_row(row: Dict[str, Any]) -> str:
+    raw = row.get("amount_kobo")
+    if raw is None:
+        raw = row.get("amount")
+    try:
+        value = int(float(str(raw or 0)))
+    except Exception:
+        value = 0
+    # Paystack stores amounts in kobo. Some legacy rows may store NGN directly.
+    if value >= 1000:
+        amount_ngn = value / 100
+    else:
+        amount_ngn = value
+    currency = _clean(row.get("currency") or (row.get("metadata") or {}).get("currency") if isinstance(row.get("metadata"), dict) else "NGN").upper()
+    if currency == "NGN":
+        return f"₦{amount_ngn:,.0f}"
+    return f"{currency} {amount_ngn:,.2f}"
+
+
+def _billing_subscription_ref(sub: Optional[Dict[str, Any]]) -> str:
+    row = sub or {}
+    return _clean(row.get("provider_ref") or row.get("paystack_ref") or row.get("payment_reference") or row.get("reference"))
+
+
+def _billing_subscription_summary(account_id: str) -> str:
+    sub = _get_subscription(account_id)
+    balance = _credit_balance(account_id)
+    if not sub:
+        return (
+            "💳 *Billing Summary*\n\n"
+            "Current plan: Free Forever\n"
+            f"Usage Credits: {balance}\n"
+            "Status: Free access\n\n"
+            "Reply 4 to view subscription plans, PAY2 for payment history, or 0 for main menu."
+        )
+
+    plan_code = _clean(sub.get("plan_code") or sub.get("plan") or "free")
+    plan_name = _clean(sub.get("plan_name")) or _billing_plan_display_name(plan_code)
+    status = _billing_status_label(sub.get("status") or ("active" if sub.get("is_active") else "inactive"))
+    expiry = _clean(sub.get("expires_at") or sub.get("current_period_end") or sub.get("valid_until") or sub.get("ends_at"))
+    started = _clean(sub.get("started_at") or sub.get("starts_at") or sub.get("created_at"))
+    provider = _clean(sub.get("provider") or "paystack")
+    reference = _billing_subscription_ref(sub)
+    pending = _clean(sub.get("pending_plan_code"))
+    topup_note = "Available to active paid users" if _is_active_paid_subscription(account_id) else "Requires active paid subscription"
+
+    lines = [
+        "💳 *Billing Summary*",
+        "",
+        f"Current plan: {plan_name}",
+        f"Plan code: {plan_code or 'free'}",
+        f"Status: {status}",
+        f"Usage Credits: {balance}",
+        f"Provider: {provider or 'not shown'}",
+    ]
+    if started:
+        lines.append(f"Started: {started[:10]}")
+    if expiry:
+        lines.append(f"Renewal/expiry: {expiry[:10]}")
+    if reference:
+        lines.append(f"Latest plan reference: {reference}")
+    if pending:
+        lines.append(f"Pending plan change: {pending}")
+    lines.extend([
+        f"Top-up status: {topup_note}",
+        "",
+        "Reply PAY2 for payment history, PAY3 for latest payment, PAY6 for renewal/expiry, or 0 for main menu.",
+    ])
+    return _clip("\n".join(lines), 3900)
+
+
+def _billing_transaction_rows(account_id: str, limit: int = 10) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    # paystack_transactions is the canonical transaction memory used by billing.py.
+    rows, err = _query_many(
+        "paystack_transactions",
+        "*",
+        limit=limit,
+        order_col="created_at",
+        desc=True,
+        account_id=account_id,
+    )
+    if rows:
+        return rows, None
+    return [], err
+
+
+def _billing_positive_credit_rows(account_id: str, limit: int = 10) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    rows, err = _query_many(
+        "credit_usage_logs",
+        "*",
+        limit=max(limit, 15),
+        order_col="created_at",
+        desc=True,
+        account_id=account_id,
+    )
+    if err:
+        return [], err
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        try:
+            delta = int(float(str(row.get("credits_delta") or 0)))
+        except Exception:
+            delta = 0
+        text = _lower(row.get("action_code") or row.get("description"))
+        if delta > 0 or "topup" in text or "top-up" in text or "credit_topup" in text:
+            out.append(row)
+    return out[:limit], None
+
+
+def _billing_tx_line(row: Dict[str, Any], index: int) -> str:
+    reference = _clean(row.get("reference") or row.get("provider_ref") or row.get("payment_reference") or row.get("id"))
+    status = _billing_status_label(row.get("status") or row.get("event_type") or "recorded")
+    plan = _clean(row.get("plan_code") or ((row.get("metadata") or {}).get("plan_code") if isinstance(row.get("metadata"), dict) else ""))
+    purpose = _clean(row.get("event_type") or ((row.get("metadata") or {}).get("purpose") if isinstance(row.get("metadata"), dict) else "") or plan or "payment")
+    created = _history_date_label(row.get("paid_at") or row.get("created_at") or row.get("updated_at"))
+    amount = _billing_money_from_row(row)
+    plan_text = f" | {plan}" if plan else ""
+    ref_text = f"\n   Ref: {reference}" if reference else ""
+    return f"{index}. {amount} - {status}\n   {purpose}{plan_text} | {created}{ref_text}"
+
+
+def _billing_credit_line(row: Dict[str, Any], index: int) -> str:
+    reference = _clean(row.get("reference") or row.get("id"))
+    created = _history_date_label(row.get("created_at"))
+    desc = _clean(row.get("description") or row.get("action_code") or "credit activity")
+    try:
+        delta = int(float(str(row.get("credits_delta") or 0)))
+    except Exception:
+        delta = 0
+    balance_after = row.get("balance_after")
+    bal_text = f" | balance: {balance_after}" if balance_after not in (None, "") else ""
+    ref_text = f"\n   Ref: {reference}" if reference else ""
+    return f"{index}. +{delta} credit(s)\n   {desc} | {created}{bal_text}{ref_text}"
+
+
+def _billing_history_text(account_id: str) -> str:
+    tx_rows, tx_err = _billing_transaction_rows(account_id, limit=5)
+    credit_rows, credit_err = _billing_positive_credit_rows(account_id, limit=5)
+    sub = _get_subscription(account_id)
+    sub_ref = _billing_subscription_ref(sub)
+
+    lines = ["🧾 *Payment History*", ""]
+    count = 0
+    if tx_rows:
+        lines.append("Plan/payment records:")
+        for row in tx_rows[:5]:
+            count += 1
+            lines.append(_billing_tx_line(row, count))
+    if credit_rows:
+        if count:
+            lines.append("")
+        lines.append("Credit/top-up records:")
+        for row in credit_rows[:5]:
+            count += 1
+            lines.append(_billing_credit_line(row, count))
+    if not count and sub_ref:
+        lines.extend([
+            "No separate payment-history rows were found yet, but your subscription has a recorded payment reference:",
+            sub_ref,
+        ])
+    if not count and not sub_ref:
+        lines.append("No payment history was found for this WhatsApp-linked account yet.")
+
+    if (tx_err or credit_err) and _debug_enabled():
+        lines.extend(["", f"Debug note: {_clip(tx_err or credit_err, 300)}"])
+
+    lines.extend(["", "Reply PAY1 for billing summary, PAY4 <reference> to verify a payment, or 0 for main menu."])
+    return _clip("\n".join(lines), 3900)
+
+
+def _billing_latest_payment_text(account_id: str) -> str:
+    tx_rows, tx_err = _billing_transaction_rows(account_id, limit=1)
+    if tx_rows:
+        return _clip(
+            "📌 *Latest Payment Status*\n\n"
+            + _billing_tx_line(tx_rows[0], 1)
+            + "\n\nReply PAY2 for payment history, PAY4 <reference> to verify another payment, or 0 for main menu.",
+            3900,
+        )
+
+    sub = _get_subscription(account_id)
+    ref = _billing_subscription_ref(sub)
+    if sub and ref:
+        plan = _clean(sub.get("plan_code") or "plan")
+        status = _billing_status_label(sub.get("status") or "active")
+        expiry = _clean(sub.get("expires_at") or sub.get("current_period_end") or "")
+        body = (
+            "📌 *Latest Payment Status*\n\n"
+            f"Reference: {ref}\n"
+            f"Plan: {_billing_plan_display_name(plan)}\n"
+            f"Status: {status}\n"
+        )
+        if expiry:
+            body += f"Renewal/expiry: {expiry[:10]}\n"
+        body += "\nReply PAY2 for payment history or 0 for main menu."
+        return body
+
+    note = f"\n\nDebug note: {_clip(tx_err, 300)}" if tx_err and _debug_enabled() else ""
+    return "📌 *Latest Payment Status*\n\nNo latest payment record was found for this account yet.\n\nReply PAY1 for billing summary or 0 for main menu." + note
+
+
+def _billing_extract_reference(text: Any) -> str:
+    raw = _clean(text)
+    # Prefer normal NTG-style references, then fall back to the token after PAY4.
+    ref = _extract_payment_reference(raw)
+    if ref:
+        return ref
+    cleaned = re.sub(r"^PAY4\b[:\-\s]*", "", raw, flags=re.I).strip()
+    match = re.search(r"\b[A-Z0-9][A-Z0-9\-_]{5,80}\b", cleaned, flags=re.I)
+    return match.group(0).strip() if match else ""
+
+
+def _billing_verify_reference_text(account_id: str, text: str) -> str:
+    ref = _billing_extract_reference(text)
+    if not ref:
+        return (
+            "🔎 *Verify Payment Reference*\n\n"
+            "Please send PAY4 followed by your payment reference.\n\n"
+            "Example:\nPAY4 NTG-WA-ABC123\n\n"
+            "Reply PAY2 for payment history or 0 for main menu."
+        )
+
+    # Account-scoped checks only. Never show another user's payment details.
+    tx_rows, tx_err = _query_many(
+        "paystack_transactions",
+        "*",
+        limit=1,
+        order_col="created_at",
+        desc=True,
+        account_id=account_id,
+        reference=ref,
+    )
+    if tx_rows:
+        return _clip("🔎 *Payment Reference Found*\n\n" + _billing_tx_line(tx_rows[0], 1) + "\n\nReply PAY2 for payment history or 0 for main menu.", 3900)
+
+    credit_row, credit_err = _query_one("credit_usage_logs", "*", account_id=account_id, reference=ref)
+    if credit_row:
+        return _clip("🔎 *Credit Reference Found*\n\n" + _billing_credit_line(credit_row, 1) + "\n\nReply CR2 for credit activity or 0 for main menu.", 3900)
+
+    sub = _get_subscription(account_id)
+    if sub and ref.lower() == _billing_subscription_ref(sub).lower():
+        return (
+            "🔎 *Payment Reference Found*\n\n"
+            f"Reference: {ref}\n"
+            f"Plan: {_billing_plan_display_name(sub.get('plan_code'))}\n"
+            f"Status: {_billing_status_label(sub.get('status') or 'active')}\n"
+            f"Renewal/expiry: {_clean(sub.get('expires_at') or sub.get('current_period_end') or 'not shown')[:10]}\n\n"
+            "Reply PAY1 for billing summary or 0 for main menu."
+        )
+
+    debug_note = ""
+    if _debug_enabled() and (tx_err or credit_err):
+        debug_note = f"\n\nDebug note: {_clip(tx_err or credit_err, 300)}"
+
+    return (
+        "🔎 *Payment Reference Not Found*\n\n"
+        f"Reference checked: {ref}\n\n"
+        "I could not find this reference under your WhatsApp-linked account. If you paid recently, wait a few seconds and try PAY3 or PAY4 again.\n\n"
+        "For payment issues, reply SUP1 to contact support."
+        f"{debug_note}"
+    )
+
+
+def _billing_pending_change_text(account_id: str) -> str:
+    sub = _get_subscription(account_id)
+    if not sub:
+        return (
+            "🔄 *Pending Plan Change*\n\n"
+            "No paid subscription was found yet, so there is no pending plan change.\n\n"
+            "Reply 4 to view plans or 0 for main menu."
+        )
+
+    pending = _clean(sub.get("pending_plan_code"))
+    pending_at = _clean(sub.get("pending_starts_at") or sub.get("pending_start_at"))
+    if not pending:
+        return (
+            "🔄 *Pending Plan Change*\n\n"
+            "No pending plan change is currently recorded on your account.\n\n"
+            f"Current plan: {_billing_plan_display_name(sub.get('plan_code'))}\n"
+            f"Status: {_billing_status_label(sub.get('status') or 'active')}\n\n"
+            "Reply PAY1 for billing summary or 0 for main menu."
+        )
+
+    body = (
+        "🔄 *Pending Plan Change*\n\n"
+        f"Current plan: {_billing_plan_display_name(sub.get('plan_code'))}\n"
+        f"Pending plan: {_billing_plan_display_name(pending)}\n"
+    )
+    if pending_at:
+        body += f"Pending start: {pending_at[:10]}\n"
+    body += "\nUse the website Billing page to clear or manage pending plan changes.\n\nReply PAY1 for billing summary or 0 for main menu."
+    return body
+
+
+def _billing_renewal_text(account_id: str) -> str:
+    sub = _get_subscription(account_id)
+    if not sub:
+        return (
+            "📅 *Renewal / Expiry Date*\n\n"
+            "Current plan: Free Forever\n"
+            "Renewal/expiry: Not applicable\n\n"
+            "Reply 4 to view paid plans or 0 for main menu."
+        )
+
+    plan = _billing_plan_display_name(sub.get("plan_code"))
+    status = _billing_status_label(sub.get("status") or ("active" if sub.get("is_active") else "inactive"))
+    expiry = _clean(sub.get("expires_at") or sub.get("current_period_end") or sub.get("valid_until") or sub.get("ends_at"))
+    started = _clean(sub.get("started_at") or sub.get("starts_at") or sub.get("created_at"))
+    auto = "Yes" if sub.get("auto_renew") else "No"
+
+    lines = [
+        "📅 *Renewal / Expiry Date*",
+        "",
+        f"Plan: {plan}",
+        f"Status: {status}",
+        f"Auto-renew: {auto}",
+    ]
+    if started:
+        lines.append(f"Started: {started[:10]}")
+    lines.append(f"Renewal/expiry: {expiry[:10] if expiry else 'not shown'}")
+    lines.extend(["", "Reply PAY1 for billing summary, PAY2 for payment history, or 0 for main menu."])
+    return "\n".join(lines)
+
+
+def _handle_billing_history_command(wa_id: str, account_id: str, text: str) -> Dict[str, Any]:
+    norm = _normalize_text(text)
+
+    if norm in {"billing", "billing menu", "payment", "payments", "payment menu"}:
+        return {"ok": True, "handled": "billing_menu", "send_result": _send_whatsapp_text(wa_id, _billing_menu())}
+
+    if norm in {"pay1", "billing summary", "payment summary", "my billing"}:
+        return {"ok": True, "handled": "billing_summary", "send_result": _send_whatsapp_text(wa_id, _billing_subscription_summary(account_id))}
+
+    if norm in {"pay2", "payment history", "billing history", "my payment history", "payments history"}:
+        return {"ok": True, "handled": "billing_history", "send_result": _send_whatsapp_text(wa_id, _billing_history_text(account_id))}
+
+    if norm in {"pay3", "latest payment", "latest payment status", "last payment", "last payment status"}:
+        return {"ok": True, "handled": "latest_payment", "send_result": _send_whatsapp_text(wa_id, _billing_latest_payment_text(account_id))}
+
+    if norm == "pay4" or norm.startswith("pay4 ") or norm.startswith("pay4-") or norm.startswith("pay4:") or "verify" in norm:
+        return {"ok": True, "handled": "verify_payment_reference", "send_result": _send_whatsapp_text(wa_id, _billing_verify_reference_text(account_id, text))}
+
+    if norm in {"pay5", "pending plan", "pending plan change", "plan change", "pending change"}:
+        return {"ok": True, "handled": "pending_plan_change", "send_result": _send_whatsapp_text(wa_id, _billing_pending_change_text(account_id))}
+
+    if norm in {"pay6", "renewal", "expiry", "expiry date", "renewal date", "plan expiry", "subscription expiry"}:
+        return {"ok": True, "handled": "renewal_expiry", "send_result": _send_whatsapp_text(wa_id, _billing_renewal_text(account_id))}
+
+    return {"ok": True, "handled": "billing_menu", "send_result": _send_whatsapp_text(wa_id, _billing_menu())}
+
+
 # =============================================================================
 # Core action handlers
 # =============================================================================
@@ -5164,11 +5570,14 @@ def _handle_text_message(msg: Dict[str, Any]) -> Dict[str, Any]:
     if recognition.get("kind") == "referral":
         return _handle_referral_command(wa_id, account_id, text)
 
+    if recognition.get("kind") == "billing_history":
+        return _handle_billing_history_command(wa_id, account_id, text)
+
     if recognition["kind"] == "invalid_menu":
         return {
             "ok": True,
             "handled": "invalid_menu_option",
-            "send_result": _send_whatsapp_text(wa_id, "⚠️ That code/menu option is not available yet, so no AI credit was used.\n\nReply 0 for main menu, F1 for calculators, Q1 for quiz, D1 for reminders, H1 for history, CR1 for credits, SUP1 for support, or type your Nigerian tax question in words."),
+            "send_result": _send_whatsapp_text(wa_id, "⚠️ That code/menu option is not available yet, so no AI credit was used.\n\nReply 0 for main menu, F1 for calculators, Q1 for quiz, D1 for reminders, H1 for history, CR1 for credits, SUP1 for support, PAY1 for billing, or type your Nigerian tax question in words."),
         }
 
     if recognition["kind"] == "ambiguous":
