@@ -57,7 +57,7 @@ except Exception:  # pragma: no cover
 
 bp = Blueprint("whatsapp", __name__)
 
-WHATSAPP_FLOW_VERSION = "2026-05-25-v32a-dynamic-quiz-helper-fix"
+WHATSAPP_FLOW_VERSION = "2026-05-25-v32b-dynamic-quiz-copy-cleanup"
 
 
 # =============================================================================
@@ -3282,7 +3282,6 @@ def _start_quiz(wa_id: str, account_id: str, state: Optional[Dict[str, Any]] = N
         f"🧠 *Tax Quiz* ({quiz.get('category') or 'General'})\n\n"
         f"Question {attempts + 1}: {quiz.get('question')}\n\n"
         f"{options}\n\n"
-        "Note: question and answer positions are shuffled each time.\n"
         f"Remaining today: {remaining}\n\n"
         "Reply A, B, C, or D.\n"
         "Reply CANCEL to stop."
@@ -3458,12 +3457,21 @@ def _handle_quiz_command(wa_id: str, account_id: str, text: str, state: Dict[str
 
         debit = _debit_q5_usage_credit(account_id)
         if not debit.get("ok"):
-            body = (
-                "🔒 *Q5 Detailed Explanation not available*\n\n"
-                "Q5 costs 1 Usage Credit, but your credit balance could not be charged.\n"
-                "No detailed explanation was unlocked.\n\n"
-                "Reply 3 to check your plan/credits, 4 to view plans, or Q4 for the normal review."
-            )
+            if _clean(debit.get("error")) == "insufficient_credits":
+                current_balance = int(debit.get("before") or 0)
+                body = (
+                    "🔒 *Q5 Detailed Explanation locked*\n\n"
+                    f"Q5 costs 1 Usage Credit, but your current balance is {current_balance}.\n"
+                    "No detailed explanation was unlocked.\n\n"
+                    "Reply CR1 to check balance, 6 to buy add-ons, 4 to view plans, or Q4 for the normal review."
+                )
+            else:
+                body = (
+                    "🔒 *Q5 Detailed Explanation not available*\n\n"
+                    "Q5 costs 1 Usage Credit, but your credit balance could not be charged.\n"
+                    "No detailed explanation was unlocked.\n\n"
+                    "Reply CR1 to check balance, 4 to view plans, or Q4 for the normal review."
+                )
             return {
                 "ok": True,
                 "handled": "quiz_q5_debit_failed",
