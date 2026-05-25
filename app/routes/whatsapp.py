@@ -57,7 +57,7 @@ except Exception:  # pragma: no cover
 
 bp = Blueprint("whatsapp", __name__)
 
-WHATSAPP_FLOW_VERSION = "2026-05-25-v32-dynamic-quiz-cached-q5"
+WHATSAPP_FLOW_VERSION = "2026-05-25-v32a-dynamic-quiz-helper-fix"
 
 
 # =============================================================================
@@ -797,6 +797,78 @@ def _increment_quiz_attempts(wa_id: str) -> int:
         data=data,
     )
     return int(usage["attempts"])
+
+
+def _quiz_attempt_info(state: Optional[Dict[str, Any]]) -> Tuple[str, int]:
+    """
+    Return today's quiz usage counter from the WhatsApp session data.
+
+    Batch 25A fix:
+    Batch 25 introduced the dynamic quiz engine but the helper that reads the
+    daily quiz counter was missing. This function supports both the new
+    quiz_date/quiz_attempts fields and the older quiz_usage fallback.
+    """
+    today = _today_key()
+    data = _session_data(state)
+
+    quiz_date = _clean(data.get("quiz_date"))
+    if quiz_date == today:
+        try:
+            return today, max(0, int(data.get("quiz_attempts") or 0))
+        except Exception:
+            return today, 0
+
+    usage = data.get("quiz_usage") if isinstance(data.get("quiz_usage"), dict) else {}
+    if usage.get("date") == today:
+        try:
+            return today, max(0, int(usage.get("attempts") or 0))
+        except Exception:
+            return today, 0
+
+    return today, 0
+
+
+def _quiz_daily_numbers(data: Dict[str, Any]) -> Dict[str, int]:
+    """
+    Return today's quiz score numbers from session data.
+
+    The dynamic quiz flow stores quiz_date, quiz_attempts, quiz_correct_count,
+    and quiz_wrong_count in whatsapp_flow_sessions.data. If the stored date is
+    not today, the score resets for display purposes.
+    """
+    today = _today_key()
+    if not isinstance(data, dict):
+        return {"attempts": 0, "correct": 0, "wrong": 0}
+
+    if _clean(data.get("quiz_date")) != today:
+        usage = data.get("quiz_usage") if isinstance(data.get("quiz_usage"), dict) else {}
+        if usage.get("date") == today:
+            attempts = max(0, int(usage.get("attempts") or 0))
+            return {"attempts": attempts, "correct": 0, "wrong": attempts}
+        return {"attempts": 0, "correct": 0, "wrong": 0}
+
+    try:
+        attempts = max(0, int(data.get("quiz_attempts") or 0))
+    except Exception:
+        attempts = 0
+
+    try:
+        correct = max(0, int(data.get("quiz_correct_count") or 0))
+    except Exception:
+        correct = 0
+
+    try:
+        wrong = max(0, int(data.get("quiz_wrong_count") or 0))
+    except Exception:
+        wrong = max(0, attempts - correct)
+
+    if attempts < correct + wrong:
+        attempts = correct + wrong
+    if wrong == 0 and attempts > correct:
+        wrong = attempts - correct
+
+    return {"attempts": attempts, "correct": correct, "wrong": wrong}
+
 
 
 
