@@ -39,7 +39,7 @@ except Exception:  # pragma: no cover
 
 bp = Blueprint("whatsapp", __name__)
 
-WHATSAPP_FLOW_VERSION = "2026-05-25-v26-credit-activity-support-history"
+WHATSAPP_FLOW_VERSION = "2026-05-25-v27-support-reply-close-credit-history"
 
 
 # =============================================================================
@@ -1512,10 +1512,10 @@ def _recognize(text: str, context: str = "main") -> Dict[str, Any]:
     # Exact/prefix command recognition must run before natural question fallback.
     # This guarantees "C1 986000", "D1 PAYE ...", and "Q1" are handled as
     # structured WhatsApp commands, not link codes and not AI questions.
-    prefix_match = re.match(r"^(sup[1236]|cr[1-4]|s[1-3]|p[1-3]|b[1-3]|t(?:10|50|100|500)|f[1-8]|c[1-8]|q[1-5]|d[1-4]|h[1-2])\b", norm)
+    prefix_match = re.match(r"^(sup[1-6]|cr[1-4]|s[1-3]|p[1-3]|b[1-3]|t(?:10|50|100|500)|f[1-8]|c[1-8]|q[1-5]|d[1-4]|h[1-2])\b", norm)
     if prefix_match:
         code = prefix_match.group(1).upper()
-        if code in {"SUP1", "SUP2", "SUP3", "SUP6"}:
+        if code in {"SUP1", "SUP2", "SUP3", "SUP4", "SUP5", "SUP6"}:
             return {"kind": "support", "action": code.lower(), "code": code, "text": raw}
         if code in {"CR1", "CR2", "CR3", "CR4"}:
             return {"kind": "credit_activity", "action": code.lower(), "code": code, "text": raw}
@@ -1535,7 +1535,7 @@ def _recognize(text: str, context: str = "main") -> Dict[str, Any]:
             return {"kind": "history", "action": code.lower(), "code": code}
 
     # Invalid command-like inputs should not consume AI credits.
-    # Examples: C9, F11, Q9, D9, S9, T20, SUP4 before support replies are enabled.
+    # Examples: C9, F11, Q9, D9, S9, T20, or unsupported SUP commands.
     if re.match(r"^sup\d+\b", norm):
         return {"kind": "invalid_menu", "action": "invalid_command", "value": raw}
     if re.match(r"^(?:s|p|b|t|f|c|q|d|h|cr)\d+\b", norm):
@@ -1583,6 +1583,10 @@ def _recognize(text: str, context: str = "main") -> Dict[str, Any]:
         return {"kind": "support", "action": "sup2", "code": "SUP2", "text": raw}
     if norm in {"sup3", "latest ticket", "last ticket", "recent ticket"}:
         return {"kind": "support", "action": "sup3", "code": "SUP3", "text": raw}
+    if norm in {"sup4", "reply ticket", "reply to ticket", "support reply", "respond to ticket"}:
+        return {"kind": "support", "action": "sup4", "code": "SUP4", "text": raw}
+    if norm in {"sup5", "close ticket", "close support ticket", "resolve ticket"}:
+        return {"kind": "support", "action": "sup5", "code": "SUP5", "text": raw}
     if norm in {"sup6", "support email", "contact email", "email support"}:
         return {"kind": "support", "action": "sup6", "code": "SUP6", "text": raw}
 
@@ -1795,6 +1799,8 @@ def _main_menu(wa_id: str = "", account_id: str = "") -> str:
         "H2 - Last tax answer 📌\n"
         "SUP1 - Create support ticket 🛟\n"
         "SUP2 - View support tickets 🎫\n"
+        "SUP4 - Reply to support ticket ✍️\n"
+        "SUP5 - Close support ticket 🔒\n"
         "0 or MENU - Main menu 🏠\n"
         "* or BACK - Go back ↩️\n"
         "CANCEL - Cancel current flow ❌\n\n"
@@ -1872,7 +1878,7 @@ def _help_text() -> str:
         "• Main menu uses numbers 1–8.\n"
         "• Submenus use short codes like S1, T50, F1, C1, Q1, D1, H1, H2, and SUP1.\n"
         "• Use H1 for recent history and H2 for your last tax answer.\n"
-        "• Use SUP1 for support, SUP2 for tickets, SUP3 for latest ticket, and SUP6 for support email.\n"
+        "• Use SUP1 for support, SUP2 for tickets, SUP3 for latest ticket, SUP4 to reply, SUP5 to close, and SUP6 for support email.\n"
         "• You can type natural words too, e.g. Starter Monthly or VAT calculator.\n"
         "• Basic calculators are free. 🧮\n"
         "• Database/cache answers may be served without credit charge. ✅\n"
@@ -3476,9 +3482,13 @@ def _support_menu() -> str:
         "SUP1 - Create support ticket\n"
         "SUP2 - View my support tickets\n"
         "SUP3 - View latest ticket\n"
+        "SUP4 - Reply to latest/open ticket\n"
+        "SUP5 - Close latest/open ticket\n"
         "SUP6 - Contact support email\n\n"
-        "Quick example:\n"
-        "SUP1 I paid but my plan has not updated. Reference NTG-...\n\n"
+        "Quick examples:\n"
+        "SUP1 I paid but my plan has not updated. Reference NTG-...\n"
+        "SUP4 Please note that my Paystack reference is NTG-...\n"
+        "SUP5\n\n"
         "Reply 0 for main menu."
     )
 
@@ -3536,7 +3546,7 @@ def _support_list_text(account_id: str, limit: int = 5) -> str:
     lines = ["🎫 *My Support Tickets*", ""]
     for index, ticket in enumerate(rows, start=1):
         lines.append(_support_ticket_line(ticket, index))
-    lines.extend(["", "Reply SUP3 to view the latest ticket, SUP1 to create a new ticket, or 0 for main menu."])
+    lines.extend(["", "Reply SUP3 to view the latest ticket, SUP4 to reply, SUP5 to close a ticket, SUP1 to create a new ticket, or 0 for main menu."])
     return _clip("\n".join(lines), 3900)
 
 
@@ -3574,7 +3584,7 @@ def _support_latest_text(account_id: str) -> str:
         f"Updated: {updated}\n\n"
         f"Subject:\n{_clip(subject, 300)}\n\n"
         f"Message:\n{_clip(message, 1400)}\n\n"
-        "Reply SUP2 for all tickets, SUP1 to create a new ticket, or 0 for main menu."
+        "Reply SUP4 to reply to this ticket, SUP5 to close it, SUP2 for all tickets, SUP1 to create a new ticket, or 0 for main menu."
     )
     return _clip(body, 3900)
 
@@ -3706,9 +3716,359 @@ def _create_support_ticket_from_message(
         f"Status: open\n\n"
         f"Subject:\n{subject}\n\n"
         "Our support team can review it from the support dashboard.\n\n"
-        "Reply SUP2 to view your tickets, SUP3 for the latest ticket, or 0 for main menu."
+        "Reply SUP2 to view your tickets, SUP3 for the latest ticket, SUP4 to add a reply, or 0 for main menu."
     )
     return {"ok": True, "handled": "support_ticket_created", "send_result": _send_whatsapp_text(wa_id, _clip(body, 3900))}
+
+
+
+def _support_extract_ticket_id(value: Any) -> str:
+    text = _clean(value).upper()
+    match = re.search(r"\bNTG-WA-[A-Z0-9]{4,20}\b", text)
+    return match.group(0) if match else ""
+
+
+def _support_reply_message_from_command(text: Any) -> str:
+    raw = _clean(text)
+    raw = re.sub(r"^SUP4\b[:\-\s]*", "", raw, flags=re.I).strip()
+    raw = re.sub(r"\bNTG-WA-[A-Z0-9]{4,20}\b", "", raw, count=1, flags=re.I).strip()
+    return raw
+
+
+def _support_latest_open_ticket(account_id: str) -> Optional[Dict[str, Any]]:
+    rows, _ = _support_tickets_for_account(account_id, limit=10)
+    if not rows:
+        return None
+
+    for row in rows:
+        status = _normalize_text(row.get("status") or "open")
+        if status not in {"closed", "resolved", "cancelled", "canceled"}:
+            return row
+
+    return rows[0]
+
+
+def _support_ticket_by_reference(account_id: str, ticket_ref: str = "") -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    ticket_ref = _clean(ticket_ref).upper()
+
+    if ticket_ref:
+        try:
+            res = (
+                _admin_sb()
+                .table("support_tickets")
+                .select("*")
+                .eq("account_id", account_id)
+                .eq("ticket_id", ticket_ref)
+                .limit(1)
+                .execute()
+            )
+            rows = getattr(res, "data", None) or []
+            if rows and isinstance(rows[0], dict):
+                return rows[0], None
+        except Exception as exc:
+            return None, f"support_tickets: {type(exc).__name__}: {_clip(exc)}"
+        return None, None
+
+    return _support_latest_open_ticket(account_id), None
+
+
+def _support_ticket_ref(ticket: Dict[str, Any]) -> str:
+    return _clean(ticket.get("ticket_id") or ticket.get("id") or "Ticket")
+
+
+def _insert_support_reply_row(
+    *,
+    ticket: Dict[str, Any],
+    account_id: str,
+    message: str,
+    wa_id: str,
+    sender_type: str = "user",
+) -> Dict[str, Any]:
+    now = _now_iso()
+    ticket_id = _support_ticket_ref(ticket)
+    metadata = {
+        "wa_id": _normalize_phone(wa_id),
+        "flow_version": WHATSAPP_FLOW_VERSION,
+        "support_ticket_row_id": _clean(ticket.get("id")) or None,
+    }
+
+    rich_payload = {
+        "ticket_id": ticket_id,
+        "ticket_row_id": _clean(ticket.get("id")) or None,
+        "account_id": account_id,
+        "message": message,
+        "sender_type": sender_type,
+        "channel": "whatsapp",
+        "source": "whatsapp",
+        "metadata": metadata,
+        "created_at": now,
+    }
+    mid_payload = {
+        "ticket_id": ticket_id,
+        "account_id": account_id,
+        "message": message,
+        "sender_type": sender_type,
+        "channel": "whatsapp",
+        "source": "whatsapp",
+        "created_at": now,
+    }
+    minimal_payload = {
+        "ticket_id": ticket_id,
+        "account_id": account_id,
+        "message": message,
+        "created_at": now,
+    }
+
+    last: Dict[str, Any] = {"ok": False, "error": "not_attempted"}
+    for payload in (rich_payload, mid_payload, minimal_payload):
+        last = _safe_insert_admin("support_ticket_replies", payload)
+        if last.get("ok"):
+            return last
+    return last
+
+
+def _update_support_ticket_after_reply(ticket: Dict[str, Any], account_id: str, message: str, status: str = "open") -> Dict[str, Any]:
+    now = _now_iso()
+    ticket_id = _support_ticket_ref(ticket)
+    preview = " ".join(_clean(message).split())[:200]
+
+    rich_payload = {
+        "status": status,
+        "updated_at": now,
+        "last_reply_at": now,
+        "last_reply_by": "user",
+        "last_message_preview": preview,
+    }
+    mid_payload = {
+        "updated_at": now,
+        "last_reply_at": now,
+        "last_reply_by": "user",
+        "last_message_preview": preview,
+    }
+    minimal_payload = {
+        "updated_at": now,
+        "last_message_preview": preview,
+    }
+
+    last: Dict[str, Any] = {"ok": False, "error": "not_attempted"}
+    for payload in (rich_payload, mid_payload, minimal_payload):
+        last = _safe_update_admin("support_tickets", payload, account_id=account_id, ticket_id=ticket_id)
+        if last.get("ok"):
+            return last
+    return last
+
+
+def _create_support_reply_from_message(
+    *,
+    wa_id: str,
+    account_id: str,
+    message: str,
+    ticket_ref: str = "",
+) -> Dict[str, Any]:
+    ticket_ref = ticket_ref or _support_extract_ticket_id(message)
+    clean_message = _support_reply_message_from_command(message)
+    ticket, err = _support_ticket_by_reference(account_id, ticket_ref)
+
+    if err:
+        return {
+            "ok": True,
+            "handled": "support_reply_lookup_failed",
+            "send_result": _send_whatsapp_text(
+                wa_id,
+                "⚠️ I could not load your support ticket right now.\n\n"
+                f"Please email: {_support_to_email()}",
+            ),
+        }
+
+    if not ticket:
+        _set_session_state(wa_id, context="main", pending_action="", data={})
+        return {
+            "ok": True,
+            "handled": "support_reply_no_ticket",
+            "send_result": _send_whatsapp_text(
+                wa_id,
+                "No support ticket was found for your account yet.\n\n"
+                "Reply SUP1 to create a new support ticket.",
+            ),
+        }
+
+    ticket_id = _support_ticket_ref(ticket)
+    if len(clean_message) < 3:
+        _set_session_state(
+            wa_id,
+            context="support_reply",
+            pending_action="support_reply",
+            data={"ticket_id": ticket_id},
+        )
+        return {
+            "ok": True,
+            "handled": "support_reply_prompt",
+            "send_result": _send_whatsapp_text(
+                wa_id,
+                "✍️ *Reply to Support Ticket*\n\n"
+                f"Ticket ID: {ticket_id}\n\n"
+                "Please type the message you want to add to this ticket.\n\n"
+                "Reply CANCEL to stop.",
+            ),
+        }
+
+    insert_result = _insert_support_reply_row(
+        ticket=ticket,
+        account_id=account_id,
+        message=clean_message,
+        wa_id=wa_id,
+        sender_type="user",
+    )
+
+    if not insert_result.get("ok"):
+        return {
+            "ok": True,
+            "handled": "support_reply_insert_failed",
+            "send_result": _send_whatsapp_text(
+                wa_id,
+                "⚠️ I found the ticket, but I could not save your reply right now.\n\n"
+                "Please try again shortly or email support.\n\n"
+                f"Support email: {_support_to_email()}",
+            ),
+            "debug": {"error": insert_result.get("error")} if _debug_enabled() else None,
+        }
+
+    _update_support_ticket_after_reply(ticket, account_id, clean_message, status="open")
+    _set_session_state(wa_id, context="main", pending_action="", data={})
+
+    body = (
+        "✅ *Reply added to support ticket*\n\n"
+        f"Ticket ID: {ticket_id}\n"
+        "Status: open\n\n"
+        f"Your reply:\n{_clip(clean_message, 1200)}\n\n"
+        "Reply SUP3 to view the latest ticket, SUP2 for all tickets, or 0 for main menu."
+    )
+    return {"ok": True, "handled": "support_reply_created", "send_result": _send_whatsapp_text(wa_id, _clip(body, 3900))}
+
+
+def _support_close_prompt(wa_id: str, account_id: str, ticket_ref: str = "") -> Dict[str, Any]:
+    ticket, err = _support_ticket_by_reference(account_id, ticket_ref)
+    if err:
+        return {
+            "ok": True,
+            "handled": "support_close_lookup_failed",
+            "send_result": _send_whatsapp_text(wa_id, "⚠️ I could not load your support ticket right now. Please try again shortly."),
+        }
+    if not ticket:
+        return {
+            "ok": True,
+            "handled": "support_close_no_ticket",
+            "send_result": _send_whatsapp_text(wa_id, "No support ticket was found for your account yet.\n\nReply SUP1 to create a ticket."),
+        }
+
+    ticket_id = _support_ticket_ref(ticket)
+    status = _clean(ticket.get("status") or "open")
+    if _normalize_text(status) in {"closed", "resolved"}:
+        return {
+            "ok": True,
+            "handled": "support_close_already_closed",
+            "send_result": _send_whatsapp_text(
+                wa_id,
+                f"This ticket is already closed/resolved.\n\nTicket ID: {ticket_id}\nStatus: {status}\n\nReply SUP2 for all tickets.",
+            ),
+        }
+
+    _set_session_state(
+        wa_id,
+        context="support_close_confirm",
+        pending_action="support_close_confirm",
+        data={"ticket_id": ticket_id},
+    )
+    return {
+        "ok": True,
+        "handled": "support_close_confirm_prompt",
+        "send_result": _send_whatsapp_text(
+            wa_id,
+            "🔒 *Close Support Ticket*\n\n"
+            f"Ticket ID: {ticket_id}\n"
+            f"Current status: {status}\n\n"
+            "Reply YES CLOSE to close this ticket, or CANCEL to keep it open.",
+        ),
+    }
+
+
+def _confirm_close_support_ticket(wa_id: str, account_id: str, ticket_ref: str = "") -> Dict[str, Any]:
+    ticket, err = _support_ticket_by_reference(account_id, ticket_ref)
+    if err or not ticket:
+        _set_session_state(wa_id, context="main", pending_action="", data={})
+        return {
+            "ok": True,
+            "handled": "support_close_not_found",
+            "send_result": _send_whatsapp_text(wa_id, "I could not find that support ticket again. Reply SUP2 to view your tickets."),
+        }
+
+    ticket_id = _support_ticket_ref(ticket)
+    close_message = "Ticket closed by user from WhatsApp."
+    _insert_support_reply_row(
+        ticket=ticket,
+        account_id=account_id,
+        message=close_message,
+        wa_id=wa_id,
+        sender_type="user",
+    )
+
+    now = _now_iso()
+    update_attempts = [
+        {
+            "status": "closed",
+            "updated_at": now,
+            "last_reply_at": now,
+            "last_reply_by": "user",
+            "last_message_preview": close_message,
+        },
+        {
+            "status": "resolved",
+            "updated_at": now,
+            "last_reply_at": now,
+            "last_reply_by": "user",
+            "last_message_preview": close_message,
+        },
+        {
+            "updated_at": now,
+            "last_reply_at": now,
+            "last_reply_by": "user",
+            "last_message_preview": close_message,
+        },
+        {
+            "updated_at": now,
+            "last_message_preview": close_message,
+        },
+    ]
+
+    update_result: Dict[str, Any] = {"ok": False}
+    for payload in update_attempts:
+        update_result = _safe_update_admin("support_tickets", payload, account_id=account_id, ticket_id=ticket_id)
+        if update_result.get("ok"):
+            break
+
+    _set_session_state(wa_id, context="main", pending_action="", data={})
+
+    if not update_result.get("ok"):
+        return {
+            "ok": True,
+            "handled": "support_close_failed",
+            "send_result": _send_whatsapp_text(
+                wa_id,
+                "⚠️ I could not close the ticket right now. Please try again shortly or contact support."
+            ),
+            "debug": {"error": update_result.get("error")} if _debug_enabled() else None,
+        }
+
+    return {
+        "ok": True,
+        "handled": "support_ticket_closed",
+        "send_result": _send_whatsapp_text(
+            wa_id,
+            "✅ *Support ticket closed*\n\n"
+            f"Ticket ID: {ticket_id}\n\n"
+            "Reply SUP2 to view your tickets, SUP1 to create a new ticket, or 0 for main menu.",
+        ),
+    }
 
 
 def _handle_support_command(
@@ -3733,6 +4093,10 @@ def _handle_support_command(
         return {"ok": True, "handled": "support_tickets", "send_result": _send_whatsapp_text(wa_id, _support_list_text(account_id, limit=5))}
     if norm in {"sup3", "latest ticket", "last ticket", "recent ticket"}:
         return {"ok": True, "handled": "support_latest", "send_result": _send_whatsapp_text(wa_id, _support_latest_text(account_id))}
+    if norm.startswith("sup4") or norm in {"reply ticket", "reply to ticket", "support reply", "respond to ticket"}:
+        return _create_support_reply_from_message(wa_id=wa_id, account_id=account_id, message=text)
+    if norm.startswith("sup5") or norm in {"close ticket", "close support ticket", "resolve ticket"}:
+        return _support_close_prompt(wa_id=wa_id, account_id=account_id, ticket_ref=_support_extract_ticket_id(text))
     if norm in {"sup6", "support email", "contact email", "email support"}:
         return {"ok": True, "handled": "support_contact", "send_result": _send_whatsapp_text(wa_id, _support_contact_text())}
     return {"ok": True, "handled": "support_menu", "send_result": _send_whatsapp_text(wa_id, _support_menu())}
@@ -4180,7 +4544,7 @@ def _handle_text_message(msg: Dict[str, Any]) -> Dict[str, Any]:
 
     # Only attempt link-code lookup when the user is in the link flow, or when the input
     # is not already recognized as a command/calculator/plan/top-up/tool.
-    if context == "link" or (not is_command_like and context not in {"support_create"}):
+    if context == "link" or (not is_command_like and context not in {"support_create", "support_reply", "support_close_confirm"}):
         link_reply = _try_link_code(wa_id, text, profile_name=profile_name)
         if link_reply:
             _set_session_state(wa_id, "main")
@@ -4244,6 +4608,42 @@ def _handle_text_message(msg: Dict[str, Any]) -> Dict[str, Any]:
             message=text,
             profile_name=profile_name,
         )
+
+    if context == "support_reply":
+        normalized = _normalize_text(text)
+        if normalized in {"cancel", "stop", "end", "0", "menu", "main", "main menu", "back"}:
+            _set_session_state(wa_id, "main")
+            return {
+                "ok": True,
+                "handled": "support_reply_cancelled",
+                "send_result": _send_whatsapp_text(wa_id, "Support reply cancelled.\n\n" + _main_menu(wa_id, account_id)),
+            }
+        data = state.get("data") if isinstance(state.get("data"), dict) else {}
+        return _create_support_reply_from_message(
+            wa_id=wa_id,
+            account_id=account_id,
+            message=text,
+            ticket_ref=_clean(data.get("ticket_id")),
+        )
+
+    if context == "support_close_confirm":
+        normalized = _normalize_text(text)
+        data = state.get("data") if isinstance(state.get("data"), dict) else {}
+        ticket_ref = _clean(data.get("ticket_id"))
+        if normalized in {"yes", "yes close", "close", "confirm", "confirm close", "resolved", "done"}:
+            return _confirm_close_support_ticket(wa_id=wa_id, account_id=account_id, ticket_ref=ticket_ref)
+        if normalized in {"cancel", "stop", "end", "0", "menu", "main", "main menu", "back", "no", "keep open"}:
+            _set_session_state(wa_id, "main")
+            return {
+                "ok": True,
+                "handled": "support_close_cancelled",
+                "send_result": _send_whatsapp_text(wa_id, "Ticket close cancelled. The ticket remains open.\n\n" + _main_menu(wa_id, account_id)),
+            }
+        return {
+            "ok": True,
+            "handled": "support_close_confirm_repeat",
+            "send_result": _send_whatsapp_text(wa_id, "Please reply YES CLOSE to close the ticket, or CANCEL to keep it open."),
+        }
 
     if context == "unlink_confirm":
         normalized = _normalize_text(text)
