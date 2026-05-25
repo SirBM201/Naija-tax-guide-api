@@ -56,7 +56,7 @@ except Exception:  # pragma: no cover
 
 bp = Blueprint("whatsapp", __name__)
 
-WHATSAPP_FLOW_VERSION = "2026-05-25-v30-account-settings-billing-referrals"
+WHATSAPP_FLOW_VERSION = "2026-05-25-v31-file-tax-account-cleanup"
 
 
 # =============================================================================
@@ -1529,7 +1529,7 @@ def _recognize(text: str, context: str = "main") -> Dict[str, Any]:
     # Exact/prefix command recognition must run before natural question fallback.
     # This guarantees "C1 986000", "D1 PAYE ...", and "Q1" are handled as
     # structured WhatsApp commands, not link codes and not AI questions.
-    prefix_match = re.match(r"^(acc[1-3]|set[1-3]|sup[1-6]|cr[1-4]|pay[1-6]|r[1-6]|s[1-3]|p[1-3]|b[1-3]|t(?:10|50|100|500)|f[1-8]|c[1-8]|q[1-5]|d[1-4]|h[1-2])\b", norm)
+    prefix_match = re.match(r"^(acc[1-3]|set[1-3]|sup[1-6]|cr[1-4]|pay[1-6]|ft[1-8]|r[1-6]|s[1-3]|p[1-3]|b[1-3]|t(?:10|50|100|500)|f[1-8]|c[1-8]|q[1-5]|d[1-4]|h[1-2])\b", norm)
     if prefix_match:
         code = prefix_match.group(1).upper()
         if code in {"SUP1", "SUP2", "SUP3", "SUP4", "SUP5", "SUP6"}:
@@ -1540,6 +1540,8 @@ def _recognize(text: str, context: str = "main") -> Dict[str, Any]:
             return {"kind": "referral", "action": code.lower(), "code": code, "text": raw}
         if code in {"PAY1", "PAY2", "PAY3", "PAY4", "PAY5", "PAY6"}:
             return {"kind": "billing_history", "action": code.lower(), "code": code, "text": raw}
+        if code in {"FT1", "FT2", "FT3", "FT4", "FT5", "FT6", "FT7", "FT8"}:
+            return {"kind": "filing_assistance", "action": code.lower(), "code": code, "text": raw}
         if code in {"ACC1", "ACC2", "ACC3"}:
             return {"kind": "account_profile", "action": code.lower(), "code": code, "text": raw}
         if code in {"SET1", "SET2", "SET3"}:
@@ -1563,7 +1565,7 @@ def _recognize(text: str, context: str = "main") -> Dict[str, Any]:
     # Examples: C9, F11, Q9, D9, S9, T20, or unsupported SUP commands.
     if re.match(r"^sup\d+\b", norm):
         return {"kind": "invalid_menu", "action": "invalid_command", "value": raw}
-    if re.match(r"^(?:s|p|b|t|f|c|q|d|h|cr|r|pay|acc|set)\d+\b", norm):
+    if re.match(r"^(?:s|p|b|t|ft|f|c|q|d|h|cr|r|pay|acc|set)\d+\b", norm):
         return {"kind": "invalid_menu", "action": "invalid_command", "value": raw}
 
     if norm in {"0", "menu", "main", "main menu", "start", "hello", "hi"}:
@@ -1628,6 +1630,24 @@ def _recognize(text: str, context: str = "main") -> Dict[str, Any]:
         return {"kind": "billing_history", "action": "pay5", "code": "PAY5", "text": raw}
     if norm in {"pay6", "renewal", "expiry", "expiry date", "renewal date", "plan expiry", "subscription expiry"}:
         return {"kind": "billing_history", "action": "pay6", "code": "PAY6", "text": raw}
+    if norm in {"file tax", "file taxes", "filing assistance", "filing help", "tax filing help", "tax filing assistance"}:
+        return {"kind": "filing_assistance", "action": "menu", "code": "FT", "text": raw}
+    if norm in {"ft1", "start filing", "start filing assistance", "start tax filing", "filing start"}:
+        return {"kind": "filing_assistance", "action": "ft1", "code": "FT1", "text": raw}
+    if norm in {"ft2", "paye filing help", "paye filing assistance"}:
+        return {"kind": "filing_assistance", "action": "ft2", "code": "FT2", "text": raw}
+    if norm in {"ft3", "vat filing help", "vat filing assistance"}:
+        return {"kind": "filing_assistance", "action": "ft3", "code": "FT3", "text": raw}
+    if norm in {"ft4", "cit filing help", "company tax filing help", "company income tax filing help"}:
+        return {"kind": "filing_assistance", "action": "ft4", "code": "FT4", "text": raw}
+    if norm in {"ft5", "wht filing help", "withholding tax filing help"}:
+        return {"kind": "filing_assistance", "action": "ft5", "code": "FT5", "text": raw}
+    if norm in {"ft6", "document checklist", "filing documents", "filing checklist documents", "tax documents"}:
+        return {"kind": "filing_assistance", "action": "ft6", "code": "FT6", "text": raw}
+    if norm in {"ft7", "request filing help", "human assisted filing", "request human assisted filing", "request human filing"}:
+        return {"kind": "filing_assistance", "action": "ft7", "code": "FT7", "text": raw}
+    if norm in {"ft8", "filing status", "latest filing request", "my filing request", "filing request status"}:
+        return {"kind": "filing_assistance", "action": "ft8", "code": "FT8", "text": raw}
     if norm in {"account", "my account", "account menu", "profile", "my profile", "profile menu"}:
         return {"kind": "account_profile", "action": "menu", "code": "ACC", "text": raw}
     if norm in {"acc1", "account profile", "my account profile", "my profile details", "profile details"}:
@@ -1870,6 +1890,8 @@ def _main_menu(wa_id: str = "", account_id: str = "") -> str:
         "SUP2 - View support tickets 🎫\n"
         "PAY1 - Billing summary 💳\n"
         "PAY2 - Payment history 🧾\n"
+        "FT1 - Filing assistance 🗂️\n"
+        "FT7 - Request human filing help 🧑‍💼\n"
         "R1 - My referral code/link 🤝\n"
         "R4 - Referral statistics 📊\n"
         "ACC1 - My account profile 👤\n"
@@ -1921,7 +1943,10 @@ def _tools_menu() -> str:
         "F6 - Tax deadlines/calendar 📅\n"
         "F7 - Filing checklist ✅\n"
         "F8 - Back to main menu 🏠\n\n"
-        "Reply with a code like F1, F2, or F7."
+        "Advanced filing help:\n"
+        "FT1 - Filing assistance menu 🗂️\n"
+        "FT7 - Request human-assisted filing 🧑‍💼\n\n"
+        "Reply with a code like F1, F2, F7, FT1, or FT7."
     )
 
 
@@ -1949,11 +1974,12 @@ def _help_text() -> str:
     return (
         "ℹ️ *Help - Naija Tax Guide*\n\n"
         "• Main menu uses numbers 1–8.\n"
-        "• Submenus use short codes like S1, T50, F1, C1, Q1, D1, H1, H2, SUP1, CR1, R1, PAY1, ACC1, and SET1.\n"
+        "• Submenus use short codes like S1, T50, F1, C1, Q1, D1, H1, H2, SUP1, CR1, R1, PAY1, FT1, ACC1, and SET1.\n"
         "• Use H1 for recent history and H2 for your last tax answer.\n"
         "• Use SUP1 for support, SUP2 for tickets, SUP3 for latest ticket, SUP4 to reply, SUP5 to close, and SUP6 for support email.\n"
         "• Use R1 for referral code, R2 for referral link, R3 to share invitation, R4 for stats, R5 for rewards, and R6 for payout status.\n"
         "• Use PAY1 for billing summary, PAY2 for payment history, PAY3 for latest payment, PAY4 to verify a reference, PAY5 for pending plan change, and PAY6 for renewal/expiry.\n"
+        "• Use FT1 for filing assistance, FT6 for document checklist, FT7 to request human filing help, and FT8 for latest filing request.\n"
         "• Use ACC1 for profile, ACC2 for linked channels, and ACC3 for account summary.\n"
         "• Use SET1 for notifications, SET2 for reminder timezone defaults, and SET3 for privacy/data options.\n"
         "• You can type natural words too, e.g. Starter Monthly or VAT calculator.\n"
@@ -5072,6 +5098,320 @@ def _handle_billing_history_command(wa_id: str, account_id: str, text: str) -> D
 
 
 
+
+# =============================================================================
+# WhatsApp File Tax / Filing Assistance helpers
+# =============================================================================
+
+def _filing_assistance_menu() -> str:
+    return (
+        "🗂️ *File Tax / Filing Assistance*\n\n"
+        "FT1 - Start filing assistance\n"
+        "FT2 - PAYE filing help\n"
+        "FT3 - VAT filing help\n"
+        "FT4 - CIT filing help\n"
+        "FT5 - WHT filing help\n"
+        "FT6 - Document checklist\n"
+        "FT7 - Request human-assisted filing\n"
+        "FT8 - Filing status / latest request\n\n"
+        "For calculations, use F1 or C1-C5. For reminders, use D1-D4.\n"
+        "Reply with FT1, FT2, FT3, FT4, FT5, FT6, FT7, or FT8.\n"
+        "Reply 0 for main menu."
+    )
+
+
+def _filing_document_checklist() -> str:
+    return (
+        "✅ *Tax Filing Document Checklist*\n\n"
+        "Prepare the items that apply to your case:\n\n"
+        "General\n"
+        "• Taxpayer name / company name\n"
+        "• TIN, CAC/RC/BN details where applicable\n"
+        "• Contact details and tax office/state/FIRS details\n"
+        "• Prior tax filings, assessments, receipts, and notices\n\n"
+        "PAYE\n"
+        "• Employee list and monthly payroll schedule\n"
+        "• Salary, allowances, benefits, pension, NHF, and other deductions\n"
+        "• Evidence of PAYE remittance and pension/NHF records\n\n"
+        "VAT\n"
+        "• Sales invoices and output VAT schedule\n"
+        "• Purchase invoices and input VAT support\n"
+        "• Bank/payment records and VAT remittance receipts\n\n"
+        "CIT\n"
+        "• Financial statements / management accounts\n"
+        "• Profit computation, expense schedules, and bank statements\n"
+        "• Capital allowance, WHT credit notes, and prior-year returns\n\n"
+        "WHT\n"
+        "• Contract/payment details\n"
+        "• WHT rate used and remittance evidence\n"
+        "• Credit notes received/issued\n\n"
+        "Reply FT7 to request human-assisted filing, or 0 for main menu."
+    )
+
+
+def _filing_help_text(action: str) -> str:
+    action = _lower(action)
+    mapping = {
+        "ft2": "paye_guide",
+        "ft3": "vat_guide",
+        "ft4": "cit_guide",
+        "ft5": "wht_guide",
+    }
+    guide_key = mapping.get(action)
+    if not guide_key:
+        return _filing_assistance_menu()
+
+    extra = (
+        "\n\nNeed help preparing or checking your filing?\n"
+        "Reply FT6 for document checklist or FT7 to request human-assisted filing."
+    )
+    return _clip(_guide(guide_key) + extra, 3900)
+
+
+def _filing_request_message_from_command(text: Any) -> str:
+    raw = _clean(text)
+    return re.sub(r"^FT7\b[:\-\s]*", "", raw, flags=re.I).strip()
+
+
+def _filing_subject_from_message(value: Any) -> str:
+    text = _filing_request_message_from_command(value)
+    if not text:
+        return "Human-assisted tax filing request"
+    first_sentence = re.split(r"[\n\r.!?]", text, maxsplit=1)[0].strip()
+    subject = first_sentence or text
+    if not _normalize_text(subject).startswith("filing"):
+        subject = f"Filing assistance: {subject}"
+    return subject[:120]
+
+
+def _filing_request_payloads(
+    *,
+    ticket_id: str,
+    account_id: str,
+    account: Optional[Dict[str, Any]],
+    wa_id: str,
+    message: str,
+    profile_name: str = "",
+) -> List[Dict[str, Any]]:
+    now = _now_iso()
+    clean_message = _filing_request_message_from_command(message)
+    account = account or {}
+    subject = _filing_subject_from_message(clean_message)
+    preview = " ".join(clean_message.split())[:200]
+    plan_code = _current_plan_code(account_id)
+    plan_name = _plan_label(account_id).split("\n", 1)[0]
+    balance = _credit_balance(account_id)
+    display_name = _clean(profile_name or account.get("display_name") or _display_phone(wa_id))
+    metadata = {
+        "created_from": "whatsapp",
+        "request_type": "filing_assistance",
+        "wa_id": _normalize_phone(wa_id),
+        "profile_name": profile_name or None,
+        "flow_version": WHATSAPP_FLOW_VERSION,
+    }
+
+    rich_payload = {
+        "ticket_id": ticket_id,
+        "account_id": account_id,
+        "account_email": _clean(account.get("email")) or None,
+        "account_name": display_name or None,
+        "category": "filing_assistance",
+        "priority": _support_priority_from_text(clean_message),
+        "subject": subject,
+        "message": clean_message,
+        "plan_name": plan_name,
+        "credit_balance": balance,
+        "channel_state": "whatsapp",
+        "status": "open",
+        "created_at": now,
+        "updated_at": now,
+        "last_reply_at": now,
+        "last_reply_by": "user",
+        "last_message_preview": preview,
+        "issue_type": "filing_assistance",
+        "channel": "whatsapp",
+        "source": "whatsapp",
+        "plan_code": plan_code,
+        "metadata": metadata,
+    }
+    mid_payload = {
+        "ticket_id": ticket_id,
+        "account_id": account_id,
+        "category": "filing_assistance",
+        "priority": _support_priority_from_text(clean_message),
+        "subject": subject,
+        "message": clean_message,
+        "status": "open",
+        "created_at": now,
+        "updated_at": now,
+        "last_message_preview": preview,
+        "issue_type": "filing_assistance",
+        "channel": "whatsapp",
+        "source": "whatsapp",
+        "metadata": metadata,
+    }
+    minimal_payload = {
+        "ticket_id": ticket_id,
+        "account_id": account_id,
+        "subject": subject,
+        "message": clean_message,
+        "status": "open",
+        "created_at": now,
+        "updated_at": now,
+    }
+    return [rich_payload, mid_payload, minimal_payload]
+
+
+def _create_filing_request_from_message(
+    *,
+    wa_id: str,
+    account_id: str,
+    account: Optional[Dict[str, Any]],
+    message: str,
+    profile_name: str = "",
+) -> Dict[str, Any]:
+    clean_message = _filing_request_message_from_command(message)
+    if len(clean_message) < 10:
+        _set_session_state(wa_id, context="filing_request", pending_action="filing_request", data={})
+        return {
+            "ok": True,
+            "handled": "filing_request_prompt",
+            "send_result": _send_whatsapp_text(
+                wa_id,
+                "🗂️ *Request Human-Assisted Filing*\n\n"
+                "Please type what you need help filing in one clear message.\n\n"
+                "Example:\n"
+                "I need help filing VAT for my business for April 2026. I have sales invoices and bank records.\n\n"
+                "Reply FT6 for document checklist or CANCEL to stop.",
+            ),
+        }
+
+    ticket_id = _support_ticket_id()
+    insert_result: Dict[str, Any] = {"ok": False}
+    errors: List[str] = []
+    for payload in _filing_request_payloads(
+        ticket_id=ticket_id,
+        account_id=account_id,
+        account=account,
+        wa_id=wa_id,
+        message=clean_message,
+        profile_name=profile_name,
+    ):
+        insert_result = _safe_insert_admin("support_tickets", payload)
+        if insert_result.get("ok"):
+            break
+        errors.append(_clean(insert_result.get("error")))
+
+    _set_session_state(wa_id, context="main", pending_action="", data={})
+
+    if not insert_result.get("ok"):
+        return {
+            "ok": True,
+            "handled": "filing_request_failed",
+            "send_result": _send_whatsapp_text(
+                wa_id,
+                "⚠️ I could not save your filing request right now.\n\n"
+                "Please try again shortly or contact support.\n\n"
+                f"Support email: {_support_to_email()}",
+            ),
+            "debug": {"errors": errors[:3]} if _debug_enabled() else None,
+        }
+
+    body = (
+        "✅ *Filing assistance request created*\n\n"
+        f"Ticket ID: {ticket_id}\n"
+        "Status: open\n\n"
+        f"Request:\n{_clip(clean_message, 1200)}\n\n"
+        "Next step: prepare your documents using FT6. A support/admin user can review and follow up.\n\n"
+        "Reply FT8 to view latest filing request, SUP2 to view all support tickets, or 0 for main menu."
+    )
+    return {"ok": True, "handled": "filing_request_created", "send_result": _send_whatsapp_text(wa_id, _clip(body, 3900))}
+
+
+def _is_filing_ticket(row: Dict[str, Any]) -> bool:
+    metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+    combined = " ".join(
+        _normalize_text(x)
+        for x in (
+            row.get("category"),
+            row.get("issue_type"),
+            row.get("subject"),
+            metadata.get("request_type"),
+        )
+        if x is not None
+    )
+    return "filing" in combined or "tax filing" in combined
+
+
+def _latest_filing_request_text(account_id: str) -> str:
+    rows, err = _support_tickets_for_account(account_id, limit=10)
+    filing_rows = [row for row in rows if _is_filing_ticket(row)]
+    if err:
+        return (
+            "⚠️ I could not load your filing request status right now.\n\n"
+            f"Support email: {_support_to_email()}"
+        )
+    if not filing_rows:
+        return (
+            "🗂️ *Filing Request Status*\n\n"
+            "No human-assisted filing request was found yet.\n\n"
+            "Reply FT7 to create one, FT6 for document checklist, or 0 for main menu."
+        )
+
+    ticket = filing_rows[0]
+    ticket_id = _clean(ticket.get("ticket_id") or ticket.get("id") or "Ticket")
+    status = _clean(ticket.get("status") or "open")
+    subject = _clean(ticket.get("subject") or "Filing assistance request")
+    message = _clean(ticket.get("message") or ticket.get("last_message_preview") or "No message preview.")
+    created = _history_date_label(ticket.get("created_at"))
+    updated = _history_date_label(ticket.get("updated_at"))
+
+    body = (
+        "🗂️ *Latest Filing Request*\n\n"
+        f"Ticket ID: {ticket_id}\n"
+        f"Status: {status}\n"
+        f"Created: {created}\n"
+        f"Updated: {updated}\n\n"
+        f"Subject:\n{_clip(subject, 250)}\n\n"
+        f"Request:\n{_clip(message, 1200)}\n\n"
+        "Reply SUP4 to add more details to this ticket, SUP5 to close it, FT6 for documents, or 0 for main menu."
+    )
+    return _clip(body, 3900)
+
+
+def _handle_filing_assistance_command(
+    wa_id: str,
+    account_id: str,
+    text: str,
+    account: Optional[Dict[str, Any]] = None,
+    profile_name: str = "",
+) -> Dict[str, Any]:
+    norm = _normalize_text(text)
+    if norm in {"file tax", "file taxes", "filing assistance", "filing help", "tax filing help", "tax filing assistance", "ft1", "start filing", "start filing assistance", "start tax filing", "filing start"}:
+        return {"ok": True, "handled": "filing_menu", "send_result": _send_whatsapp_text(wa_id, _filing_assistance_menu())}
+    if norm.startswith("ft2") or norm in {"paye filing help", "paye filing assistance"}:
+        return {"ok": True, "handled": "filing_paye_help", "send_result": _send_whatsapp_text(wa_id, _filing_help_text("ft2"))}
+    if norm.startswith("ft3") or norm in {"vat filing help", "vat filing assistance"}:
+        return {"ok": True, "handled": "filing_vat_help", "send_result": _send_whatsapp_text(wa_id, _filing_help_text("ft3"))}
+    if norm.startswith("ft4") or norm in {"cit filing help", "company tax filing help", "company income tax filing help"}:
+        return {"ok": True, "handled": "filing_cit_help", "send_result": _send_whatsapp_text(wa_id, _filing_help_text("ft4"))}
+    if norm.startswith("ft5") or norm in {"wht filing help", "withholding tax filing help"}:
+        return {"ok": True, "handled": "filing_wht_help", "send_result": _send_whatsapp_text(wa_id, _filing_help_text("ft5"))}
+    if norm.startswith("ft6") or norm in {"document checklist", "filing documents", "filing checklist documents", "tax documents"}:
+        return {"ok": True, "handled": "filing_document_checklist", "send_result": _send_whatsapp_text(wa_id, _filing_document_checklist())}
+    if norm.startswith("ft7") or norm in {"request filing help", "human assisted filing", "request human assisted filing", "request human filing"}:
+        return _create_filing_request_from_message(
+            wa_id=wa_id,
+            account_id=account_id,
+            account=account,
+            message=text,
+            profile_name=profile_name,
+        )
+    if norm.startswith("ft8") or norm in {"filing status", "latest filing request", "my filing request", "filing request status"}:
+        return {"ok": True, "handled": "filing_status", "send_result": _send_whatsapp_text(wa_id, _latest_filing_request_text(account_id))}
+    return {"ok": True, "handled": "filing_menu", "send_result": _send_whatsapp_text(wa_id, _filing_assistance_menu())}
+
+
 # =============================================================================
 # Account/Profile and Settings helpers
 # =============================================================================
@@ -5188,7 +5528,7 @@ def _channel_line(row: Dict[str, Any], index: int) -> str:
 
 
 def _linked_channels_text(account_id: str, wa_id: str = "") -> str:
-    rows, err = _query_many("channel_identities", "*", limit=10, order_col="updated_at", desc=True, account_id=account_id)
+    rows, err = _query_many("channel_identities", "*", limit=10, order_col="linked_at", desc=True, account_id=account_id)
 
     # Fallback by current WhatsApp number when account_id does not return rows.
     if not rows and wa_id:
@@ -5647,7 +5987,7 @@ def _handle_text_message(msg: Dict[str, Any]) -> Dict[str, Any]:
 
     # Only attempt link-code lookup when the user is in the link flow, or when the input
     # is not already recognized as a command/calculator/plan/top-up/tool.
-    if context == "link" or (not is_command_like and context not in {"support_create", "support_reply", "support_close_confirm"}):
+    if context == "link" or (not is_command_like and context not in {"support_create", "support_reply", "support_close_confirm", "filing_request"}):
         link_reply = _try_link_code(wa_id, text, profile_name=profile_name)
         if link_reply:
             _set_session_state(wa_id, "main")
@@ -5694,6 +6034,23 @@ def _handle_text_message(msg: Dict[str, Any]) -> Dict[str, Any]:
             "handled": "email_saved",
             "send_result": _send_whatsapp_text(wa_id, "✅ Email saved successfully.\n\nReply 4 for plans or 6 for Usage Credit add-ons."),
         }
+
+    if context == "filing_request":
+        normalized = _normalize_text(text)
+        if normalized in {"cancel", "stop", "end", "0", "menu", "main", "main menu", "back"}:
+            _set_session_state(wa_id, "main")
+            return {
+                "ok": True,
+                "handled": "filing_request_cancelled",
+                "send_result": _send_whatsapp_text(wa_id, "Filing assistance request cancelled.\n\n" + _main_menu(wa_id, account_id)),
+            }
+        return _create_filing_request_from_message(
+            wa_id=wa_id,
+            account_id=account_id,
+            account=account,
+            message=text,
+            profile_name=profile_name,
+        )
 
     if context == "support_create":
         normalized = _normalize_text(text)
@@ -5865,6 +6222,9 @@ def _handle_text_message(msg: Dict[str, Any]) -> Dict[str, Any]:
     if recognition.get("kind") == "billing_history":
         return _handle_billing_history_command(wa_id, account_id, text)
 
+    if recognition.get("kind") == "filing_assistance":
+        return _handle_filing_assistance_command(wa_id, account_id, text, account=account, profile_name=profile_name)
+
     if recognition.get("kind") == "account_profile":
         return _handle_account_command(wa_id, account_id, text)
 
@@ -5875,7 +6235,7 @@ def _handle_text_message(msg: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "ok": True,
             "handled": "invalid_menu_option",
-            "send_result": _send_whatsapp_text(wa_id, "⚠️ That code/menu option is not available yet, so no AI credit was used.\n\nReply 0 for main menu, F1 for calculators, Q1 for quiz, D1 for reminders, H1 for history, CR1 for credits, SUP1 for support, PAY1 for billing, ACC1 for account, SET1 for settings, or type your Nigerian tax question in words."),
+            "send_result": _send_whatsapp_text(wa_id, "⚠️ That code/menu option is not available yet, so no AI credit was used.\n\nReply 0 for main menu, F1 for calculators, Q1 for quiz, D1 for reminders, H1 for history, CR1 for credits, SUP1 for support, PAY1 for billing, FT1 for filing assistance, ACC1 for account, SET1 for settings, or type your Nigerian tax question in words."),
         }
 
     if recognition["kind"] == "ambiguous":
