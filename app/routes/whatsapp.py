@@ -57,7 +57,7 @@ except Exception:  # pragma: no cover
 
 bp = Blueprint("whatsapp", __name__)
 
-WHATSAPP_FLOW_VERSION = "2026-05-25-v33a-account-resolution-credit-fix"
+WHATSAPP_FLOW_VERSION = "2026-05-25-v33b-q5-explanation-copy-cleanup"
 
 
 # =============================================================================
@@ -3067,15 +3067,9 @@ def _quiz_usage_text() -> str:
 
 def _quiz_static_premium_explanation(question: Dict[str, Any]) -> str:
     base = _clean(question.get("premium_explanation") or question.get("explain") or question.get("short_explanation"))
-    category = _clean(question.get("category") or "General")
     if not base:
-        return "This quiz item is part of the Nigerian tax compliance learning bank. Review the correct option and apply it based on the tax type involved."
-    return _clip(
-        "• " + base + "\n"
-        f"• Category: {category}. This matters because different Nigerian taxes apply to different income, transaction, filing, or compliance situations.\n"
-        "• Use the correct answer as a guide, but confirm current filing dates, rates, and obligations for the exact taxpayer or business case.",
-        900,
-    )
+        return "Review the correct answer and apply it based on the tax type involved."
+    return _clip(base, 900)
 
 
 def _quiz_question_from_db_row(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -3629,7 +3623,7 @@ def _handle_quiz_command(wa_id: str, account_id: str, text: str, state: Dict[str
         _log_quiz_q5_used(attempt_id, debit)
         answer = _clip(explanation, 900)
         body = (
-            "💡 *Q5 Detailed Saved Explanation*\n\n"
+            "💡 *Q5 Detailed Explanation*\n\n"
             f"{answer}\n\n"
             f"💎 Usage Credit deducted: 1\n"
             f"Balance: {debit.get('after')}\n\n"
