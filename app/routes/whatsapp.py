@@ -57,7 +57,7 @@ except Exception:  # pragma: no cover
 
 bp = Blueprint("whatsapp", __name__)
 
-WHATSAPP_FLOW_VERSION = "2026-05-25-v32b-dynamic-quiz-copy-cleanup"
+WHATSAPP_FLOW_VERSION = "2026-05-25-v33-final-whatsapp-qa-stability"
 
 
 # =============================================================================
@@ -1664,6 +1664,8 @@ def _recognize(text: str, context: str = "main") -> Dict[str, Any]:
         return {"kind": "global", "action": "cancel"}
     if norm in {"help", "8"}:
         return {"kind": "main", "action": "help"}
+    if norm in {"all", "commands", "command list", "full commands", "full menu", "list commands", "menu list", "all commands"}:
+        return {"kind": "main", "action": "command_list"}
     if norm in {"q1", "start quiz", "quiz me", "take quiz", "tax quiz"}:
         return {"kind": "quiz_action", "code": "Q1", "action": "q1", "text": raw}
     if norm in {"q2", "quiz rules", "quiz categories", "choose quiz category"}:
@@ -1984,6 +1986,7 @@ def _main_menu(wa_id: str = "", account_id: str = "") -> str:
         "R4 - Referral statistics 📊\n"
         "ACC1 - My account profile 👤\n"
         "SET1 - Notification settings ⚙️\n"
+        "ALL - Full command list 📋\n"
         "0 or MENU - Main menu 🏠\n"
         "* or BACK - Go back ↩️\n"
         "CANCEL - Cancel current flow ❌\n\n"
@@ -2062,6 +2065,7 @@ def _help_text() -> str:
     return (
         "ℹ️ *Help - Naija Tax Guide*\n\n"
         "• Main menu uses numbers 1–8.\n"
+        "• Reply ALL anytime to see the full command list.\n"
         "• Submenus use short codes like S1, T50, F1, C1, Q1, D1, H1, H2, SUP1, CR1, R1, PAY1, FT1, ACC1, and SET1.\n"
         "• Use H1 for recent history and H2 for your last tax answer.\n"
         "• Use SUP1 for support, SUP2 for tickets, SUP3 for latest ticket, SUP4 to reply, SUP5 to close, and SUP6 for support email.\n"
@@ -2076,6 +2080,89 @@ def _help_text() -> str:
         "• AI answers require an active paid plan and Usage Credits. 💎\n"
         "• Web, WhatsApp, and Telegram share one credit wallet when linked. 🔗\n\n"
         "Reply 0 for main menu."
+    )
+
+
+def _all_commands_text() -> str:
+    return (
+        "📋 *Naija Tax Guide Command List*\n\n"
+        "Main menu:\n"
+        "1 - Ask a tax question\n"
+        "2 - Check Usage Credits\n"
+        "3 - Check current plan\n"
+        "4 - View subscription plans\n"
+        "5 - Link/unlink website account\n"
+        "6 - Buy Usage Credit add-ons\n"
+        "7 - Tax tools, filing & quiz\n"
+        "8 - Help\n\n"
+        "Plans:\n"
+        "S1/S2/S3 - Starter monthly/quarterly/yearly\n"
+        "P1/P2/P3 - Professional monthly/quarterly/yearly\n"
+        "B1/B2/B3 - Business monthly/quarterly/yearly\n\n"
+        "Credits and billing:\n"
+        "T10/T50/T100/T500 - Buy credit add-ons\n"
+        "CR1 - Credit balance\n"
+        "CR2 - Recent credit activity\n"
+        "CR3 - AI credit deductions\n"
+        "CR4 - Credit additions/top-ups\n"
+        "PAY1 - Billing summary\n"
+        "PAY2 - Payment history\n"
+        "PAY3 - Latest payment status\n"
+        "PAY4 <reference> - Verify payment reference\n"
+        "PAY5 - Pending plan change\n"
+        "PAY6 - Renewal/expiry date\n\n"
+        "Tax tools and quiz:\n"
+        "F1 - Calculator menu\n"
+        "C1 - PAYE calculator\n"
+        "C2 - Company Income Tax calculator\n"
+        "C3 - VAT calculator\n"
+        "C4 - Withholding Tax calculator\n"
+        "C5 - Salary/net pay comparison\n"
+        "C6 or Q1 - Tax quiz\n"
+        "Q2 - Quiz categories\n"
+        "Q3 - Quiz score\n"
+        "Q4 - Last quiz review\n"
+        "Q5 - Detailed saved quiz explanation\n\n"
+        "Deadlines and history:\n"
+        "D1 - Create reminder\n"
+        "D2 - List reminders\n"
+        "D3 - Delete reminder\n"
+        "D4 - Update reminder\n"
+        "H1 - Recent tax history\n"
+        "H2 - Last tax answer\n\n"
+        "Support, referral, filing, account:\n"
+        "SUP1-SUP6 - Support tickets and support email\n"
+        "R1-R6 - Referral code, link, stats, rewards, payout\n"
+        "FT1-FT8 - Filing assistance and filing requests\n"
+        "ACC1-ACC3 - Account/profile and linked channels\n"
+        "SET1-SET3 - Settings guidance\n\n"
+        "Navigation:\n"
+        "0 or MENU - Main menu\n"
+        "* or BACK - Go back\n"
+        "CANCEL - Cancel current flow"
+    )
+
+
+def _invalid_command_text(value: str = "") -> str:
+    value = _clean(value)
+    shown = f"\n\nReceived: {value}" if value else ""
+    return (
+        "⚠️ That menu code is not available, so no AI credit was used."
+        f"{shown}\n\n"
+        "Useful commands:\n"
+        "0 - Main menu\n"
+        "ALL - Full command list\n"
+        "F1 - Calculators\n"
+        "Q1 - Quiz\n"
+        "D1 - Reminders\n"
+        "H1 - History\n"
+        "CR1 - Credits\n"
+        "SUP1 - Support\n"
+        "PAY1 - Billing\n"
+        "FT1 - Filing assistance\n"
+        "ACC1 - Account\n"
+        "SET1 - Settings\n\n"
+        "You can also type your Nigerian tax question in normal words."
     )
 
 
@@ -6564,7 +6651,7 @@ def _handle_text_message(msg: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "ok": True,
             "handled": "invalid_menu_option",
-            "send_result": _send_whatsapp_text(wa_id, "⚠️ That code/menu option is not available yet, so no AI credit was used.\n\nReply 0 for main menu, F1 for calculators, Q1 for quiz, D1 for reminders, H1 for history, CR1 for credits, SUP1 for support, PAY1 for billing, FT1 for filing assistance, ACC1 for account, SET1 for settings, or type your Nigerian tax question in words."),
+            "send_result": _send_whatsapp_text(wa_id, _invalid_command_text(str(recognition.get("value") or text))),
         }
 
     if recognition["kind"] == "ambiguous":
@@ -6615,6 +6702,9 @@ def _handle_text_message(msg: Dict[str, Any]) -> Dict[str, Any]:
         if action == "help":
             _set_session_state(wa_id, "main")
             return {"ok": True, "handled": "help", "send_result": _send_whatsapp_text(wa_id, _help_text())}
+        if action == "command_list":
+            _set_session_state(wa_id, "main")
+            return {"ok": True, "handled": "command_list", "send_result": _send_whatsapp_text(wa_id, _all_commands_text())}
 
     if recognition["kind"] == "plan":
         _set_session_state(wa_id, "main")
