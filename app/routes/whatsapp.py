@@ -57,7 +57,7 @@ except Exception:  # pragma: no cover
 
 bp = Blueprint("whatsapp", __name__)
 
-WHATSAPP_FLOW_VERSION = "2026-05-25-v33-final-whatsapp-qa-stability"
+WHATSAPP_FLOW_VERSION = "2026-05-25-v33a-account-resolution-credit-fix"
 
 
 # =============================================================================
@@ -1314,12 +1314,72 @@ def _find_account_by_wa(wa_id: str) -> Tuple[Optional[Dict[str, Any]], Dict[str,
     if not wa_id:
         return None, {**debug, "error": "missing_wa_id"}
 
+    # IMPORTANT PRODUCTION RULE:
+    # A WhatsApp number that has been linked from the website must resolve to
+    # the website owner account first.  The web owner account is where the live
+    # subscription, shared Usage Credit balance, history, referrals and support
+    # records belong.
+    #
+    # Earlier batches checked the standalone WhatsApp shell account first
+    # (accounts.provider='wa').  That caused a linked WhatsApp user to keep
+    # seeing 0 credits while the web account had credits, because the bot was
+    # reading account_id from the shell account instead of channel_identities.
+    for channel_type in ("whatsapp", "wa"):
+        identity, err = _query_one("channel_identities", "*", channel_type=channel_type, provider_user_id=wa_id)
+        debug["steps"].append(
+            {
+                "table": "channel_identities",
+                "channel_type": channel_type,
+                "provider_user_id": wa_id,
+                "error": err,
+                "found": bool(identity),
+            }
+        )
+        if identity:
+            account_id = _clean(identity.get("account_id") or identity.get("owner_account_id"))
+            if account_id:
+                row, row_err = _query_one("accounts", _account_select_cols(), account_id=account_id)
+                debug["steps"].append(
+                    {
+                        "table": "accounts",
+                        "via": "channel_identity_owner_first",
+                        "account_id": account_id,
+                        "error": row_err,
+                        "found": bool(row),
+                    }
+                )
+                if row:
+                    resolved = dict(row)
+                    resolved["resolved_via_channel_identity"] = True
+                    resolved["linked_channel_identity_id"] = identity.get("id")
+                    resolved["channel_provider"] = channel_type
+                    resolved["channel_provider_user_id"] = wa_id
+                    resolved["channel_phone"] = identity.get("provider_user_id") or wa_id
+                    return resolved, debug
+                return {
+                    "account_id": account_id,
+                    "id": account_id,
+                    "provider": "web",
+                    "provider_user_id": account_id,
+                    "resolved_via_channel_identity": True,
+                    "linked_channel_identity_id": identity.get("id"),
+                    "channel_provider": channel_type,
+                    "channel_provider_user_id": wa_id,
+                    "channel_phone": identity.get("provider_user_id") or wa_id,
+                }, debug
+
+    # Fallback: some older link attempts stored the website owner account_id on
+    # the WhatsApp shell account auth_user_id.  Keep this fallback, but only
+    # after the canonical channel_identities lookup above.
     for provider in ("wa", "whatsapp"):
         row, err = _query_one("accounts", _account_select_cols(), provider=provider, provider_user_id=wa_id)
         debug["steps"].append({"table": "accounts", "provider": provider, "error": err, "found": bool(row)})
         if row:
             owner = _linked_owner_account_from_channel_account(row, debug)
-            return (owner or row), debug
+            if owner:
+                owner["resolved_via_channel_account_fallback"] = True
+                return owner, debug
+            return row, debug
 
     for column in ("phone_e164", "phone"):
         for value in (_display_phone(wa_id), wa_id):
@@ -1328,18 +1388,6 @@ def _find_account_by_wa(wa_id: str) -> Tuple[Optional[Dict[str, Any]], Dict[str,
             if row:
                 owner = _linked_owner_account_from_channel_account(row, debug)
                 return (owner or row), debug
-
-    for channel_type in ("whatsapp", "wa"):
-        identity, err = _query_one("channel_identities", "*", channel_type=channel_type, provider_user_id=wa_id)
-        debug["steps"].append({"table": "channel_identities", "channel_type": channel_type, "error": err, "found": bool(identity)})
-        if identity:
-            account_id = _clean(identity.get("account_id") or identity.get("owner_account_id"))
-            if account_id:
-                row, row_err = _query_one("accounts", _account_select_cols(), account_id=account_id)
-                debug["steps"].append({"table": "accounts", "account_id": account_id, "error": row_err, "found": bool(row)})
-                if row:
-                    return row, debug
-                return {"account_id": account_id, "provider": "wa", "provider_user_id": wa_id}, debug
 
     return None, debug
 
@@ -1350,6 +1398,18 @@ def _create_or_update_wa_account(wa_id: str, profile_name: str = "") -> Tuple[Op
 
     existing, debug = _find_account_by_wa(wa_id)
     if existing:
+        # If the user is linked through channel_identities, do NOT convert or
+        # overwrite the web owner account as a WhatsApp account.  Only refresh
+        # the channel identity last_seen_at for tracking.
+        if existing.get("resolved_via_channel_identity"):
+            identity_id = _clean(existing.get("linked_channel_identity_id"))
+            if identity_id:
+                channel_payload: Dict[str, Any] = {"last_seen_at": now_iso}
+                if profile_name:
+                    channel_payload["metadata"] = {"display_name": profile_name, "last_seen_via": "whatsapp_webhook"}
+                _safe_update("channel_identities", channel_payload, id=identity_id)
+            return existing, {**debug, "created": False, "resolved_account_scope": "web_owner_from_channel_identity"}
+
         account_id = _account_id_from_row(existing)
         update_payload = {
             "provider": existing.get("provider") or "wa",
