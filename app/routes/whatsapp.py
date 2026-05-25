@@ -39,7 +39,7 @@ except Exception:  # pragma: no cover
 
 bp = Blueprint("whatsapp", __name__)
 
-WHATSAPP_FLOW_VERSION = "2026-05-25-v25-support-basic-history-clean"
+WHATSAPP_FLOW_VERSION = "2026-05-25-v26-credit-activity-support-history"
 
 
 # =============================================================================
@@ -1512,11 +1512,13 @@ def _recognize(text: str, context: str = "main") -> Dict[str, Any]:
     # Exact/prefix command recognition must run before natural question fallback.
     # This guarantees "C1 986000", "D1 PAYE ...", and "Q1" are handled as
     # structured WhatsApp commands, not link codes and not AI questions.
-    prefix_match = re.match(r"^(sup[1236]|s[1-3]|p[1-3]|b[1-3]|t(?:10|50|100|500)|f[1-8]|c[1-8]|q[1-5]|d[1-4]|h[1-2])\b", norm)
+    prefix_match = re.match(r"^(sup[1236]|cr[1-4]|s[1-3]|p[1-3]|b[1-3]|t(?:10|50|100|500)|f[1-8]|c[1-8]|q[1-5]|d[1-4]|h[1-2])\b", norm)
     if prefix_match:
         code = prefix_match.group(1).upper()
         if code in {"SUP1", "SUP2", "SUP3", "SUP6"}:
             return {"kind": "support", "action": code.lower(), "code": code, "text": raw}
+        if code in {"CR1", "CR2", "CR3", "CR4"}:
+            return {"kind": "credit_activity", "action": code.lower(), "code": code, "text": raw}
         if code in PLAN_OPTIONS:
             return {"kind": "plan", "code": code}
         if code in TOPUP_OPTIONS:
@@ -1536,7 +1538,7 @@ def _recognize(text: str, context: str = "main") -> Dict[str, Any]:
     # Examples: C9, F11, Q9, D9, S9, T20, SUP4 before support replies are enabled.
     if re.match(r"^sup\d+\b", norm):
         return {"kind": "invalid_menu", "action": "invalid_command", "value": raw}
-    if re.match(r"^(?:s|p|b|t|f|c|q|d|h)\d+\b", norm):
+    if re.match(r"^(?:s|p|b|t|f|c|q|d|h|cr)\d+\b", norm):
         return {"kind": "invalid_menu", "action": "invalid_command", "value": raw}
 
     if norm in {"0", "menu", "main", "main menu", "start", "hello", "hi"}:
@@ -1563,6 +1565,16 @@ def _recognize(text: str, context: str = "main") -> Dict[str, Any]:
         return {"kind": "history", "action": "h1", "code": "H1"}
     if norm in {"h2", "last answer", "last tax answer", "last history", "latest answer", "latest tax answer"}:
         return {"kind": "history", "action": "h2", "code": "H2"}
+    if norm in {"credits activity", "credit activity", "credit menu", "usage activity", "usage credit activity"}:
+        return {"kind": "credit_activity", "action": "menu", "code": "CR", "text": raw}
+    if norm in {"cr1", "credit balance", "usage credit balance", "my credit balance"}:
+        return {"kind": "credit_activity", "action": "cr1", "code": "CR1", "text": raw}
+    if norm in {"cr2", "recent credit activity", "recent credits", "credit logs", "credit history"}:
+        return {"kind": "credit_activity", "action": "cr2", "code": "CR2", "text": raw}
+    if norm in {"cr3", "ai credit deductions", "credit deductions", "deductions", "credits deducted"}:
+        return {"kind": "credit_activity", "action": "cr3", "code": "CR3", "text": raw}
+    if norm in {"cr4", "credit additions", "topup history", "top-up history", "credit topups", "credit top-ups"}:
+        return {"kind": "credit_activity", "action": "cr4", "code": "CR4", "text": raw}
     if norm in {"support", "help support", "support menu", "customer support", "contact support"}:
         return {"kind": "support", "action": "menu", "code": "SUP", "text": raw}
     if norm in {"sup1", "create ticket", "open ticket", "new ticket", "support ticket"}:
@@ -3725,6 +3737,141 @@ def _handle_support_command(
         return {"ok": True, "handled": "support_contact", "send_result": _send_whatsapp_text(wa_id, _support_contact_text())}
     return {"ok": True, "handled": "support_menu", "send_result": _send_whatsapp_text(wa_id, _support_menu())}
 
+
+# =============================================================================
+# WhatsApp Credit Activity helpers
+# =============================================================================
+
+def _credit_activity_menu() -> str:
+    return (
+        "💎 *Credit Activity*\n\n"
+        "CR1 - Credit balance\n"
+        "CR2 - Recent credit activity\n"
+        "CR3 - AI credit deductions\n"
+        "CR4 - Credit additions / top-up history\n\n"
+        "Reply with CR1, CR2, CR3, or CR4.\n"
+        "Reply 0 for main menu."
+    )
+
+
+def _safe_int_value(value: Any, default: int = 0) -> int:
+    try:
+        if value is None or value == "":
+            return default
+        return int(float(str(value)))
+    except Exception:
+        return default
+
+
+def _credit_delta_label(delta: Any) -> str:
+    value = _safe_int_value(delta, 0)
+    if value > 0:
+        return f"+{value}"
+    return str(value)
+
+
+def _credit_activity_rows(account_id: str, limit: int = 10) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    try:
+        q = (
+            _admin_sb()
+            .table("credit_usage_logs")
+            .select("account_id,reference,action_code,description,channel,credits_delta,balance_after,metadata,created_at")
+            .eq("account_id", account_id)
+            .order("created_at", desc=True)
+            .limit(max(1, min(limit, 30)))
+        )
+        res = q.execute()
+        rows = getattr(res, "data", None) or []
+        return [row for row in rows if isinstance(row, dict)], None
+    except Exception as exc:
+        return [], f"credit_usage_logs: {type(exc).__name__}: {_clip(exc)}"
+
+
+def _credit_activity_line(row: Dict[str, Any], index: int) -> str:
+    action = _clean(row.get("action_code") or "credit_activity")
+    desc = _clean(row.get("description") or action.replace("_", " ").title())
+    channel = _clean(row.get("channel") or "app")
+    created = _history_date_label(row.get("created_at"))
+    delta = _credit_delta_label(row.get("credits_delta"))
+    balance_after = row.get("balance_after")
+    balance_text = ""
+    if balance_after is not None:
+        balance_text = f" | balance: {_safe_int_value(balance_after, 0)}"
+    ref = _clean(row.get("reference"))
+    ref_text = f"\n   Ref: {_clip(ref, 80)}" if ref else ""
+    return f"{index}. {delta} credit(s) - {_clip(desc, 100)}\n   {created} | {channel}{balance_text}{ref_text}"
+
+
+def _credit_balance_text(account_id: str) -> str:
+    balance = _credit_balance(account_id)
+    plan = _plan_label(account_id).split("\n", 1)[0]
+    return (
+        "💎 *Usage Credit Balance*\n\n"
+        f"Available balance: {balance}\n"
+        f"Current plan: {plan}\n\n"
+        "Use CR2 to view recent credit activity.\n"
+        "Use CR3 to view AI credit deductions.\n"
+        "Use CR4 to view credit additions/top-ups.\n\n"
+        "Reply 0 for main menu."
+    )
+
+
+def _credit_activity_text(account_id: str, mode: str = "all") -> str:
+    rows, err = _credit_activity_rows(account_id, limit=20)
+    if err:
+        return (
+            "⚠️ I could not load your credit activity right now.\n\n"
+            "Please try again shortly, or reply SUP1 to contact support."
+        )
+
+    title = "📒 *Recent Credit Activity*"
+    empty = "No credit activity log found yet."
+
+    if mode == "debits":
+        rows = [r for r in rows if _safe_int_value(r.get("credits_delta"), 0) < 0]
+        title = "📉 *AI Credit Deductions*"
+        empty = "No AI credit deduction log found yet."
+    elif mode == "credits":
+        rows = [r for r in rows if _safe_int_value(r.get("credits_delta"), 0) > 0]
+        title = "📈 *Credit Additions / Top-ups*"
+        empty = "No credit addition or top-up log found yet."
+
+    rows = rows[:5]
+    if not rows:
+        return (
+            f"{title}\n\n"
+            f"{empty}\n\n"
+            f"Current balance: {_credit_balance(account_id)}\n\n"
+            "Reply CR1 for balance or 0 for main menu."
+        )
+
+    lines = [title, ""]
+    for index, row in enumerate(rows, start=1):
+        lines.append(_credit_activity_line(row, index))
+    lines.extend([
+        "",
+        f"Current balance: {_credit_balance(account_id)}",
+        "",
+        "Reply CR1 for balance, CR3 for deductions, CR4 for additions, or 0 for main menu.",
+    ])
+    return _clip("\n".join(lines), 3900)
+
+
+def _handle_credit_activity_command(wa_id: str, account_id: str, text: str) -> Dict[str, Any]:
+    norm = _normalize_text(text)
+    if norm in {"credits activity", "credit activity", "credit menu", "usage activity", "usage credit activity"}:
+        return {"ok": True, "handled": "credit_activity_menu", "send_result": _send_whatsapp_text(wa_id, _credit_activity_menu())}
+    if norm in {"cr1", "credit balance", "usage credit balance", "my credit balance"}:
+        return {"ok": True, "handled": "credit_balance", "send_result": _send_whatsapp_text(wa_id, _credit_balance_text(account_id))}
+    if norm in {"cr2", "recent credit activity", "recent credits", "credit logs", "credit history"}:
+        return {"ok": True, "handled": "credit_activity_recent", "send_result": _send_whatsapp_text(wa_id, _credit_activity_text(account_id, mode="all"))}
+    if norm in {"cr3", "ai credit deductions", "credit deductions", "deductions", "credits deducted"}:
+        return {"ok": True, "handled": "credit_activity_debits", "send_result": _send_whatsapp_text(wa_id, _credit_activity_text(account_id, mode="debits"))}
+    if norm in {"cr4", "credit additions", "topup history", "top-up history", "credit topups", "credit top-ups"}:
+        return {"ok": True, "handled": "credit_activity_credits", "send_result": _send_whatsapp_text(wa_id, _credit_activity_text(account_id, mode="credits"))}
+    return {"ok": True, "handled": "credit_activity_menu", "send_result": _send_whatsapp_text(wa_id, _credit_activity_menu())}
+
+
 # =============================================================================
 # Core action handlers
 # =============================================================================
@@ -4029,7 +4176,7 @@ def _handle_text_message(msg: Dict[str, Any]) -> Dict[str, Any]:
     # This prevents values like C3 985000 or C3985000 from being queried as link codes,
     # and prevents free calculators from falling through to AI credit deduction.
     recognition = _recognize(text, context)
-    is_command_like = recognition.get("kind") in {"global", "main", "plan", "topup", "tool", "calc", "quiz_action", "deadline", "history", "support", "ambiguous", "invalid_menu"}
+    is_command_like = recognition.get("kind") in {"global", "main", "plan", "topup", "tool", "calc", "quiz_action", "deadline", "history", "support", "credit_activity", "ambiguous", "invalid_menu"}
 
     # Only attempt link-code lookup when the user is in the link flow, or when the input
     # is not already recognized as a command/calculator/plan/top-up/tool.
@@ -4206,11 +4353,14 @@ def _handle_text_message(msg: Dict[str, Any]) -> Dict[str, Any]:
     if recognition.get("kind") == "support":
         return _handle_support_command(wa_id, account_id, text, account=account, profile_name=profile_name)
 
+    if recognition.get("kind") == "credit_activity":
+        return _handle_credit_activity_command(wa_id, account_id, text)
+
     if recognition["kind"] == "invalid_menu":
         return {
             "ok": True,
             "handled": "invalid_menu_option",
-            "send_result": _send_whatsapp_text(wa_id, "⚠️ That code/menu option is not available yet, so no AI credit was used.\n\nReply 0 for main menu, F1 for calculators, Q1 for quiz, D1 for reminders, H1 for history, SUP1 for support, or type your Nigerian tax question in words."),
+            "send_result": _send_whatsapp_text(wa_id, "⚠️ That code/menu option is not available yet, so no AI credit was used.\n\nReply 0 for main menu, F1 for calculators, Q1 for quiz, D1 for reminders, H1 for history, CR1 for credits, SUP1 for support, or type your Nigerian tax question in words."),
         }
 
     if recognition["kind"] == "ambiguous":
