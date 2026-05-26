@@ -41,7 +41,7 @@ from app.services.tax_filing_service import (
 
 bp = Blueprint("telegram", __name__)
 
-TELEGRAM_ROUTE_VERSION = "2026-05-26-v34a-telegram-supabase-client-fix"
+TELEGRAM_ROUTE_VERSION = "2026-05-26-v34b-telegram-link-persistence-fix"
 
 LINK_CODE_RE = re.compile(r"^[A-Z0-9]{8}$")
 MENU_NUMBER_RE = re.compile(r"^[1-8]$")
@@ -107,7 +107,7 @@ def telegram_health():
             "service": "telegram",
             "version": TELEGRAM_ROUTE_VERSION,
             "route_mount": "/api/telegram/*",
-            "account_resolution": "channel_identities_first",
+            "account_resolution": "channel_identities_first_accounts_auth_fallback",
             "configured": {
                 "bot_token": _env_present("TELEGRAM_BOT_TOKEN", "TG_BOT_TOKEN", "TELEGRAM_TOKEN"),
                 "webhook_secret": _env_present("TELEGRAM_WEBHOOK_SECRET", "TG_WEBHOOK_SECRET"),
@@ -135,6 +135,195 @@ def _get_telegram_identity(provider_user_id: str) -> Optional[dict[str, Any]]:
     if row and row.get("account_id"):
         return row
     return None
+
+
+def _get_telegram_account_row(provider_user_id: str) -> Optional[dict[str, Any]]:
+    provider_user_id = _clean_text(provider_user_id)
+    if not provider_user_id:
+        return None
+
+    try:
+        resp = (
+            supabase.table("accounts")
+            .select("*")
+            .eq("provider", "tg")
+            .eq("provider_user_id", provider_user_id)
+            .limit(1)
+            .execute()
+        )
+        return _first(resp)
+    except Exception:
+        logging.exception("Telegram account row lookup failed")
+        return None
+
+
+def _effective_account_id_from_tg_account(row: Optional[dict[str, Any]]) -> Optional[str]:
+    """
+    For provider=tg rows:
+      - auth_user_id is the linked website owner account.
+      - account_id/id can be only the standalone Telegram shell account.
+
+    Therefore auth_user_id must be preferred whenever it exists.
+    """
+    if not isinstance(row, dict):
+        return None
+
+    for key in ("auth_user_id", "account_id", "id"):
+        value = _clean_text(row.get(key))
+        if value:
+            return value
+
+    return None
+
+
+def _clear_telegram_account_auth(provider_user_id: str) -> None:
+    provider_user_id = _clean_text(provider_user_id)
+    if not provider_user_id:
+        return
+
+    try:
+        supabase.table("accounts").update(
+            {
+                "auth_user_id": None,
+                "updated_at": _utc_now_iso(),
+            }
+        ).eq("provider", "tg").eq("provider_user_id", provider_user_id).execute()
+    except Exception:
+        logging.exception("Telegram accounts.auth_user_id clear failed")
+
+
+def _set_telegram_account_auth(provider_user_id: str, account_id: str, display_name: Optional[str] = None) -> None:
+    provider_user_id = _clean_text(provider_user_id)
+    account_id = _clean_text(account_id)
+    if not provider_user_id or not account_id:
+        return
+
+    try:
+        # Ensure the provider=tg row exists first.
+        try:
+            upsert_account(provider="tg", provider_user_id=provider_user_id, display_name=display_name, phone=None)
+        except Exception:
+            logging.exception("Telegram account upsert before auth link failed")
+
+        patch: dict[str, Any] = {
+            "auth_user_id": account_id,
+            "updated_at": _utc_now_iso(),
+        }
+        if display_name:
+            patch["display_name"] = display_name
+
+        supabase.table("accounts").update(patch).eq("provider", "tg").eq("provider_user_id", provider_user_id).execute()
+    except Exception:
+        logging.exception("Telegram accounts.auth_user_id set failed")
+
+
+def _ensure_telegram_channel_identity(
+    *,
+    account_id: str,
+    provider_user_id: str,
+    display_name: Optional[str] = None,
+    source: str = "telegram_link_persistence",
+) -> dict[str, Any]:
+    """
+    Persist the durable link in channel_identities.
+
+    The old RPC/account fallback can report "linked successfully" without a
+    channel_identities row. The web Channels page and the Telegram resolver
+    both need channel_identities, so we create it here after successful code
+    consumption.
+    """
+    account_id = _clean_text(account_id)
+    provider_user_id = _clean_text(provider_user_id)
+
+    if not account_id or not provider_user_id:
+        return {"ok": False, "reason": "missing_account_or_provider_user_id"}
+
+    now = _utc_now_iso()
+
+    # Enforce one Telegram identity per Telegram user and one Telegram identity per account.
+    for field, value in (("provider_user_id", provider_user_id), ("account_id", account_id)):
+        try:
+            supabase.table("channel_identities").delete().eq("channel_type", "telegram").eq(field, value).execute()
+        except Exception:
+            logging.exception("Telegram channel identity cleanup failed for %s=%s", field, value)
+
+    base_payload: dict[str, Any] = {
+        "account_id": account_id,
+        "channel_type": "telegram",
+        "provider_user_id": provider_user_id,
+    }
+
+    metadata = {
+        "source": source,
+        "display_name": display_name,
+        "linked_at": now,
+    }
+
+    # Column-safe attempts. Different table revisions may not have every column.
+    payload_attempts: list[dict[str, Any]] = [
+        {
+            **base_payload,
+            "is_verified": True,
+            "verified": True,
+            "value": provider_user_id,
+            "metadata": metadata,
+            "created_at": now,
+            "updated_at": now,
+            "last_seen_at": now,
+        },
+        {
+            **base_payload,
+            "is_verified": True,
+            "metadata": metadata,
+            "updated_at": now,
+            "last_seen_at": now,
+        },
+        {
+            **base_payload,
+            "metadata": metadata,
+            "updated_at": now,
+            "last_seen_at": now,
+        },
+        base_payload,
+    ]
+
+    last_error = None
+    for payload in payload_attempts:
+        ok, resp, err = _safe_exec(supabase.table("channel_identities").insert(payload))
+        if ok:
+            row = _first(resp)
+            return {"ok": True, "row": row, "payload_keys": sorted(payload.keys())}
+        last_error = err
+
+    return {"ok": False, "reason": "insert_failed", "error": last_error}
+
+
+def _persist_successful_telegram_link(
+    *,
+    account_id: str,
+    provider_user_id: str,
+    display_name: Optional[str] = None,
+) -> dict[str, Any]:
+    account_id = _clean_text(account_id)
+    provider_user_id = _clean_text(provider_user_id)
+
+    if not account_id or not provider_user_id:
+        return {"ok": False, "reason": "missing_account_or_provider_user_id"}
+
+    _set_telegram_account_auth(provider_user_id, account_id, display_name=display_name)
+    identity_result = _ensure_telegram_channel_identity(
+        account_id=account_id,
+        provider_user_id=provider_user_id,
+        display_name=display_name,
+        source="consume_link_token_success",
+    )
+
+    return {
+        "ok": bool(identity_result.get("ok")),
+        "account_id": account_id,
+        "provider_user_id": provider_user_id,
+        "identity_result": identity_result,
+    }
 
 
 def _touch_telegram_identity(identity: dict[str, Any], display_name: Optional[str] = None) -> None:
@@ -192,7 +381,27 @@ def _resolve_telegram_account(*, tg_user_id: str, display_name: Optional[str] = 
     if not lk.get("ok"):
         return {"ok": False, "reason": "lookup_account_not_ok", "lookup": lk}
 
-    account_id = lk.get("account_id") or lk.get("id") or lk.get("auth_user_id") or tg_user_id
+    row = lk.get("row") if isinstance(lk.get("row"), dict) else _get_telegram_account_row(tg_user_id)
+    auth_user_id = _clean_text((row or {}).get("auth_user_id") or lk.get("auth_user_id"))
+
+    # If auth_user_id exists, this Telegram row is already linked to a website account.
+    # Prefer it over the Telegram shell account_id/id.
+    if auth_user_id:
+        identity_result = _ensure_telegram_channel_identity(
+            account_id=auth_user_id,
+            provider_user_id=tg_user_id,
+            display_name=display_name,
+            source="accounts_auth_user_id_fallback",
+        )
+        return {
+            "ok": True,
+            "account_id": auth_user_id,
+            "linked": True,
+            "identity": identity_result.get("row"),
+            "source": "accounts_auth_user_id_fallback",
+        }
+
+    account_id = _effective_account_id_from_tg_account(row) or lk.get("account_id") or lk.get("id") or tg_user_id
 
     return {
         "ok": True,
@@ -205,21 +414,33 @@ def _resolve_telegram_account(*, tg_user_id: str, display_name: Optional[str] = 
 
 def _unlink_telegram_identity(tg_user_id: str) -> dict[str, Any]:
     identity = _get_telegram_identity(tg_user_id)
-    if not identity:
+    unlinked = False
+    account_id = None
+
+    if identity:
+        identity_id = identity.get("id")
+        account_id = identity.get("account_id")
+        if identity_id:
+            ok, _, err = _safe_exec(supabase.table("channel_identities").delete().eq("id", identity_id))
+            if not ok:
+                return {"ok": False, "reason": "delete_failed", "error": err}
+            unlinked = True
+
+    # Also clear the legacy accounts.auth_user_id fallback so a Telegram account
+    # cannot remain silently linked after channel_identities is removed.
+    tg_row = _get_telegram_account_row(tg_user_id)
+    if tg_row and _clean_text(tg_row.get("auth_user_id")):
+        account_id = account_id or tg_row.get("auth_user_id")
+        _clear_telegram_account_auth(tg_user_id)
+        unlinked = True
+
+    if not unlinked:
         return {"ok": True, "unlinked": False, "reason": "not_linked"}
 
-    identity_id = identity.get("id")
-    if not identity_id:
-        return {"ok": False, "reason": "missing_identity_id"}
-
-    ok, _, err = _safe_exec(supabase.table("channel_identities").delete().eq("id", identity_id))
-    if not ok:
-        return {"ok": False, "reason": "delete_failed", "error": err}
-
-    return {"ok": True, "unlinked": True, "account_id": identity.get("account_id")}
+    return {"ok": True, "unlinked": True, "account_id": account_id}
 
 
-def _try_consume_link_code(provider_user_id: str, raw_text: str) -> dict[str, Any]:
+def _try_consume_link_code(provider_user_id: str, raw_text: str, display_name: Optional[str] = None) -> dict[str, Any]:
     code = (raw_text or "").strip().upper()
     if not LINK_CODE_RE.match(code):
         return {"ok": False, "reason": "not_a_code"}
@@ -246,7 +467,20 @@ def _try_consume_link_code(provider_user_id: str, raw_text: str) -> dict[str, An
 
     linked_account_id = row.get("account_id") or row.get("auth_user_id") or row.get("user_id")
     if row.get("ok") is True and linked_account_id:
-        return {"ok": True, "account_id": linked_account_id, "rpc": row}
+        persist_result = _persist_successful_telegram_link(
+            account_id=str(linked_account_id),
+            provider_user_id=provider_user_id,
+            display_name=display_name,
+        )
+        if not persist_result.get("ok"):
+            return {
+                "ok": False,
+                "reason": "link_persistence_failed",
+                "account_id": linked_account_id,
+                "rpc": row,
+                "persist_result": persist_result,
+            }
+        return {"ok": True, "account_id": linked_account_id, "rpc": row, "persist_result": persist_result}
 
     return {"ok": False, "reason": row.get("reason") or "consume_failed", "rpc": row}
 
@@ -711,9 +945,9 @@ def tg_webhook():
         return jsonify({"ok": True})
 
     if LINK_CODE_RE.match(text.upper()):
-        attempt = _try_consume_link_code(tg_user_id, text)
+        attempt = _try_consume_link_code(tg_user_id, text, display_name=display_name)
         if attempt.get("ok"):
-            send_telegram_text(chat_id_str, "✅ *Telegram linked successfully!*\n\nYour Telegram account is now connected to the website workspace. Your plan and Usage Credits will now sync here.")
+            send_telegram_text(chat_id_str, "✅ *Telegram linked successfully!*\n\nYour Telegram account is now connected to the website workspace. Your plan and Usage Credits will now sync here.\n\nReply 0 to refresh your menu, or reply 2 to check Usage Credits.")
             return jsonify({"ok": True, "linked": True, "account_id": attempt.get("account_id")})
         send_telegram_text(chat_id_str, "❌ *Invalid or expired link code*\n\nPlease generate a fresh Telegram code from the website Channels page and send it here.\n\nReply 0 for main menu.")
         return jsonify({"ok": True, "linked": False, "reason": attempt.get("reason")})
