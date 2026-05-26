@@ -1,3 +1,4 @@
+# app/routes/link.py
 from __future__ import annotations
 
 import hashlib
@@ -22,7 +23,7 @@ except Exception:
 # prefixes. Therefore routes below include /link directly.
 bp = Blueprint("link", __name__)
 
-LINK_ROUTE_VERSION = "generate_alias_safe_v6b-used-at-only-api-link-path"
+LINK_ROUTE_VERSION = "2026-05-26-v6c-telegram-web-verification-status-cleanup"
 CODE_LENGTH = int(os.getenv("LINK_CODE_LENGTH", "8"))
 CODE_TTL_MINUTES = int(os.getenv("LINK_CODE_TTL_MINUTES", "30"))
 CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
@@ -105,6 +106,24 @@ def _json_error(message: str, status: int = 400, **extra: Any):
     }
     payload.update(extra)
     return jsonify(payload), status
+
+
+def _clean(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+
+    if value is None:
+        return False
+
+    if isinstance(value, (int, float)):
+        return value != 0
+
+    text = str(value).strip().lower()
+    return text in {"true", "1", "yes", "y", "verified", "linked", "active"}
 
 
 # -----------------------------------------------------------------------------
@@ -240,6 +259,33 @@ def _fallback_account_for_channel(
     return None
 
 
+def _identity_verified(row: dict[str, Any], channel_type: str) -> bool:
+    """
+    Batch 27B3:
+    Telegram Batch 27B2 may create a minimal channel_identities row because the
+    table rejected richer payloads. If the row exists and has provider_user_id,
+    the link is already durable and should be shown as verified on the web page.
+
+    WhatsApp remains compatible with richer is_verified/verified columns, but
+    also treats a durable identity row with provider_user_id as verified because
+    the bot-side link was already confirmed before the row was written.
+    """
+
+    if _truthy(row.get("is_verified")) or _truthy(row.get("verified")):
+        return True
+
+    if _clean(row.get("provider_user_id")):
+        return True
+
+    if channel_type == "telegram" and (_clean(row.get("value")) or _clean(row.get("username"))):
+        return True
+
+    if channel_type == "whatsapp" and (_clean(row.get("value")) or _clean(row.get("phone"))):
+        return True
+
+    return False
+
+
 def _status_object(
     db: Any,
     account_id: str,
@@ -249,14 +295,38 @@ def _status_object(
     row = _identity_for_channel(db, account_id, channel_type)
 
     if row:
-        provider_user_id = row.get("provider_user_id")
+        provider_user_id = (
+            row.get("provider_user_id")
+            or row.get("value")
+            or row.get("username")
+            or row.get("phone")
+        )
         metadata = row.get("metadata") or {}
 
         if not isinstance(metadata, dict):
             metadata = {}
 
-        verified = bool(row.get("is_verified") or row.get("verified"))
-        updated_at = row.get("last_seen_at") or row.get("linked_at") or row.get("updated_at")
+        verified = _identity_verified(row, channel_type)
+        updated_at = (
+            row.get("last_seen_at")
+            or row.get("linked_at")
+            or row.get("updated_at")
+            or row.get("created_at")
+        )
+
+        phone = None
+        username = None
+
+        if channel_type == "whatsapp":
+            phone = row.get("phone") or row.get("value") or provider_user_id
+        elif channel_type == "telegram":
+            username = (
+                metadata.get("username")
+                or row.get("username")
+                or row.get("value")
+                or provider_user_id
+            )
+            phone = metadata.get("phone")
 
         return {
             "linked": True,
@@ -264,12 +334,13 @@ def _status_object(
             "is_verified": verified,
             "value": provider_user_id,
             "provider_user_id": provider_user_id,
-            "phone": provider_user_id if channel_type == "whatsapp" else metadata.get("phone"),
-            "username": metadata.get("username")
-            or (provider_user_id if channel_type == "telegram" else None),
-            "display_name": metadata.get("display_name"),
+            "phone": phone,
+            "username": username,
+            "display_name": metadata.get("display_name") or row.get("display_name"),
             "updated_at": updated_at,
-            "last_seen_at": row.get("last_seen_at"),
+            "last_seen_at": row.get("last_seen_at") or updated_at,
+            "status": "linked" if verified else "pending_verification",
+            "verification_status": "verified" if verified else "pending",
         }
 
     fallback = _fallback_account_for_channel(db, account_id, provider)
@@ -284,11 +355,15 @@ def _status_object(
             "is_verified": True,
             "value": provider_user_id,
             "provider_user_id": provider_user_id,
-            "phone": fallback.get("phone_e164") or fallback.get("phone") or provider_user_id,
+            "phone": fallback.get("phone_e164") or fallback.get("phone") or (
+                provider_user_id if channel_type == "whatsapp" else None
+            ),
             "username": provider_user_id if channel_type == "telegram" else None,
             "display_name": fallback.get("display_name"),
             "updated_at": updated_at,
             "last_seen_at": updated_at,
+            "status": "linked",
+            "verification_status": "verified",
         }
 
     return {
@@ -302,6 +377,8 @@ def _status_object(
         "display_name": None,
         "updated_at": None,
         "last_seen_at": None,
+        "status": "not_linked",
+        "verification_status": "not_verified",
     }
 
 
@@ -326,6 +403,8 @@ def _build_status(account_id: str) -> dict[str, Any]:
         "telegram_verified": bool(telegram.get("verified")),
         "telegram_username": telegram.get("username") or telegram.get("provider_user_id"),
         "telegram_updated_at": telegram.get("updated_at"),
+
+        "route_version": LINK_ROUTE_VERSION,
     }
 
 
@@ -445,6 +524,7 @@ def health():
             "version": LINK_ROUTE_VERSION,
             "token_schema": "used_at_only",
             "route_mount": "/api/link/*",
+            "status_policy": "durable_channel_identity_is_verified",
         }
     )
 
