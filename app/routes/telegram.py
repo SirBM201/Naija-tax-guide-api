@@ -41,7 +41,7 @@ from app.services.tax_filing_service import (
 
 bp = Blueprint("telegram", __name__)
 
-TELEGRAM_ROUTE_VERSION = "2026-05-26-v34b-telegram-link-persistence-fix"
+TELEGRAM_ROUTE_VERSION = "2026-05-26-v34c-telegram-command-namespace-cleanup"
 
 LINK_CODE_RE = re.compile(r"^[A-Z0-9]{8}$")
 MENU_NUMBER_RE = re.compile(r"^[1-8]$")
@@ -108,6 +108,7 @@ def telegram_health():
             "version": TELEGRAM_ROUTE_VERSION,
             "route_mount": "/api/telegram/*",
             "account_resolution": "channel_identities_first_accounts_auth_fallback",
+            "command_namespace": "ALL_CR_PAY_ACC_SET",
             "configured": {
                 "bot_token": _env_present("TELEGRAM_BOT_TOKEN", "TG_BOT_TOKEN", "TELEGRAM_TOKEN"),
                 "webhook_secret": _env_present("TELEGRAM_WEBHOOK_SECRET", "TG_WEBHOOK_SECRET"),
@@ -503,6 +504,11 @@ def _send_main_menu(chat_id: str, *, linked: bool = False) -> None:
         "7️⃣ Tax filing & management 🗂️\n"
         "8️⃣ Help / Menu ℹ️\n\n"
         "Quick commands:\n"
+        "ALL - Show all Telegram commands\n"
+        "CR1 - Credit balance\n"
+        "PAY1 - Current plan\n"
+        "ACC1 - Account/channel status\n"
+        "SET1 - Settings help\n"
         "0 or MENU - Main menu 🏠\n"
         "UNLINK - Disconnect Telegram from website account\n\n"
         "You can also type your Nigerian tax question directly."
@@ -531,12 +537,13 @@ def _send_help(chat_id: str, *, linked: bool = False) -> None:
         "*📖 Help Guide*\n\n"
         "• Ask tax questions: type your question naturally.\n"
         "  Example: What is PAYE tax?\n\n"
-        "• Check Usage Credits: reply 2\n"
-        "• View current plan: reply 3\n"
-        "• View/upgrade plans: reply 4\n"
-        f"• {option_5}: reply 5\n"
-        "• Buy Usage Credit add-ons: reply 6\n"
+        "• Check Usage Credits: reply 2 or CR1\n"
+        "• View current plan: reply 3 or PAY1\n"
+        "• View/upgrade plans: reply 4 or PAY2\n"
+        f"• {option_5}: reply 5 or ACC2\n"
+        "• Buy Usage Credit add-ons: reply 6 or CR2\n"
         "• File taxes: reply 7\n"
+        "• Show all commands: reply ALL\n"
         "• Show menu: reply 0 or MENU\n\n"
         "Need help? Email support@naijataxguides.com"
     )
@@ -546,6 +553,451 @@ def _send_help(chat_id: str, *, linked: bool = False) -> None:
 def _send_welcome(chat_id: str, *, linked: bool = False) -> None:
     send_telegram_text(chat_id, "*Welcome to Naija Tax Guide!* ✅\n\nI'm your AI tax assistant for Nigerian taxes.")
     _send_main_menu(chat_id, linked=linked)
+
+
+
+# ---------------------------------------------------------------------------
+# Batch 27C command namespace helpers
+# ---------------------------------------------------------------------------
+
+def _money(value: Any) -> str:
+    try:
+        amount = float(value or 0)
+        return f"₦{amount:,.0f}"
+    except Exception:
+        return str(value or "₦0")
+
+
+def _date_short(value: Any) -> str:
+    text = _clean_text(value)
+    if not text:
+        return "Not shown"
+
+    try:
+        cleaned = text.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(cleaned)
+        return dt.strftime("%d %b %Y")
+    except Exception:
+        return text[:10]
+
+
+def _send_all_commands(chat_id: str, *, linked: bool = False) -> None:
+    option_5 = "UNLINK" if linked else "5 / link code"
+
+    msg = (
+        "*📚 Telegram Command Center*\\n\\n"
+        "*Main menu*\\n"
+        "0 or MENU - Main menu\\n"
+        "1 - Ask a tax question\\n"
+        "2 - Credit balance\\n"
+        "3 - Current plan\\n"
+        "4 - Subscription plans\\n"
+        f"5 - Link / Unlink ({option_5})\\n"
+        "6 - Usage Credit add-ons\\n"
+        "7 - Tax filing menu\\n"
+        "8 - Help\\n\\n"
+        "*Credits*\\n"
+        "CR1 - Credit balance\\n"
+        "CR2 - Buy Usage Credit add-ons\\n"
+        "CR3 - Credit deduction/activity log\\n"
+        "CR4 - Credit rules and help\\n\\n"
+        "*Billing / Plans*\\n"
+        "PAY1 - Current plan\\n"
+        "PAY2 - View subscription plans\\n"
+        "PAY3 - How to upgrade or renew\\n"
+        "PAY4 - Payment history\\n"
+        "PAY5 - Renewal/cancel information\\n"
+        "PAY6 - Billing support\\n\\n"
+        "*Account / Channels*\\n"
+        "ACC1 - Account and channel status\\n"
+        "ACC2 - Link/unlink instructions\\n"
+        "ACC3 - Support contact\\n\\n"
+        "*Settings*\\n"
+        "SET1 - Language settings\\n"
+        "SET2 - Notification settings\\n"
+        "SET3 - Privacy and account safety\\n\\n"
+        "Use CANCEL anytime to stop the current flow."
+    )
+    send_telegram_text(chat_id, msg)
+
+
+def _send_credit_package_menu(chat_id: str, account_id: str, *, has_subscription: bool) -> None:
+    if not has_subscription:
+        send_telegram_text(
+            chat_id,
+            "💎 Usage Credit add-ons are available only to active paid subscribers.\\n\\n"
+            "Reply PAY2 to view subscription plans or PAY1 to check your current plan.",
+        )
+        return
+
+    msg = (
+        "*💎 Buy Usage Credit Add-ons*\\n\\n"
+        "Reply with a package command:\\n\\n"
+        "T10 - 10 credits - ₦500\\n"
+        "T50 - 50 credits - ₦2,000\\n"
+        "T100 - 100 credits - ₦3,500\\n"
+        "T500 - 500 credits - ₦15,000\\n\\n"
+        "You may also reply 1, 2, 3, or 4 immediately after this menu.\\n"
+        "Reply 0 or CANCEL to stop."
+    )
+    user_states[chat_id] = {"awaiting_credit_package": True}
+    send_telegram_text(chat_id, msg)
+
+
+def _select_credit_package_number(text_lower: str) -> Optional[int]:
+    package_map = {
+        "1": 1,
+        "2": 2,
+        "3": 3,
+        "4": 4,
+        "t10": 1,
+        "t50": 2,
+        "t100": 3,
+        "t500": 4,
+        "cr2a": 1,
+        "cr2b": 2,
+        "cr2c": 3,
+        "cr2d": 4,
+    }
+    return package_map.get(text_lower)
+
+
+def _handle_credit_package_selection(
+    *,
+    chat_id: str,
+    account_id: str,
+    tg_user_id: str,
+    text_lower: str,
+    has_subscription: bool,
+) -> bool:
+    package_num = _select_credit_package_number(text_lower)
+
+    if package_num is None:
+        return False
+
+    if not has_subscription:
+        user_states.pop(chat_id, None)
+        send_telegram_text(
+            chat_id,
+            "💎 Usage Credit add-ons are available only to active paid subscribers.\\n\\n"
+            "Reply PAY2 to view subscription plans.",
+        )
+        return True
+
+    package = validate_package_number(package_num)
+    if not package:
+        send_telegram_text(chat_id, "❌ Invalid add-on package. Reply CR2 to see packages again.")
+        return True
+
+    result = create_credit_payment(account_id, package_num, "telegram", tg_user_id)
+    user_states.pop(chat_id, None)
+    send_telegram_text(
+        chat_id,
+        result.get("message") if result.get("ok") else f"❌ {result.get('message', 'Please try again.')}",
+    )
+    return True
+
+
+def _safe_table_rows(table_name: str, account_id: str, limit: int = 5) -> list[dict[str, Any]]:
+    try:
+        resp = (
+            supabase.table(table_name)
+            .select("*")
+            .eq("account_id", account_id)
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return _rows(resp)
+    except Exception:
+        return []
+
+
+def _send_credit_activity(chat_id: str, account_id: str) -> None:
+    rows: list[dict[str, Any]] = []
+
+    for table_name in ("ai_credit_transactions", "credit_transactions", "ai_credit_deductions"):
+        rows = _safe_table_rows(table_name, account_id, limit=5)
+        if rows:
+            break
+
+    balance = get_credit_balance(account_id)
+
+    if not rows:
+        bal = balance.get("balance", 0) if isinstance(balance, dict) else "Not shown"
+        send_telegram_text(
+            chat_id,
+            "*📉 Usage Credit Activity*\\n\\n"
+            "No recent credit deduction log found yet.\\n\\n"
+            f"Current balance: {bal}\\n\\n"
+            "Reply CR1 for balance, CR2 to buy add-ons, or 0 for main menu.",
+        )
+        return
+
+    msg = "*📉 Recent Usage Credit Activity*\\n\\n"
+    for idx, row in enumerate(rows, 1):
+        amount = row.get("amount") or row.get("credits") or row.get("credit_delta") or row.get("delta") or row.get("used") or ""
+        reason = row.get("reason") or row.get("description") or row.get("event_type") or row.get("type") or "Credit activity"
+        created_at = row.get("created_at") or row.get("updated_at")
+        msg += f"{idx}. {reason}\\n"
+        if amount != "":
+            msg += f"   Credits: {amount}\\n"
+        msg += f"   Date: {_date_short(created_at)}\\n\\n"
+
+    msg += "Reply CR1 for balance, CR2 to buy add-ons, or 0 for main menu."
+    send_telegram_text(chat_id, msg)
+
+
+def _send_credit_rules(chat_id: str) -> None:
+    send_telegram_text(
+        chat_id,
+        "*💎 Usage Credit Rules*\\n\\n"
+        "• Credits are shared across web, WhatsApp, and Telegram when your channels are linked.\\n"
+        "• AI tax answers and premium quiz explanations may deduct credits.\\n"
+        "• Basic calculators and free tools should remain available according to your plan rules.\\n"
+        "• Add-ons are available only to active paid subscribers.\\n\\n"
+        "Reply CR1 for balance, CR2 for add-ons, or 0 for main menu.",
+    )
+
+
+def _send_payment_history(chat_id: str, account_id: str) -> None:
+    rows: list[dict[str, Any]] = []
+
+    for table_name in ("paystack_transactions", "payment_transactions", "billing_transactions"):
+        rows = _safe_table_rows(table_name, account_id, limit=5)
+        if rows:
+            break
+
+    if not rows:
+        send_telegram_text(
+            chat_id,
+            "*🧾 Payment History*\\n\\n"
+            "No payment history found for this account yet.\\n\\n"
+            "Reply PAY2 to view plans or PAY6 for billing support.",
+        )
+        return
+
+    msg = "*🧾 Recent Payment History*\\n\\n"
+    for idx, row in enumerate(rows, 1):
+        plan = row.get("plan_code") or row.get("plan") or row.get("product_code") or "Payment"
+        status = row.get("status") or row.get("payment_status") or row.get("event") or "status not shown"
+        amount = row.get("amount") or row.get("amount_naira") or row.get("price") or row.get("paid_amount")
+        reference = row.get("reference") or row.get("payment_reference") or row.get("provider_reference") or ""
+        created_at = row.get("created_at") or row.get("paid_at") or row.get("updated_at")
+
+        msg += f"{idx}. {plan}\\n"
+        if amount is not None:
+            msg += f"   Amount: {_money(amount)}\\n"
+        msg += f"   Status: {status}\\n"
+        if reference:
+            msg += f"   Ref: {reference}\\n"
+        msg += f"   Date: {_date_short(created_at)}\\n\\n"
+
+    msg += "Reply PAY1 for current plan, PAY2 for plans, or 0 for main menu."
+    send_telegram_text(chat_id, msg)
+
+
+def _send_upgrade_help(chat_id: str) -> None:
+    send_telegram_text(
+        chat_id,
+        "*🛒 Upgrade / Renew Help*\\n\\n"
+        "1. Reply PAY2 to view available plans.\\n"
+        "2. Choose a plan using S1, S2, S3, etc.\\n"
+        "3. Complete payment through the secure checkout link.\\n"
+        "4. Your web, WhatsApp, and Telegram access should update automatically after payment.\\n\\n"
+        "Reply PAY1 to check your current plan or PAY6 for billing support.",
+    )
+
+
+def _send_renewal_help(chat_id: str) -> None:
+    send_telegram_text(
+        chat_id,
+        "*🔁 Renewal / Cancel Information*\\n\\n"
+        "Your current plan details are shown with PAY1.\\n\\n"
+        "To upgrade or renew, reply PAY2 and select a plan.\\n"
+        "To cancel or resolve billing issues, contact support.\\n\\n"
+        "Support: support@naijataxguides.com",
+    )
+
+
+def _send_billing_support(chat_id: str) -> None:
+    send_telegram_text(
+        chat_id,
+        "*🧾 Billing Support*\\n\\n"
+        "For failed payment, wrong plan, missing credits, or subscription issues, contact:\\n"
+        "support@naijataxguides.com\\n\\n"
+        "Include your registered email/phone and payment reference if available.\\n\\n"
+        "Reply PAY4 for payment history or 0 for main menu.",
+    )
+
+
+def _send_account_status(chat_id: str, account_id: str, tg_user_id: str, linked: bool) -> None:
+    identity = _get_telegram_identity(tg_user_id)
+    balance = get_credit_balance(account_id)
+
+    msg = (
+        "*👤 Account / Channel Status*\\n\\n"
+        f"Telegram linked: {'Yes ✅' if linked else 'No ❌'}\\n"
+        f"Telegram ID: {tg_user_id}\\n"
+        f"Workspace account: {account_id}\\n"
+    )
+
+    if identity:
+        msg += f"Linked account: {identity.get('account_id') or account_id}\\n"
+        msg += f"Last seen: {_date_short(identity.get('last_seen_at') or identity.get('updated_at'))}\\n"
+
+    if isinstance(balance, dict):
+        msg += f"Usage Credits: {balance.get('balance', 0)}\\n"
+
+    msg += "\\nReply ACC2 for link/unlink help or 0 for main menu."
+    send_telegram_text(chat_id, msg)
+
+
+def _send_link_help(chat_id: str, *, linked: bool) -> None:
+    if linked:
+        send_telegram_text(
+            chat_id,
+            "*🔗 Telegram is linked*\\n\\n"
+            "This Telegram account is connected to your website workspace.\\n\\n"
+            "Reply UNLINK to disconnect Telegram, or reply 0 for main menu.",
+        )
+    else:
+        send_telegram_text(
+            chat_id,
+            "*🔗 Link Telegram to Website*\\n\\n"
+            "1. Login on the website.\\n"
+            "2. Open Channels.\\n"
+            "3. Generate a Telegram link code.\\n"
+            "4. Send the 8-character code here.\\n\\n"
+            "After linking, Telegram will use the same website plan and Usage Credits.",
+        )
+
+
+def _send_account_support(chat_id: str) -> None:
+    send_telegram_text(
+        chat_id,
+        "*🛟 Account Support*\\n\\n"
+        "For login, channel linking, wrong balance, or account access issues, contact:\\n"
+        "support@naijataxguides.com\\n\\n"
+        "Useful commands:\\n"
+        "ACC1 - Account/channel status\\n"
+        "ACC2 - Link/unlink help\\n"
+        "CR1 - Credit balance\\n"
+        "PAY1 - Current plan",
+    )
+
+
+def _send_language_settings(chat_id: str) -> None:
+    send_telegram_text(
+        chat_id,
+        "*🌐 Language Settings*\\n\\n"
+        "Current default language: English.\\n\\n"
+        "You can ask tax questions in simple English. Multi-language preferences can be managed from the web dashboard when available.\\n\\n"
+        "Reply SET2 for notification settings or 0 for main menu.",
+    )
+
+
+def _send_notification_settings(chat_id: str) -> None:
+    send_telegram_text(
+        chat_id,
+        "*🔔 Notification Settings*\\n\\n"
+        "Telegram notifications are active when this channel is linked.\\n\\n"
+        "Use ACC2 if you want to unlink Telegram from your website account.\\n"
+        "More notification controls can be managed from the web dashboard when available.",
+    )
+
+
+def _send_privacy_settings(chat_id: str) -> None:
+    send_telegram_text(
+        chat_id,
+        "*🔐 Privacy & Account Safety*\\n\\n"
+        "• Keep your Telegram and website accounts secure.\\n"
+        "• Do not share payment links or OTP codes with strangers.\\n"
+        "• Use UNLINK if this Telegram account should no longer access your web workspace.\\n\\n"
+        "Support: support@naijataxguides.com",
+    )
+
+
+def _handle_namespace_command(
+    *,
+    chat_id: str,
+    account_id: str,
+    tg_user_id: str,
+    text_lower: str,
+    linked: bool,
+    has_subscription: bool,
+) -> bool:
+    cmd = text_lower.upper()
+
+    if cmd == "ALL":
+        _send_all_commands(chat_id, linked=linked)
+        return True
+
+    if cmd == "CR1":
+        send_telegram_text(chat_id, format_balance_message(get_credit_balance(account_id)))
+        return True
+
+    if cmd == "CR2":
+        _send_credit_package_menu(chat_id, account_id, has_subscription=has_subscription)
+        return True
+
+    if cmd == "CR3":
+        _send_credit_activity(chat_id, account_id)
+        return True
+
+    if cmd == "CR4":
+        _send_credit_rules(chat_id)
+        return True
+
+    if cmd == "PAY1":
+        send_telegram_text(chat_id, format_subscription_message(account_id))
+        return True
+
+    if cmd == "PAY2":
+        send_telegram_text(chat_id, get_plans_list_menu())
+        return True
+
+    if cmd == "PAY3":
+        _send_upgrade_help(chat_id)
+        return True
+
+    if cmd == "PAY4":
+        _send_payment_history(chat_id, account_id)
+        return True
+
+    if cmd == "PAY5":
+        _send_renewal_help(chat_id)
+        return True
+
+    if cmd == "PAY6":
+        _send_billing_support(chat_id)
+        return True
+
+    if cmd == "ACC1":
+        _send_account_status(chat_id, account_id, tg_user_id, linked)
+        return True
+
+    if cmd == "ACC2":
+        _send_link_help(chat_id, linked=linked)
+        return True
+
+    if cmd == "ACC3":
+        _send_account_support(chat_id)
+        return True
+
+    if cmd == "SET1":
+        _send_language_settings(chat_id)
+        return True
+
+    if cmd == "SET2":
+        _send_notification_settings(chat_id)
+        return True
+
+    if cmd == "SET3":
+        _send_privacy_settings(chat_id)
+        return True
+
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -825,6 +1277,7 @@ def tg_webhook():
     account_id = str(resolved.get("account_id"))
     linked = bool(resolved.get("linked"))
     user_state = user_states.get(chat_id_str, {})
+    has_subscription = bool(has_active_subscription(account_id))
 
     if not text:
         _send_welcome(chat_id_str, linked=linked)
@@ -862,7 +1315,7 @@ def tg_webhook():
         pending_plan = user_state.get("pending_plan")
         if email in ["cancel", "0", "menu"]:
             user_states.pop(chat_id_str, None)
-            send_telegram_text(chat_id_str, "❌ Subscription cancelled. Reply 4 to see plans.")
+            send_telegram_text(chat_id_str, "❌ Subscription cancelled. Reply PAY2 to see plans.")
             return jsonify({"ok": True})
         if "@" in email and "." in email:
             result = create_subscription_payment(account_id=account_id, plan=pending_plan, channel_type="telegram", provider_user_id=tg_user_id, email=email)
@@ -872,14 +1325,35 @@ def tg_webhook():
             send_telegram_text(chat_id_str, "❌ Invalid email. Send a valid email or CANCEL to abort.")
         return jsonify({"ok": True})
 
+    if user_state.get("awaiting_credit_package"):
+        handled = _handle_credit_package_selection(
+            chat_id=chat_id_str,
+            account_id=account_id,
+            tg_user_id=tg_user_id,
+            text_lower=text_lower,
+            has_subscription=has_subscription,
+        )
+        if handled:
+            return jsonify({"ok": True})
+        send_telegram_text(chat_id_str, "Please reply T10, T50, T100, T500, or 0 to cancel.")
+        return jsonify({"ok": True})
+
     if user_state.get("filing_type") and user_state.get("step"):
         _handle_continue_filing(chat_id_str, account_id, text)
         return jsonify({"ok": True})
 
+    if _handle_namespace_command(
+        chat_id=chat_id_str,
+        account_id=account_id,
+        tg_user_id=tg_user_id,
+        text_lower=text_lower,
+        linked=linked,
+        has_subscription=has_subscription,
+    ):
+        return jsonify({"ok": True, "namespace_command": text_lower.upper()})
+
     if _handle_tax_filing_command(chat_id_str, account_id, text):
         return jsonify({"ok": True})
-
-    has_subscription = bool(has_active_subscription(account_id))
 
     if MENU_NUMBER_RE.match(text):
         option = int(text)
@@ -887,8 +1361,7 @@ def tg_webhook():
             send_telegram_text(chat_id_str, "💬 Please type your Nigerian tax question.")
             return jsonify({"ok": True})
         if option == 2:
-            balance = get_credit_balance(account_id)
-            send_telegram_text(chat_id_str, format_balance_message(balance))
+            send_telegram_text(chat_id_str, format_balance_message(get_credit_balance(account_id)))
             return jsonify({"ok": True})
         if option == 3:
             send_telegram_text(chat_id_str, format_subscription_message(account_id))
@@ -897,16 +1370,10 @@ def tg_webhook():
             send_telegram_text(chat_id_str, get_plans_list_menu())
             return jsonify({"ok": True})
         if option == 5:
-            if linked:
-                send_telegram_text(chat_id_str, "🔗 *Telegram is linked*\n\nThis Telegram account is already connected to your website workspace.\n\nReply UNLINK to disconnect Telegram from the website account, or reply 0 for main menu.")
-            else:
-                send_telegram_text(chat_id_str, "🔗 *Link Telegram to Website*\n\n1. Login on the website.\n2. Open Channels.\n3. Generate a Telegram link code.\n4. Send that 8-character code here.\n\nAfter linking, Telegram will use the same website plan and Usage Credits.")
+            _send_link_help(chat_id_str, linked=linked)
             return jsonify({"ok": True})
         if option == 6:
-            if has_subscription:
-                send_telegram_text(chat_id_str, get_credit_packages_menu())
-            else:
-                send_telegram_text(chat_id_str, "💎 Usage Credit add-ons are available only to active paid subscribers.\n\nReply 4 to view subscription plans or 3 to check your current plan.")
+            _send_credit_package_menu(chat_id_str, account_id, has_subscription=has_subscription)
             return jsonify({"ok": True})
         if option == 7:
             _send_tax_menu(chat_id_str)
@@ -915,25 +1382,22 @@ def tg_webhook():
             _send_help(chat_id_str, linked=linked)
             return jsonify({"ok": True})
 
-    if text_lower in ["t10", "t50", "t100", "t500"]:
-        if not has_subscription:
-            send_telegram_text(chat_id_str, "💎 Usage Credit add-ons are available only to active paid subscribers.\n\nReply 4 to view subscription plans.")
+    # Package commands can also work directly without opening CR2/6 first.
+    if _select_credit_package_number(text_lower) is not None:
+        if _handle_credit_package_selection(
+            chat_id=chat_id_str,
+            account_id=account_id,
+            tg_user_id=tg_user_id,
+            text_lower=text_lower,
+            has_subscription=has_subscription,
+        ):
             return jsonify({"ok": True})
-        package_map = {"t10": 1, "t50": 2, "t100": 3, "t500": 4}
-        package_num = package_map[text_lower]
-        package = validate_package_number(package_num)
-        if not package:
-            send_telegram_text(chat_id_str, "❌ Invalid add-on package. Reply 6 to see packages.")
-            return jsonify({"ok": True})
-        result = create_credit_payment(account_id, package_num, "telegram", tg_user_id)
-        send_telegram_text(chat_id_str, result.get("message") if result.get("ok") else f"❌ {result.get('message', 'Please try again.')}")
-        return jsonify({"ok": True})
 
     if re.match(r"^s[1-9]$", text_lower):
         plan_num = int(text_lower[1:])
         plan = validate_plan_number(plan_num)
         if not plan:
-            send_telegram_text(chat_id_str, "❌ Invalid plan code. Reply 4 to see plans.")
+            send_telegram_text(chat_id_str, "❌ Invalid plan code. Reply PAY2 to see plans.")
             return jsonify({"ok": True})
         user_email = get_user_email(account_id)
         if user_email:
@@ -947,7 +1411,7 @@ def tg_webhook():
     if LINK_CODE_RE.match(text.upper()):
         attempt = _try_consume_link_code(tg_user_id, text, display_name=display_name)
         if attempt.get("ok"):
-            send_telegram_text(chat_id_str, "✅ *Telegram linked successfully!*\n\nYour Telegram account is now connected to the website workspace. Your plan and Usage Credits will now sync here.\n\nReply 0 to refresh your menu, or reply 2 to check Usage Credits.")
+            send_telegram_text(chat_id_str, "✅ *Telegram linked successfully!*\n\nYour Telegram account is now connected to the website workspace. Your plan and Usage Credits will now sync here.\n\nReply 0 to refresh your menu, or reply CR1 to check Usage Credits.")
             return jsonify({"ok": True, "linked": True, "account_id": attempt.get("account_id")})
         send_telegram_text(chat_id_str, "❌ *Invalid or expired link code*\n\nPlease generate a fresh Telegram code from the website Channels page and send it here.\n\nReply 0 for main menu.")
         return jsonify({"ok": True, "linked": False, "reason": attempt.get("reason")})
