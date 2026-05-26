@@ -37,9 +37,11 @@ from app.services.tax_filing_service import (
     submit_tax_filing,
 )
 
+# Batch 27B1 fix: use the imported Supabase client object directly; do not call supabase().
+
 bp = Blueprint("telegram", __name__)
 
-TELEGRAM_ROUTE_VERSION = "2026-05-26-v34-telegram-account-resolution-health"
+TELEGRAM_ROUTE_VERSION = "2026-05-26-v34a-telegram-supabase-client-fix"
 
 LINK_CODE_RE = re.compile(r"^[A-Z0-9]{8}$")
 MENU_NUMBER_RE = re.compile(r"^[1-8]$")
@@ -119,7 +121,7 @@ def telegram_health():
 # ---------------------------------------------------------------------------
 
 def _get_telegram_identity(provider_user_id: str) -> Optional[dict[str, Any]]:
-    db = supabase()
+    db = supabase
     ok, resp, _ = _safe_exec(
         db.table("channel_identities")
         .select("*")
@@ -150,7 +152,7 @@ def _touch_telegram_identity(identity: dict[str, Any], display_name: Optional[st
         payload["metadata"] = metadata
 
     try:
-        supabase().table("channel_identities").update(payload).eq("id", identity_id).execute()
+        supabase.table("channel_identities").update(payload).eq("id", identity_id).execute()
     except Exception:
         logging.exception("Telegram identity touch failed")
 
@@ -210,7 +212,7 @@ def _unlink_telegram_identity(tg_user_id: str) -> dict[str, Any]:
     if not identity_id:
         return {"ok": False, "reason": "missing_identity_id"}
 
-    ok, _, err = _safe_exec(supabase().table("channel_identities").delete().eq("id", identity_id))
+    ok, _, err = _safe_exec(supabase.table("channel_identities").delete().eq("id", identity_id))
     if not ok:
         return {"ok": False, "reason": "delete_failed", "error": err}
 
@@ -224,7 +226,7 @@ def _try_consume_link_code(provider_user_id: str, raw_text: str) -> dict[str, An
 
     try:
         res = (
-            supabase()
+            supabase
             .rpc(
                 "consume_link_token",
                 {
