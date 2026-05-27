@@ -43,7 +43,7 @@ from app.services.tax_filing_service import (
 
 bp = Blueprint("telegram", __name__)
 
-TELEGRAM_ROUTE_VERSION = "2026-05-27-v35e1-telegram-support-insert-payload-noise-cleanup"
+TELEGRAM_ROUTE_VERSION = "2026-05-27-v35f-telegram-referral-filing-request-parity"
 
 LINK_CODE_RE = re.compile(r"^[A-Z0-9]{8}$")
 MENU_NUMBER_RE = re.compile(r"^[1-8]$")
@@ -202,7 +202,7 @@ def telegram_health():
             "version": TELEGRAM_ROUTE_VERSION,
             "route_mount": "/api/telegram/*",
             "account_resolution": "channel_identities_first_accounts_auth_fallback",
-            "command_namespace": "whatsapp_master_registry_support_insert_payload_noise_cleanup",
+            "command_namespace": "whatsapp_master_registry_referral_filing_request_parity",
             "configured": {
                 "bot_token": _env_present("TELEGRAM_BOT_TOKEN", "TG_BOT_TOKEN", "TELEGRAM_TOKEN"),
                 "webhook_secret": _env_present("TELEGRAM_WEBHOOK_SECRET", "TG_WEBHOOK_SECRET"),
@@ -666,7 +666,10 @@ def _send_tax_menu(chat_id: str) -> None:
         "FT2 - PAYE filing help\n"
         "FT3 - VAT filing help\n"
         "FT4 - CIT filing help\n"
-        "FT7 - Request human filing assistance\n\n"
+        "FT5 - WHT filing help\n"
+        "FT6 - Document checklist\n"
+        "FT7 - Request human filing assistance\n"
+        "FT8 - Filing status / latest request\n\n"
         "You can also type /paye, /vat, /cit, /deadlines, or quiz.\n"
         "Reply 0 for main menu."
     )
@@ -2422,51 +2425,631 @@ def _close_support_ticket(chat_id: str, account_id: str, text_raw: str) -> None:
     )
 
 
-def _send_referral_menu(chat_id: str, account_id: str, action: str) -> None:
-    fallback_code = f"NTG-{account_id.replace('-', '')[:8].upper()}" if account_id else "NTG-USER"
-    base = os.getenv("FRONTEND_BASE_URL") or os.getenv("APP_BASE_URL") or "https://www.naijataxguides.com"
-    link = f"{base.rstrip()}/?ref={fallback_code}"
+def _referral_frontend_base() -> str:
+    base = (
+        os.getenv("FRONTEND_BASE_URL")
+        or os.getenv("WEB_APP_URL")
+        or os.getenv("APP_BASE_URL")
+        or "https://www.naijataxguides.com"
+    )
+    return base.rstrip("/")
 
-    if action == "r1":
-        send_telegram_text(chat_id, f"🤝 *My Referral Code*\n\nCode: {fallback_code}\n\nReply R2 for your referral link or R3 for a share message.")
-    elif action == "r2":
-        send_telegram_text(chat_id, f"🔗 *My Referral Link*\n\n{link}\n\nReply R3 for a ready-to-share invitation.")
-    elif action == "r3":
-        send_telegram_text(chat_id, f"📣 *Referral Invitation*\n\nUse Naija Tax Guide for Nigerian tax answers, calculators, reminders, and filing support.\n\nJoin here:\n{link}")
-    elif action == "r4":
-        send_telegram_text(chat_id, "📊 *Referral Statistics*\n\nReferral statistics are available on the website dashboard.\n\nReply R1 for your code or R2 for your link.")
-    elif action == "r5":
-        send_telegram_text(chat_id, "💰 *Referral Rewards*\n\nReferral rewards are tracked on your web dashboard.\n\nReply R6 for payout status.")
-    elif action == "r6":
-        send_telegram_text(chat_id, "🏦 *Payout Status*\n\nReferral payout status is available on your web dashboard.\n\nContact support if a payout is delayed.")
-    else:
-        send_telegram_text(
-            chat_id,
-            "🤝 *Referral Centre*\n\n"
-            "R1 - My referral code\n"
-            "R2 - My referral link\n"
-            "R3 - Share referral invitation\n"
-            "R4 - Referral statistics\n"
-            "R5 - Referral rewards\n"
-            "R6 - Payout status",
+
+def _referral_fallback_code(account_id: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9]", "", _clean_text(account_id)).upper()
+    return f"NTG{(cleaned or 'USER')[:8]}"
+
+
+def _referral_link_for_code(code: str) -> str:
+    return f"{_referral_frontend_base()}/?ref={_clean_text(code)}"
+
+
+def _referral_number(value: Any, default: int = 0) -> int:
+    try:
+        return int(float(value or 0))
+    except Exception:
+        return default
+
+
+def _referral_amount(value: Any) -> float:
+    try:
+        return float(str(value or "0").replace(",", "").replace("₦", "").strip())
+    except Exception:
+        return 0.0
+
+
+def _referral_money(value: Any, currency: str = "NGN") -> str:
+    amount = _referral_amount(value)
+    symbol = "₦" if _clean_text(currency).upper() in {"NGN", "N"} else f"{_clean_text(currency).upper()} "
+    return f"{symbol}{amount:,.0f}"
+
+
+def _referral_profile_row(account_id: str) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    account_id = _clean_text(account_id)
+    if not account_id:
+        return None, "missing_account_id"
+
+    try:
+        resp = (
+            supabase.table("referral_profiles")
+            .select("*")
+            .eq("account_id", account_id)
+            .limit(1)
+            .execute()
         )
+        row = _first(resp)
+        if row:
+            return row, None
+    except Exception as exc:
+        return None, f"referral_profiles_select_failed: {type(exc).__name__}"
+
+    return None, None
 
 
-def _send_filing_assistance(chat_id: str, action: str) -> None:
-    if action == "ft1":
-        _send_tax_menu(chat_id)
+def _referral_code_available(code: str) -> bool:
+    code = _clean_text(code).upper()
+    if not code:
+        return False
+
+    try:
+        resp = (
+            supabase.table("referral_profiles")
+            .select("*")
+            .eq("referral_code", code)
+            .eq("is_active", True)
+            .limit(1)
+            .execute()
+        )
+        return not bool(_rows(resp))
+    except Exception:
+        # If the uniqueness check fails, still allow the deterministic fallback.
+        # The final insert/table uniqueness policy remains the source of truth.
+        return True
+
+
+def _create_referral_profile_row(account_id: str) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    account_id = _clean_text(account_id)
+    if not account_id:
+        return None, "missing_account_id"
+
+    base_code = _referral_fallback_code(account_id)
+    code = base_code
+    if not _referral_code_available(code):
+        code = f"{base_code}{uuid.uuid4().hex[:3].upper()}"
+
+    now = _utc_now_iso()
+    payload_attempts = [
+        {
+            "account_id": account_id,
+            "referral_code": code,
+            "is_active": True,
+            "created_at": now,
+            "updated_at": now,
+        },
+        {
+            "account_id": account_id,
+            "referral_code": code,
+            "is_active": True,
+            "created_at": now,
+        },
+        {
+            "account_id": account_id,
+            "referral_code": code,
+        },
+    ]
+
+    errors: list[str] = []
+    seen: set[str] = set()
+    for payload in payload_attempts:
+        cleaned = {k: v for k, v in payload.items() if v is not None}
+        signature = repr(sorted(cleaned.keys()))
+        if signature in seen:
+            continue
+        seen.add(signature)
+
+        ok, resp, err = _safe_exec(supabase.table("referral_profiles").insert(cleaned))
+        if ok:
+            row = _first(resp)
+            return row or cleaned, None
+        errors.append(str(err))
+
+    return None, errors[-1] if errors else "referral_profile_insert_failed"
+
+
+def _referral_code_link(account_id: str) -> tuple[str, str, Optional[str]]:
+    row, err = _referral_profile_row(account_id)
+    if not row and not err:
+        row, err = _create_referral_profile_row(account_id)
+
+    code = _clean_text((row or {}).get("referral_code")) or _referral_fallback_code(account_id)
+    link = _referral_link_for_code(code)
+    return code, link, err
+
+
+def _referral_rows_for_account(account_id: str, limit: int = 50) -> list[dict[str, Any]]:
+    try:
+        resp = (
+            supabase.table("referrals")
+            .select("*")
+            .eq("referrer_account_id", account_id)
+            .order("created_at", desc=True)
+            .limit(max(1, min(limit, 100)))
+            .execute()
+        )
+        return _rows(resp)
+    except Exception:
+        return []
+
+
+def _referral_rewards_rows_telegram(account_id: str, limit: int = 10) -> list[dict[str, Any]]:
+    try:
+        resp = (
+            supabase.table("referral_rewards")
+            .select("*")
+            .eq("account_id", account_id)
+            .order("created_at", desc=True)
+            .limit(max(1, min(limit, 50)))
+            .execute()
+        )
+        return _rows(resp)
+    except Exception:
+        return []
+
+
+def _referral_payout_rows_telegram(account_id: str, limit: int = 10) -> list[dict[str, Any]]:
+    try:
+        resp = (
+            supabase.table("referral_payouts")
+            .select("*")
+            .eq("account_id", account_id)
+            .order("created_at", desc=True)
+            .limit(max(1, min(limit, 50)))
+            .execute()
+        )
+        return _rows(resp)
+    except Exception:
+        return []
+
+
+def _referral_totals_telegram(account_id: str) -> dict[str, Any]:
+    referral_rows = _referral_rows_for_account(account_id, limit=100)
+    reward_rows = _referral_rewards_rows_telegram(account_id, limit=100)
+    payout_rows = _referral_payout_rows_telegram(account_id, limit=100)
+
+    total_referrals = len(referral_rows)
+    qualified = 0
+    pending_referrals = 0
+
+    for row in referral_rows:
+        status = _clean_text(row.get("status")).lower()
+        if status in {"qualified", "rewarded", "paid", "approved", "converted", "active"}:
+            qualified += 1
+        elif status in {"pending", "created", "registered", ""}:
+            pending_referrals += 1
+
+    pending_rewards = 0.0
+    approved_rewards = 0.0
+    paid_rewards = 0.0
+    reversed_rewards = 0.0
+    currency = "NGN"
+
+    for row in reward_rows:
+        currency = _clean_text(row.get("currency") or currency).upper() or "NGN"
+        amount = _referral_amount(row.get("reward_amount") or row.get("amount"))
+        status = _clean_text(row.get("status")).lower()
+        if status in {"paid", "completed", "settled"}:
+            paid_rewards += amount
+        elif status in {"approved", "available", "ready"}:
+            approved_rewards += amount
+        elif status in {"reversed", "cancelled", "canceled", "failed"}:
+            reversed_rewards += amount
+        else:
+            pending_rewards += amount
+
+    return {
+        "referrals": referral_rows,
+        "rewards": reward_rows,
+        "payouts": payout_rows,
+        "total_referrals": total_referrals,
+        "qualified_referrals": qualified,
+        "pending_referrals": pending_referrals,
+        "pending_rewards": pending_rewards,
+        "approved_rewards": approved_rewards,
+        "available_balance": approved_rewards,
+        "paid_rewards": paid_rewards,
+        "reversed_rewards": reversed_rewards,
+        "currency": currency,
+    }
+
+
+def _referral_reward_line_telegram(row: dict[str, Any], index: int) -> str:
+    reward_type = _clean_text(row.get("reward_type") or "reward").replace("_", " ").title()
+    status = _clean_text(row.get("status") or "pending").title()
+    currency = _clean_text(row.get("currency") or "NGN").upper()
+    amount = _referral_money(row.get("reward_amount") or row.get("amount"), currency)
+    created = _date_short(row.get("created_at") or row.get("earned_at"))
+    plan = _clean_text(row.get("plan_code"))
+    plan_text = f" | Plan: {plan}" if plan else ""
+    return f"{index}. {amount} - {status}\n   {reward_type} | {created}{plan_text}"
+
+
+def _referral_payout_line_telegram(row: dict[str, Any], index: int) -> str:
+    status = _clean_text(row.get("status") or "pending").title()
+    currency = _clean_text(row.get("currency") or "NGN").upper()
+    amount = _referral_money(row.get("amount") or row.get("payout_amount") or row.get("total_amount"), currency)
+    created = _date_short(row.get("created_at") or row.get("requested_at"))
+    provider = _clean_text(row.get("provider") or "payout").title()
+    ref = _clean_text(row.get("provider_reference") or row.get("reference") or row.get("id"))
+    ref_text = f"\n   Ref: {_history_excerpt(ref, 80)}" if ref else ""
+    return f"{index}. {amount} - {status}\n   {provider} | {created}{ref_text}"
+
+
+def _send_referral_menu(chat_id: str, account_id: str, action: str) -> None:
+    action = _clean_text(action).lower()
+    code, link, err = _referral_code_link(account_id)
+
+    if action in {"r1", "referral", "referrals"}:
+        body = (
+            "🤝 *My Referral Code*\n\n"
+            f"Code: {code}\n"
+            f"Link: {link}\n\n"
+            "Share this code or link with people who need Nigerian tax answers, calculators, reminders, and filing support.\n\n"
+            "Reply R2 for only the link, R3 for a ready-to-share invitation, or R4 for referral statistics."
+        )
+        if err:
+            body += "\n\nNote: I used a safe fallback code because the referral profile could not be fully refreshed."
+        send_telegram_text(chat_id, _clip_text(body))
         return
 
+    if action == "r2":
+        send_telegram_text(
+            chat_id,
+            "🔗 *My Referral Link*\n\n"
+            f"{link}\n\n"
+            f"Referral code: {code}\n\n"
+            "Reply R3 for a ready-to-share invitation.",
+        )
+        return
+
+    if action == "r3":
+        send_telegram_text(
+            chat_id,
+            "📣 *Referral Invitation*\n\n"
+            "Copy and share this message:\n\n"
+            "Hi, I use Naija Tax Guide for Nigerian tax questions, calculators, filing guidance, and reminders.\n\n"
+            f"Join with my referral link:\n{link}\n\n"
+            f"Referral code: {code}\n\n"
+            "After signup, you can use the web app and supported chat channels.",
+        )
+        return
+
+    if action == "r4":
+        totals = _referral_totals_telegram(account_id)
+        currency = _clean_text(totals.get("currency") or "NGN").upper()
+        body = (
+            "📊 *Referral Statistics*\n\n"
+            f"Referral code: {code}\n"
+            f"Total referrals: {_referral_number(totals.get('total_referrals'))}\n"
+            f"Qualified/rewarded referrals: {_referral_number(totals.get('qualified_referrals'))}\n"
+            f"Pending referrals: {_referral_number(totals.get('pending_referrals'))}\n\n"
+            "Rewards:\n"
+            f"Pending: {_referral_money(totals.get('pending_rewards'), currency)}\n"
+            f"Approved/available: {_referral_money(totals.get('approved_rewards'), currency)}\n"
+            f"Paid: {_referral_money(totals.get('paid_rewards'), currency)}\n"
+            f"Reversed: {_referral_money(totals.get('reversed_rewards'), currency)}\n\n"
+            "Reply R5 for reward details, R6 for payout status, or 0 for main menu."
+        )
+        send_telegram_text(chat_id, _clip_text(body))
+        return
+
+    if action == "r5":
+        rows = _referral_rewards_rows_telegram(account_id, limit=10)
+        if not rows:
+            send_telegram_text(
+                chat_id,
+                "🎁 *Referral Rewards*\n\n"
+                "No referral reward found yet.\n\n"
+                "Share your link with R3. Rewards will appear here after referred users qualify according to the referral policy.\n\n"
+                "Reply R1 for your code/link or 0 for main menu.",
+            )
+            return
+
+        lines = ["🎁 *Referral Rewards*", ""]
+        for index, row in enumerate(rows[:5], start=1):
+            lines.append(_referral_reward_line_telegram(row, index))
+        lines.extend(["", "Reply R4 for statistics, R6 for payout status, or 0 for main menu."])
+        send_telegram_text(chat_id, _clip_text("\n".join(lines)))
+        return
+
+    if action == "r6":
+        totals = _referral_totals_telegram(account_id)
+        currency = _clean_text(totals.get("currency") or "NGN").upper()
+        rows = _referral_payout_rows_telegram(account_id, limit=10)
+
+        lines = [
+            "🏦 *Referral Payout Status*",
+            "",
+            f"Approved/available rewards: {_referral_money(totals.get('approved_rewards'), currency)}",
+            f"Pending rewards: {_referral_money(totals.get('pending_rewards'), currency)}",
+            f"Paid rewards: {_referral_money(totals.get('paid_rewards'), currency)}",
+            "",
+        ]
+
+        if rows:
+            lines.append("Recent payouts:")
+            for index, row in enumerate(rows[:5], start=1):
+                lines.append(_referral_payout_line_telegram(row, index))
+        else:
+            lines.append("No referral payout request found yet.")
+
+        lines.extend(
+            [
+                "",
+                "Payout requests and payout account setup should still be completed from the secure web Referrals page for now.",
+                "",
+                "Reply R5 for rewards, R4 for statistics, or 0 for main menu.",
+            ]
+        )
+        send_telegram_text(chat_id, _clip_text("\n".join(lines)))
+        return
+
+    send_telegram_text(
+        chat_id,
+        "🤝 *Referral Centre*\n\n"
+        "R1 - My referral code\n"
+        "R2 - My referral link\n"
+        "R3 - Share referral invitation\n"
+        "R4 - Referral statistics\n"
+        "R5 - Referral rewards\n"
+        "R6 - Payout status\n\n"
+        "Reply 0 for main menu.",
+    )
+
+
+def _filing_assistance_menu() -> str:
+    return (
+        "🗂️ *File Tax / Filing Assistance*\n\n"
+        "FT1 - Start filing assistance\n"
+        "FT2 - PAYE filing help\n"
+        "FT3 - VAT filing help\n"
+        "FT4 - CIT filing help\n"
+        "FT5 - WHT filing help\n"
+        "FT6 - Document checklist\n"
+        "FT7 - Request human-assisted filing\n"
+        "FT8 - Filing status / latest request\n\n"
+        "For calculations, use F1 or C1-C5. For reminders, use D1-D4.\n"
+        "Reply with FT1, FT2, FT3, FT4, FT5, FT6, FT7, or FT8.\n"
+        "Reply 0 for main menu."
+    )
+
+
+def _filing_document_checklist() -> str:
+    return (
+        "✅ *Tax Filing Document Checklist*\n\n"
+        "Prepare the items that apply to your case:\n\n"
+        "General\n"
+        "• Taxpayer name / company name\n"
+        "• TIN, CAC/RC/BN details where applicable\n"
+        "• Contact details and tax office/state/FIRS details\n"
+        "• Prior tax filings, assessments, receipts, and notices\n\n"
+        "PAYE\n"
+        "• Employee list and monthly payroll schedule\n"
+        "• Salary, allowances, benefits, pension, NHF, and other deductions\n"
+        "• Evidence of PAYE remittance and pension/NHF records\n\n"
+        "VAT\n"
+        "• Sales invoices and output VAT schedule\n"
+        "• Purchase invoices and input VAT support\n"
+        "• Bank/payment records and VAT remittance receipts\n\n"
+        "CIT\n"
+        "• Financial statements / management accounts\n"
+        "• Profit computation, expense schedules, and bank statements\n"
+        "• Capital allowance, WHT credit notes, and prior-year returns\n\n"
+        "WHT\n"
+        "• Contract/payment details\n"
+        "• WHT rate used and remittance evidence\n"
+        "• Credit notes received/issued\n\n"
+        "Reply FT7 to request human-assisted filing, or 0 for main menu."
+    )
+
+
+def _filing_help_text(action: str) -> str:
+    action = _clean_text(action).lower()
     messages = {
-        "ft2": "👥 *PAYE Filing Help*\n\nUse this for employee salary tax guidance, PAYE calculations, and payroll filing preparation.\n\nYou can also use C1 for PAYE calculator.",
-        "ft3": "🧾 *VAT Filing Help*\n\nUse this for VAT registration, output VAT/input VAT guidance, and VAT filing preparation.\n\nYou can also use C3 for VAT calculator.",
-        "ft4": "🏢 *CIT Filing Help*\n\nUse this for Company Income Tax filing preparation, records, and tax computation guidance.\n\nYou can also use C2 for CIT calculator.",
-        "ft5": "💼 *WHT Filing Help*\n\nUse this for withholding tax deduction/remittance guidance.\n\nYou can also use C4 for WHT calculator.",
-        "ft6": "✅ *Document Checklist*\n\nCommon tax filing documents include financial statements, invoices, receipts, bank statements, payroll records, WHT credit notes, VAT records, and prior filings.",
-        "ft7": "🧑‍💼 *Human-Assisted Filing Request*\n\nSend SUP1 followed by your filing request and contact details.\n\nExample:\nSUP1 I need help filing VAT for April 2026.",
-        "ft8": "📌 *Latest Filing Request*\n\nUse the website filing page for detailed request tracking. Reply 7 for the Telegram filing menu.",
+        "ft2": (
+            "👥 *PAYE Filing Help*\n\n"
+            "PAYE filing usually requires payroll records, employee details, taxable pay, reliefs/deductions, tax deducted, and remittance evidence.\n\n"
+            "Useful steps:\n"
+            "1. Confirm employee payroll for the month.\n"
+            "2. Calculate PAYE correctly.\n"
+            "3. Keep remittance proof and employee records.\n"
+            "4. File/remit to the relevant State Internal Revenue Service.\n\n"
+            "Use C1 for PAYE calculator, FT6 for checklist, or FT7 for human-assisted filing."
+        ),
+        "ft3": (
+            "🧾 *VAT Filing Help*\n\n"
+            "VAT filing usually requires sales invoices, output VAT, input VAT support, bank/payment records, and VAT remittance details.\n\n"
+            "Useful steps:\n"
+            "1. Confirm VATable sales for the period.\n"
+            "2. Separate output VAT and allowable input VAT.\n"
+            "3. Keep invoice and payment evidence.\n"
+            "4. Submit/remit through the correct FIRS process.\n\n"
+            "Use C3 for VAT calculator, FT6 for checklist, or FT7 for human-assisted filing."
+        ),
+        "ft4": (
+            "🏢 *CIT Filing Help*\n\n"
+            "Company Income Tax filing usually requires financial statements, profit computation, expense schedules, capital allowance details, WHT credit notes, and prior filings.\n\n"
+            "Useful steps:\n"
+            "1. Confirm accounting year-end.\n"
+            "2. Prepare accounts and tax computation.\n"
+            "3. Check applicable company size/rate rules.\n"
+            "4. Keep supporting documents before submission.\n\n"
+            "Use C2 for CIT calculator, FT6 for checklist, or FT7 for human-assisted filing."
+        ),
+        "ft5": (
+            "💼 *WHT Filing Help*\n\n"
+            "Withholding Tax filing/remittance usually requires contract/payment details, recipient information, applicable rate, tax deducted, and remittance evidence.\n\n"
+            "Useful steps:\n"
+            "1. Confirm if the payment is WHT-applicable.\n"
+            "2. Apply the correct rate.\n"
+            "3. Remit to the relevant authority.\n"
+            "4. Keep WHT credit notes/receipts.\n\n"
+            "Use C4 for WHT calculator, FT6 for checklist, or FT7 for human-assisted filing."
+        ),
     }
-    send_telegram_text(chat_id, messages.get(action, "🗂️ *Filing Assistance*\n\nReply FT1 to open the filing assistance menu."))
+    return messages.get(action, _filing_assistance_menu())
+
+
+def _filing_request_message_from_command(text: Any) -> str:
+    raw = _clean_text(text)
+    return re.sub(r"^FT7\b[:\-\s]*", "", raw, flags=re.I).strip()
+
+
+def _filing_subject_from_message(value: Any) -> str:
+    text = _filing_request_message_from_command(value)
+    if not text:
+        return "Human-assisted tax filing request"
+    first_sentence = re.split(r"[\n\r.!?]", text, maxsplit=1)[0].strip()
+    subject = first_sentence or text
+    if not subject.lower().startswith("filing"):
+        subject = f"Filing assistance: {subject}"
+    return subject[:120]
+
+
+def _filing_request_priority(text: str) -> str:
+    low = _clean_text(text).lower()
+    if any(word in low for word in ("urgent", "deadline today", "overdue", "penalty", "audit", "notice")):
+        return "high"
+    return "normal"
+
+
+def _create_filing_request_telegram(chat_id: str, account_id: str, text_raw: str) -> None:
+    clean_message = _filing_request_message_from_command(text_raw)
+    if len(clean_message) < 10:
+        send_telegram_text(
+            chat_id,
+            "🗂️ *Request Human-Assisted Filing*\n\n"
+            "Please send FT7 followed by what you need help filing in one clear message.\n\n"
+            "Example:\n"
+            "FT7 I need help filing VAT for my business for April 2026. I have sales invoices and bank records.\n\n"
+            "Reply FT6 for document checklist or CANCEL to stop.",
+        )
+        return
+
+    ticket_id = f"NTG-FT-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+    now = _utc_now_iso()
+    subject = _filing_subject_from_message(clean_message)
+    preview = " ".join(clean_message.split())[:200]
+    payload = {
+        "ticket_id": ticket_id,
+        "account_id": account_id,
+        "category": "filing_assistance",
+        "priority": _filing_request_priority(clean_message),
+        "subject": subject,
+        "message": clean_message,
+        "status": "open",
+        "channel": "telegram",
+        "source": "telegram",
+        "issue_type": "filing_assistance",
+        "last_message_preview": preview,
+        "metadata": {"created_from": "telegram", "request_type": "filing_assistance", "command": "FT7"},
+        "created_at": now,
+        "updated_at": now,
+    }
+
+    result = _support_insert_ticket(payload)
+    if not result.get("ok"):
+        send_telegram_text(
+            chat_id,
+            "⚠️ I could not save your filing request right now.\n\n"
+            "Please try again shortly or contact support.\n\n"
+            "Support email: support@naijataxguides.com",
+        )
+        return
+
+    send_telegram_text(
+        chat_id,
+        "✅ *Filing Assistance Request Created*\n\n"
+        f"Ticket ID: {ticket_id}\n"
+        "Status: Open\n\n"
+        f"Request:\n{_clip_text(clean_message, 1200)}\n\n"
+        "Next step: prepare your documents using FT6. A support/admin user can review and follow up.\n\n"
+        "Reply FT8 to view latest filing request, SUP4 to add more details, or 0 for main menu.",
+    )
+
+
+def _is_filing_ticket_telegram(row: dict[str, Any]) -> bool:
+    metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+    combined = " ".join(
+        _clean_text(x).lower()
+        for x in (
+            row.get("category"),
+            row.get("issue_type"),
+            row.get("subject"),
+            row.get("message"),
+            metadata.get("request_type"),
+        )
+        if x is not None
+    )
+    return "filing" in combined or "file tax" in combined or "tax filing" in combined
+
+
+def _latest_filing_request_text_telegram(account_id: str) -> str:
+    rows = _support_rows(account_id, limit=10)
+    filing_rows = [row for row in rows if _is_filing_ticket_telegram(row)]
+
+    if not filing_rows:
+        return (
+            "🗂️ *Filing Request Status*\n\n"
+            "No human-assisted filing request was found yet.\n\n"
+            "Reply FT7 to create one, FT6 for document checklist, or 0 for main menu."
+        )
+
+    ticket = filing_rows[0]
+    ticket_id = _support_ref(ticket)
+    status = _support_status(ticket).title()
+    subject = _clean_text(ticket.get("subject") or "Filing assistance request")
+    message = _clean_text(ticket.get("message") or ticket.get("last_message_preview") or "No message preview.")
+    created = _date_short(ticket.get("created_at"))
+    updated = _date_short(ticket.get("updated_at"))
+    admin_note = _support_admin_note(ticket)
+
+    body = (
+        "🗂️ *Latest Filing Request*\n\n"
+        f"Ticket ID: {ticket_id}\n"
+        f"Status: {status}\n"
+        f"Created: {created}\n"
+        f"Updated: {updated}\n\n"
+        f"Subject:\n{_clip_text(subject, 250)}\n\n"
+        f"Request:\n{_clip_text(message, 1200)}\n"
+    )
+
+    if admin_note:
+        body += f"\nAdmin note:\n{_clip_text(admin_note, 800)}\n"
+
+    body += "\nReply SUP4 to add more details, SUP5 to close it, FT6 for documents, or 0 for main menu."
+    return _clip_text(body)
+
+
+def _send_filing_assistance(chat_id: str, account_id: str, action: str, text_raw: str = "") -> None:
+    action = _clean_text(action).lower()
+
+    if action == "ft1":
+        send_telegram_text(chat_id, _filing_assistance_menu())
+        return
+    if action in {"ft2", "ft3", "ft4", "ft5"}:
+        send_telegram_text(chat_id, _clip_text(_filing_help_text(action)))
+        return
+    if action == "ft6":
+        send_telegram_text(chat_id, _clip_text(_filing_document_checklist()))
+        return
+    if action == "ft7":
+        _create_filing_request_telegram(chat_id, account_id, text_raw)
+        return
+    if action == "ft8":
+        send_telegram_text(chat_id, _latest_filing_request_text_telegram(account_id))
+        return
+
+    send_telegram_text(chat_id, _filing_assistance_menu())
 
 
 def _send_account_profile(chat_id: str, account_id: str, tg_user_id: str, linked: bool, action: str) -> None:
@@ -2567,7 +3150,7 @@ def _handle_master_command(
         return True
 
     if cmd.startswith("FT"):
-        _send_filing_assistance(chat_id, cmd.lower())
+        _send_filing_assistance(chat_id, account_id, cmd.lower(), text_raw)
         return True
 
     if cmd.startswith("ACC"):
