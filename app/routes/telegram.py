@@ -5230,3 +5230,5 @@ def tg_webhook():
             "Sorry, I encountered an error while answering your tax question. No credit should be charged for this failed request. Please try again later.\n\nReply 0 for main menu.",
         )
         return jsonify({"ok": True, "error_handled": True, "stage": "telegram_ai_ask"})
+
+
