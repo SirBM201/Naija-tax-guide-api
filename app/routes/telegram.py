@@ -43,7 +43,7 @@ from app.services.tax_filing_service import (
 
 bp = Blueprint("telegram", __name__)
 
-TELEGRAM_ROUTE_VERSION = "2026-05-27-v35d-telegram-quiz-q1-q5-parity"
+TELEGRAM_ROUTE_VERSION = "2026-05-27-v35d1-telegram-quiz-session-persistence-fix"
 
 LINK_CODE_RE = re.compile(r"^[A-Z0-9]{8}$")
 MENU_NUMBER_RE = re.compile(r"^[1-8]$")
@@ -202,7 +202,7 @@ def telegram_health():
             "version": TELEGRAM_ROUTE_VERSION,
             "route_mount": "/api/telegram/*",
             "account_resolution": "channel_identities_first_accounts_auth_fallback",
-            "command_namespace": "whatsapp_master_registry_quiz_q1_q5_parity",
+            "command_namespace": "whatsapp_master_registry_quiz_q1_q5_persistent_state",
             "configured": {
                 "bot_token": _env_present("TELEGRAM_BOT_TOKEN", "TG_BOT_TOKEN", "TELEGRAM_TOKEN"),
                 "webhook_secret": _env_present("TELEGRAM_WEBHOOK_SECRET", "TG_WEBHOOK_SECRET"),
@@ -4102,6 +4102,124 @@ def _debit_q5_usage_credit_telegram(account_id: str, attempt_id: str = "") -> di
     return {"ok": False, "error": errors[-1] if errors else "credit_update_failed", "before": before, "after": before, "column": column}
 
 
+
+TELEGRAM_QUIZ_STATE_METADATA_KEY = "telegram_quiz_state_v1"
+
+
+def _telegram_quiz_compact_state(chat_id: str, state: dict[str, Any]) -> dict[str, Any]:
+    data = state.get("quiz_data") if isinstance(state.get("quiz_data"), dict) else {}
+    return {
+        "chat_id": _clean_text(chat_id),
+        "quiz_mode": _clean_text(state.get("quiz_mode")),
+        "quiz_data": data,
+        "saved_at": _utc_now_iso(),
+        "version": "28D1",
+    }
+
+
+def _telegram_quiz_state_is_fresh(saved: dict[str, Any]) -> bool:
+    saved_at = _parse_dt(saved.get("saved_at"))
+    if not saved_at:
+        return False
+    try:
+        return (datetime.now(timezone.utc) - saved_at).total_seconds() <= 86400
+    except Exception:
+        return False
+
+
+def _load_telegram_quiz_state(tg_user_id: str, chat_id: str = "") -> dict[str, Any]:
+    """
+    Load Telegram quiz state from channel_identities.metadata.
+
+    Why this is needed:
+    Koyeb/Gunicorn can route Q1 and the later A/B/C/D answer to different
+    workers. Plain in-memory user_states is not reliable across workers.
+    """
+    tg_user_id = _clean_text(tg_user_id)
+    if not tg_user_id:
+        return {}
+
+    identity = _get_telegram_identity(tg_user_id)
+    if not identity:
+        return {}
+
+    metadata = identity.get("metadata") if isinstance(identity.get("metadata"), dict) else {}
+    saved = metadata.get(TELEGRAM_QUIZ_STATE_METADATA_KEY)
+    if not isinstance(saved, dict):
+        return {}
+
+    if not _telegram_quiz_state_is_fresh(saved):
+        return {}
+
+    saved_chat_id = _clean_text(saved.get("chat_id"))
+    if chat_id and saved_chat_id and saved_chat_id != _clean_text(chat_id):
+        return {}
+
+    data = saved.get("quiz_data") if isinstance(saved.get("quiz_data"), dict) else {}
+    if not data:
+        return {}
+
+    return {
+        "quiz_mode": _clean_text(saved.get("quiz_mode")),
+        "quiz_data": data,
+    }
+
+
+def _save_telegram_quiz_state(tg_user_id: str, chat_id: str, state: dict[str, Any]) -> None:
+    tg_user_id = _clean_text(tg_user_id)
+    if not tg_user_id:
+        return
+
+    identity = _get_telegram_identity(tg_user_id)
+    if not identity:
+        return
+
+    identity_id = _clean_text(identity.get("id"))
+    if not identity_id:
+        return
+
+    metadata = identity.get("metadata") if isinstance(identity.get("metadata"), dict) else {}
+    metadata[TELEGRAM_QUIZ_STATE_METADATA_KEY] = _telegram_quiz_compact_state(chat_id, state)
+
+    payload_attempts = [
+        {"metadata": metadata, "updated_at": _utc_now_iso()},
+        {"metadata": metadata},
+    ]
+
+    for payload in payload_attempts:
+        ok, _resp, _err = _safe_exec(supabase.table("channel_identities").update(payload).eq("id", identity_id))
+        if ok:
+            return
+
+    logging.warning("Telegram quiz state persistence failed for %s", tg_user_id)
+
+
+def _clear_telegram_quiz_state(tg_user_id: str) -> None:
+    tg_user_id = _clean_text(tg_user_id)
+    if not tg_user_id:
+        return
+
+    identity = _get_telegram_identity(tg_user_id)
+    if not identity:
+        return
+
+    identity_id = _clean_text(identity.get("id"))
+    if not identity_id:
+        return
+
+    metadata = identity.get("metadata") if isinstance(identity.get("metadata"), dict) else {}
+    if TELEGRAM_QUIZ_STATE_METADATA_KEY not in metadata:
+        return
+
+    metadata.pop(TELEGRAM_QUIZ_STATE_METADATA_KEY, None)
+
+    for payload in ({"metadata": metadata, "updated_at": _utc_now_iso()}, {"metadata": metadata}):
+        ok, _resp, _err = _safe_exec(supabase.table("channel_identities").update(payload).eq("id", identity_id))
+        if ok:
+            return
+
+
+
 def _start_quiz_telegram(chat_id: str, account_id: str, tg_user_id: str, category: str = "") -> None:
     state = _quiz_state(chat_id)
     data = state.get("quiz_data") if isinstance(state.get("quiz_data"), dict) else {}
@@ -4153,6 +4271,7 @@ def _start_quiz_telegram(chat_id: str, account_id: str, tg_user_id: str, categor
         "quiz_mode": "answer",
         "quiz_data": data,
     }
+    _save_telegram_quiz_state(tg_user_id, chat_id, user_states[chat_id])
 
     options = "\n".join([f"{key}. {value}" for key, value in (quiz.get("options") or {}).items()])
     remaining = "Unlimited" if _quiz_is_paid(account_id) else str(max(0, QUIZ_FREE_DAILY_LIMIT - numbers["attempts"]))
@@ -4168,7 +4287,7 @@ def _start_quiz_telegram(chat_id: str, account_id: str, tg_user_id: str, categor
     send_telegram_text(chat_id, _clip_text(body, 3900))
 
 
-def _handle_quiz_answer_telegram(chat_id: str, account_id: str, text: str) -> bool:
+def _handle_quiz_answer_telegram(chat_id: str, account_id: str, text: str, tg_user_id: str = "") -> bool:
     answer = _clean_text(text).upper()[:1]
     state = _quiz_state(chat_id)
     data = state.get("quiz_data") if isinstance(state.get("quiz_data"), dict) else {}
@@ -4176,6 +4295,7 @@ def _handle_quiz_answer_telegram(chat_id: str, account_id: str, text: str) -> bo
     if _quiz_norm(text) in {"cancel", "stop", "end"}:
         state.pop("quiz_mode", None)
         user_states[chat_id] = state
+        _clear_telegram_quiz_state(tg_user_id)
         send_telegram_text(chat_id, "Quiz cancelled.\n\nReply Q1 to start again or 0 for menu.")
         return True
 
@@ -4243,6 +4363,7 @@ def _handle_quiz_answer_telegram(chat_id: str, account_id: str, text: str) -> bo
     state["quiz_data"] = data
     state.pop("quiz_mode", None)
     user_states[chat_id] = state
+    _save_telegram_quiz_state(tg_user_id, chat_id, state)
 
     verdict = "✅ Correct!" if passed else f"❌ Not correct. Correct answer: {correct}."
     short_explanation_line = f"\n\nWhy: {explain}" if explain else ""
@@ -4772,6 +4893,18 @@ def tg_webhook():
     account_id = str(resolved.get("account_id"))
     linked = bool(resolved.get("linked"))
     user_state = user_states.get(chat_id_str, {})
+    if not isinstance(user_state, dict):
+        user_state = {}
+
+    # Batch 28D1:
+    # Restore quiz state from channel_identities.metadata when the next Telegram
+    # message lands on another Koyeb/Gunicorn worker.
+    if not user_state.get("quiz_mode") and not user_state.get("quiz_data"):
+        persisted_quiz_state = _load_telegram_quiz_state(tg_user_id, chat_id_str)
+        if persisted_quiz_state:
+            user_state = persisted_quiz_state
+            user_states[chat_id_str] = user_state
+
     has_subscription = bool(has_active_subscription(account_id))
 
     if not text:
@@ -4780,6 +4913,7 @@ def tg_webhook():
 
     if text_lower in ["/start", "start", "0", "menu", "/menu"]:
         user_states.pop(chat_id_str, None)
+        _clear_telegram_quiz_state(tg_user_id)
         _send_main_menu(chat_id_str, linked=linked)
         return jsonify({"ok": True})
 
@@ -4790,11 +4924,13 @@ def tg_webhook():
     if text_lower in ["back", "*", "cancel"]:
         if user_state:
             user_states.pop(chat_id_str, None)
+            _clear_telegram_quiz_state(tg_user_id)
             send_telegram_text(chat_id_str, "Current flow cancelled.")
         _send_main_menu(chat_id_str, linked=linked)
         return jsonify({"ok": True})
 
     if text_lower in ["unlink", "unlink telegram", "disconnect telegram", "remove telegram"]:
+        _clear_telegram_quiz_state(tg_user_id)
         result = _unlink_telegram_identity(tg_user_id)
         user_states.pop(chat_id_str, None)
         if result.get("ok") and result.get("unlinked"):
@@ -4824,7 +4960,7 @@ def tg_webhook():
     if user_state.get("quiz_mode") == "answer":
         answer_norm = _clean_text(text).upper()
         if answer_norm in {"A", "B", "C", "D", "CANCEL", "STOP", "END"}:
-            _handle_quiz_answer_telegram(chat_id_str, account_id, text)
+            _handle_quiz_answer_telegram(chat_id_str, account_id, text, tg_user_id)
             return jsonify({"ok": True, "quiz_answer": True})
 
     # Direct top-up package commands work anytime and do not depend on in-memory worker state.
