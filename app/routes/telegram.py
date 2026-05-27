@@ -41,7 +41,7 @@ from app.services.tax_filing_service import (
 
 bp = Blueprint("telegram", __name__)
 
-TELEGRAM_ROUTE_VERSION = "2026-05-27-v34h-telegram-checkout-guard-type-separation"
+TELEGRAM_ROUTE_VERSION = "2026-05-27-v34i-telegram-checkout-fingerprint-guard"
 
 LINK_CODE_RE = re.compile(r"^[A-Z0-9]{8}$")
 MENU_NUMBER_RE = re.compile(r"^[1-8]$")
@@ -200,7 +200,7 @@ def telegram_health():
             "version": TELEGRAM_ROUTE_VERSION,
             "route_mount": "/api/telegram/*",
             "account_resolution": "channel_identities_first_accounts_auth_fallback",
-            "command_namespace": "whatsapp_master_registry_stabilized_checkout_type_separation",
+            "command_namespace": "whatsapp_master_registry_stabilized_checkout_fingerprint_guard",
             "configured": {
                 "bot_token": _env_present("TELEGRAM_BOT_TOKEN", "TG_BOT_TOKEN", "TELEGRAM_TOKEN"),
                 "webhook_secret": _env_present("TELEGRAM_WEBHOOK_SECRET", "TG_WEBHOOK_SECRET"),
@@ -855,6 +855,188 @@ def _topup_search_terms(package_code: str) -> list[str]:
     return [t for t in terms if t]
 
 
+def _checkout_fingerprint(account_id: str, *, kind: str, code: str) -> str:
+    safe_kind = re.sub(r"[^a-z0-9_]+", "_", _clean_text(kind).lower()).strip("_")
+    safe_code = re.sub(r"[^a-z0-9_]+", "_", _clean_text(code).lower()).strip("_")
+    safe_account = re.sub(r"[^a-z0-9_-]+", "_", _clean_text(account_id).lower()).strip("_")
+    return f"telegram:{safe_kind}:{safe_account}:{safe_code}"
+
+
+def _checkout_lock_code_from_fingerprint(fingerprint: str) -> str:
+    parts = _clean_text(fingerprint).split(":")
+    return parts[-1].upper() if parts else "CHECKOUT"
+
+
+def _checkout_lock_message(lock: dict[str, Any], *, kind: str, code: str) -> str:
+    ref = _clean_text(
+        lock.get("reference")
+        or lock.get("payment_reference")
+        or lock.get("provider_reference")
+        or lock.get("gateway_reference")
+        or "not shown"
+    )
+    url = _clean_text(lock.get("url") or lock.get("checkout_url") or lock.get("authorization_url"))
+    label = _clean_text(code).upper() or _checkout_lock_code_from_fingerprint(_clean_text(lock.get("fingerprint")))
+    kind_label = "top-up" if kind == "topup" else "subscription" if kind == "subscription" else "payment"
+
+    if url.startswith("http"):
+        return (
+            "🧾 *Recent Checkout Found*\n\n"
+            f"I found a recent pending {kind_label} checkout for {label}. "
+            "To avoid duplicate payment records, use this existing checkout link:\n\n"
+            f"{url}\n\n"
+            f"Reference: {ref}\n\n"
+            "If the link has expired, wait about 15 minutes and try again."
+        )
+
+    return (
+        "🧾 *Recent Pending Checkout Found*\n\n"
+        f"You already have a recent pending {kind_label} checkout for {label}.\n\n"
+        "Please use the last payment link already shown above in this chat. "
+        "To avoid duplicate payment records, I will not create another checkout immediately.\n\n"
+        f"Reference: {ref}\n\n"
+        "If you cannot find the link, wait about 15 minutes and try again, or contact support with SUP6."
+    )
+
+
+def _get_telegram_checkout_locks(tg_user_id: str) -> tuple[Optional[dict[str, Any]], dict[str, Any]]:
+    identity = _get_telegram_identity(tg_user_id)
+    if not identity:
+        return None, {}
+
+    metadata = identity.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    locks = metadata.get("telegram_checkout_locks") or {}
+    if not isinstance(locks, dict):
+        locks = {}
+
+    return identity, locks
+
+
+def _telegram_checkout_lock_message(
+    *,
+    tg_user_id: str,
+    account_id: str,
+    kind: str,
+    code: str,
+) -> Optional[str]:
+    fingerprint = _checkout_fingerprint(account_id, kind=kind, code=code)
+    _identity, locks = _get_telegram_checkout_locks(tg_user_id)
+    lock = locks.get(fingerprint)
+
+    if not isinstance(lock, dict):
+        return None
+
+    expires_at = _parse_dt(lock.get("expires_at"))
+    if not expires_at or expires_at <= datetime.now(timezone.utc):
+        return None
+
+    return _checkout_lock_message(lock, kind=kind, code=code)
+
+
+def _extract_checkout_info_from_result(result: dict[str, Any]) -> dict[str, str]:
+    raw_parts: list[str] = []
+
+    if isinstance(result, dict):
+        for key in (
+            "message",
+            "authorization_url",
+            "checkout_url",
+            "payment_url",
+            "url",
+            "reference",
+            "payment_reference",
+            "provider_reference",
+        ):
+            value = result.get(key)
+            if value:
+                raw_parts.append(_clean_text(value))
+
+    raw = "\n".join(raw_parts)
+
+    url = ""
+    match_url = re.search(r"https?://[^\s<>()]+", raw)
+    if match_url:
+        url = match_url.group(0).rstrip(".,)")
+
+    reference = ""
+    for pattern in (
+        r"(?:Reference|Ref|reference|ref)\s*[:#-]\s*([A-Za-z0-9_.:-]+)",
+        r"\b((?:SUB|TOP|TOPUP|NTG|TRX|PAY)[A-Za-z0-9_.:-]{6,})\b",
+    ):
+        match_ref = re.search(pattern, raw)
+        if match_ref:
+            reference = match_ref.group(1)
+            break
+
+    return {"url": url, "reference": reference}
+
+
+def _record_telegram_checkout_lock(
+    *,
+    tg_user_id: str,
+    account_id: str,
+    kind: str,
+    code: str,
+    result: Optional[dict[str, Any]] = None,
+) -> None:
+    identity, locks = _get_telegram_checkout_locks(tg_user_id)
+    if not identity:
+        return
+
+    identity_id = _clean_text(identity.get("id"))
+    if not identity_id:
+        return
+
+    metadata = identity.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    if not isinstance(locks, dict):
+        locks = {}
+
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(minutes=15)
+    fingerprint = _checkout_fingerprint(account_id, kind=kind, code=code)
+    info = _extract_checkout_info_from_result(result or {})
+
+    # Keep the lock list small and remove expired locks.
+    cleaned_locks: dict[str, Any] = {}
+    for key, value in locks.items():
+        if not isinstance(value, dict):
+            continue
+        expiry = _parse_dt(value.get("expires_at"))
+        if expiry and expiry > now:
+            cleaned_locks[key] = value
+
+    cleaned_locks[fingerprint] = {
+        "fingerprint": fingerprint,
+        "kind": kind,
+        "code": _clean_text(code).upper(),
+        "reference": info.get("reference") or "",
+        "url": info.get("url") or "",
+        "created_at": now.isoformat(),
+        "expires_at": expires_at.isoformat(),
+        "source": "telegram_batch_27d4",
+    }
+
+    metadata["telegram_checkout_locks"] = cleaned_locks
+    metadata["last_checkout_fingerprint"] = fingerprint
+
+    try:
+        supabase.table("channel_identities").update(
+            {
+                "metadata": metadata,
+                "updated_at": _utc_now_iso(),
+            }
+        ).eq("id", identity_id).execute()
+    except Exception:
+        logging.exception("Telegram checkout fingerprint lock update failed")
+
+
+
 def _plan_search_terms(plan_code: str) -> list[str]:
     code = _clean_text(plan_code).lower()
     terms = [code]
@@ -866,22 +1048,43 @@ def _plan_search_terms(plan_code: str) -> list[str]:
     return [t for t in terms if t]
 
 
-def _recent_checkout_reuse_message(account_id: str, *, plan_code: str = "", package_code: str = "") -> Optional[str]:
+def _recent_checkout_reuse_message(
+    account_id: str,
+    *,
+    tg_user_id: str = "",
+    plan_code: str = "",
+    package_code: str = "",
+) -> Optional[str]:
     """
-    Batch 27D3:
-    Type-separated duplicate checkout guard.
+    Batch 27D4:
+    Fingerprint-first checkout guard.
 
-    Rules:
-      - A recent S1/P1/B1 subscription checkout can block only a matching/recent
-        subscription checkout.
-      - A recent T10/T50/T100/T500 top-up checkout can block only a matching/recent
-        top-up checkout.
-      - Subscription checkouts must not block top-up checkouts.
-      - Top-up checkouts must not block subscription checkouts.
+    paystack_transactions rows may not consistently store package_code/plan_code.
+    To stop exact repeated commands reliably, Telegram now records a short-lived
+    checkout fingerprint inside channel_identities.metadata after successful
+    checkout creation.
+
+    Fingerprints:
+      - telegram:subscription:<account_id>:<plan_code>
+      - telegram:topup:<account_id>:<package_code>
     """
     requested_kind = "subscription" if plan_code else "topup" if package_code else ""
-    requested_label = (plan_code or package_code or "checkout").upper()
+    requested_code = plan_code or package_code
+    requested_label = (requested_code or "checkout").upper()
 
+    # 1. Exact fingerprint lock check. This is the most reliable guard.
+    if tg_user_id and requested_kind and requested_code:
+        lock_message = _telegram_checkout_lock_message(
+            tg_user_id=tg_user_id,
+            account_id=account_id,
+            kind=requested_kind,
+            code=requested_code,
+        )
+        if lock_message:
+            return lock_message
+
+    # 2. Legacy paystack_transactions scan. Keep it as a fallback for older
+    # checkout records created before Batch 27D4.
     if requested_kind == "subscription":
         requested_terms = _plan_search_terms(plan_code)
     elif requested_kind == "topup":
@@ -911,9 +1114,8 @@ def _recent_checkout_reuse_message(account_id: str, *, plan_code: str = "", pack
         if row_kind == "unknown" and not is_match:
             continue
 
-        # Same-kind, very recent fallback. This catches double-click/repeated
-        # command issues when the row does not store the exact plan/package code.
-        if not is_match and row_kind == requested_kind and _row_recent_enough(row, seconds=120):
+        # Same-kind fallback for very recent duplicate clicks.
+        if not is_match and row_kind == requested_kind and _row_recent_enough(row, seconds=45):
             if recent_same_kind_fallback is None:
                 recent_same_kind_fallback = row
             continue
@@ -996,7 +1198,11 @@ def _handle_plan_code_selection(
         return True
 
     plan_code = _clean_text(plan.get("plan_code") or plan.get("code") or plan.get("slug") or "")
-    reuse_msg = _recent_checkout_reuse_message(account_id, plan_code=plan_code) if plan_code else None
+    reuse_msg = (
+        _recent_checkout_reuse_message(account_id, tg_user_id=tg_user_id, plan_code=plan_code)
+        if plan_code
+        else None
+    )
     if reuse_msg:
         send_telegram_text(chat_id, reuse_msg)
         return True
@@ -1010,6 +1216,14 @@ def _handle_plan_code_selection(
             provider_user_id=tg_user_id,
             email=user_email,
         )
+        if result.get("ok") and plan_code:
+            _record_telegram_checkout_lock(
+                tg_user_id=tg_user_id,
+                account_id=account_id,
+                kind="subscription",
+                code=plan_code,
+                result=result,
+            )
         send_telegram_text(
             chat_id,
             result.get("message") if result.get("ok") else f"❌ {result.get('message', 'Please try again.')}",
@@ -1852,12 +2066,24 @@ def _handle_credit_package_selection(
         return True
 
     package_code = next((code for code, num in MASTER_TOPUP_CODE_TO_NUMBER.items() if num == package_num), "")
-    reuse_msg = _recent_checkout_reuse_message(account_id, package_code=package_code) if package_code else None
+    reuse_msg = (
+        _recent_checkout_reuse_message(account_id, tg_user_id=tg_user_id, package_code=package_code)
+        if package_code
+        else None
+    )
     if reuse_msg:
         send_telegram_text(chat_id, reuse_msg)
         return True
 
     result = create_credit_payment(account_id, package_num, "telegram", tg_user_id)
+    if result.get("ok") and package_code:
+        _record_telegram_checkout_lock(
+            tg_user_id=tg_user_id,
+            account_id=account_id,
+            kind="topup",
+            code=package_code,
+            result=result,
+        )
     user_states.pop(chat_id, None)
     send_telegram_text(
         chat_id,
