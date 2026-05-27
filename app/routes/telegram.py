@@ -43,7 +43,7 @@ from app.services.tax_filing_service import (
 
 bp = Blueprint("telegram", __name__)
 
-TELEGRAM_ROUTE_VERSION = "2026-05-27-v35h-batch28h-quiz-state-credit-sync"
+TELEGRAM_ROUTE_VERSION = "2026-05-27-v35j-batch28j-deadline-mode-schema-sync"
 
 LINK_CODE_RE = re.compile(r"^[A-Z0-9]{8}$")
 MENU_NUMBER_RE = re.compile(r"^[1-8]$")
@@ -4071,6 +4071,11 @@ def _handle_calculator_step(chat_id: str, user_state: dict[str, Any], text: str)
 
 DEADLINE_TAX_TYPES = {"PAYE", "VAT", "CIT", "WHT"}
 
+# Batch 28J: cache tax_deadlines columns discovered from SELECT * so D1/D4
+# can send a schema-safe payload first instead of triggering avoidable
+# PostgREST 400 responses before falling back.
+_TELEGRAM_TAX_DEADLINE_COLUMN_CACHE: Optional[set[str]] = None
+
 
 def _telegram_deadline_today() -> Any:
     return datetime.now(timezone.utc).date()
@@ -4265,6 +4270,33 @@ def _deadline_computed_status_telegram(item: dict[str, Any]) -> str:
     return "active" if enabled else "inactive"
 
 
+def _deadline_mode_for_display_telegram(item: dict[str, Any]) -> str:
+    """
+    Resolve the reminder delivery mode for Telegram display.
+
+    Batch 28J reason:
+    Some tax_deadlines schemas default channel/reminder_mode to whatsapp.
+    When a Telegram reminder is created through a schema-safe fallback, older
+    code could display the new reminder as "via whatsapp". This helper now
+    prefers explicit Telegram fields when present and defaults empty/minimal
+    Telegram rows to telegram instead of inheriting a whatsapp default.
+    """
+    reminder_mode = _clean_text(item.get("reminder_mode")).lower()
+    channel = _clean_text(item.get("channel")).lower()
+    source = _clean_text(item.get("source")).lower()
+
+    for value in (reminder_mode, channel, source):
+        if value in {"telegram", "tg"} or value.startswith("telegram"):
+            return "telegram"
+
+    if reminder_mode:
+        return reminder_mode
+    if channel:
+        return channel
+
+    return "telegram"
+
+
 def _deadline_display_line_telegram(item: dict[str, Any], index: int) -> str:
     tax_type = _clean_text(item.get("tax_type") or item.get("title") or "Tax").upper()
     due = _clean_text(item.get("due_date") or "No date")
@@ -4274,9 +4306,8 @@ def _deadline_display_line_telegram(item: dict[str, Any], index: int) -> str:
         days_text = "7 days before"
     status = _deadline_computed_status_telegram(item)
     time_text = _clean_text(item.get("reminder_time") or "09:00")
-    mode_text = _clean_text(item.get("reminder_mode") or item.get("channel") or "telegram")
+    mode_text = _deadline_mode_for_display_telegram(item)
     return f"{index}. {tax_type} - due {due} - reminder {days_text} - {status} - {time_text} via {mode_text}"
-
 
 def _telegram_deadline_rows(account_id: str, limit: int = 10) -> list[dict[str, Any]]:
     try:
@@ -4311,47 +4342,103 @@ def _telegram_deadline_by_index(account_id: str, index: int) -> Optional[dict[st
     return rows[index - 1]
 
 
+def _telegram_deadline_column_names_telegram(account_id: str = "") -> set[str]:
+    """
+    Discover currently available tax_deadlines columns without relying on a
+    failing INSERT attempt.
+
+    Supabase/PostgREST returns real column keys with select("*"). This lets the
+    Telegram route keep optional fields such as reminder_time/reminder_mode/
+    channel only when the deployed table actually exposes them.
+    """
+    global _TELEGRAM_TAX_DEADLINE_COLUMN_CACHE
+
+    if _TELEGRAM_TAX_DEADLINE_COLUMN_CACHE is not None:
+        return set(_TELEGRAM_TAX_DEADLINE_COLUMN_CACHE)
+
+    # These columns were proven by the successful fallback insert in Batch 28I.
+    discovered: set[str] = {
+        "user_id",
+        "account_id",
+        "tax_type",
+        "due_date",
+        "reminder_days_before",
+        "enabled",
+        "updated_at",
+    }
+
+    try:
+        q = supabase.table("tax_deadlines").select("*")
+        if _clean_text(account_id):
+            q = q.eq("account_id", account_id)
+        resp = q.limit(1).execute()
+        rows = _rows(resp)
+        if rows:
+            discovered.update(str(k) for k in rows[0].keys())
+    except Exception:
+        logging.exception("Telegram tax_deadlines column discovery failed")
+
+    # If the table has channel/reminder_mode columns and there are existing rows,
+    # select("*") above will expose them. If there are no rows, we avoid guessing
+    # optional columns so the first INSERT remains clean.
+    _TELEGRAM_TAX_DEADLINE_COLUMN_CACHE = set(discovered)
+    return set(discovered)
+
+
+def _deadline_payload_filtered_telegram(payload: dict[str, Any], columns: set[str], *, include_updated_at: bool = True) -> dict[str, Any]:
+    cleaned: dict[str, Any] = {}
+
+    for key, value in payload.items():
+        if value is None:
+            continue
+        if key == "updated_at" and not include_updated_at:
+            continue
+        if key in columns:
+            cleaned[key] = value
+
+    return cleaned
+
+
+def _deadline_payload_core_telegram(payload: dict[str, Any], columns: Optional[set[str]] = None, *, include_updated_at: bool = True) -> dict[str, Any]:
+    allowed = {
+        "user_id",
+        "account_id",
+        "tax_type",
+        "due_date",
+        "reminder_days_before",
+        "enabled",
+    }
+    if include_updated_at:
+        allowed.add("updated_at")
+
+    cleaned = {k: v for k, v in payload.items() if k in allowed and v is not None}
+    if columns:
+        cleaned = {k: v for k, v in cleaned.items() if k in columns}
+    return cleaned
+
+
 def _telegram_deadline_insert(payload: dict[str, Any]) -> dict[str, Any]:
-    attempts: list[dict[str, Any]] = []
+    columns = _telegram_deadline_column_names_telegram(_clean_text(payload.get("account_id")))
 
-    # Full payload first.
-    attempts.append(dict(payload))
-
-    # Remove newer optional columns if DB schema is older.
-    optional_remove = {"reminder_time", "timezone", "reminder_mode", "reminder_email", "reminder_phone", "source", "channel"}
-    attempts.append({k: v for k, v in payload.items() if k not in optional_remove})
-
-    # Remove updated_at if table does not expose it.
-    attempts.append({k: v for k, v in payload.items() if k not in optional_remove | {"updated_at"}})
-
-    # Account-only minimal fallback.
-    attempts.append(
-        {
-            "account_id": payload.get("account_id"),
-            "tax_type": payload.get("tax_type"),
-            "due_date": payload.get("due_date"),
-            "reminder_days_before": payload.get("reminder_days_before"),
-            "enabled": payload.get("enabled", True),
-        }
-    )
-
-    # user_id/account_id fallback for schemas that expect user_id.
-    attempts.append(
-        {
-            "user_id": payload.get("account_id"),
-            "account_id": payload.get("account_id"),
-            "tax_type": payload.get("tax_type"),
-            "due_date": payload.get("due_date"),
-            "reminder_days_before": payload.get("reminder_days_before"),
-            "enabled": payload.get("enabled", True),
-        }
-    )
+    # Batch 28J: schema-safe payloads first. This avoids the previous noisy
+    # sequence where the full payload caused 400, then a fallback succeeded.
+    attempts: list[dict[str, Any]] = [
+        _deadline_payload_filtered_telegram(payload, columns, include_updated_at=True),
+        _deadline_payload_filtered_telegram(payload, columns, include_updated_at=False),
+        _deadline_payload_core_telegram(payload, columns, include_updated_at=True),
+        _deadline_payload_core_telegram(payload, columns, include_updated_at=False),
+        _deadline_payload_core_telegram(payload, None, include_updated_at=True),
+        _deadline_payload_core_telegram(payload, None, include_updated_at=False),
+    ]
 
     seen: set[str] = set()
     errors: list[str] = []
 
     for attempt in attempts:
         cleaned = {k: v for k, v in attempt.items() if v is not None}
+        if not cleaned.get("account_id") or not cleaned.get("tax_type") or not cleaned.get("due_date"):
+            continue
+
         signature = repr(sorted(cleaned.keys()))
         if signature in seen:
             continue
@@ -4359,17 +4446,22 @@ def _telegram_deadline_insert(payload: dict[str, Any]) -> dict[str, Any]:
 
         ok, resp, err = _safe_exec(supabase.table("tax_deadlines").insert(cleaned))
         if ok:
-            return {"ok": True, "data": _rows(resp), "mode": signature}
+            return {"ok": True, "data": _rows(resp), "mode": signature, "attempt_keys": sorted(cleaned.keys())}
         errors.append(str(err))
 
     return {"ok": False, "error": errors[-1] if errors else "insert_failed", "errors": errors[:3]}
 
 
 def _telegram_deadline_update(deadline_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-    attempts = [
-        dict(payload),
-        {k: v for k, v in payload.items() if k not in {"reminder_time", "timezone", "reminder_mode", "source", "channel"}},
-        {k: v for k, v in payload.items() if k not in {"reminder_time", "timezone", "reminder_mode", "source", "channel", "updated_at"}},
+    columns = _telegram_deadline_column_names_telegram()
+
+    attempts: list[dict[str, Any]] = [
+        _deadline_payload_filtered_telegram(payload, columns, include_updated_at=True),
+        _deadline_payload_filtered_telegram(payload, columns, include_updated_at=False),
+        _deadline_payload_core_telegram(payload, columns, include_updated_at=True),
+        _deadline_payload_core_telegram(payload, columns, include_updated_at=False),
+        _deadline_payload_core_telegram(payload, None, include_updated_at=True),
+        _deadline_payload_core_telegram(payload, None, include_updated_at=False),
     ]
 
     errors: list[str] = []
@@ -4377,6 +4469,8 @@ def _telegram_deadline_update(deadline_id: str, payload: dict[str, Any]) -> dict
 
     for attempt in attempts:
         cleaned = {k: v for k, v in attempt.items() if v is not None}
+        if not cleaned:
+            continue
         signature = repr(sorted(cleaned.keys()))
         if signature in seen:
             continue
@@ -4384,12 +4478,11 @@ def _telegram_deadline_update(deadline_id: str, payload: dict[str, Any]) -> dict
 
         try:
             resp = supabase.table("tax_deadlines").update(cleaned).eq("id", deadline_id).execute()
-            return {"ok": True, "data": _rows(resp), "mode": signature}
+            return {"ok": True, "data": _rows(resp), "mode": signature, "attempt_keys": sorted(cleaned.keys())}
         except Exception as exc:
             errors.append(str(exc))
 
     return {"ok": False, "error": errors[-1] if errors else "update_failed", "errors": errors[:3]}
-
 
 def _telegram_deadline_delete(deadline_id: str) -> dict[str, Any]:
     try:
@@ -4618,6 +4711,8 @@ def _update_deadline_reminder_telegram(chat_id: str, account_id: str, text_raw: 
     updated["enabled"] = True
     updated["reminder_time"] = reminder_time
     updated["reminder_mode"] = reminder_mode
+    updated["channel"] = "telegram"
+    updated["source"] = "telegram"
 
     send_telegram_text(
         chat_id,
