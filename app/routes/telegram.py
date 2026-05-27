@@ -41,7 +41,7 @@ from app.services.tax_filing_service import (
 
 bp = Blueprint("telegram", __name__)
 
-TELEGRAM_ROUTE_VERSION = "2026-05-27-v34k-telegram-fingerprint-metadata-patch-fix"
+TELEGRAM_ROUTE_VERSION = "2026-05-27-v35a-telegram-ai-ask-history-credit-parity"
 
 LINK_CODE_RE = re.compile(r"^[A-Z0-9]{8}$")
 MENU_NUMBER_RE = re.compile(r"^[1-8]$")
@@ -200,7 +200,7 @@ def telegram_health():
             "version": TELEGRAM_ROUTE_VERSION,
             "route_mount": "/api/telegram/*",
             "account_resolution": "channel_identities_first_accounts_auth_fallback",
-            "command_namespace": "whatsapp_master_registry_stabilized_fingerprint_metadata_patch_fix",
+            "command_namespace": "whatsapp_master_registry_ai_ask_history_credit_parity",
             "configured": {
                 "bot_token": _env_present("TELEGRAM_BOT_TOKEN", "TG_BOT_TOKEN", "TELEGRAM_TOKEN"),
                 "webhook_secret": _env_present("TELEGRAM_WEBHOOK_SECRET", "TG_WEBHOOK_SECRET"),
@@ -1325,11 +1325,12 @@ def _send_last_answer(chat_id: str, account_id: str) -> None:
     except Exception:
         credits = 0
 
+    credit_line = f"Credits used: {credits}" if credits else "Credits used: 0 or not charged"
     body = (
         "📌 *Last Tax Answer*\n\n"
         f"Date: {created}\n"
         f"Source: {source}\n"
-        f"Credits used: {credits}\n\n"
+        f"{credit_line}\n\n"
         f"Question:\n{question}\n\n"
         f"Answer:\n{answer}\n\n"
         "Reply H1 for recent history or 0 for main menu."
@@ -1337,28 +1338,203 @@ def _send_last_answer(chat_id: str, account_id: str) -> None:
     send_telegram_text(chat_id, _clip_text(body))
 
 
-def _log_telegram_history(*, account_id: str, question: str, answer: str, result: dict[str, Any]) -> None:
+def _history_key(value: Any) -> str:
+    text = re.sub(r"\s+", " ", _clean_text(value).lower()).strip()
+    text = re.sub(r"[^a-z0-9]+", "_", text)
+    return text[:180]
+
+
+def _safe_insert_row(table: str, payload: dict[str, Any]) -> dict[str, Any]:
+    ok, resp, err = _safe_exec(supabase.table(table).insert(payload))
+    return {"ok": ok, "resp": resp, "error": err}
+
+
+def _log_telegram_history(*, account_id: str, question: str, answer: str, result: dict[str, Any]) -> dict[str, Any]:
+    """
+    Batch 28A:
+    Robust Telegram qa_history logging.
+
+    The earlier Telegram history insert had one payload only and failed silently
+    when optional columns did not exist. This version follows the safer WhatsApp
+    pattern: try richer payload first, then simpler fallbacks.
+    """
+    meta = result.get("meta") if isinstance(result, dict) and isinstance(result.get("meta"), dict) else {}
+
     try:
-        meta = result.get("meta") if isinstance(result.get("meta"), dict) else {}
-        credits_consumed = int(meta.get("credits_consumed") or 0)
-        from_cache = bool(result.get("source") == "database" or result.get("mode") == "direct_cache")
-        payload = {
+        credits_consumed = int(meta.get("credits_consumed") or meta.get("credit_cost") or 0)
+    except Exception:
+        credits_consumed = 0
+
+    source = _clean_text(result.get("source") if isinstance(result, dict) else "")
+    mode = _clean_text(result.get("mode") if isinstance(result, dict) else "")
+    from_cache = bool(source == "database" or mode == "direct_cache" or source == "cache" or mode == "cache")
+    usage_charged = bool(meta.get("usage_charged") is True or credits_consumed > 0)
+    now_iso = _utc_now_iso()
+    normalized_question = re.sub(r"\s+", " ", _clean_text(question)).strip()
+
+    payloads = [
+        {
             "account_id": account_id or None,
             "question": _clip_text(question, 5000),
             "answer": _clip_text(answer, 20000),
             "lang": "en",
             "source": "telegram",
+            "provider": "telegram",
+            "from_cache": from_cache,
+            "canonical_key": _history_key(question),
+            "normalized_question": normalized_question,
+            "plan_code": _clean_text(meta.get("plan_code")) or None,
+            "credits_consumed": credits_consumed,
+            "usage_charged": usage_charged,
+            "channel": "telegram",
+            "created_at": now_iso,
+            "updated_at": now_iso,
+        },
+        {
+            "account_id": account_id or None,
+            "question": _clip_text(question, 5000),
+            "answer": _clip_text(answer, 20000),
+            "lang": "en",
+            "source": "telegram",
+            "provider": "telegram",
             "from_cache": from_cache,
             "credits_consumed": credits_consumed,
-            "usage_charged": bool(credits_consumed > 0 or meta.get("usage_charged") is True),
+            "usage_charged": usage_charged,
             "channel": "telegram",
-            "created_at": _utc_now_iso(),
-            "updated_at": _utc_now_iso(),
-        }
-        supabase.table("qa_history").insert(payload).execute()
+            "created_at": now_iso,
+        },
+        {
+            "account_id": account_id or None,
+            "question": _clip_text(question, 5000),
+            "answer": _clip_text(answer, 20000),
+            "source": "telegram",
+            "channel": "telegram",
+            "created_at": now_iso,
+        },
+        {
+            "account_id": account_id or None,
+            "question": _clip_text(question, 5000),
+            "answer": _clip_text(answer, 20000),
+            "created_at": now_iso,
+        },
+        {
+            "question": _clip_text(question, 5000),
+            "answer": _clip_text(answer, 20000),
+            "created_at": now_iso,
+        },
+    ]
+
+    errors: list[str] = []
+    for idx, payload in enumerate(payloads):
+        inserted = _safe_insert_row("qa_history", payload)
+        if inserted.get("ok"):
+            return {"ok": True, "mode": f"telegram_history_payload_{idx}"}
+        errors.append(str(inserted.get("error")))
+
+    logging.warning("Telegram qa_history insert failed: %s", errors[:3])
+    return {"ok": False, "error": "telegram_history_insert_failed", "errors": errors[:3]}
+
+
+def _telegram_answer_credit_note(result: dict[str, Any]) -> str:
+    if not isinstance(result, dict):
+        return ""
+
+    meta = result.get("meta") if isinstance(result.get("meta"), dict) else {}
+    result_ok = bool(result.get("ok") is True)
+
+    if result_ok and meta.get("usage_charged") is True:
+        used = meta.get("credits_consumed") or meta.get("credit_cost") or 1
+        balance = meta.get("credits_left")
+        if balance is None:
+            balance = meta.get("balance")
+        balance_text = f" Balance: {balance}." if balance is not None else ""
+        return f"\n\n💎 Credit used: {used}.{balance_text}"
+
+    source = _clean_text(result.get("source"))
+    mode = _clean_text(result.get("mode"))
+    if result_ok and (source in {"database", "cache"} or mode in {"direct_cache", "cache"}):
+        return "\n\n✅ Served from saved database/cache. No new credit charged."
+
+    error_code = _clean_text(result.get("error"))
+    if not result_ok and error_code in {"paid_plan_required", "insufficient_credits", "no_credits", "credit_balance_empty"}:
+        return "\n\nNo credit was charged for this blocked request. Reply CR1 to check credits or 6 to buy Usage Credits."
+
+    return ""
+
+
+def _telegram_answer_text(result: dict[str, Any]) -> str:
+    if not isinstance(result, dict):
+        return "I could not generate an answer right now. Please try again shortly."
+
+    answer = _clean_text(result.get("answer") or result.get("message"))
+    if not answer:
+        if result.get("ok") is True:
+            answer = "I couldn't find a clear answer. Please try rephrasing your question."
+        else:
+            answer = "I could not generate an answer right now. Please try again shortly."
+
+    return _clip_text(answer + _telegram_answer_credit_note(result) + "\n\nReply H1 for history or 0 for main menu.", 3900)
+
+
+def _handle_telegram_tax_question(
+    *,
+    chat_id: str,
+    account_id: str,
+    tg_user_id: str,
+    question: str,
+    account_source: str = "",
+) -> dict[str, Any]:
+    """
+    Batch 28A:
+    Central Telegram AI ask handler.
+
+    Guarantees:
+      - Uses resolved channel_identity/account_id.
+      - Sends provider/provider_user_id to ask_guarded.
+      - Lets ask_guarded decide cache/library/AI and credit charging.
+      - Logs successful answers to qa_history.
+      - Adds clear credit/cache note to the Telegram response.
+      - Failed answers are not logged as successful history.
+    """
+    before_balance = None
+    try:
+        before_balance = get_credit_balance(account_id)
     except Exception:
-        # History must not break the Telegram answer flow.
-        pass
+        before_balance = None
+
+    result = ask_guarded(
+        {
+            "account_id": account_id,
+            "question": question,
+            "lang": "en",
+            "channel": "telegram",
+            "provider": "telegram",
+            "provider_user_id": tg_user_id,
+            "action_code": "ai_tax_answer",
+            "before_balance": before_balance,
+        }
+    )
+
+    if not isinstance(result, dict):
+        result = {"ok": False, "message": "I could not generate an answer right now. Please try again shortly."}
+
+    answer = _clean_text(result.get("answer") or result.get("message"))
+    if result.get("ok") is True and answer:
+        _log_telegram_history(account_id=account_id, question=question, answer=answer, result=result)
+
+    send_telegram_text(chat_id, _telegram_answer_text(result))
+
+    meta = result.get("meta") if isinstance(result.get("meta"), dict) else {}
+    return {
+        "ok": True,
+        "answered": True,
+        "result_ok": bool(result.get("ok") is True),
+        "account_source": account_source,
+        "usage_charged": meta.get("usage_charged"),
+        "credits_consumed": meta.get("credits_consumed"),
+        "source": result.get("source"),
+        "mode": result.get("mode"),
+    }
 
 
 def _subscription_row(account_id: str) -> Optional[dict[str, Any]]:
@@ -2735,16 +2911,18 @@ def tg_webhook():
         return jsonify({"ok": True, "linked": False, "reason": attempt.get("reason")})
 
     try:
-        result = ask_guarded({"question": text, "account_id": account_id, "lang": "en", "channel": "telegram"})
-        if result.get("ok"):
-            answer = result.get("answer", "")
-            if answer:
-                _log_telegram_history(account_id=account_id, question=text, answer=answer, result=result)
-            send_telegram_text(chat_id_str, answer if answer else "I couldn't find an answer. Please try rephrasing.\n\nReply 0 for main menu.")
-        else:
-            send_telegram_text(chat_id_str, "Sorry, I encountered an error. Please try again.\n\nReply 0 for main menu.")
-        return jsonify({"ok": True, "answered": True, "account_source": resolved.get("source")})
+        answer_payload = _handle_telegram_tax_question(
+            chat_id=chat_id_str,
+            account_id=account_id,
+            tg_user_id=tg_user_id,
+            question=text,
+            account_source=_clean_text(resolved.get("source")),
+        )
+        return jsonify(answer_payload)
     except Exception as exc:
-        logging.exception("Telegram webhook error: %s", exc)
-        send_telegram_text(chat_id_str, "Sorry, I encountered an error. Please try again later.")
-        return jsonify({"ok": True, "error_handled": True})
+        logging.exception("Telegram AI ask flow error: %s", exc)
+        send_telegram_text(
+            chat_id_str,
+            "Sorry, I encountered an error while answering your tax question. No credit should be charged for this failed request. Please try again later.\n\nReply 0 for main menu.",
+        )
+        return jsonify({"ok": True, "error_handled": True, "stage": "telegram_ai_ask"})
