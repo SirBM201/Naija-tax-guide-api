@@ -41,7 +41,7 @@ from app.services.tax_filing_service import (
 
 bp = Blueprint("telegram", __name__)
 
-TELEGRAM_ROUTE_VERSION = "2026-05-27-v34i1-telegram-checkout-fingerprint-timedelta-hotfix"
+TELEGRAM_ROUTE_VERSION = "2026-05-27-v34j-telegram-exact-checkout-fingerprint-guard"
 
 LINK_CODE_RE = re.compile(r"^[A-Z0-9]{8}$")
 MENU_NUMBER_RE = re.compile(r"^[1-8]$")
@@ -200,7 +200,7 @@ def telegram_health():
             "version": TELEGRAM_ROUTE_VERSION,
             "route_mount": "/api/telegram/*",
             "account_resolution": "channel_identities_first_accounts_auth_fallback",
-            "command_namespace": "whatsapp_master_registry_stabilized_checkout_fingerprint_guard_hotfix",
+            "command_namespace": "whatsapp_master_registry_stabilized_exact_checkout_fingerprint_guard",
             "configured": {
                 "bot_token": _env_present("TELEGRAM_BOT_TOKEN", "TG_BOT_TOKEN", "TELEGRAM_TOKEN"),
                 "webhook_secret": _env_present("TELEGRAM_WEBHOOK_SECRET", "TG_WEBHOOK_SECRET"),
@@ -1048,6 +1048,34 @@ def _plan_search_terms(plan_code: str) -> list[str]:
     return [t for t in terms if t]
 
 
+def _checkout_has_exact_term(row_text: str, term: str) -> bool:
+    """
+    Batch 27D5:
+    Exact checkout matching.
+
+    Avoid substring mistakes such as:
+      - T50 matching T500
+      - credit_50 matching credit_500
+      - S1-style plan checks accidentally matching unrelated text.
+    """
+    text = _clean_text(row_text).lower()
+    value = _clean_text(term).lower()
+
+    if not text or not value:
+        return False
+
+    # For phrases, normalize whitespace and use boundary-safe regex.
+    if " " in value:
+        escaped = r"\s+".join(re.escape(part) for part in value.split())
+        return re.search(rf"(?<![a-z0-9]){escaped}(?![a-z0-9])", text, flags=re.I) is not None
+
+    return re.search(rf"(?<![a-z0-9]){re.escape(value)}(?![a-z0-9])", text, flags=re.I) is not None
+
+
+def _checkout_has_any_exact_term(row_text: str, terms: list[str]) -> bool:
+    return any(_checkout_has_exact_term(row_text, term) for term in terms)
+
+
 def _recent_checkout_reuse_message(
     account_id: str,
     *,
@@ -1056,23 +1084,25 @@ def _recent_checkout_reuse_message(
     package_code: str = "",
 ) -> Optional[str]:
     """
-    Batch 27D4:
-    Fingerprint-first checkout guard.
+    Batch 27D5:
+    Exact checkout fingerprint guard.
 
-    paystack_transactions rows may not consistently store package_code/plan_code.
-    To stop exact repeated commands reliably, Telegram now records a short-lived
-    checkout fingerprint inside channel_identities.metadata after successful
-    checkout creation.
+    Blocking is now allowed only when:
+      1. an exact short-lived fingerprint lock exists; or
+      2. the legacy paystack_transactions row contains an exact matching
+         plan/top-up term.
 
-    Fingerprints:
-      - telegram:subscription:<account_id>:<plan_code>
-      - telegram:topup:<account_id>:<package_code>
+    Removed broad same-kind fallback because it caused:
+      - T50 to block T500;
+      - T500 to block T50;
+      - possible S1/P1/B1 cross-blocking.
     """
     requested_kind = "subscription" if plan_code else "topup" if package_code else ""
     requested_code = plan_code or package_code
     requested_label = (requested_code or "checkout").upper()
 
-    # 1. Exact fingerprint lock check. This is the most reliable guard.
+    # 1. Exact fingerprint lock check. This is the reliable guard for new
+    # checkout records created by Batch 27D4+.
     if tg_user_id and requested_kind and requested_code:
         lock_message = _telegram_checkout_lock_message(
             tg_user_id=tg_user_id,
@@ -1083,8 +1113,8 @@ def _recent_checkout_reuse_message(
         if lock_message:
             return lock_message
 
-    # 2. Legacy paystack_transactions scan. Keep it as a fallback for older
-    # checkout records created before Batch 27D4.
+    # 2. Legacy paystack_transactions scan. Exact-code only.
+    # No same-kind fallback is allowed here.
     if requested_kind == "subscription":
         requested_terms = _plan_search_terms(plan_code)
     elif requested_kind == "topup":
@@ -1093,7 +1123,6 @@ def _recent_checkout_reuse_message(
         requested_terms = []
 
     rows = _rows_for_account("paystack_transactions", account_id, limit=20)
-    recent_same_kind_fallback: Optional[dict[str, Any]] = None
 
     for row in rows:
         if not _row_is_open_checkout(row) or not _row_recent_enough(row, seconds=900):
@@ -1103,24 +1132,14 @@ def _recent_checkout_reuse_message(
         row_kind = _checkout_row_kind(row_text)
 
         # Hard separation:
-        # known subscription rows must not block top-up rows, and known top-up
-        # rows must not block subscription rows.
+        # known subscription rows cannot block top-up rows;
+        # known top-up rows cannot block subscription rows.
         if requested_kind and row_kind not in {requested_kind, "unknown"}:
             continue
 
-        is_match = any(term and term in row_text for term in requested_terms)
-
-        # Unknown rows are allowed to block only when there is a direct term match.
-        if row_kind == "unknown" and not is_match:
-            continue
-
-        # Same-kind fallback for very recent duplicate clicks.
-        if not is_match and row_kind == requested_kind and _row_recent_enough(row, seconds=45):
-            if recent_same_kind_fallback is None:
-                recent_same_kind_fallback = row
-            continue
-
-        if not is_match:
+        # Exact match only. This prevents T50 from matching T500 and prevents
+        # a generic recent top-up from blocking another top-up package.
+        if not _checkout_has_any_exact_term(row_text, requested_terms):
             continue
 
         url = _checkout_url_from_row(row)
@@ -1149,33 +1168,6 @@ def _recent_checkout_reuse_message(
             "To avoid duplicate payment records, I will not create another checkout immediately.\n\n"
             f"Reference: {ref}\n\n"
             "If you cannot find the link, wait about 15 minutes and try again, or contact support with SUP6."
-        )
-
-    if recent_same_kind_fallback:
-        ref = (
-            recent_same_kind_fallback.get("reference")
-            or recent_same_kind_fallback.get("payment_reference")
-            or recent_same_kind_fallback.get("provider_reference")
-            or recent_same_kind_fallback.get("gateway_reference")
-            or "not shown"
-        )
-        url = _checkout_url_from_row(recent_same_kind_fallback)
-
-        if url:
-            return (
-                "🧾 *Recent Checkout Found*\n\n"
-                f"I found a very recent pending {requested_kind or 'payment'} checkout on your account. "
-                "To avoid duplicate payment records, complete this checkout first:\n\n"
-                f"{url}\n\n"
-                f"Reference: {ref}"
-            )
-
-        return (
-            "🧾 *Recent Pending Checkout Found*\n\n"
-            f"I found a very recent pending {requested_kind or 'payment'} checkout on your account. "
-            "Please use the last payment link already shown above before creating another one.\n\n"
-            f"Reference: {ref}\n\n"
-            "If you cannot find the link, wait about 15 minutes and try again."
         )
 
     return None
