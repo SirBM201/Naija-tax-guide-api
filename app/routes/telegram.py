@@ -43,7 +43,7 @@ from app.services.tax_filing_service import (
 
 bp = Blueprint("telegram", __name__)
 
-TELEGRAM_ROUTE_VERSION = "2026-05-27-v35g-batch28g-command-routing"
+TELEGRAM_ROUTE_VERSION = "2026-05-27-v35h-batch28h-quiz-state-credit-sync"
 
 LINK_CODE_RE = re.compile(r"^[A-Z0-9]{8}$")
 MENU_NUMBER_RE = re.compile(r"^[1-8]$")
@@ -1583,10 +1583,59 @@ def _subscription_row(account_id: str) -> Optional[dict[str, Any]]:
         return None
 
 
+def _credit_balance_value(balance: Any) -> int:
+    """
+    Return the user's current Usage Credit balance from different service/table
+    payload shapes.
+
+    Batch 28H fix:
+    CR1 can show the correct balance while PAY1/ACC1 show 0 if the service
+    returns a key such as credits or available_credits instead of balance.
+    Keep all Telegram balance displays aligned with CR1.
+    """
+    if isinstance(balance, (int, float)):
+        try:
+            return int(balance)
+        except Exception:
+            return 0
+
+    if not isinstance(balance, dict):
+        return 0
+
+    for key in (
+        "balance",
+        "credits",
+        "credit_balance",
+        "available_credits",
+        "remaining_credits",
+        "usage_credits",
+        "total_credits",
+        "remaining",
+    ):
+        if key in balance and balance.get(key) not in (None, ""):
+            try:
+                return int(float(str(balance.get(key)).replace(",", "")))
+            except Exception:
+                pass
+
+    for key in ("row", "data", "balance_row", "credit_balance_row"):
+        nested = balance.get(key)
+        if isinstance(nested, dict):
+            value = _credit_balance_value(nested)
+            if value != 0:
+                return value
+        if isinstance(nested, list) and nested and isinstance(nested[0], dict):
+            value = _credit_balance_value(nested[0])
+            if value != 0:
+                return value
+
+    return 0
+
+
 def _billing_summary_text(account_id: str) -> str:
     sub = _subscription_row(account_id)
     balance = get_credit_balance(account_id)
-    bal_value = balance.get("balance", 0) if isinstance(balance, dict) else 0
+    bal_value = _credit_balance_value(balance)
 
     if not sub:
         return (
@@ -1867,7 +1916,7 @@ def _send_credit_rows(chat_id: str, account_id: str, *, mode: str) -> None:
 
     if not rows:
         balance = get_credit_balance(account_id)
-        bal_value = balance.get("balance", 0) if isinstance(balance, dict) else 0
+        bal_value = _credit_balance_value(balance)
         send_telegram_text(chat_id, f"{title}\n\nNo matching credit activity found yet.\n\nCurrent balance: {bal_value}\n\nReply CR1 for balance or 0 for main menu.")
         return
 
@@ -3429,7 +3478,7 @@ def _send_credit_activity(chat_id: str, account_id: str) -> None:
     balance = get_credit_balance(account_id)
 
     if not rows:
-        bal = balance.get("balance", 0) if isinstance(balance, dict) else "Not shown"
+        bal = _credit_balance_value(balance) if isinstance(balance, dict) else "Not shown"
         send_telegram_text(
             chat_id,
             "*📉 Usage Credit Activity*\n\n"
@@ -3554,7 +3603,7 @@ def _send_account_status(chat_id: str, account_id: str, tg_user_id: str, linked:
         msg += f"Last seen: {_date_short(identity.get('last_seen_at') or identity.get('updated_at'))}\n"
 
     if isinstance(balance, dict):
-        msg += f"Usage Credits: {balance.get('balance', 0)}\n"
+        msg += f"Usage Credits: {_credit_balance_value(balance)}\n"
 
     msg += "\nReply ACC2 for link/unlink help or 0 for main menu."
     send_telegram_text(chat_id, msg)
@@ -5307,7 +5356,7 @@ def _telegram_quiz_compact_state(chat_id: str, state: dict[str, Any]) -> dict[st
         "quiz_mode": _clean_text(state.get("quiz_mode")),
         "quiz_data": data,
         "saved_at": _utc_now_iso(),
-        "version": "28D1",
+        "version": "28H",
     }
 
 
@@ -5486,7 +5535,19 @@ def _start_quiz_telegram(chat_id: str, account_id: str, tg_user_id: str, categor
 
 def _handle_quiz_answer_telegram(chat_id: str, account_id: str, text: str, tg_user_id: str = "") -> bool:
     answer = _clean_text(text).upper()[:1]
-    state = _quiz_state(chat_id)
+
+    # Batch 28H fix:
+    # Koyeb/Gunicorn may route the Q1 message and the later A/B/C/D answer to
+    # different workers. Always reload the persisted quiz state before grading so
+    # the answer is checked against the exact question last sent to the user, not
+    # a stale in-memory worker copy.
+    persisted_state = _load_telegram_quiz_state(tg_user_id, chat_id) if _clean_text(tg_user_id) else {}
+    if persisted_state:
+        state = persisted_state
+        user_states[chat_id] = state
+    else:
+        state = _quiz_state(chat_id)
+
     data = state.get("quiz_data") if isinstance(state.get("quiz_data"), dict) else {}
 
     if _quiz_norm(text) in {"cancel", "stop", "end"}:
@@ -5580,8 +5641,17 @@ def _handle_quiz_answer_telegram(chat_id: str, account_id: str, text: str, tg_us
     return True
 
 
-def _send_quiz_score_telegram(chat_id: str, account_id: str) -> None:
-    data = _quiz_data(chat_id)
+def _quiz_display_data(chat_id: str, tg_user_id: str = "") -> dict[str, Any]:
+    persisted_state = _load_telegram_quiz_state(tg_user_id, chat_id) if _clean_text(tg_user_id) else {}
+    if persisted_state:
+        user_states[chat_id] = persisted_state
+        data = persisted_state.get("quiz_data")
+        return data if isinstance(data, dict) else {}
+    return _quiz_data(chat_id)
+
+
+def _send_quiz_score_telegram(chat_id: str, account_id: str, tg_user_id: str = "") -> None:
+    data = _quiz_display_data(chat_id, tg_user_id)
     numbers = _quiz_daily_numbers_from_data(data)
     attempts = numbers["attempts"]
     accuracy = "0%" if attempts <= 0 else f"{round((numbers['correct'] / attempts) * 100)}%"
@@ -5599,8 +5669,8 @@ def _send_quiz_score_telegram(chat_id: str, account_id: str) -> None:
     send_telegram_text(chat_id, body)
 
 
-def _send_quiz_review_telegram(chat_id: str) -> None:
-    data = _quiz_data(chat_id)
+def _send_quiz_review_telegram(chat_id: str, tg_user_id: str = "") -> None:
+    data = _quiz_display_data(chat_id, tg_user_id)
     last = data.get("last_quiz") if isinstance(data.get("last_quiz"), dict) else None
     if not last:
         send_telegram_text(chat_id, "📌 No quiz answer to review yet. Reply Q1 to start a quiz.")
@@ -5625,8 +5695,8 @@ def _send_quiz_review_telegram(chat_id: str) -> None:
     send_telegram_text(chat_id, _clip_text(body, 3900))
 
 
-def _send_quiz_q5_telegram(chat_id: str, account_id: str) -> None:
-    data = _quiz_data(chat_id)
+def _send_quiz_q5_telegram(chat_id: str, account_id: str, tg_user_id: str = "") -> None:
+    data = _quiz_display_data(chat_id, tg_user_id)
     last = data.get("last_quiz") if isinstance(data.get("last_quiz"), dict) else None
 
     question = _clean_text((last or {}).get("question") or data.get("quiz_question"))
@@ -5710,15 +5780,15 @@ def _handle_quiz_command_telegram(chat_id: str, account_id: str, tg_user_id: str
         return True
 
     if norm.startswith("q3") or "score" in norm:
-        _send_quiz_score_telegram(chat_id, account_id)
+        _send_quiz_score_telegram(chat_id, account_id, tg_user_id)
         return True
 
     if norm.startswith("q4") or "review" in norm:
-        _send_quiz_review_telegram(chat_id)
+        _send_quiz_review_telegram(chat_id, tg_user_id)
         return True
 
     if norm.startswith("q5") or "explain" in norm:
-        _send_quiz_q5_telegram(chat_id, account_id)
+        _send_quiz_q5_telegram(chat_id, account_id, tg_user_id)
         return True
 
     send_telegram_text(chat_id, _quiz_text_telegram())
@@ -6093,14 +6163,24 @@ def tg_webhook():
     if not isinstance(user_state, dict):
         user_state = {}
 
-    # Batch 28D1:
-    # Restore quiz state from channel_identities.metadata when the next Telegram
-    # message lands on another Koyeb/Gunicorn worker.
-    if not user_state.get("quiz_mode") and not user_state.get("quiz_data"):
-        persisted_quiz_state = _load_telegram_quiz_state(tg_user_id, chat_id_str)
-        if persisted_quiz_state:
-            user_state = persisted_quiz_state
-            user_states[chat_id_str] = user_state
+    # Batch 28H:
+    # Restore quiz state from channel_identities.metadata more aggressively for
+    # quiz-related messages. This prevents Q4/Q5 and A/B/C/D answers from using
+    # stale in-memory worker state when Gunicorn routes messages across workers.
+    quiz_text_candidate = bool(
+        re.match(r"^Q[1-5]\b", text, flags=re.I)
+        or _clean_text(text).upper() in {"A", "B", "C", "D"}
+        or text_lower in {"quiz", "start quiz", "tax quiz", "quiz me", "take quiz", "cancel", "stop", "end"}
+    )
+    persisted_quiz_state = _load_telegram_quiz_state(tg_user_id, chat_id_str)
+    if persisted_quiz_state and (
+        not user_state
+        or bool(user_state.get("quiz_mode"))
+        or isinstance(user_state.get("quiz_data"), dict)
+        or quiz_text_candidate
+    ):
+        user_state = persisted_quiz_state
+        user_states[chat_id_str] = user_state
 
     has_subscription = bool(has_active_subscription(account_id))
 
