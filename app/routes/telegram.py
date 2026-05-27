@@ -43,7 +43,7 @@ from app.services.tax_filing_service import (
 
 bp = Blueprint("telegram", __name__)
 
-TELEGRAM_ROUTE_VERSION = "2026-05-27-v35d3-telegram-quiz-schema-payload-noise-cleanup"
+TELEGRAM_ROUTE_VERSION = "2026-05-27-v35e-telegram-support-ticket-reply-close-parity"
 
 LINK_CODE_RE = re.compile(r"^[A-Z0-9]{8}$")
 MENU_NUMBER_RE = re.compile(r"^[1-8]$")
@@ -202,7 +202,7 @@ def telegram_health():
             "version": TELEGRAM_ROUTE_VERSION,
             "route_mount": "/api/telegram/*",
             "account_resolution": "channel_identities_first_accounts_auth_fallback",
-            "command_namespace": "whatsapp_master_registry_quiz_schema_payload_noise_cleanup",
+            "command_namespace": "whatsapp_master_registry_support_ticket_reply_close_parity",
             "configured": {
                 "bot_token": _env_present("TELEGRAM_BOT_TOKEN", "TG_BOT_TOKEN", "TELEGRAM_TOKEN"),
                 "webhook_secret": _env_present("TELEGRAM_WEBHOOK_SECRET", "TG_WEBHOOK_SECRET"),
@@ -620,8 +620,8 @@ def _send_main_menu(chat_id: str, *, linked: bool = False) -> None:
         "Quick commands:\n"
         "H1 - Recent tax history 🕘\n"
         "H2 - Last tax answer 📌\n"
-        "SUP1 - Create support ticket 🛟\n"
-        "SUP2 - View support tickets 🎫\n"
+        "SUP1 - Create support ticket 🛟\nSUP3 - View open support tickets 🎫\nSUP4 - Reply to support ticket 📝\nSUP5 - Close support ticket ✅\n"
+        "SUP2 - View latest support ticket 🎫\n"
         "PAY1 - Billing summary 💳\n"
         "PAY2 - Payment history 🧾\n"
         "FT1 - Filing assistance 🗂️\n"
@@ -688,7 +688,7 @@ def _send_help(chat_id: str, *, linked: bool = False) -> None:
         f"• {option_5}: reply 5 or ACC2\n"
         "• Buy Usage Credit add-ons: reply 6 then choose T10, T50, T100, or T500\n"
         "• Recent history: H1 / H2\n"
-        "• Support: SUP1-SUP6\n"
+        "• Support: SUP1 create, SUP2 latest, SUP3 open, SUP4 reply, SUP5 close, SUP6 contact\n"
         "• Referrals: R1-R6\n"
         "• Show all commands: ALL\n"
         "• Show menu: 0 or MENU\n\n"
@@ -1882,15 +1882,17 @@ def _send_support_menu(chat_id: str) -> None:
         chat_id,
         "🛟 *Support Centre*\n\n"
         "SUP1 - Create support ticket\n"
-        "SUP2 - View my support tickets\n"
-        "SUP3 - View latest ticket\n"
-        "SUP4 - Reply to latest/open ticket\n"
-        "SUP5 - Close latest/open ticket\n"
-        "SUP6 - Contact support email\n\n"
+        "SUP2 - View latest ticket\n"
+        "SUP3 - View open tickets\n"
+        "SUP4 - Reply/update latest ticket\n"
+        "SUP5 - Close latest ticket\n"
+        "SUP6 - Contact support / escalation guide\n\n"
         "Quick examples:\n"
         "SUP1 I paid but my plan has not updated. Reference NTG-...\n"
         "SUP4 Please note that my Paystack reference is NTG-...\n"
-        "SUP5\n\n"
+        "SUP4 2 I have attached the missing information.\n"
+        "SUP5\n"
+        "SUP5 1 Resolved now, thank you.\n\n"
         "Reply 0 for main menu.",
     )
 
@@ -1898,11 +1900,291 @@ def _send_support_menu(chat_id: str) -> None:
 def _send_support_email(chat_id: str) -> None:
     send_telegram_text(
         chat_id,
-        "📧 *Contact Support*\n\n"
+        "📧 *Contact Support / Escalation Guide*\n\n"
         "Email: support@naijataxguides.com\n\n"
-        "For faster help, include your Telegram ID, registered email/phone, payment reference if any, and a short description of the issue.\n\n"
-        "You can also reply SUP1 followed by your issue to create a support ticket.",
+        "For faster help, include:\n"
+        "• Your Telegram ID\n"
+        "• Registered email/phone\n"
+        "• Ticket reference if available\n"
+        "• Payment reference if it is a billing issue\n"
+        "• A short description of the issue\n\n"
+        "Telegram commands:\n"
+        "SUP1 your issue - create ticket\n"
+        "SUP2 - view latest ticket\n"
+        "SUP3 - view open tickets\n"
+        "SUP4 your update - reply to latest open ticket\n"
+        "SUP5 - close latest open ticket",
     )
+
+
+def _support_ref(row: dict[str, Any]) -> str:
+    return _clean_text(row.get("ticket_id") or row.get("reference") or row.get("id") or "No reference")
+
+
+def _support_status(row: dict[str, Any]) -> str:
+    return _clean_text(row.get("status") or row.get("admin_status") or "open").lower()
+
+
+def _support_is_open(row: dict[str, Any]) -> bool:
+    status = _support_status(row)
+    return status not in {"closed", "resolved", "cancelled", "canceled", "done", "completed"}
+
+
+def _support_subject(row: dict[str, Any]) -> str:
+    return _clean_text(
+        row.get("subject")
+        or row.get("title")
+        or row.get("message")
+        or row.get("description")
+        or "Support ticket"
+    )
+
+
+def _support_user_message(row: dict[str, Any]) -> str:
+    return _clean_text(row.get("message") or row.get("description") or row.get("body") or "")
+
+
+def _support_admin_note(row: dict[str, Any]) -> str:
+    for key in (
+        "admin_reply",
+        "admin_note",
+        "admin_notes",
+        "support_reply",
+        "response",
+        "resolution",
+        "resolution_note",
+        "resolution_notes",
+        "last_admin_reply",
+    ):
+        value = _clean_text(row.get(key))
+        if value:
+            return value
+    return ""
+
+
+def _support_rows(account_id: str, *, limit: int = 10) -> list[dict[str, Any]]:
+    try:
+        resp = (
+            supabase.table("support_tickets")
+            .select("*")
+            .eq("account_id", account_id)
+            .order("created_at", desc=True)
+            .limit(max(1, min(limit, 20)))
+            .execute()
+        )
+        return _rows(resp)
+    except Exception:
+        try:
+            resp = (
+                supabase.table("support_tickets")
+                .select("*")
+                .eq("account_id", account_id)
+                .limit(max(1, min(limit, 20)))
+                .execute()
+            )
+            return _rows(resp)
+        except Exception:
+            return []
+
+
+def _support_open_rows(account_id: str, *, limit: int = 10) -> list[dict[str, Any]]:
+    rows = _support_rows(account_id, limit=limit)
+    return [row for row in rows if _support_is_open(row)]
+
+
+def _support_ticket_line(row: dict[str, Any], idx: int) -> list[str]:
+    ref = _support_ref(row)
+    status = _support_status(row).title()
+    subject = _history_excerpt(_support_subject(row), 120)
+    created = row.get("created_at")
+    updated = row.get("updated_at")
+    priority = _clean_text(row.get("priority"))
+    category = _clean_text(row.get("category"))
+    admin_note = _support_admin_note(row)
+
+    lines = [
+        f"{idx}. {ref}",
+        f"   Status: {status}",
+        f"   Subject: {subject}",
+        f"   Created: {_date_short(created)}",
+    ]
+
+    if updated:
+        lines.append(f"   Last update: {_date_short(updated)}")
+    if category:
+        lines.append(f"   Category: {category}")
+    if priority:
+        lines.append(f"   Priority: {priority}")
+    if admin_note:
+        lines.append(f"   Admin note: {_history_excerpt(admin_note, 140)}")
+
+    return lines
+
+
+def _send_support_tickets(chat_id: str, account_id: str, *, mode: str = "latest") -> None:
+    if mode == "open":
+        rows = _support_open_rows(account_id, limit=10)
+        title = "🎫 *Open Support Tickets*"
+        empty = (
+            "🎫 *Open Support Tickets*\n\n"
+            "No open support ticket found.\n\n"
+            "Reply SUP1 followed by your issue to create one."
+        )
+    elif mode == "all":
+        rows = _support_rows(account_id, limit=5)
+        title = "🎫 *My Support Tickets*"
+        empty = (
+            "🎫 *Support Tickets*\n\n"
+            "No support ticket found yet.\n\n"
+            "Reply SUP1 followed by your issue to create one."
+        )
+    else:
+        rows = _support_rows(account_id, limit=1)
+        title = "🎫 *Latest Support Ticket*"
+        empty = (
+            "🎫 *Latest Support Ticket*\n\n"
+            "No support ticket found yet.\n\n"
+            "Reply SUP1 followed by your issue to create one."
+        )
+
+    if not rows:
+        send_telegram_text(chat_id, empty)
+        return
+
+    lines = [title, ""]
+    for idx, row in enumerate(rows, 1):
+        lines.extend(_support_ticket_line(row, idx))
+        lines.append("")
+
+    if mode == "open":
+        lines.append("Reply SUP4 1 your message to add a reply, SUP5 1 to close ticket, or 0 for menu.")
+    else:
+        lines.append("Reply SUP4 with your message to add a note, SUP5 to close latest/open ticket, SUP3 to view open tickets, or 0 for menu.")
+
+    send_telegram_text(chat_id, _clip_text("\n".join(lines)))
+
+
+def _support_find_ticket(account_id: str, selector: str = "", *, prefer_open: bool = True) -> tuple[Optional[dict[str, Any]], list[dict[str, Any]]]:
+    rows = _support_rows(account_id, limit=10)
+    if not rows:
+        return None, rows
+
+    selector = _clean_text(selector)
+    open_rows = [row for row in rows if _support_is_open(row)]
+
+    if selector:
+        if selector.isdigit():
+            idx = int(selector) - 1
+            source_rows = open_rows if prefer_open and open_rows else rows
+            if 0 <= idx < len(source_rows):
+                return source_rows[idx], rows
+            return None, rows
+
+        selector_norm = selector.lower()
+        for row in rows:
+            ref = _support_ref(row).lower()
+            row_id = _clean_text(row.get("id")).lower()
+            if selector_norm == ref or selector_norm == row_id:
+                return row, rows
+            if ref and selector_norm in ref:
+                return row, rows
+
+    if prefer_open and open_rows:
+        return open_rows[0], rows
+
+    return rows[0], rows
+
+
+def _support_update_where(row: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    row_id = _clean_text(row.get("id"))
+    ticket_ref = _support_ref(row)
+
+    attempts = [
+        dict(payload),
+        {k: v for k, v in payload.items() if k not in {"updated_at", "metadata"}},
+        {k: v for k, v in payload.items() if k in {"message", "status"}},
+        {k: v for k, v in payload.items() if k == "status"},
+    ]
+
+    errors: list[str] = []
+    seen: set[str] = set()
+
+    for candidate in attempts:
+        cleaned = {k: v for k, v in candidate.items() if v is not None}
+        if not cleaned:
+            continue
+        signature = repr(sorted(cleaned.keys()))
+        if signature in seen:
+            continue
+        seen.add(signature)
+
+        if row_id:
+            ok, resp, err = _safe_exec(supabase.table("support_tickets").update(cleaned).eq("id", row_id))
+            if ok:
+                return {"ok": True, "data": _rows(resp), "mode": signature, "where": "id"}
+            errors.append(str(err))
+
+        if ticket_ref and ticket_ref != "No reference":
+            ok, resp, err = _safe_exec(supabase.table("support_tickets").update(cleaned).eq("ticket_id", ticket_ref))
+            if ok:
+                return {"ok": True, "data": _rows(resp), "mode": signature, "where": "ticket_id"}
+            errors.append(str(err))
+
+    return {"ok": False, "error": errors[-1] if errors else "update_failed", "errors": errors[:3]}
+
+
+def _support_insert_ticket(payload: dict[str, Any]) -> dict[str, Any]:
+    # Use minimal known-safe payload first, then wider payloads as fallback.
+    payload_attempts = [
+        {
+            "ticket_id": payload.get("ticket_id"),
+            "account_id": payload.get("account_id"),
+            "message": payload.get("message"),
+            "status": payload.get("status"),
+            "created_at": payload.get("created_at"),
+        },
+        {
+            "ticket_id": payload.get("ticket_id"),
+            "account_id": payload.get("account_id"),
+            "subject": payload.get("subject"),
+            "message": payload.get("message"),
+            "status": payload.get("status"),
+            "created_at": payload.get("created_at"),
+            "updated_at": payload.get("updated_at"),
+        },
+        {
+            "ticket_id": payload.get("ticket_id"),
+            "account_id": payload.get("account_id"),
+            "category": payload.get("category"),
+            "priority": payload.get("priority"),
+            "subject": payload.get("subject"),
+            "message": payload.get("message"),
+            "status": payload.get("status"),
+            "channel": payload.get("channel"),
+            "source": payload.get("source"),
+            "metadata": payload.get("metadata"),
+            "created_at": payload.get("created_at"),
+            "updated_at": payload.get("updated_at"),
+        },
+        dict(payload),
+    ]
+
+    errors: list[str] = []
+    seen: set[str] = set()
+
+    for candidate in payload_attempts:
+        cleaned = {k: v for k, v in candidate.items() if v is not None}
+        signature = repr(sorted(cleaned.keys()))
+        if signature in seen:
+            continue
+        seen.add(signature)
+
+        ok, resp, err = _safe_exec(supabase.table("support_tickets").insert(cleaned))
+        if ok:
+            return {"ok": True, "data": _rows(resp), "mode": signature}
+        errors.append(str(err))
+
+    return {"ok": False, "error": errors[-1] if errors else "insert_failed", "errors": errors[:3]}
 
 
 def _create_support_ticket_from_text(chat_id: str, account_id: str, text_raw: str) -> None:
@@ -1922,112 +2204,199 @@ def _create_support_ticket_from_text(chat_id: str, account_id: str, text_raw: st
     ticket_id = f"NTG-TG-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
     now = _utc_now_iso()
 
-    # Batch 27D2:
-    # Live DB error confirmed support_tickets.ticket_id is NOT NULL.
-    # Use ticket_id in every payload attempt and keep the first payload close
-    # to the actual row shape shown by Supabase error details.
-    payload_attempts = [
-        {
-            "ticket_id": ticket_id,
-            "account_id": account_id,
-            "category": "general",
-            "priority": "normal",
-            "subject": details[:120],
-            "message": details,
-            "status": "open",
-            "channel": "telegram",
-            "source": "telegram",
-            "metadata": {"created_from": "telegram", "command": "SUP1"},
-            "created_at": now,
-            "updated_at": now,
-        },
-        {
-            "ticket_id": ticket_id,
-            "account_id": account_id,
-            "subject": details[:120],
-            "message": details,
-            "status": "open",
-            "channel": "telegram",
-            "source": "telegram",
-            "created_at": now,
-            "updated_at": now,
-        },
-        {
-            "ticket_id": ticket_id,
-            "account_id": account_id,
-            "subject": details[:120],
-            "message": details,
-            "status": "open",
-            "created_at": now,
-            "updated_at": now,
-        },
-        {
-            "ticket_id": ticket_id,
-            "account_id": account_id,
-            "message": details,
-            "status": "open",
-            "created_at": now,
-            "updated_at": now,
-        },
-        {
-            "ticket_id": ticket_id,
-            "account_id": account_id,
-            "message": details,
-            "status": "open",
-            "created_at": now,
-        },
-    ]
+    payload = {
+        "ticket_id": ticket_id,
+        "account_id": account_id,
+        "category": "general",
+        "priority": "normal",
+        "subject": details[:120],
+        "message": details,
+        "status": "open",
+        "channel": "telegram",
+        "source": "telegram",
+        "metadata": {"created_from": "telegram", "command": "SUP1"},
+        "created_at": now,
+        "updated_at": now,
+    }
 
-    saved_row = None
-    last_error = None
-
-    for payload in payload_attempts:
-        ok, resp, err = _safe_exec(supabase.table("support_tickets").insert(payload))
-        if ok:
-            saved_row = _first(resp) or payload
-            break
-        last_error = err
-
-    if saved_row:
-        ref = saved_row.get("ticket_id") or saved_row.get("id") or ticket_id
+    result = _support_insert_ticket(payload)
+    if result.get("ok"):
+        rows = result.get("data") if isinstance(result.get("data"), list) else []
+        saved_row = rows[0] if rows and isinstance(rows[0], dict) else payload
+        ref = _support_ref(saved_row) or ticket_id
         send_telegram_text(
             chat_id,
-            f"✅ *Support Ticket Created*\n\nTicket: {ref}\n\nOur support team will review it.\n\nReply SUP2 to view tickets or 0 for main menu.",
+            f"✅ *Support Ticket Created*\n\n"
+            f"Ticket: {ref}\n"
+            f"Status: Open\n\n"
+            "Our support team will review it.\n\n"
+            "Reply SUP2 to view latest ticket, SUP4 to add a reply, or 0 for main menu.",
         )
-    else:
-        logging.warning("Telegram support ticket insert failed: %s", last_error)
-        send_telegram_text(
-            chat_id,
-            "⚠️ I could not save the support ticket automatically.\n\n"
-            "Please email support@naijataxguides.com and include this reference:\n"
-            f"{ticket_id}\n\n"
-            "Your message:\n"
-            f"{_clip_text(details, 600)}",
-        )
-
-
-def _send_support_tickets(chat_id: str, account_id: str, latest_only: bool = False) -> None:
-    rows = _rows_for_account("support_tickets", account_id, limit=1 if latest_only else 5)
-
-    if not rows:
-        send_telegram_text(chat_id, "🎫 *Support Tickets*\n\nNo support ticket found yet.\n\nReply SUP1 followed by your issue to create one.")
         return
 
-    title = "🎫 *Latest Support Ticket*" if latest_only else "🎫 *My Support Tickets*"
-    lines = [title, ""]
-    for idx, row in enumerate(rows, 1):
-        ref = row.get("ticket_id") or row.get("id") or "No reference"
-        status = row.get("status") or "open"
-        subject = row.get("subject") or row.get("title") or row.get("message") or row.get("description") or "Support ticket"
-        created = row.get("created_at")
-        lines.append(f"{idx}. {ref}")
-        lines.append(f"   Status: {status}")
-        lines.append(f"   Subject: {_history_excerpt(subject, 120)}")
-        lines.append(f"   Date: {_date_short(created)}")
-        lines.append("")
+    logging.warning("Telegram support ticket insert failed: %s", result.get("error"))
+    send_telegram_text(
+        chat_id,
+        "⚠️ I could not save the support ticket automatically.\n\n"
+        "Please email support@naijataxguides.com and include this reference:\n"
+        f"{ticket_id}\n\n"
+        "Your message:\n"
+        f"{_clip_text(details, 600)}",
+    )
 
-    lines.append("Reply SUP4 with your message to add a note, SUP5 to close latest/open ticket, or 0 for menu.")
-    send_telegram_text(chat_id, _clip_text("\n".join(lines)))
+
+def _parse_support_selector_and_message(text_raw: str, command: str) -> tuple[str, str]:
+    body = re.sub(rf"^{re.escape(command)}\b", "", _clean_text(text_raw), flags=re.I).strip()
+    if not body:
+        return "", ""
+
+    parts = body.split(maxsplit=1)
+    first = parts[0].strip()
+    rest = parts[1].strip() if len(parts) > 1 else ""
+
+    # Numeric selector: SUP4 2 message / SUP5 1
+    if first.isdigit():
+        return first, rest
+
+    # Reference selector: SUP4 NTG-TG-20260527010101 message
+    looks_like_ref = (
+        len(first) >= 8
+        and bool(re.search(r"[A-Z0-9]", first, flags=re.I))
+        and ("-" in first or first.upper().startswith("NTG") or first.count("-") >= 2)
+    )
+    if looks_like_ref and rest:
+        return first, rest
+
+    return "", body
+
+
+def _append_support_reply(chat_id: str, account_id: str, text_raw: str) -> None:
+    selector, reply = _parse_support_selector_and_message(text_raw, "SUP4")
+
+    if not reply:
+        send_telegram_text(
+            chat_id,
+            "📝 *Reply to Support Ticket*\n\n"
+            "Send SUP4 followed by your message.\n\n"
+            "Examples:\n"
+            "SUP4 Please note that my Paystack reference is NTG-...\n"
+            "SUP4 2 I have attached the missing information.\n\n"
+            "Use SUP3 to view open ticket numbers.",
+        )
+        return
+
+    row, rows = _support_find_ticket(account_id, selector, prefer_open=True)
+    if not row:
+        send_telegram_text(
+            chat_id,
+            "🎫 I could not find an open ticket to update.\n\n"
+            "Reply SUP1 followed by your issue to create a new ticket, or SUP3 to view open tickets.",
+        )
+        return
+
+    if not _support_is_open(row):
+        send_telegram_text(
+            chat_id,
+            "⚠️ That ticket is already closed/resolved.\n\n"
+            "Reply SUP1 followed by your new issue to create a fresh ticket.",
+        )
+        return
+
+    old_message = _support_user_message(row)
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    appended = (
+        f"{old_message}\n\n"
+        f"--- Telegram user update ({timestamp}) ---\n"
+        f"{reply}"
+    ).strip()
+    appended = _clip_text(appended, 6000)
+
+    payload = {
+        "message": appended,
+        "status": "open",
+        "updated_at": _utc_now_iso(),
+        "metadata": {
+            "last_user_reply_source": "telegram",
+            "last_user_reply_at": _utc_now_iso(),
+        },
+    }
+
+    result = _support_update_where(row, payload)
+    if not result.get("ok"):
+        send_telegram_text(
+            chat_id,
+            "⚠️ I could not save your reply automatically.\n\n"
+            f"Ticket: {_support_ref(row)}\n"
+            "Please email support@naijataxguides.com with your update if urgent.",
+        )
+        return
+
+    send_telegram_text(
+        chat_id,
+        "✅ *Support Ticket Updated*\n\n"
+        f"Ticket: {_support_ref(row)}\n"
+        "Status: Open\n\n"
+        f"Your update:\n{_clip_text(reply, 700)}\n\n"
+        "Reply SUP2 to view latest ticket, SUP5 to close it, or 0 for menu.",
+    )
+
+
+def _close_support_ticket(chat_id: str, account_id: str, text_raw: str) -> None:
+    selector, note = _parse_support_selector_and_message(text_raw, "SUP5")
+
+    row, rows = _support_find_ticket(account_id, selector, prefer_open=True)
+    if not row:
+        send_telegram_text(
+            chat_id,
+            "🎫 I could not find an open ticket to close.\n\n"
+            "Reply SUP3 to view open tickets or SUP1 followed by your issue to create one.",
+        )
+        return
+
+    if not _support_is_open(row):
+        send_telegram_text(
+            chat_id,
+            f"✅ Ticket already closed/resolved.\n\nTicket: {_support_ref(row)}\n\nReply SUP3 to view open tickets or 0 for menu.",
+        )
+        return
+
+    old_message = _support_user_message(row)
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    closure_note = note or "Closed by user from Telegram."
+    appended = (
+        f"{old_message}\n\n"
+        f"--- Ticket closed by user ({timestamp}) ---\n"
+        f"{closure_note}"
+    ).strip()
+    appended = _clip_text(appended, 6000)
+
+    payload = {
+        "message": appended,
+        "status": "closed",
+        "updated_at": _utc_now_iso(),
+        "metadata": {
+            "closed_from": "telegram",
+            "closed_at": _utc_now_iso(),
+        },
+    }
+
+    result = _support_update_where(row, payload)
+    if not result.get("ok"):
+        send_telegram_text(
+            chat_id,
+            "⚠️ I could not close that ticket automatically.\n\n"
+            f"Ticket: {_support_ref(row)}\n"
+            "Please email support@naijataxguides.com if it must be closed urgently.",
+        )
+        return
+
+    send_telegram_text(
+        chat_id,
+        "✅ *Support Ticket Closed*\n\n"
+        f"Ticket: {_support_ref(row)}\n"
+        "Status: Closed\n\n"
+        "Reply SUP3 to view open tickets, SUP1 to create a new ticket, or 0 for menu.",
+    )
 
 
 def _send_referral_menu(chat_id: str, account_id: str, action: str) -> None:
@@ -2159,13 +2528,13 @@ def _handle_master_command(
         if cmd == "SUP1":
             _create_support_ticket_from_text(chat_id, account_id, text_raw)
         elif cmd == "SUP2":
-            _send_support_tickets(chat_id, account_id, latest_only=False)
+            _send_support_tickets(chat_id, account_id, mode="latest")
         elif cmd == "SUP3":
-            _send_support_tickets(chat_id, account_id, latest_only=True)
+            _send_support_tickets(chat_id, account_id, mode="open")
         elif cmd == "SUP4":
-            send_telegram_text(chat_id, "📝 *Reply to Ticket*\n\nSend SUP4 followed by your reply. Ticket reply threading will be fully expanded in a later support-specific batch.")
+            _append_support_reply(chat_id, account_id, text_raw)
         elif cmd == "SUP5":
-            send_telegram_text(chat_id, "✅ *Close Ticket*\n\nTicket closing from Telegram will be fully expanded in a later support-specific batch. For now, email support@naijataxguides.com if urgent.")
+            _close_support_ticket(chat_id, account_id, text_raw)
         elif cmd == "SUP6":
             _send_support_email(chat_id)
         return True
