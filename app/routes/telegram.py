@@ -43,7 +43,7 @@ from app.services.tax_filing_service import (
 
 bp = Blueprint("telegram", __name__)
 
-TELEGRAM_ROUTE_VERSION = "2026-05-27-v35d2-telegram-q5-credit-activity-log-cleanup"
+TELEGRAM_ROUTE_VERSION = "2026-05-27-v35d3-telegram-quiz-schema-payload-noise-cleanup"
 
 LINK_CODE_RE = re.compile(r"^[A-Z0-9]{8}$")
 MENU_NUMBER_RE = re.compile(r"^[1-8]$")
@@ -202,7 +202,7 @@ def telegram_health():
             "version": TELEGRAM_ROUTE_VERSION,
             "route_mount": "/api/telegram/*",
             "account_resolution": "channel_identities_first_accounts_auth_fallback",
-            "command_namespace": "whatsapp_master_registry_q5_credit_activity_log_cleanup",
+            "command_namespace": "whatsapp_master_registry_quiz_schema_payload_noise_cleanup",
             "configured": {
                 "bot_token": _env_present("TELEGRAM_BOT_TOKEN", "TG_BOT_TOKEN", "TELEGRAM_TOKEN"),
                 "webhook_secret": _env_present("TELEGRAM_WEBHOOK_SECRET", "TG_WEBHOOK_SECRET"),
@@ -4055,12 +4055,43 @@ def _quiz_safe_update_by_id(table: str, row_id: str, payload: dict[str, Any]) ->
 
 
 def _quiz_safe_insert_telegram(table: str, payload: dict[str, Any]) -> dict[str, Any]:
-    payloads = [
-        dict(payload),
-        {k: v for k, v in payload.items() if k != "updated_at"},
-        {k: v for k, v in payload.items() if k not in {"updated_at", "metadata"}},
-        {k: v for k, v in payload.items() if k in {"account_id", "question_id", "question_code", "category", "status", "created_at"}},
-    ]
+    """
+    Batch 28D3:
+    Reduce Supabase 400 retry noise by trying the known accepted quiz-attempt
+    schema first.
+
+    From Batch 28D2 logs, tax_quiz_attempts accepted the minimal payload after
+    wider payloads failed. We now send that accepted payload first.
+    """
+    if table == "tax_quiz_attempts":
+        payloads = [
+            {
+                "account_id": payload.get("account_id"),
+                "question_id": payload.get("question_id"),
+                "question_code": payload.get("question_code"),
+                "category": payload.get("category"),
+                "status": payload.get("status"),
+                "created_at": payload.get("created_at"),
+            },
+            {
+                "account_id": payload.get("account_id"),
+                "question_id": payload.get("question_id"),
+                "question_code": payload.get("question_code"),
+                "category": payload.get("category"),
+                "status": payload.get("status"),
+                "created_at": payload.get("created_at"),
+                "channel": payload.get("channel"),
+            },
+            {k: v for k, v in payload.items() if k not in {"updated_at", "metadata", "displayed_option_order", "correct_option_id", "provider_user_id", "tg_user_id"}},
+            {k: v for k, v in payload.items() if k not in {"updated_at", "metadata"}},
+            dict(payload),
+        ]
+    else:
+        payloads = [
+            dict(payload),
+            {k: v for k, v in payload.items() if k != "updated_at"},
+            {k: v for k, v in payload.items() if k not in {"updated_at", "metadata"}},
+        ]
 
     errors: list[str] = []
     seen: set[str] = set()
@@ -4149,20 +4180,37 @@ def _quiz_credit_column(row: dict[str, Any]) -> str:
 
 def _insert_quiz_credit_log(account_id: str, before: int, after: int, attempt_id: str) -> dict[str, Any]:
     """
-    Batch 28D2:
-    Write Q5 deduction to the existing CR3 table without noisy 404 fallbacks.
+    Batch 28D3:
+    Write Q5 deduction to credit_usage_logs with the accepted schema first.
 
-    Previous version tried:
-      credit_usage_logs, ai_credit_transactions, credit_transactions, ai_credit_deductions
+    Batch 28D2 proved the third payload worked:
+      account_id, action_code, description, credits_delta, created_at
 
-    The last three tables are not available in the current backend and created
-    unnecessary 404 noise. credit_usage_logs exists, but its schema may be
-    narrower than the full payload, so we try progressively smaller payloads.
+    So Batch 28D3 tries that first to remove avoidable 400 retry noise.
     """
     now_iso = _utc_now_iso()
     reference = f"Q5-TG-{uuid.uuid4().hex[:12].upper()}"
 
     payload_attempts: list[dict[str, Any]] = [
+        {
+            "account_id": account_id,
+            "action_code": "quiz_q5_saved_explanation",
+            "description": "Telegram Q5 detailed saved quiz explanation",
+            "credits_delta": -1,
+            "created_at": now_iso,
+        },
+        {
+            "account_id": account_id,
+            "description": "Telegram Q5 detailed saved quiz explanation",
+            "credits_delta": -1,
+            "created_at": now_iso,
+        },
+        {
+            "account_id": account_id,
+            "description": "Telegram Q5 detailed saved quiz explanation",
+            "amount": -1,
+            "created_at": now_iso,
+        },
         {
             "account_id": account_id,
             "reference": reference,
@@ -4174,34 +4222,6 @@ def _insert_quiz_credit_log(account_id: str, before: int, after: int, attempt_id
             "balance_before": before,
             "balance_after": after,
             "metadata": {"source": "telegram_quiz", "live_ai_called": False, "attempt_id": attempt_id},
-            "created_at": now_iso,
-        },
-        {
-            "account_id": account_id,
-            "action_code": "quiz_q5_saved_explanation",
-            "description": "Telegram Q5 detailed saved quiz explanation",
-            "credits_delta": -1,
-            "balance_before": before,
-            "balance_after": after,
-            "created_at": now_iso,
-        },
-        {
-            "account_id": account_id,
-            "action_code": "quiz_q5_saved_explanation",
-            "description": "Telegram Q5 detailed saved quiz explanation",
-            "credits_delta": -1,
-            "created_at": now_iso,
-        },
-        {
-            "account_id": account_id,
-            "description": "Telegram Q5 detailed saved quiz explanation",
-            "credits_delta": -1,
-            "created_at": now_iso,
-        },
-        {
-            "account_id": account_id,
-            "description": "Telegram Q5 detailed saved quiz explanation",
-            "amount": -1,
             "created_at": now_iso,
         },
     ]
@@ -4344,9 +4364,12 @@ def _save_telegram_quiz_state(tg_user_id: str, chat_id: str, state: dict[str, An
     metadata = identity.get("metadata") if isinstance(identity.get("metadata"), dict) else {}
     metadata[TELEGRAM_QUIZ_STATE_METADATA_KEY] = _telegram_quiz_compact_state(chat_id, state)
 
+    # Batch 28D3:
+    # Current channel_identities schema accepts metadata-only first. Avoid
+    # unnecessary PATCH 400 noise from updated_at on this table.
     payload_attempts = [
-        {"metadata": metadata, "updated_at": _utc_now_iso()},
         {"metadata": metadata},
+        {"metadata": metadata, "updated_at": _utc_now_iso()},
     ]
 
     for payload in payload_attempts:
@@ -4376,7 +4399,7 @@ def _clear_telegram_quiz_state(tg_user_id: str) -> None:
 
     metadata.pop(TELEGRAM_QUIZ_STATE_METADATA_KEY, None)
 
-    for payload in ({"metadata": metadata, "updated_at": _utc_now_iso()}, {"metadata": metadata}):
+    for payload in ({"metadata": metadata}, {"metadata": metadata, "updated_at": _utc_now_iso()}):
         ok, _resp, _err = _safe_exec(supabase.table("channel_identities").update(payload).eq("id", identity_id))
         if ok:
             return
@@ -5230,5 +5253,3 @@ def tg_webhook():
             "Sorry, I encountered an error while answering your tax question. No credit should be charged for this failed request. Please try again later.\n\nReply 0 for main menu.",
         )
         return jsonify({"ok": True, "error_handled": True, "stage": "telegram_ai_ask"})
-
-
