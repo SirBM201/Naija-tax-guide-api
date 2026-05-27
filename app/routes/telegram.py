@@ -41,7 +41,7 @@ from app.services.tax_filing_service import (
 
 bp = Blueprint("telegram", __name__)
 
-TELEGRAM_ROUTE_VERSION = "2026-05-27-v35b-telegram-calculator-parity"
+TELEGRAM_ROUTE_VERSION = "2026-05-27-v35c-telegram-deadline-reminder-parity"
 
 LINK_CODE_RE = re.compile(r"^[A-Z0-9]{8}$")
 MENU_NUMBER_RE = re.compile(r"^[1-8]$")
@@ -200,7 +200,7 @@ def telegram_health():
             "version": TELEGRAM_ROUTE_VERSION,
             "route_mount": "/api/telegram/*",
             "account_resolution": "channel_identities_first_accounts_auth_fallback",
-            "command_namespace": "whatsapp_master_registry_calculator_parity",
+            "command_namespace": "whatsapp_master_registry_deadline_reminder_parity",
             "configured": {
                 "bot_token": _env_present("TELEGRAM_BOT_TOKEN", "TG_BOT_TOKEN", "TELEGRAM_TOKEN"),
                 "webhook_secret": _env_present("TELEGRAM_WEBHOOK_SECRET", "TG_WEBHOOK_SECRET"),
@@ -639,7 +639,7 @@ def _send_main_menu(chat_id: str, *, linked: bool = False) -> None:
 
 def _send_tax_menu(chat_id: str) -> None:
     menu = (
-        "🧰 *Tax Tools, Filing & Quiz*\n\n"
+        "🧰 *Tax Tools, Filing, Deadlines & Quiz*\n\n"
         "Calculators:\n"
         "F1 - Calculator menu\n"
         "C1 - PAYE calculator\n"
@@ -647,17 +647,22 @@ def _send_tax_menu(chat_id: str) -> None:
         "C3 - VAT calculator\n"
         "C4 - Withholding Tax calculator\n"
         "C5 - Salary / net pay estimate\n\n"
+        "Deadline reminders:\n"
+        "D1 - Create reminder\n"
+        "D2 - List reminders\n"
+        "D3 - Delete reminder\n"
+        "D4 - Update reminder settings\n"
+        "Example: D1 PAYE 2026-06-10 3 09:00 telegram\n\n"
         "Filing assistance:\n"
         "FT1 - Filing assistance menu\n"
         "FT2 - PAYE filing help\n"
         "FT3 - VAT filing help\n"
         "FT4 - CIT filing help\n"
         "FT7 - Request human filing assistance\n\n"
-        "Quiz and deadlines:\n"
+        "Quiz and history:\n"
         "Q1 - Start tax quiz\n"
-        "D1 - Create tax reminder\n"
         "H1 - Recent tax history\n\n"
-        "You can also type /paye, /vat, or /cit to start guided filing.\n"
+        "You can also type /paye, /vat, /cit, or /deadlines.\n"
         "Reply 0 for main menu."
     )
     send_telegram_text(chat_id, menu)
@@ -670,6 +675,7 @@ def _send_help(chat_id: str, *, linked: bool = False) -> None:
         "• Ask tax questions: type your question naturally.\n"
         "  Example: What is PAYE tax?\n\n"
         "• Calculators: reply F1, or use C1-C5\n"
+        "• Deadline reminders: use D1-D4\n"
         "• Check Usage Credits: reply 2 or CR1\n"
         "• View current plan: reply 3 or PAY1\n"
         "• View/upgrade plans: reply 4 then choose S1, P1, or B1\n"
@@ -2117,7 +2123,7 @@ def _handle_master_command(
         return True
 
     if cmd.startswith("D"):
-        send_telegram_text(chat_id, "📅 Deadline command received. Full Telegram deadline/reminder parity will be handled in a later batch. Use the website Deadlines page for now.")
+        _handle_deadline_command_telegram(chat_id, account_id, tg_user_id, text_raw)
         return True
 
     return False
@@ -2886,6 +2892,601 @@ def _handle_calculator_step(chat_id: str, user_state: dict[str, Any], text: str)
 
 
 
+
+# ---------------------------------------------------------------------------
+# Batch 28C - Telegram deadline/reminder parity
+# ---------------------------------------------------------------------------
+
+DEADLINE_TAX_TYPES = {"PAYE", "VAT", "CIT", "WHT"}
+
+
+def _telegram_deadline_today() -> Any:
+    return datetime.now(timezone.utc).date()
+
+
+def _parse_deadline_date(value: Any) -> Optional[Any]:
+    try:
+        return datetime.strptime(_clean_text(value), "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
+def _valid_deadline_time(value: Any) -> str:
+    raw = _clean_text(value or "09:00")
+    match = re.match(r"^(\d{1,2}):(\d{2})$", raw)
+    if not match:
+        return "09:00"
+
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        return "09:00"
+    return f"{hour:02d}:{minute:02d}"
+
+
+def _valid_deadline_mode(value: Any) -> str:
+    raw = _clean_text(value or "telegram").lower().replace(" ", "")
+    allowed = {
+        "telegram",
+        "email",
+        "sms",
+        "telegram,email",
+        "telegram,sms",
+        "email,sms",
+        "telegram,email,sms",
+        "whatsapp",
+        "whatsapp,email",
+        "whatsapp,sms",
+        "whatsapp,email,sms",
+    }
+    return raw if raw in allowed else "telegram"
+
+
+def _deadline_allowed_for_account_telegram(account_id: str) -> bool:
+    try:
+        return bool(has_active_subscription(account_id))
+    except Exception:
+        row = _subscription_row(account_id)
+        if not row:
+            return False
+        status = _clean_text(row.get("status")).lower()
+        plan_code = _clean_text(row.get("plan_code")).lower()
+        if status in {"inactive", "expired", "cancelled", "canceled", "disabled"}:
+            return False
+        return any(x in plan_code for x in ("starter", "professional", "business"))
+
+
+def _telegram_deadline_usage_text(account_id: str) -> str:
+    if not _deadline_allowed_for_account_telegram(account_id):
+        return (
+            "📅 *Tax Deadline Reminders*\n\n"
+            "Free users can view the general tax calendar. Custom reminder creation is available on paid plans.\n\n"
+            "D1 - Create reminder 🔔 (paid)\n"
+            "D2 - View reminders 📋\n"
+            "D3 - Delete reminder 🗑️ (paid)\n"
+            "D4 - Update reminder ⚙️ (paid)\n\n"
+            "General guide:\n"
+            "• PAYE: usually monthly, commonly by the 10th of the following month.\n"
+            "• VAT: usually monthly, commonly by the 21st of the following month.\n"
+            "• CIT: generally due within 6 months after company year-end.\n\n"
+            "Reply 4 to view plans or 0 for main menu."
+        )
+
+    return (
+        "📅 *Tax Deadline Reminders*\n\n"
+        "Use these commands:\n"
+        "D1 PAYE 2026-06-10 3 - create PAYE reminder 3 days before\n"
+        "D1 VAT 2026-06-21 7 09:00 telegram - create VAT reminder\n"
+        "D2 - view my reminders\n"
+        "D3 1 - delete reminder number 1 from D2 list\n"
+        "D4 1 2 08:30 telegram - update reminder number 1 to 2 days before\n\n"
+        "Supported types: PAYE, VAT, CIT, WHT.\n"
+        "Reminder date must not be in the past.\n"
+        "These commands do not use AI credits."
+    )
+
+
+def _parse_deadline_create_telegram(text: str) -> Optional[dict[str, Any]]:
+    raw = _clean_text(text).upper()
+
+    match = re.search(
+        r"\bD1\s+(PAYE|VAT|CIT|WHT)\s+(\d{4}-\d{2}-\d{2})(?:\s+(\d{1,3}))?(?:\s+(\d{1,2}:\d{2}))?(?:\s+([A-Z,]+))?",
+        raw,
+        flags=re.I,
+    )
+    if not match:
+        return None
+
+    tax_type = match.group(1).upper()
+    due_date = match.group(2)
+    try:
+        reminder_days = int(match.group(3) or 7)
+    except Exception:
+        reminder_days = 7
+
+    reminder_days = max(0, min(365, reminder_days))
+    reminder_time = _valid_deadline_time(match.group(4) or "09:00")
+    reminder_mode = _valid_deadline_mode(match.group(5) or "telegram")
+
+    if not _parse_deadline_date(due_date):
+        return None
+
+    return {
+        "tax_type": tax_type,
+        "due_date": due_date,
+        "reminder_days_before": reminder_days,
+        "reminder_time": reminder_time,
+        "timezone": "Africa/Lagos",
+        "reminder_mode": reminder_mode,
+        "source": "telegram",
+    }
+
+
+def _deadline_validation_telegram(due_date_text: Any, reminder_days: Any) -> dict[str, Any]:
+    today = _telegram_deadline_today()
+    due_date = _parse_deadline_date(due_date_text)
+
+    try:
+        days = int(reminder_days)
+    except Exception:
+        days = 7
+
+    days = max(0, min(365, days))
+
+    if not due_date:
+        return {
+            "ok": False,
+            "reason": "invalid_due_date",
+            "max_days": 0,
+            "message": "The due date is invalid. Use YYYY-MM-DD, for example D1 PAYE 2026-06-10 3.",
+        }
+
+    days_until_due = (due_date - today).days
+    reminder_date = due_date - timedelta(days=days)
+
+    if days_until_due < 0:
+        return {
+            "ok": False,
+            "reason": "due_date_passed",
+            "today": today.isoformat(),
+            "due_date": due_date.isoformat(),
+            "reminder_date": reminder_date.isoformat(),
+            "max_days": 0,
+            "message": f"The due date {due_date.isoformat()} has already passed. Please choose a future due date.",
+        }
+
+    if reminder_date < today:
+        max_days = max(0, days_until_due)
+        return {
+            "ok": False,
+            "reason": "reminder_date_passed",
+            "today": today.isoformat(),
+            "due_date": due_date.isoformat(),
+            "reminder_date": reminder_date.isoformat(),
+            "max_days": max_days,
+            "message": (
+                f"That reminder is no longer possible.\n\n"
+                f"Today: {today.isoformat()}\n"
+                f"Due date: {due_date.isoformat()}\n"
+                f"Requested reminder: {days} day(s) before\n"
+                f"Reminder date would be: {reminder_date.isoformat()}\n\n"
+                f"Use {max_days} day(s) before or choose a later due date."
+            ),
+        }
+
+    return {
+        "ok": True,
+        "reason": "valid",
+        "today": today.isoformat(),
+        "due_date": due_date.isoformat(),
+        "reminder_date": reminder_date.isoformat(),
+        "max_days": max(0, days_until_due),
+        "days": days,
+    }
+
+
+def _deadline_computed_status_telegram(item: dict[str, Any]) -> str:
+    enabled = bool(item.get("enabled", True))
+    validation = _deadline_validation_telegram(item.get("due_date"), item.get("reminder_days_before", 7))
+    if not validation.get("ok"):
+        return "inactive"
+    return "active" if enabled else "inactive"
+
+
+def _deadline_display_line_telegram(item: dict[str, Any], index: int) -> str:
+    tax_type = _clean_text(item.get("tax_type") or item.get("title") or "Tax").upper()
+    due = _clean_text(item.get("due_date") or "No date")
+    try:
+        days_text = f"{int(item.get('reminder_days_before', 7))} days before"
+    except Exception:
+        days_text = "7 days before"
+    status = _deadline_computed_status_telegram(item)
+    time_text = _clean_text(item.get("reminder_time") or "09:00")
+    mode_text = _clean_text(item.get("reminder_mode") or item.get("channel") or "telegram")
+    return f"{index}. {tax_type} - due {due} - reminder {days_text} - {status} - {time_text} via {mode_text}"
+
+
+def _telegram_deadline_rows(account_id: str, limit: int = 10) -> list[dict[str, Any]]:
+    try:
+        resp = (
+            supabase.table("tax_deadlines")
+            .select("*")
+            .eq("account_id", account_id)
+            .order("created_at", desc=True)
+            .limit(max(1, min(limit, 20)))
+            .execute()
+        )
+        return _rows(resp)
+    except Exception:
+        try:
+            resp = (
+                supabase.table("tax_deadlines")
+                .select("*")
+                .eq("account_id", account_id)
+                .limit(max(1, min(limit, 20)))
+                .execute()
+            )
+            return _rows(resp)
+        except Exception:
+            logging.exception("Telegram tax_deadlines list failed")
+            return []
+
+
+def _telegram_deadline_by_index(account_id: str, index: int) -> Optional[dict[str, Any]]:
+    rows = _telegram_deadline_rows(account_id, limit=10)
+    if index < 1 or index > len(rows):
+        return None
+    return rows[index - 1]
+
+
+def _telegram_deadline_insert(payload: dict[str, Any]) -> dict[str, Any]:
+    attempts: list[dict[str, Any]] = []
+
+    # Full payload first.
+    attempts.append(dict(payload))
+
+    # Remove newer optional columns if DB schema is older.
+    optional_remove = {"reminder_time", "timezone", "reminder_mode", "reminder_email", "reminder_phone", "source", "channel"}
+    attempts.append({k: v for k, v in payload.items() if k not in optional_remove})
+
+    # Remove updated_at if table does not expose it.
+    attempts.append({k: v for k, v in payload.items() if k not in optional_remove | {"updated_at"}})
+
+    # Account-only minimal fallback.
+    attempts.append(
+        {
+            "account_id": payload.get("account_id"),
+            "tax_type": payload.get("tax_type"),
+            "due_date": payload.get("due_date"),
+            "reminder_days_before": payload.get("reminder_days_before"),
+            "enabled": payload.get("enabled", True),
+        }
+    )
+
+    # user_id/account_id fallback for schemas that expect user_id.
+    attempts.append(
+        {
+            "user_id": payload.get("account_id"),
+            "account_id": payload.get("account_id"),
+            "tax_type": payload.get("tax_type"),
+            "due_date": payload.get("due_date"),
+            "reminder_days_before": payload.get("reminder_days_before"),
+            "enabled": payload.get("enabled", True),
+        }
+    )
+
+    seen: set[str] = set()
+    errors: list[str] = []
+
+    for attempt in attempts:
+        cleaned = {k: v for k, v in attempt.items() if v is not None}
+        signature = repr(sorted(cleaned.keys()))
+        if signature in seen:
+            continue
+        seen.add(signature)
+
+        ok, resp, err = _safe_exec(supabase.table("tax_deadlines").insert(cleaned))
+        if ok:
+            return {"ok": True, "data": _rows(resp), "mode": signature}
+        errors.append(str(err))
+
+    return {"ok": False, "error": errors[-1] if errors else "insert_failed", "errors": errors[:3]}
+
+
+def _telegram_deadline_update(deadline_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    attempts = [
+        dict(payload),
+        {k: v for k, v in payload.items() if k not in {"reminder_time", "timezone", "reminder_mode", "source", "channel"}},
+        {k: v for k, v in payload.items() if k not in {"reminder_time", "timezone", "reminder_mode", "source", "channel", "updated_at"}},
+    ]
+
+    errors: list[str] = []
+    seen: set[str] = set()
+
+    for attempt in attempts:
+        cleaned = {k: v for k, v in attempt.items() if v is not None}
+        signature = repr(sorted(cleaned.keys()))
+        if signature in seen:
+            continue
+        seen.add(signature)
+
+        try:
+            resp = supabase.table("tax_deadlines").update(cleaned).eq("id", deadline_id).execute()
+            return {"ok": True, "data": _rows(resp), "mode": signature}
+        except Exception as exc:
+            errors.append(str(exc))
+
+    return {"ok": False, "error": errors[-1] if errors else "update_failed", "errors": errors[:3]}
+
+
+def _telegram_deadline_delete(deadline_id: str) -> dict[str, Any]:
+    try:
+        resp = supabase.table("tax_deadlines").delete().eq("id", deadline_id).execute()
+        return {"ok": True, "data": _rows(resp)}
+    except Exception as exc:
+        logging.exception("Telegram deadline delete failed")
+        return {"ok": False, "error": str(exc)}
+
+
+def _create_deadline_reminder_telegram(chat_id: str, account_id: str, tg_user_id: str, text_raw: str) -> None:
+    if not _deadline_allowed_for_account_telegram(account_id):
+        send_telegram_text(
+            chat_id,
+            "🔒 *Custom Deadline Reminders*\n\n"
+            "Custom deadline reminders are available on paid plans.\n\n"
+            "Reply 4 to view plans, or D2 to view any reminders already saved.",
+        )
+        return
+
+    parsed = _parse_deadline_create_telegram(text_raw)
+    if not parsed:
+        send_telegram_text(
+            chat_id,
+            "🔔 *Create Deadline Reminder*\n\n"
+            "Send it like this:\n"
+            "D1 PAYE 2026-06-10 3 09:00 telegram\n\n"
+            "Format: D1 tax_type due_date reminder_days_before time mode\n"
+            "Supported types: PAYE, VAT, CIT, WHT.\n"
+            "Mode can be telegram, email, sms, or telegram,email.",
+        )
+        return
+
+    validation = _deadline_validation_telegram(parsed["due_date"], parsed.get("reminder_days_before", 7))
+    if not validation.get("ok"):
+        max_days = validation.get("max_days", 0)
+        send_telegram_text(
+            chat_id,
+            "⚠️ *Reminder Not Created*\n\n"
+            f"{validation.get('message')}\n\n"
+            f"Try: D1 {parsed['tax_type']} {parsed['due_date']} {max_days} {_valid_deadline_time(parsed.get('reminder_time'))} {_valid_deadline_mode(parsed.get('reminder_mode'))}\n"
+            "Or choose a later due date.",
+        )
+        return
+
+    now_iso = _utc_now_iso()
+    payload = {
+        "user_id": account_id,
+        "account_id": account_id,
+        "tax_type": parsed["tax_type"],
+        "due_date": parsed["due_date"],
+        "reminder_days_before": int(parsed.get("reminder_days_before") or 7),
+        "enabled": True,
+        "updated_at": now_iso,
+        "reminder_time": _valid_deadline_time(parsed.get("reminder_time")),
+        "timezone": "Africa/Lagos",
+        "reminder_mode": _valid_deadline_mode(parsed.get("reminder_mode")),
+        "reminder_phone": tg_user_id,
+        "channel": "telegram",
+        "source": "telegram",
+    }
+
+    result = _telegram_deadline_insert(payload)
+    if not result.get("ok"):
+        send_telegram_text(
+            chat_id,
+            "⚠️ Reminder saving failed. Please try again.\n\n"
+            f"{parsed['tax_type']} due date: {parsed['due_date']}\n"
+            f"Reminder: {parsed['reminder_days_before']} days before\n\n"
+            "If this repeats, contact support with SUP6.",
+        )
+        return
+
+    send_telegram_text(
+        chat_id,
+        "✅ *Deadline Reminder Saved*\n\n"
+        f"Tax type: {parsed['tax_type']}\n"
+        f"Due date: {parsed['due_date']}\n"
+        f"Reminder: {parsed['reminder_days_before']} days before\n"
+        f"Time: {_valid_deadline_time(parsed.get('reminder_time'))}\n"
+        f"Mode: {_valid_deadline_mode(parsed.get('reminder_mode'))}\n"
+        f"Reminder date: {validation.get('reminder_date')}\n\n"
+        "Reply D2 to view reminders or 0 for menu.",
+    )
+
+
+def _send_deadline_reminders_telegram(chat_id: str, account_id: str) -> None:
+    rows = _telegram_deadline_rows(account_id, limit=10)
+
+    if not rows:
+        send_telegram_text(
+            chat_id,
+            "📋 *Your Deadline Reminders*\n\n"
+            "No saved deadline reminders yet.\n\n"
+            "Create one like this:\n"
+            "D1 PAYE 2026-06-10 3",
+        )
+        return
+
+    lines = ["📋 *Your Deadline Reminders*", ""]
+    for idx, row in enumerate(rows, start=1):
+        lines.append(_deadline_display_line_telegram(row, idx))
+
+    lines.extend(
+        [
+            "",
+            "To delete: D3 1",
+            "To update: D4 1 3 09:00 telegram",
+            "Reply 0 for main menu.",
+        ]
+    )
+    send_telegram_text(chat_id, _clip_text("\n".join(lines), 3900))
+
+
+def _delete_deadline_reminder_telegram(chat_id: str, account_id: str, text_raw: str) -> None:
+    if not _deadline_allowed_for_account_telegram(account_id):
+        send_telegram_text(
+            chat_id,
+            "🔒 Custom deadline management is available on paid plans.\n\n"
+            "Reply 4 to view plans, or D2 to view any existing reminders.",
+        )
+        return
+
+    match = re.search(r"\bD3\s+(\d{1,2})\b", _clean_text(text_raw), flags=re.I)
+    if not match:
+        send_telegram_text(
+            chat_id,
+            "🗑️ *Delete Deadline Reminder*\n\n"
+            "Reply like this:\n"
+            "D3 1\n\n"
+            "Use D2 first to see your reminder numbers.",
+        )
+        return
+
+    idx = int(match.group(1))
+    row = _telegram_deadline_by_index(account_id, idx)
+    if not row:
+        send_telegram_text(chat_id, "I could not find that reminder number. Reply D2 to view your current reminders.")
+        return
+
+    deadline_id = _clean_text(row.get("id"))
+    if not deadline_id:
+        send_telegram_text(chat_id, "I found the reminder, but it has no valid ID. Please try D2 again or contact support.")
+        return
+
+    result = _telegram_deadline_delete(deadline_id)
+    if not result.get("ok"):
+        send_telegram_text(chat_id, "⚠️ I could not delete that reminder now. Reply D2 and try again, for example D3 1.")
+        return
+
+    send_telegram_text(
+        chat_id,
+        "🗑️ *Deadline Reminder Deleted*\n\n"
+        f"{_deadline_display_line_telegram(row, idx)}\n\n"
+        "Reply D2 to view remaining reminders.",
+    )
+
+
+def _update_deadline_reminder_telegram(chat_id: str, account_id: str, text_raw: str) -> None:
+    if not _deadline_allowed_for_account_telegram(account_id):
+        send_telegram_text(
+            chat_id,
+            "🔒 Custom reminder settings are available on paid plans.\n\n"
+            "Reply 4 to view plans, or D2 to view any existing reminders.",
+        )
+        return
+
+    match = re.search(
+        r"\bD4\s+(\d{1,2})\s+(\d{1,3})(?:\s+(\d{1,2}:\d{2}))?(?:\s+([A-Z,]+))?\b",
+        _clean_text(text_raw),
+        flags=re.I,
+    )
+    if not match:
+        send_telegram_text(
+            chat_id,
+            "⚙️ *Update Deadline Reminder*\n\n"
+            "Reply like this:\n"
+            "D4 1 3 09:00 telegram\n\n"
+            "Use D2 first to see your reminder numbers.",
+        )
+        return
+
+    idx = int(match.group(1))
+    days = max(0, min(365, int(match.group(2))))
+    reminder_time = _valid_deadline_time(match.group(3) or "09:00")
+    reminder_mode = _valid_deadline_mode(match.group(4) or "telegram")
+
+    row = _telegram_deadline_by_index(account_id, idx)
+    if not row:
+        send_telegram_text(chat_id, "I could not find that reminder number. Reply D2 to view your current reminders.")
+        return
+
+    validation = _deadline_validation_telegram(row.get("due_date"), days)
+    if not validation.get("ok"):
+        send_telegram_text(
+            chat_id,
+            "⚠️ *Reminder Not Updated*\n\n"
+            f"{validation.get('message')}\n\n"
+            "Reply D2 to view your reminders.",
+        )
+        return
+
+    deadline_id = _clean_text(row.get("id"))
+    if not deadline_id:
+        send_telegram_text(chat_id, "I found the reminder, but it has no valid ID. Please try D2 again or contact support.")
+        return
+
+    payload = {
+        "reminder_days_before": days,
+        "enabled": True,
+        "updated_at": _utc_now_iso(),
+        "reminder_time": reminder_time,
+        "timezone": "Africa/Lagos",
+        "reminder_mode": reminder_mode,
+        "channel": "telegram",
+        "source": "telegram",
+    }
+
+    result = _telegram_deadline_update(deadline_id, payload)
+    if not result.get("ok"):
+        send_telegram_text(chat_id, "⚠️ I could not update that reminder now. Reply D2 and try again.")
+        return
+
+    updated = dict(row)
+    updated["reminder_days_before"] = days
+    updated["enabled"] = True
+    updated["reminder_time"] = reminder_time
+    updated["reminder_mode"] = reminder_mode
+
+    send_telegram_text(
+        chat_id,
+        "⚙️ *Reminder Updated*\n\n"
+        f"{_deadline_display_line_telegram(updated, idx)}\n\n"
+        "Reply D2 to view all reminders.",
+    )
+
+
+def _handle_deadline_command_telegram(chat_id: str, account_id: str, tg_user_id: str, text_raw: str) -> bool:
+    text_clean = _clean_text(text_raw)
+    cmd_match = re.match(r"^(D[1-4])\b", text_clean, flags=re.I)
+    cmd = cmd_match.group(1).upper() if cmd_match else ""
+
+    if not cmd:
+        return False
+
+    if cmd == "D1":
+        # D1 alone opens help/menu. D1 with details creates a reminder.
+        if re.search(r"\bD1\s+(PAYE|VAT|CIT|WHT)\b", text_clean, flags=re.I):
+            _create_deadline_reminder_telegram(chat_id, account_id, tg_user_id, text_clean)
+        else:
+            send_telegram_text(chat_id, _telegram_deadline_usage_text(account_id))
+        return True
+
+    if cmd == "D2":
+        _send_deadline_reminders_telegram(chat_id, account_id)
+        return True
+
+    if cmd == "D3":
+        _delete_deadline_reminder_telegram(chat_id, account_id, text_clean)
+        return True
+
+    if cmd == "D4":
+        _update_deadline_reminder_telegram(chat_id, account_id, text_clean)
+        return True
+
+    return False
+
+
+
 def _send_link_help(chat_id: str, *, linked: bool) -> None:
     if linked:
         send_telegram_text(
@@ -3210,7 +3811,7 @@ def _handle_tax_filing_command(chat_id: str, account_id: str, text: str) -> bool
             send_telegram_text(chat_id, "📋 No tax filings found. Reply P to file PAYE tax.")
         return True
     if text_lower in ["/deadlines", "deadlines", "tax deadlines", "filing deadlines"]:
-        send_telegram_text(chat_id, "📅 *Tax Deadlines*\n\n• PAYE: Monthly by 10th\n• VAT: Monthly by 21st\n• CIT: 6 months after year end\n• Annual Returns: March 31st\n\nSet reminders in your web dashboard.")
+        send_telegram_text(chat_id, _telegram_deadline_usage_text(account_id))
         return True
     return False
 
