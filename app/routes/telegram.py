@@ -43,7 +43,7 @@ from app.services.tax_filing_service import (
 
 bp = Blueprint("telegram", __name__)
 
-TELEGRAM_ROUTE_VERSION = "2026-05-27-v35e-telegram-support-ticket-reply-close-parity"
+TELEGRAM_ROUTE_VERSION = "2026-05-27-v35e1-telegram-support-insert-payload-noise-cleanup"
 
 LINK_CODE_RE = re.compile(r"^[A-Z0-9]{8}$")
 MENU_NUMBER_RE = re.compile(r"^[1-8]$")
@@ -202,7 +202,7 @@ def telegram_health():
             "version": TELEGRAM_ROUTE_VERSION,
             "route_mount": "/api/telegram/*",
             "account_resolution": "channel_identities_first_accounts_auth_fallback",
-            "command_namespace": "whatsapp_master_registry_support_ticket_reply_close_parity",
+            "command_namespace": "whatsapp_master_registry_support_insert_payload_noise_cleanup",
             "configured": {
                 "bot_token": _env_present("TELEGRAM_BOT_TOKEN", "TG_BOT_TOKEN", "TELEGRAM_TOKEN"),
                 "webhook_secret": _env_present("TELEGRAM_WEBHOOK_SECRET", "TG_WEBHOOK_SECRET"),
@@ -2134,15 +2134,32 @@ def _support_update_where(row: dict[str, Any], payload: dict[str, Any]) -> dict[
 
 
 def _support_insert_ticket(payload: dict[str, Any]) -> dict[str, Any]:
-    # Use minimal known-safe payload first, then wider payloads as fallback.
+    """
+    Batch 28E1:
+    Reduce SUP1 support_tickets insert retry noise.
+
+    Batch 28E logs showed:
+      1st insert payload -> 400 Bad Request
+      2nd insert payload -> 201 Created
+
+    The accepted payload contained:
+      ticket_id, account_id, subject, message, status, created_at, updated_at
+
+    Therefore we now try that accepted payload first.
+    """
+    accepted_payload = {
+        "ticket_id": payload.get("ticket_id"),
+        "account_id": payload.get("account_id"),
+        "subject": payload.get("subject"),
+        "message": payload.get("message"),
+        "status": payload.get("status"),
+        "created_at": payload.get("created_at"),
+        "updated_at": payload.get("updated_at"),
+    }
+
+    # Keep narrower/wider fallbacks, but place them after the known accepted schema.
     payload_attempts = [
-        {
-            "ticket_id": payload.get("ticket_id"),
-            "account_id": payload.get("account_id"),
-            "message": payload.get("message"),
-            "status": payload.get("status"),
-            "created_at": payload.get("created_at"),
-        },
+        accepted_payload,
         {
             "ticket_id": payload.get("ticket_id"),
             "account_id": payload.get("account_id"),
@@ -2150,7 +2167,13 @@ def _support_insert_ticket(payload: dict[str, Any]) -> dict[str, Any]:
             "message": payload.get("message"),
             "status": payload.get("status"),
             "created_at": payload.get("created_at"),
-            "updated_at": payload.get("updated_at"),
+        },
+        {
+            "ticket_id": payload.get("ticket_id"),
+            "account_id": payload.get("account_id"),
+            "message": payload.get("message"),
+            "status": payload.get("status"),
+            "created_at": payload.get("created_at"),
         },
         {
             "ticket_id": payload.get("ticket_id"),
