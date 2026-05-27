@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import logging
 import os
+import random
 import re
+import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 
@@ -41,7 +43,7 @@ from app.services.tax_filing_service import (
 
 bp = Blueprint("telegram", __name__)
 
-TELEGRAM_ROUTE_VERSION = "2026-05-27-v35c-telegram-deadline-reminder-parity"
+TELEGRAM_ROUTE_VERSION = "2026-05-27-v35d-telegram-quiz-q1-q5-parity"
 
 LINK_CODE_RE = re.compile(r"^[A-Z0-9]{8}$")
 MENU_NUMBER_RE = re.compile(r"^[1-8]$")
@@ -200,7 +202,7 @@ def telegram_health():
             "version": TELEGRAM_ROUTE_VERSION,
             "route_mount": "/api/telegram/*",
             "account_resolution": "channel_identities_first_accounts_auth_fallback",
-            "command_namespace": "whatsapp_master_registry_deadline_reminder_parity",
+            "command_namespace": "whatsapp_master_registry_quiz_q1_q5_parity",
             "configured": {
                 "bot_token": _env_present("TELEGRAM_BOT_TOKEN", "TG_BOT_TOKEN", "TELEGRAM_TOKEN"),
                 "webhook_secret": _env_present("TELEGRAM_WEBHOOK_SECRET", "TG_WEBHOOK_SECRET"),
@@ -653,16 +655,19 @@ def _send_tax_menu(chat_id: str) -> None:
         "D3 - Delete reminder\n"
         "D4 - Update reminder settings\n"
         "Example: D1 PAYE 2026-06-10 3 09:00 telegram\n\n"
+        "Quiz:\n"
+        "Q1 - Random quiz\n"
+        "Q2 - Categories\n"
+        "Q3 - Score\n"
+        "Q4 - Review last answer\n"
+        "Q5 - Detailed saved explanation\n\n"
         "Filing assistance:\n"
         "FT1 - Filing assistance menu\n"
         "FT2 - PAYE filing help\n"
         "FT3 - VAT filing help\n"
         "FT4 - CIT filing help\n"
         "FT7 - Request human filing assistance\n\n"
-        "Quiz and history:\n"
-        "Q1 - Start tax quiz\n"
-        "H1 - Recent tax history\n\n"
-        "You can also type /paye, /vat, /cit, or /deadlines.\n"
+        "You can also type /paye, /vat, /cit, /deadlines, or quiz.\n"
         "Reply 0 for main menu."
     )
     send_telegram_text(chat_id, menu)
@@ -676,6 +681,7 @@ def _send_help(chat_id: str, *, linked: bool = False) -> None:
         "  Example: What is PAYE tax?\n\n"
         "• Calculators: reply F1, or use C1-C5\n"
         "• Deadline reminders: use D1-D4\n"
+        "• Tax quiz: use Q1-Q5\n"
         "• Check Usage Credits: reply 2 or CR1\n"
         "• View current plan: reply 3 or PAY1\n"
         "• View/upgrade plans: reply 4 then choose S1, P1, or B1\n"
@@ -2119,7 +2125,7 @@ def _handle_master_command(
         return True
 
     if cmd.startswith("Q"):
-        send_telegram_text(chat_id, "🧠 Quiz command received. Full Telegram quiz parity will be handled in a later batch. WhatsApp quiz remains the current live quiz channel.")
+        _handle_quiz_command_telegram(chat_id, account_id, tg_user_id, text_raw)
         return True
 
     if cmd.startswith("D"):
@@ -3487,6 +3493,921 @@ def _handle_deadline_command_telegram(chat_id: str, account_id: str, tg_user_id:
 
 
 
+
+# ---------------------------------------------------------------------------
+# Batch 28D - Telegram Quiz Q1-Q5 parity
+# ---------------------------------------------------------------------------
+
+QUIZ_FREE_DAILY_LIMIT = 12
+
+TELEGRAM_QUIZ_FALLBACK_BANK: list[dict[str, Any]] = [
+    {
+        "id": "tg_q_paye_1",
+        "category": "PAYE",
+        "question": "Which Nigerian tax is normally deducted from employee salaries by the employer?",
+        "options": {"A": "VAT", "B": "PAYE", "C": "Company Income Tax", "D": "Import Duty"},
+        "answer": "B",
+        "explain": "PAYE is deducted from employment income and remitted by the employer.",
+        "premium_explanation": "PAYE means Pay-As-You-Earn. In practice, the employer deducts tax from the employee's salary and remits it to the relevant State Internal Revenue Service. This helps employees meet Personal Income Tax obligations through payroll instead of waiting until year-end.",
+    },
+    {
+        "id": "tg_q_paye_2",
+        "category": "PAYE",
+        "question": "Who normally remits PAYE after deducting it from salaries?",
+        "options": {"A": "The employee's landlord", "B": "The employer", "C": "The customer", "D": "The bank cashier"},
+        "answer": "B",
+        "explain": "The employer deducts PAYE and remits it to the relevant State Internal Revenue Service.",
+        "premium_explanation": "The employer acts as the withholding/remitting party for PAYE. Employees bear the tax economically, but the employer is responsible for deduction and remittance from payroll to the appropriate State Internal Revenue Service.",
+    },
+    {
+        "id": "tg_q_vat_1",
+        "category": "VAT",
+        "question": "What is the standard VAT rate commonly used in Nigeria for many taxable supplies?",
+        "options": {"A": "2.5%", "B": "5%", "C": "7.5%", "D": "30%"},
+        "answer": "C",
+        "explain": "Nigeria's standard VAT rate is commonly 7.5% for many taxable supplies.",
+        "premium_explanation": "VAT is a consumption tax charged on many taxable goods and services. For many ordinary VATable supplies in Nigeria, the standard rate is 7.5%. The business usually charges output VAT and may deduct allowable input VAT before remitting the net amount.",
+    },
+    {
+        "id": "tg_q_vat_2",
+        "category": "VAT",
+        "question": "Which authority generally administers VAT in Nigeria?",
+        "options": {"A": "FIRS", "B": "Local government chairman", "C": "FRSC", "D": "NIMC"},
+        "answer": "A",
+        "explain": "VAT is generally administered by the Federal Inland Revenue Service.",
+        "premium_explanation": "VAT is generally administered by the Federal Inland Revenue Service. A VAT-registered business should understand registration, invoicing, output VAT, input VAT, returns, and remittance obligations before filing.",
+    },
+    {
+        "id": "tg_q_cit_1",
+        "category": "Company Tax",
+        "question": "Company Income Tax is mainly charged on what?",
+        "options": {"A": "Company taxable profit", "B": "Employee school fees", "C": "Bank BVN", "D": "Personal rent only"},
+        "answer": "A",
+        "explain": "Company Income Tax is generally based on company taxable profit.",
+        "premium_explanation": "Company Income Tax applies to the taxable profits of companies after relevant adjustments, allowances, and exemptions. Turnover category can also affect applicable rates, especially for small, medium, and large company classification.",
+    },
+    {
+        "id": "tg_q_wht_1",
+        "category": "WHT",
+        "question": "Withholding Tax is best described as what?",
+        "options": {"A": "A deduction at source from certain payments", "B": "A vehicle license", "C": "A bank password", "D": "A pension card"},
+        "answer": "A",
+        "explain": "WHT is deducted at source from certain qualifying payments.",
+        "premium_explanation": "Withholding Tax is deducted at source by the payer from certain qualifying payments. It is usually remitted to the relevant tax authority and may serve as advance tax credit for the recipient, depending on the transaction and taxpayer type.",
+    },
+    {
+        "id": "tg_q_records_1",
+        "category": "Records",
+        "question": "Why should a business keep PAYE records?",
+        "options": {"A": "To show salary, deductions, and remittances", "B": "To decorate the office", "C": "To replace bank accounts", "D": "To avoid all tax forever"},
+        "answer": "A",
+        "explain": "PAYE records help show salaries paid, deductions made, and remittances to the relevant tax authority.",
+        "premium_explanation": "PAYE records support payroll compliance. They help show gross salary, deductions, reliefs, tax calculated, payment dates, and remittance evidence. Good records also make audits and employee tax-clearance support easier.",
+    },
+    {
+        "id": "tg_q_deadlines_1",
+        "category": "Deadlines",
+        "question": "If a reminder date has already passed, what should a reminder system do?",
+        "options": {"A": "Reject it or suggest a valid reminder period", "B": "Accept it silently", "C": "Delete all reminders", "D": "Charge VAT automatically"},
+        "answer": "A",
+        "explain": "A reminder should only be accepted if the reminder date can still occur today or in the future.",
+        "premium_explanation": "A deadline reminder is useful only when it can still notify the user before the due date. If the calculated reminder date has passed, the system should reject it or suggest the maximum valid reminder period so users do not rely on an impossible alert.",
+    },
+]
+
+
+def _quiz_norm(value: Any) -> str:
+    return re.sub(r"\s+", " ", _clean_text(value).lower()).strip()
+
+
+def _quiz_today_key() -> str:
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+def _quiz_is_paid(account_id: str) -> bool:
+    try:
+        return bool(has_active_subscription(account_id))
+    except Exception:
+        row = _subscription_row(account_id)
+        if not row:
+            return False
+        status = _clean_text(row.get("status")).lower()
+        return status == "active"
+
+
+def _quiz_text_telegram() -> str:
+    return (
+        "🧠 *Tax Quiz*\n\n"
+        "Q1 - Start random quiz\n"
+        "Q2 - Choose category\n"
+        "Q3 - View today's score\n"
+        "Q4 - Review last answer\n"
+        "Q5 - Detailed saved explanation\n\n"
+        "Reply A, B, C, or D after a question.\n"
+        "Free users get 12 non-AI quiz attempts daily. Paid users get unlimited non-AI quiz attempts.\n"
+        "Q5 costs 1 Usage Credit and uses saved explanations, not live AI."
+    )
+
+
+def _quiz_state(chat_id: str) -> dict[str, Any]:
+    state = user_states.get(chat_id)
+    if not isinstance(state, dict):
+        state = {}
+    data = state.get("quiz_data")
+    if not isinstance(data, dict):
+        data = {}
+    state["quiz_data"] = data
+    return state
+
+
+def _quiz_data(chat_id: str) -> dict[str, Any]:
+    state = _quiz_state(chat_id)
+    data = state.get("quiz_data")
+    return data if isinstance(data, dict) else {}
+
+
+def _quiz_daily_numbers_from_data(data: dict[str, Any]) -> dict[str, int]:
+    today = _quiz_today_key()
+    if data.get("quiz_date") != today:
+        return {"attempts": 0, "correct": 0, "wrong": 0}
+    return {
+        "attempts": int(data.get("quiz_attempts") or 0),
+        "correct": int(data.get("quiz_correct_count") or 0),
+        "wrong": int(data.get("quiz_wrong_count") or 0),
+    }
+
+
+def _quiz_categories_telegram() -> list[str]:
+    categories: set[str] = set()
+    try:
+        res = supabase.table("tax_quiz_questions").select("category").eq("is_active", True).limit(200).execute()
+        for row in _rows(res):
+            category = _clean_text(row.get("category"))
+            if category:
+                categories.add(category)
+    except Exception:
+        pass
+
+    for row in TELEGRAM_QUIZ_FALLBACK_BANK:
+        category = _clean_text(row.get("category") or "General")
+        if category:
+            categories.add(category)
+
+    return sorted(categories or {"General"})
+
+
+def _quiz_category_menu_telegram() -> str:
+    lines = ["🧠 *Choose Quiz Category*", ""]
+    categories = _quiz_categories_telegram()
+    for idx, category in enumerate(categories, start=1):
+        shortcut = category.upper().replace("COMPANY TAX", "CIT")
+        lines.append(f"Q2 {idx} - {category}  |  Q1 {shortcut}")
+
+    lines.extend(
+        [
+            "",
+            "Examples:",
+            "Q1 PAYE",
+            "Q1 VAT",
+            "Q1 CIT",
+            "Q1 WHT",
+            "",
+            "Reply Q1 for mixed random quiz or 0 for menu.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _normalize_quiz_category_telegram(value: Any) -> str:
+    norm = _quiz_norm(value)
+    if not norm:
+        return ""
+
+    aliases = {
+        "cit": "Company Tax",
+        "company": "Company Tax",
+        "company tax": "Company Tax",
+        "company income tax": "Company Tax",
+        "paye": "PAYE",
+        "pay as you earn": "PAYE",
+        "vat": "VAT",
+        "wht": "WHT",
+        "withholding": "WHT",
+        "withholding tax": "WHT",
+        "deadline": "Deadlines",
+        "deadlines": "Deadlines",
+        "record": "Records",
+        "records": "Records",
+        "general": "General",
+    }
+    if norm in aliases:
+        return aliases[norm]
+
+    for category in _quiz_categories_telegram():
+        if norm == _quiz_norm(category):
+            return category
+
+    return ""
+
+
+def _resolve_quiz_category_telegram(text: str) -> str:
+    norm = _quiz_norm(text)
+    categories = _quiz_categories_telegram()
+
+    if norm in {"q1", "quiz", "start quiz", "tax quiz", "quiz me", "take quiz", "q2", "category", "quiz categories"}:
+        return ""
+
+    match_num = re.match(r"^q[12]\s+(\d{1,2})$", norm)
+    if match_num:
+        idx = int(match_num.group(1)) - 1
+        return categories[idx] if 0 <= idx < len(categories) else ""
+
+    cleaned = re.sub(r"^q[12]\s+", "", norm).strip()
+    if cleaned in {"mixed", "random", "all", "general all"}:
+        return ""
+
+    return _normalize_quiz_category_telegram(cleaned)
+
+
+def _quiz_question_from_db_row_telegram(row: dict[str, Any]) -> dict[str, Any]:
+    short = _clean_text(row.get("short_explanation") or row.get("explain"))
+    premium = _clean_text(row.get("premium_explanation") or short)
+    return {
+        "source": "db",
+        "db_id": _clean_text(row.get("id")),
+        "id": _clean_text(row.get("question_code") or row.get("id")),
+        "question_code": _clean_text(row.get("question_code") or row.get("id")),
+        "category": _clean_text(row.get("category") or "General"),
+        "difficulty": _clean_text(row.get("difficulty") or "basic"),
+        "question": _clean_text(row.get("question")),
+        "short_explanation": short,
+        "explain": short,
+        "premium_explanation": premium,
+        "source_reference": _clean_text(row.get("source_reference") or "Naija Tax Guide quiz bank"),
+    }
+
+
+def _load_quiz_questions_telegram(category: str = "") -> list[dict[str, Any]]:
+    category = _clean_text(category)
+    db_rows: list[dict[str, Any]] = []
+
+    try:
+        query = supabase.table("tax_quiz_questions").select(
+            "id,question_code,category,difficulty,question,short_explanation,premium_explanation,source_reference,is_active,created_at"
+        ).eq("is_active", True)
+        if category:
+            query = query.eq("category", category)
+        res = query.limit(120).execute()
+        db_rows = [row for row in _rows(res) if _clean_text(row.get("question"))]
+    except Exception:
+        db_rows = []
+
+    questions = [_quiz_question_from_db_row_telegram(row) for row in db_rows]
+    if questions:
+        return questions
+
+    fallback = [dict(row) for row in TELEGRAM_QUIZ_FALLBACK_BANK]
+    if category:
+        wanted = _quiz_norm(category)
+        filtered = [row for row in fallback if _quiz_norm(row.get("category")) == wanted]
+        return filtered or fallback
+    return fallback
+
+
+def _load_db_quiz_options_telegram(question: dict[str, Any]) -> list[dict[str, Any]]:
+    db_id = _clean_text(question.get("db_id"))
+    if not db_id:
+        return []
+
+    try:
+        res = (
+            supabase.table("tax_quiz_options")
+            .select("id,option_code,option_text,is_correct,created_at")
+            .eq("question_id", db_id)
+            .limit(20)
+            .execute()
+        )
+        rows = _rows(res)
+    except Exception:
+        rows = []
+
+    options: list[dict[str, Any]] = []
+    for row in rows:
+        text = _clean_text(row.get("option_text"))
+        if not text:
+            continue
+        options.append(
+            {
+                "option_id": _clean_text(row.get("id") or row.get("option_code") or text),
+                "option_text": text,
+                "is_correct": bool(row.get("is_correct")),
+                "source_code": _clean_text(row.get("option_code")),
+            }
+        )
+    return options
+
+
+def _load_static_quiz_options_telegram(question: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_options = question.get("options") if isinstance(question.get("options"), dict) else {}
+    correct = _clean_text(question.get("answer") or question.get("correct")).upper()[:1]
+
+    options: list[dict[str, Any]] = []
+    for key, value in raw_options.items():
+        label = _clean_text(key).upper()[:1]
+        text = _clean_text(value)
+        if not label or not text:
+            continue
+        options.append(
+            {
+                "option_id": f"{_clean_text(question.get('id') or question.get('question_code'))}_{label}",
+                "option_text": text,
+                "is_correct": label == correct,
+                "source_code": label,
+            }
+        )
+    return options
+
+
+def _static_premium_explanation_telegram(question: dict[str, Any]) -> str:
+    base = _clean_text(question.get("premium_explanation") or question.get("short_explanation") or question.get("explain"))
+    category = _clean_text(question.get("category") or "General")
+    if not base:
+        base = "This quiz item is part of the Nigerian tax compliance learning bank."
+    return _clip_text(
+        f"{base}\n\n"
+        f"Practical example: This helps you apply the correct {category} rule, deadline, record, or filing step in a real Nigerian tax situation.\n\n"
+        "Why it matters: Understanding the rule helps reduce wrong answers, missed steps, and avoidable compliance mistakes.",
+        1200,
+    )
+
+
+def _randomized_quiz_payload_telegram(question: dict[str, Any]) -> dict[str, Any]:
+    options = _load_db_quiz_options_telegram(question) if question.get("source") == "db" else []
+    if not options:
+        options = _load_static_quiz_options_telegram(question)
+    if not options:
+        options = [
+            {"option_id": f"{_clean_text(question.get('id'))}_A", "option_text": "True", "is_correct": True, "source_code": "A"},
+            {"option_id": f"{_clean_text(question.get('id'))}_B", "option_text": "False", "is_correct": False, "source_code": "B"},
+        ]
+
+    rng = random.SystemRandom()
+    shuffled = list(options)
+    rng.shuffle(shuffled)
+
+    labels = ["A", "B", "C", "D"]
+    display_options: dict[str, str] = {}
+    option_order: dict[str, str] = {}
+    correct_label = ""
+    correct_option_id = ""
+
+    for label, option in zip(labels, shuffled[:4]):
+        option_id = _clean_text(option.get("option_id") or option.get("source_code") or label)
+        option_text = _clean_text(option.get("option_text"))
+        if not option_text:
+            continue
+        display_options[label] = option_text
+        option_order[label] = option_id
+        if bool(option.get("is_correct")):
+            correct_label = label
+            correct_option_id = option_id
+
+    if not correct_label and display_options:
+        correct_label = next(iter(display_options.keys()))
+        correct_option_id = option_order.get(correct_label, correct_label)
+
+    short = _clean_text(question.get("short_explanation") or question.get("explain"))
+    premium = _clean_text(question.get("premium_explanation")) or _static_premium_explanation_telegram(question)
+    if not short:
+        short = premium
+
+    return {
+        **question,
+        "options": display_options,
+        "option_order": option_order,
+        "correct": correct_label,
+        "answer": correct_label,
+        "correct_option_id": correct_option_id,
+        "short_explanation": short,
+        "explain": short,
+        "premium_explanation": premium,
+    }
+
+
+def _select_quiz_question_telegram(pool: list[dict[str, Any]], data: dict[str, Any], category: str) -> dict[str, Any]:
+    if not pool:
+        pool = [dict(row) for row in TELEGRAM_QUIZ_FALLBACK_BANK]
+
+    key = "quiz_seen_ids_" + (_quiz_norm(category or "mixed").replace(" ", "_") or "mixed")
+    seen = data.get(key)
+    if not isinstance(seen, list):
+        seen = []
+
+    def qid(row: dict[str, Any]) -> str:
+        return _clean_text(row.get("id") or row.get("question_code") or row.get("db_id") or row.get("question"))
+
+    available = [row for row in pool if qid(row) not in seen]
+    if not available:
+        seen = []
+        available = list(pool)
+
+    rng = random.SystemRandom()
+    selected = dict(rng.choice(available))
+    current_id = qid(selected)
+    if current_id:
+        seen.append(current_id)
+
+    data[key] = seen[-80:]
+    return selected
+
+
+def _quiz_safe_update_by_id(table: str, row_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    if not _clean_text(row_id):
+        return {"ok": False, "error": "missing_id"}
+
+    payloads = [
+        dict(payload),
+        {k: v for k, v in payload.items() if k != "updated_at"},
+        {k: v for k, v in payload.items() if k not in {"updated_at", "metadata"}},
+    ]
+
+    errors: list[str] = []
+    seen: set[str] = set()
+
+    for candidate in payloads:
+        cleaned = {k: v for k, v in candidate.items() if v is not None}
+        signature = repr(sorted(cleaned.keys()))
+        if signature in seen:
+            continue
+        seen.add(signature)
+        ok, resp, err = _safe_exec(supabase.table(table).update(cleaned).eq("id", row_id))
+        if ok:
+            return {"ok": True, "data": _rows(resp), "mode": signature}
+        errors.append(str(err))
+
+    return {"ok": False, "error": errors[-1] if errors else "update_failed", "errors": errors[:3]}
+
+
+def _quiz_safe_insert_telegram(table: str, payload: dict[str, Any]) -> dict[str, Any]:
+    payloads = [
+        dict(payload),
+        {k: v for k, v in payload.items() if k != "updated_at"},
+        {k: v for k, v in payload.items() if k not in {"updated_at", "metadata"}},
+        {k: v for k, v in payload.items() if k in {"account_id", "question_id", "question_code", "category", "status", "created_at"}},
+    ]
+
+    errors: list[str] = []
+    seen: set[str] = set()
+    for candidate in payloads:
+        cleaned = {k: v for k, v in candidate.items() if v is not None}
+        signature = repr(sorted(cleaned.keys()))
+        if signature in seen:
+            continue
+        seen.add(signature)
+        ok, resp, err = _safe_exec(supabase.table(table).insert(cleaned))
+        if ok:
+            return {"ok": True, "data": _rows(resp), "mode": signature}
+        errors.append(str(err))
+
+    return {"ok": False, "error": errors[-1] if errors else "insert_failed", "errors": errors[:3]}
+
+
+def _log_quiz_attempt_started_telegram(account_id: str, tg_user_id: str, quiz: dict[str, Any]) -> str:
+    payload = {
+        "account_id": account_id,
+        "tg_user_id": tg_user_id,
+        "provider_user_id": tg_user_id,
+        "channel": "telegram",
+        "question_id": _clean_text(quiz.get("db_id")) or None,
+        "question_code": _clean_text(quiz.get("question_code") or quiz.get("id")) or None,
+        "category": _clean_text(quiz.get("category") or "General"),
+        "displayed_option_order": quiz.get("option_order") if isinstance(quiz.get("option_order"), dict) else {},
+        "correct_option_id": _clean_text(quiz.get("correct_option_id")) or None,
+        "status": "started",
+        "created_at": _utc_now_iso(),
+        "updated_at": _utc_now_iso(),
+        "metadata": {"source": _clean_text(quiz.get("source") or "static"), "platform": "telegram"},
+    }
+    result = _quiz_safe_insert_telegram("tax_quiz_attempts", payload)
+    rows = result.get("data") if isinstance(result.get("data"), list) else []
+    if rows and isinstance(rows[0], dict):
+        return _clean_text(rows[0].get("id"))
+    return ""
+
+
+def _log_quiz_attempt_answered_telegram(attempt_id: str, answer: str, selected_option_id: str, passed: bool) -> None:
+    _quiz_safe_update_by_id(
+        "tax_quiz_attempts",
+        attempt_id,
+        {
+            "selected_label": _clean_text(answer).upper()[:1],
+            "selected_option_id": _clean_text(selected_option_id) or None,
+            "is_correct": bool(passed),
+            "status": "answered",
+            "answered_at": _utc_now_iso(),
+            "updated_at": _utc_now_iso(),
+        },
+    )
+
+
+def _log_quiz_q5_used_telegram(attempt_id: str, debit: dict[str, Any]) -> None:
+    _quiz_safe_update_by_id(
+        "tax_quiz_attempts",
+        attempt_id,
+        {
+            "q5_explanation_used": True,
+            "credits_charged": int(debit.get("credits_consumed") or 1),
+            "q5_explained_at": _utc_now_iso(),
+            "updated_at": _utc_now_iso(),
+        },
+    )
+
+
+def _quiz_balance_row(account_id: str) -> tuple[Optional[dict[str, Any]], str]:
+    try:
+        resp = supabase.table("ai_credit_balances").select("*").eq("account_id", account_id).limit(1).execute()
+        row = _first(resp)
+        if row:
+            return row, ""
+    except Exception as exc:
+        return None, str(exc)
+    return None, "credit_balance_not_found"
+
+
+def _quiz_credit_column(row: dict[str, Any]) -> str:
+    for key in ("balance", "credits", "credit_balance", "available_credits"):
+        if key in row:
+            return key
+    return "balance"
+
+
+def _insert_quiz_credit_log(account_id: str, before: int, after: int, attempt_id: str) -> None:
+    reference = f"Q5-TG-{uuid.uuid4().hex[:12].upper()}"
+    base_payload = {
+        "account_id": account_id,
+        "reference": reference,
+        "action_code": "quiz_q5_saved_explanation",
+        "description": "Telegram Q5 detailed saved quiz explanation",
+        "channel": "telegram",
+        "credits_delta": -1,
+        "amount": -1,
+        "balance_before": before,
+        "balance_after": after,
+        "metadata": {"source": "telegram_quiz", "live_ai_called": False, "attempt_id": attempt_id},
+        "created_at": _utc_now_iso(),
+    }
+
+    # Try multiple possible log tables. This must never block the user's Q5 response.
+    for table in ("credit_usage_logs", "ai_credit_transactions", "credit_transactions", "ai_credit_deductions"):
+        try:
+            payload = dict(base_payload)
+            if table in {"ai_credit_transactions", "credit_transactions", "ai_credit_deductions"}:
+                payload.setdefault("type", "debit")
+                payload.setdefault("reason", "Q5 detailed saved quiz explanation")
+            ok, _resp, _err = _safe_exec(supabase.table(table).insert(payload))
+            if ok:
+                return
+        except Exception:
+            continue
+
+
+def _debit_q5_usage_credit_telegram(account_id: str, attempt_id: str = "") -> dict[str, Any]:
+    row, err = _quiz_balance_row(account_id)
+    if not row:
+        return {"ok": False, "error": err or "credit_balance_not_found", "mode": "no_balance_row"}
+
+    column = _quiz_credit_column(row)
+    try:
+        before = int(row.get(column) or 0)
+    except Exception:
+        before = 0
+
+    if before < 1:
+        return {"ok": False, "error": "insufficient_credits", "before": before, "after": before, "column": column}
+
+    after = before - 1
+    payloads = [
+        {column: after, "updated_at": _utc_now_iso()},
+        {column: after},
+    ]
+
+    errors: list[str] = []
+    for payload in payloads:
+        ok, _resp, err = _safe_exec(supabase.table("ai_credit_balances").update(payload).eq("account_id", account_id))
+        if ok:
+            _insert_quiz_credit_log(account_id, before, after, attempt_id)
+            return {"ok": True, "before": before, "after": after, "column": column, "credits_consumed": 1}
+        errors.append(str(err))
+
+    return {"ok": False, "error": errors[-1] if errors else "credit_update_failed", "before": before, "after": before, "column": column}
+
+
+def _start_quiz_telegram(chat_id: str, account_id: str, tg_user_id: str, category: str = "") -> None:
+    state = _quiz_state(chat_id)
+    data = state.get("quiz_data") if isinstance(state.get("quiz_data"), dict) else {}
+    today = _quiz_today_key()
+    numbers = _quiz_daily_numbers_from_data(data)
+
+    if data.get("quiz_date") != today:
+        data = {"quiz_date": today, "quiz_attempts": 0, "quiz_correct_count": 0, "quiz_wrong_count": 0}
+        numbers = {"attempts": 0, "correct": 0, "wrong": 0}
+
+    if not _quiz_is_paid(account_id) and numbers["attempts"] >= QUIZ_FREE_DAILY_LIMIT:
+        send_telegram_text(
+            chat_id,
+            "🔒 *Daily Quiz Limit Reached*\n\n"
+            f"Free users can take {QUIZ_FREE_DAILY_LIMIT} non-AI quiz attempts daily.\n"
+            "Paid users get unlimited non-AI quiz attempts.\n\n"
+            "Reply 4 to view plans or 0 for menu.",
+        )
+        return
+
+    resolved_category = _resolve_quiz_category_telegram(category or "")
+    pool = _load_quiz_questions_telegram(resolved_category)
+    base_question = _select_quiz_question_telegram(pool, data, resolved_category)
+    quiz = _randomized_quiz_payload_telegram(base_question)
+    attempt_id = _log_quiz_attempt_started_telegram(account_id, tg_user_id, quiz)
+
+    data.update(
+        {
+            "quiz_date": today,
+            "quiz_attempts": numbers["attempts"],
+            "quiz_id": quiz.get("id"),
+            "quiz_db_id": quiz.get("db_id"),
+            "quiz_attempt_id": attempt_id,
+            "quiz_category": quiz.get("category"),
+            "quiz_question": quiz.get("question"),
+            "quiz_options": quiz.get("options"),
+            "quiz_option_order": quiz.get("option_order"),
+            "correct": quiz.get("correct"),
+            "correct_option_id": quiz.get("correct_option_id"),
+            "explain": quiz.get("short_explanation") or quiz.get("explain"),
+            "premium_explain": quiz.get("premium_explanation"),
+            "source_reference": quiz.get("source_reference"),
+            "active_quiz_started_at": _utc_now_iso(),
+        }
+    )
+
+    user_states[chat_id] = {
+        **state,
+        "quiz_mode": "answer",
+        "quiz_data": data,
+    }
+
+    options = "\n".join([f"{key}. {value}" for key, value in (quiz.get("options") or {}).items()])
+    remaining = "Unlimited" if _quiz_is_paid(account_id) else str(max(0, QUIZ_FREE_DAILY_LIMIT - numbers["attempts"]))
+
+    body = (
+        f"🧠 *Tax Quiz* ({quiz.get('category') or 'General'})\n\n"
+        f"Question: {quiz.get('question')}\n\n"
+        f"{options}\n\n"
+        f"Remaining today: {remaining}\n\n"
+        "Reply A, B, C, or D.\n"
+        "Reply CANCEL to stop."
+    )
+    send_telegram_text(chat_id, _clip_text(body, 3900))
+
+
+def _handle_quiz_answer_telegram(chat_id: str, account_id: str, text: str) -> bool:
+    answer = _clean_text(text).upper()[:1]
+    state = _quiz_state(chat_id)
+    data = state.get("quiz_data") if isinstance(state.get("quiz_data"), dict) else {}
+
+    if _quiz_norm(text) in {"cancel", "stop", "end"}:
+        state.pop("quiz_mode", None)
+        user_states[chat_id] = state
+        send_telegram_text(chat_id, "Quiz cancelled.\n\nReply Q1 to start again or 0 for menu.")
+        return True
+
+    if answer not in {"A", "B", "C", "D"}:
+        send_telegram_text(chat_id, "Please reply with A, B, C, or D.\n\nReply CANCEL to stop the quiz.")
+        return True
+
+    correct = _clean_text(data.get("correct")).upper()[:1] or "A"
+    option_order = data.get("quiz_option_order") if isinstance(data.get("quiz_option_order"), dict) else {}
+    selected_option_id = _clean_text(option_order.get(answer) or answer)
+    correct_option_id = _clean_text(data.get("correct_option_id") or option_order.get(correct) or correct)
+
+    numbers = _quiz_daily_numbers_from_data(data)
+    attempts = numbers["attempts"] + 1
+    passed = bool(selected_option_id and correct_option_id and selected_option_id == correct_option_id) if option_order else answer == correct
+    correct_count = numbers["correct"] + (1 if passed else 0)
+    wrong_count = numbers["wrong"] + (0 if passed else 1)
+
+    attempt_id = _clean_text(data.get("quiz_attempt_id"))
+    _log_quiz_attempt_answered_telegram(attempt_id, answer, selected_option_id, passed)
+
+    options = data.get("quiz_options") if isinstance(data.get("quiz_options"), dict) else {}
+    selected_text = _clean_text(options.get(answer))
+    correct_text = _clean_text(options.get(correct))
+
+    explain = _clean_text(data.get("explain"))
+    premium = _clean_text(data.get("premium_explain") or explain)
+    last_quiz = {
+        "id": data.get("quiz_id"),
+        "db_id": data.get("quiz_db_id"),
+        "attempt_id": attempt_id,
+        "category": data.get("quiz_category"),
+        "question": data.get("quiz_question"),
+        "options": options,
+        "option_order": option_order,
+        "selected": answer,
+        "selected_text": selected_text,
+        "selected_option_id": selected_option_id,
+        "correct": correct,
+        "correct_text": correct_text,
+        "correct_option_id": correct_option_id,
+        "is_correct": passed,
+        "explanation": explain,
+        "premium_explanation": premium,
+        "source_reference": data.get("source_reference"),
+        "answered_at": _utc_now_iso(),
+    }
+
+    data.update(
+        {
+            "quiz_date": _quiz_today_key(),
+            "quiz_attempts": attempts,
+            "quiz_correct_count": correct_count,
+            "quiz_wrong_count": wrong_count,
+            "last_quiz": last_quiz,
+            "last_quiz_answer": answer,
+            "last_quiz_correct": correct,
+            "last_quiz_passed": passed,
+            "last_quiz_explain": explain,
+            "last_quiz_premium_explain": premium,
+            "last_quiz_attempt_id": attempt_id,
+        }
+    )
+
+    state["quiz_data"] = data
+    state.pop("quiz_mode", None)
+    user_states[chat_id] = state
+
+    verdict = "✅ Correct!" if passed else f"❌ Not correct. Correct answer: {correct}."
+    short_explanation_line = f"\n\nWhy: {explain}" if explain else ""
+    remaining = "Unlimited" if _quiz_is_paid(account_id) else str(max(0, QUIZ_FREE_DAILY_LIMIT - attempts))
+
+    body = (
+        "🧠 *Quiz Result*\n\n"
+        f"{verdict}"
+        f"{short_explanation_line}\n\n"
+        f"Attempts today: {attempts}\n"
+        f"Correct today: {correct_count}\n"
+        f"Wrong today: {wrong_count}\n"
+        f"Remaining today: {remaining}\n\n"
+        "Reply Q1 for another quiz, Q2 for categories, Q3 for score, Q4 to review, Q5 for detailed saved explanation, or 0 for menu."
+    )
+    send_telegram_text(chat_id, _clip_text(body, 3900))
+    return True
+
+
+def _send_quiz_score_telegram(chat_id: str, account_id: str) -> None:
+    data = _quiz_data(chat_id)
+    numbers = _quiz_daily_numbers_from_data(data)
+    attempts = numbers["attempts"]
+    accuracy = "0%" if attempts <= 0 else f"{round((numbers['correct'] / attempts) * 100)}%"
+    remaining = "Unlimited" if _quiz_is_paid(account_id) else str(max(0, QUIZ_FREE_DAILY_LIMIT - attempts))
+
+    body = (
+        "📊 *Today's Quiz Score*\n\n"
+        f"Attempts: {attempts}\n"
+        f"Correct: {numbers['correct']}\n"
+        f"Wrong: {numbers['wrong']}\n"
+        f"Accuracy: {accuracy}\n"
+        f"Remaining: {remaining}\n\n"
+        "Reply Q1 to continue, Q2 to choose category, or 0 for menu."
+    )
+    send_telegram_text(chat_id, body)
+
+
+def _send_quiz_review_telegram(chat_id: str) -> None:
+    data = _quiz_data(chat_id)
+    last = data.get("last_quiz") if isinstance(data.get("last_quiz"), dict) else None
+    if not last:
+        send_telegram_text(chat_id, "📌 No quiz answer to review yet. Reply Q1 to start a quiz.")
+        return
+
+    status = "✅ Correct" if last.get("is_correct") else "❌ Not correct"
+    selected = _clean_text(last.get("selected"))
+    correct = _clean_text(last.get("correct"))
+    selected_text = _clean_text(last.get("selected_text"))
+    correct_text = _clean_text(last.get("correct_text"))
+
+    body = (
+        "📌 *Last Quiz Review*\n\n"
+        f"Category: {_clean_text(last.get('category')) or 'General'}\n"
+        f"Question: {_clean_text(last.get('question'))}\n\n"
+        f"Your answer: {selected}. {selected_text}\n"
+        f"Correct answer: {correct}. {correct_text}\n"
+        f"Status: {status}\n\n"
+        f"Why: {_clean_text(last.get('explanation'))}\n\n"
+        "Reply Q1 for another quiz or Q5 for the detailed saved explanation."
+    )
+    send_telegram_text(chat_id, _clip_text(body, 3900))
+
+
+def _send_quiz_q5_telegram(chat_id: str, account_id: str) -> None:
+    data = _quiz_data(chat_id)
+    last = data.get("last_quiz") if isinstance(data.get("last_quiz"), dict) else None
+
+    question = _clean_text((last or {}).get("question") or data.get("quiz_question"))
+    explanation = _clean_text(
+        (last or {}).get("premium_explanation")
+        or data.get("last_quiz_premium_explain")
+        or (last or {}).get("explanation")
+        or data.get("last_quiz_explain")
+    )
+    attempt_id = _clean_text((last or {}).get("attempt_id") or data.get("last_quiz_attempt_id") or data.get("quiz_attempt_id"))
+
+    if not question:
+        send_telegram_text(chat_id, "No last quiz question found yet. Reply Q1 to start a quiz first.")
+        return
+
+    if not explanation:
+        send_telegram_text(
+            chat_id,
+            "⚠️ A saved detailed explanation is not available for this quiz question yet.\n\n"
+            "Reply Q4 for the normal review, Q1 for another quiz, or 0 for menu.",
+        )
+        return
+
+    if not _quiz_is_paid(account_id):
+        send_telegram_text(
+            chat_id,
+            "🔒 *Q5 Detailed Explanation is a paid feature*\n\n"
+            "Q1-Q4 remain non-AI according to your plan limits.\n"
+            "Q5 costs 1 Usage Credit because it unlocks the saved detailed explanation.\n"
+            "It does not call live AI for fixed quiz content.\n\n"
+            "Reply 4 to view plans or Q4 to review the normal explanation.",
+        )
+        return
+
+    debit = _debit_q5_usage_credit_telegram(account_id, attempt_id)
+    if not debit.get("ok"):
+        if _clean_text(debit.get("error")) == "insufficient_credits":
+            current_balance = int(debit.get("before") or 0)
+            body = (
+                "🔒 *Q5 Detailed Explanation locked*\n\n"
+                f"Q5 costs 1 Usage Credit, but your current balance is {current_balance}.\n"
+                "No detailed explanation was unlocked.\n\n"
+                "Reply CR1 to check balance, 6 to buy add-ons, 4 to view plans, or Q4 for the normal review."
+            )
+        else:
+            body = (
+                "🔒 *Q5 Detailed Explanation not available*\n\n"
+                "Q5 costs 1 Usage Credit, but your credit balance could not be charged.\n"
+                "No detailed explanation was unlocked.\n\n"
+                "Reply CR1 to check balance, 4 to view plans, or Q4 for the normal review."
+            )
+        send_telegram_text(chat_id, body)
+        return
+
+    _log_quiz_q5_used_telegram(attempt_id, debit)
+
+    body = (
+        "💡 *Q5 Detailed Explanation*\n\n"
+        f"{_clip_text(explanation, 1200)}\n\n"
+        "💎 Usage Credit deducted: 1\n"
+        f"Balance: {debit.get('after')}\n\n"
+        "Reply Q1 for another quiz, Q3 for score, or 0 for menu."
+    )
+    send_telegram_text(chat_id, _clip_text(body, 1800))
+
+
+def _handle_quiz_command_telegram(chat_id: str, account_id: str, tg_user_id: str, text_raw: str) -> bool:
+    norm = _quiz_norm(text_raw)
+
+    if norm.startswith("q1") or norm in {"quiz", "start quiz", "tax quiz", "quiz me", "take quiz"}:
+        category = _resolve_quiz_category_telegram(text_raw)
+        _start_quiz_telegram(chat_id, account_id, tg_user_id, category)
+        return True
+
+    if norm.startswith("q2") or "category" in norm:
+        category = _resolve_quiz_category_telegram(text_raw)
+        if category:
+            _start_quiz_telegram(chat_id, account_id, tg_user_id, category)
+        else:
+            send_telegram_text(chat_id, _quiz_category_menu_telegram())
+        return True
+
+    if norm.startswith("q3") or "score" in norm:
+        _send_quiz_score_telegram(chat_id, account_id)
+        return True
+
+    if norm.startswith("q4") or "review" in norm:
+        _send_quiz_review_telegram(chat_id)
+        return True
+
+    if norm.startswith("q5") or "explain" in norm:
+        _send_quiz_q5_telegram(chat_id, account_id)
+        return True
+
+    send_telegram_text(chat_id, _quiz_text_telegram())
+    return True
+
+
+
 def _send_link_help(chat_id: str, *, linked: bool) -> None:
     if linked:
         send_telegram_text(
@@ -3899,6 +4820,13 @@ def tg_webhook():
             send_telegram_text(chat_id_str, "❌ Invalid email. Send a valid email or CANCEL to abort.")
         return jsonify({"ok": True})
 
+    # Quiz answer continuation must run before the master-command state clearing.
+    if user_state.get("quiz_mode") == "answer":
+        answer_norm = _clean_text(text).upper()
+        if answer_norm in {"A", "B", "C", "D", "CANCEL", "STOP", "END"}:
+            _handle_quiz_answer_telegram(chat_id_str, account_id, text)
+            return jsonify({"ok": True, "quiz_answer": True})
+
     # Direct top-up package commands work anytime and do not depend on in-memory worker state.
     if _select_credit_package_number(text_lower) is not None:
         if _handle_credit_package_selection(
@@ -3911,9 +4839,9 @@ def tg_webhook():
             return jsonify({"ok": True})
 
     # WhatsApp master command registry must override stale conversational state.
-    # Clear old state before handling the command; the command handler may set a new
-    # state such as awaiting_email for a subscription checkout.
-    user_states.pop(chat_id_str, None)
+    # Preserve quiz memory for Q3/Q4/Q5, but clear stale state for unrelated commands.
+    if not re.match(r"^Q[1-5]\b", text, flags=re.I):
+        user_states.pop(chat_id_str, None)
     if _handle_master_command(
         chat_id=chat_id_str,
         account_id=account_id,
@@ -3943,6 +4871,10 @@ def tg_webhook():
 
     if _handle_tax_filing_command(chat_id_str, account_id, text):
         return jsonify({"ok": True})
+
+    if text_lower in {"quiz", "tax quiz", "start quiz", "quiz me", "take quiz"}:
+        _handle_quiz_command_telegram(chat_id_str, account_id, tg_user_id, text)
+        return jsonify({"ok": True, "quiz": True})
 
     if MENU_NUMBER_RE.match(text):
         option = int(text)
