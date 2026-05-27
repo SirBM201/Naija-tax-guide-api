@@ -41,7 +41,7 @@ from app.services.tax_filing_service import (
 
 bp = Blueprint("telegram", __name__)
 
-TELEGRAM_ROUTE_VERSION = "2026-05-27-v34f-telegram-master-registry-stabilization"
+TELEGRAM_ROUTE_VERSION = "2026-05-27-v34g-telegram-support-payment-guard-fix"
 
 LINK_CODE_RE = re.compile(r"^[A-Z0-9]{8}$")
 MENU_NUMBER_RE = re.compile(r"^[1-8]$")
@@ -200,7 +200,7 @@ def telegram_health():
             "version": TELEGRAM_ROUTE_VERSION,
             "route_mount": "/api/telegram/*",
             "account_resolution": "channel_identities_first_accounts_auth_fallback",
-            "command_namespace": "whatsapp_master_registry_stabilized",
+            "command_namespace": "whatsapp_master_registry_stabilized_support_payment_guard",
             "configured": {
                 "bot_token": _env_present("TELEGRAM_BOT_TOKEN", "TG_BOT_TOKEN", "TELEGRAM_TOKEN"),
                 "webhook_secret": _env_present("TELEGRAM_WEBHOOK_SECRET", "TG_WEBHOOK_SECRET"),
@@ -765,7 +765,25 @@ def _row_is_open_checkout(row: dict[str, Any]) -> bool:
 
 
 def _recent_checkout_reuse_message(account_id: str, *, plan_code: str = "", package_code: str = "") -> Optional[str]:
-    rows = _rows_for_account("paystack_transactions", account_id, limit=15)
+    """
+    Batch 27D2:
+    Stronger duplicate checkout guard.
+
+    D1 only reused a checkout when a URL was found in the existing row.
+    Some paystack_transactions rows do not expose/store the authorization URL,
+    so repeated S1/T10 could still create multiple pending rows.
+
+    This guard now:
+      - reuses the URL when available;
+      - otherwise blocks a very recent matching/open checkout and tells the user
+        to use the last link already shown in Telegram.
+    """
+    rows = _rows_for_account("paystack_transactions", account_id, limit=20)
+
+    requested_label = (plan_code or package_code or "checkout").upper()
+    requested_terms = [x.lower() for x in (plan_code, package_code) if x]
+
+    recent_open_fallback: Optional[dict[str, Any]] = None
 
     for row in rows:
         if not _row_is_open_checkout(row) or not _row_recent_enough(row, seconds=900):
@@ -775,28 +793,80 @@ def _recent_checkout_reuse_message(account_id: str, *, plan_code: str = "", pack
             _clean_text(row.get(k)).lower()
             for k in (
                 "plan_code", "package_code", "product_code", "purpose", "type",
-                "metadata", "description", "reference", "payment_reference"
+                "metadata", "description", "reference", "payment_reference",
+                "provider_reference", "gateway_reference", "plan", "package",
+                "channel_type", "source"
             )
         )
 
-        if plan_code and plan_code.lower() not in row_text:
+        is_match = False
+
+        if requested_terms:
+            is_match = any(term and term in row_text for term in requested_terms)
+
+        # Very recent open checkout fallback.
+        # This prevents double-click / repeated-command duplicates even when the
+        # DB row does not store plan_code/package_code in a searchable field.
+        if not is_match and _row_recent_enough(row, seconds=120):
+            if recent_open_fallback is None:
+                recent_open_fallback = row
             continue
 
-        if package_code and package_code.lower() not in row_text:
+        if not is_match:
             continue
 
         url = _checkout_url_from_row(row)
-        if not url:
-            continue
+        ref = (
+            row.get("reference")
+            or row.get("payment_reference")
+            or row.get("provider_reference")
+            or row.get("gateway_reference")
+            or "not shown"
+        )
 
-        ref = row.get("reference") or row.get("payment_reference") or row.get("provider_reference") or "not shown"
-        label = plan_code.upper() if plan_code else package_code.upper()
+        if url:
+            return (
+                "🧾 *Recent Checkout Found*\n\n"
+                f"I found a recent pending checkout for {requested_label}. To avoid duplicate payment records, use this existing checkout link:\n\n"
+                f"{url}\n\n"
+                f"Reference: {ref}\n\n"
+                "If the link has expired, wait a few minutes or contact support."
+            )
+
         return (
-            "🧾 *Recent Checkout Found*\n\n"
-            f"I found a recent pending checkout for {label}. To avoid duplicate payment records, use this existing checkout link:\n\n"
-            f"{url}\n\n"
+            "🧾 *Recent Pending Checkout Found*\n\n"
+            f"You already have a recent pending checkout for {requested_label}.\n\n"
+            "Please use the last payment link already shown above in this chat. "
+            "To avoid duplicate payment records, I will not create another checkout immediately.\n\n"
             f"Reference: {ref}\n\n"
-            "If the link has expired, wait a few minutes or contact support."
+            "If you cannot find the link, wait about 15 minutes and try again, or contact support with SUP6."
+        )
+
+    if recent_open_fallback:
+        ref = (
+            recent_open_fallback.get("reference")
+            or recent_open_fallback.get("payment_reference")
+            or recent_open_fallback.get("provider_reference")
+            or recent_open_fallback.get("gateway_reference")
+            or "not shown"
+        )
+        url = _checkout_url_from_row(recent_open_fallback)
+
+        if url:
+            return (
+                "🧾 *Recent Checkout Found*\n\n"
+                "I found a very recent pending checkout on your account. "
+                "To avoid duplicate payment records, complete this checkout first:\n\n"
+                f"{url}\n\n"
+                f"Reference: {ref}"
+            )
+
+        return (
+            "🧾 *Recent Pending Checkout Found*\n\n"
+            "I found a very recent pending checkout on your account. "
+            "Please use the last payment link already shown above before creating another one.\n\n"
+            f"Reference: {ref}\n\n"
+            "If you cannot find the link, wait about 15 minutes and try again."
         )
 
     return None
@@ -1085,22 +1155,23 @@ def _send_verify_payment(chat_id: str, account_id: str, text_raw: str) -> None:
         )
         return
 
-    row = None
-    for col in ("reference", "payment_reference", "provider_reference"):
-        try:
-            resp = (
-                supabase.table("paystack_transactions")
-                .select("*")
-                .eq("account_id", account_id)
-                .eq(col, reference)
-                .limit(1)
-                .execute()
-            )
-            row = _first(resp)
-            if row:
-                break
-        except Exception:
-            continue
+    # Batch 27D2:
+    # Logs confirmed paystack_transactions.reference exists, while
+    # payment_reference/provider_reference cause 400 on the current schema.
+    # Keep PAY4 stable by querying only the confirmed reference column.
+    try:
+        resp = (
+            supabase.table("paystack_transactions")
+            .select("*")
+            .eq("account_id", account_id)
+            .eq("reference", reference)
+            .limit(1)
+            .execute()
+        )
+        row = _first(resp)
+    except Exception:
+        logging.exception("Telegram PAY4 reference lookup failed")
+        row = None
 
     if not row:
         send_telegram_text(
@@ -1222,57 +1293,58 @@ def _create_support_ticket_from_text(chat_id: str, account_id: str, text_raw: st
         )
         return
 
-    ticket_ref = f"NTG-TG-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+    ticket_id = f"NTG-TG-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
     now = _utc_now_iso()
 
+    # Batch 27D2:
+    # Live DB error confirmed support_tickets.ticket_id is NOT NULL.
+    # Use ticket_id in every payload attempt and keep the first payload close
+    # to the actual row shape shown by Supabase error details.
     payload_attempts = [
         {
+            "ticket_id": ticket_id,
             "account_id": account_id,
-            "ticket_ref": ticket_ref,
+            "category": "general",
+            "priority": "normal",
             "subject": details[:120],
             "message": details,
             "status": "open",
             "channel": "telegram",
+            "source": "telegram",
+            "metadata": {"created_from": "telegram", "command": "SUP1"},
             "created_at": now,
             "updated_at": now,
         },
         {
-            "account_id": account_id,
-            "reference": ticket_ref,
-            "subject": details[:120],
-            "message": details,
-            "status": "open",
-            "source_channel": "telegram",
-            "created_at": now,
-            "updated_at": now,
-        },
-        {
+            "ticket_id": ticket_id,
             "account_id": account_id,
             "subject": details[:120],
             "message": details,
             "status": "open",
+            "channel": "telegram",
             "source": "telegram",
             "created_at": now,
             "updated_at": now,
         },
         {
-            "account_id": account_id,
-            "title": details[:120],
-            "body": details,
-            "status": "open",
-            "channel_type": "telegram",
-            "created_at": now,
-            "updated_at": now,
-        },
-        {
+            "ticket_id": ticket_id,
             "account_id": account_id,
             "subject": details[:120],
-            "description": details,
+            "message": details,
             "status": "open",
             "created_at": now,
             "updated_at": now,
         },
         {
+            "ticket_id": ticket_id,
+            "account_id": account_id,
+            "message": details,
+            "status": "open",
+            "created_at": now,
+            "updated_at": now,
+        },
+        {
+            "ticket_id": ticket_id,
             "account_id": account_id,
             "message": details,
             "status": "open",
@@ -1282,6 +1354,7 @@ def _create_support_ticket_from_text(chat_id: str, account_id: str, text_raw: st
 
     saved_row = None
     last_error = None
+
     for payload in payload_attempts:
         ok, resp, err = _safe_exec(supabase.table("support_tickets").insert(payload))
         if ok:
@@ -1290,7 +1363,7 @@ def _create_support_ticket_from_text(chat_id: str, account_id: str, text_raw: st
         last_error = err
 
     if saved_row:
-        ref = saved_row.get("ticket_ref") or saved_row.get("reference") or saved_row.get("id") or ticket_ref
+        ref = saved_row.get("ticket_id") or saved_row.get("id") or ticket_id
         send_telegram_text(
             chat_id,
             f"✅ *Support Ticket Created*\n\nTicket: {ref}\n\nOur support team will review it.\n\nReply SUP2 to view tickets or 0 for main menu.",
@@ -1301,7 +1374,7 @@ def _create_support_ticket_from_text(chat_id: str, account_id: str, text_raw: st
             chat_id,
             "⚠️ I could not save the support ticket automatically.\n\n"
             "Please email support@naijataxguides.com and include this reference:\n"
-            f"{ticket_ref}\n\n"
+            f"{ticket_id}\n\n"
             "Your message:\n"
             f"{_clip_text(details, 600)}",
         )
@@ -1317,7 +1390,7 @@ def _send_support_tickets(chat_id: str, account_id: str, latest_only: bool = Fal
     title = "🎫 *Latest Support Ticket*" if latest_only else "🎫 *My Support Tickets*"
     lines = [title, ""]
     for idx, row in enumerate(rows, 1):
-        ref = row.get("ticket_ref") or row.get("reference") or row.get("id") or "No reference"
+        ref = row.get("ticket_id") or row.get("id") or "No reference"
         status = row.get("status") or "open"
         subject = row.get("subject") or row.get("title") or row.get("message") or row.get("description") or "Support ticket"
         created = row.get("created_at")
