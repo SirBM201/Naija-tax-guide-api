@@ -41,7 +41,7 @@ from app.services.tax_filing_service import (
 
 bp = Blueprint("telegram", __name__)
 
-TELEGRAM_ROUTE_VERSION = "2026-05-26-v34e-telegram-whatsapp-master-command-registry"
+TELEGRAM_ROUTE_VERSION = "2026-05-27-v34f-telegram-master-registry-stabilization"
 
 LINK_CODE_RE = re.compile(r"^[A-Z0-9]{8}$")
 MENU_NUMBER_RE = re.compile(r"^[1-8]$")
@@ -49,6 +49,11 @@ MENU_NUMBER_RE = re.compile(r"^[1-8]$")
 # Temporary legacy state store retained from the existing Telegram route.
 # A later Telegram batch should move this into a database-backed session table.
 user_states: dict[str, dict[str, Any]] = {}
+
+# Batch 27D1: lightweight per-worker throttle to avoid PATCHing channel_identities
+# on every Telegram message. Database last_seen_at is still respected below.
+TELEGRAM_IDENTITY_TOUCH_THROTTLE_SECONDS = int(os.getenv("TELEGRAM_IDENTITY_TOUCH_THROTTLE_SECONDS", "600"))
+telegram_identity_touch_cache: dict[str, datetime] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -80,7 +85,7 @@ MASTER_TOPUP_CODE_TO_NUMBER: dict[str, int] = {
 }
 
 MASTER_COMMAND_RE = re.compile(
-    r"^(ACC[1-3]|SET[1-3]|SUP[1-6]|CR[1-4]|PAY[1-6]|FT[1-8]|R[1-6]|"
+    r"^(ALL|ACC[1-3]|SET[1-3]|SUP[1-6]|CR[1-4]|PAY[1-6]|FT[1-8]|R[1-6]|"
     r"S[1-3]|P[1-3]|B[1-3]|T(?:10|50|100|500)|F[1-8]|C[1-8]|Q[1-5]|D[1-4]|H[1-2])\b",
     re.I,
 )
@@ -136,6 +141,52 @@ def _parse_amount(text: str) -> float:
     return float(text.replace(",", "").replace("₦", "").strip())
 
 
+
+def _parse_dt(value: Any) -> Optional[datetime]:
+    raw = _clean_text(value)
+    if not raw:
+        return None
+
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _looks_like_bad_command(text: str) -> bool:
+    """
+    Stop obvious command typos from hitting the AI engine.
+    This is intentionally conservative so normal questions like "what is PAYE?"
+    or "cit filing deadline" are not blocked.
+    """
+    value = _clean_text(text).upper()
+    if not value:
+        return False
+
+    first = value.split()[0]
+
+    if first in {"ALL", "MENU", "START", "HELP", "BACK", "CANCEL", "UNLINK"}:
+        return False
+
+    if MASTER_COMMAND_RE.match(value):
+        return False
+
+    if INVALID_COMMAND_LIKE_RE.match(value):
+        return True
+
+    for prefix in ("ACC", "SET", "SUP", "PAY", "CR", "FT"):
+        if first.startswith(prefix) and len(first) > len(prefix):
+            return True
+
+    if re.match(r"^T\d+\b", first):
+        return True
+
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Health
 # ---------------------------------------------------------------------------
@@ -149,7 +200,7 @@ def telegram_health():
             "version": TELEGRAM_ROUTE_VERSION,
             "route_mount": "/api/telegram/*",
             "account_resolution": "channel_identities_first_accounts_auth_fallback",
-            "command_namespace": "whatsapp_master_registry",
+            "command_namespace": "whatsapp_master_registry_stabilized",
             "configured": {
                 "bot_token": _env_present("TELEGRAM_BOT_TOKEN", "TG_BOT_TOKEN", "TELEGRAM_TOKEN"),
                 "webhook_secret": _env_present("TELEGRAM_WEBHOOK_SECRET", "TG_WEBHOOK_SECRET"),
@@ -369,21 +420,41 @@ def _persist_successful_telegram_link(
 
 
 def _touch_telegram_identity(identity: dict[str, Any], display_name: Optional[str] = None) -> None:
-    identity_id = identity.get("id")
+    identity_id = _clean_text(identity.get("id"))
     if not identity_id:
         return
 
-    payload: dict[str, Any] = {"last_seen_at": _utc_now_iso()}
+    now = datetime.now(timezone.utc)
+    cache_key = identity_id
+
+    last_local = telegram_identity_touch_cache.get(cache_key)
+    if last_local and (now - last_local).total_seconds() < TELEGRAM_IDENTITY_TOUCH_THROTTLE_SECONDS:
+        return
+
+    last_seen = _parse_dt(identity.get("last_seen_at") or identity.get("updated_at"))
     metadata = identity.get("metadata") or {}
     if not isinstance(metadata, dict):
         metadata = {}
 
-    if display_name and not metadata.get("display_name"):
+    needs_metadata_update = bool(display_name and not metadata.get("display_name"))
+
+    if (
+        last_seen
+        and (now - last_seen).total_seconds() < TELEGRAM_IDENTITY_TOUCH_THROTTLE_SECONDS
+        and not needs_metadata_update
+    ):
+        telegram_identity_touch_cache[cache_key] = now
+        return
+
+    payload: dict[str, Any] = {"last_seen_at": _utc_now_iso()}
+
+    if needs_metadata_update:
         metadata["display_name"] = display_name
         payload["metadata"] = metadata
 
     try:
         supabase.table("channel_identities").update(payload).eq("id", identity_id).execute()
+        telegram_identity_touch_cache[cache_key] = now
     except Exception:
         logging.exception("Telegram identity touch failed")
 
@@ -671,6 +742,66 @@ def _topup_number_from_master_code(text_lower: str) -> Optional[int]:
     return MASTER_TOPUP_CODE_TO_NUMBER.get(text_lower.upper())
 
 
+def _row_recent_enough(row: dict[str, Any], seconds: int = 900) -> bool:
+    dt = _parse_dt(row.get("created_at") or row.get("updated_at"))
+    if not dt:
+        return False
+    return (datetime.now(timezone.utc) - dt).total_seconds() <= seconds
+
+
+def _checkout_url_from_row(row: dict[str, Any]) -> str:
+    for key in ("authorization_url", "checkout_url", "payment_url", "url", "provider_url", "payment_link"):
+        value = _clean_text(row.get(key))
+        if value.startswith("http"):
+            return value
+    return ""
+
+
+def _row_is_open_checkout(row: dict[str, Any]) -> bool:
+    status = _clean_text(row.get("status") or row.get("payment_status") or row.get("transaction_status")).lower()
+    if status in {"success", "successful", "paid", "completed", "verified"}:
+        return False
+    return True
+
+
+def _recent_checkout_reuse_message(account_id: str, *, plan_code: str = "", package_code: str = "") -> Optional[str]:
+    rows = _rows_for_account("paystack_transactions", account_id, limit=15)
+
+    for row in rows:
+        if not _row_is_open_checkout(row) or not _row_recent_enough(row, seconds=900):
+            continue
+
+        row_text = " ".join(
+            _clean_text(row.get(k)).lower()
+            for k in (
+                "plan_code", "package_code", "product_code", "purpose", "type",
+                "metadata", "description", "reference", "payment_reference"
+            )
+        )
+
+        if plan_code and plan_code.lower() not in row_text:
+            continue
+
+        if package_code and package_code.lower() not in row_text:
+            continue
+
+        url = _checkout_url_from_row(row)
+        if not url:
+            continue
+
+        ref = row.get("reference") or row.get("payment_reference") or row.get("provider_reference") or "not shown"
+        label = plan_code.upper() if plan_code else package_code.upper()
+        return (
+            "🧾 *Recent Checkout Found*\n\n"
+            f"I found a recent pending checkout for {label}. To avoid duplicate payment records, use this existing checkout link:\n\n"
+            f"{url}\n\n"
+            f"Reference: {ref}\n\n"
+            "If the link has expired, wait a few minutes or contact support."
+        )
+
+    return None
+
+
 def _handle_plan_code_selection(
     *,
     chat_id: str,
@@ -685,6 +816,12 @@ def _handle_plan_code_selection(
     plan = validate_plan_number(plan_num)
     if not plan:
         send_telegram_text(chat_id, "❌ Invalid plan code. Reply 4 to view plans again.")
+        return True
+
+    plan_code = _clean_text(plan.get("plan_code") or plan.get("code") or plan.get("slug") or "")
+    reuse_msg = _recent_checkout_reuse_message(account_id, plan_code=plan_code) if plan_code else None
+    if reuse_msg:
+        send_telegram_text(chat_id, reuse_msg)
         return True
 
     user_email = get_user_email(account_id)
@@ -948,23 +1085,27 @@ def _send_verify_payment(chat_id: str, account_id: str, text_raw: str) -> None:
         )
         return
 
-    try:
-        resp = (
-            supabase.table("paystack_transactions")
-            .select("*")
-            .eq("account_id", account_id)
-            .or_(f"reference.eq.{reference},payment_reference.eq.{reference},provider_reference.eq.{reference}")
-            .limit(1)
-            .execute()
-        )
-        row = _first(resp)
-    except Exception:
-        row = None
+    row = None
+    for col in ("reference", "payment_reference", "provider_reference"):
+        try:
+            resp = (
+                supabase.table("paystack_transactions")
+                .select("*")
+                .eq("account_id", account_id)
+                .eq(col, reference)
+                .limit(1)
+                .execute()
+            )
+            row = _first(resp)
+            if row:
+                break
+        except Exception:
+            continue
 
     if not row:
         send_telegram_text(
             chat_id,
-            f"🔎 *Payment Reference Check*\n\nNo payment record found for:\n{reference}\n\nIf payment was recent, wait a few minutes or contact support with PAY6.",
+            f"🔎 *Payment Reference Check*\n\nNo payment record found for:\n{reference}\n\nIf payment was recent, wait a few minutes or contact support with SUP6.",
         )
         return
 
@@ -1082,38 +1223,92 @@ def _create_support_ticket_from_text(chat_id: str, account_id: str, text_raw: st
         return
 
     ticket_ref = f"NTG-TG-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
-    payload = {
-        "account_id": account_id,
-        "ticket_ref": ticket_ref,
-        "subject": details[:120],
-        "message": details,
-        "status": "open",
-        "channel": "telegram",
-        "created_at": _utc_now_iso(),
-        "updated_at": _utc_now_iso(),
-    }
+    now = _utc_now_iso()
 
-    ok = False
-    for table_name in ("support_tickets", "support_requests"):
-        try:
-            supabase.table(table_name).insert(payload).execute()
-            ok = True
+    payload_attempts = [
+        {
+            "account_id": account_id,
+            "ticket_ref": ticket_ref,
+            "subject": details[:120],
+            "message": details,
+            "status": "open",
+            "channel": "telegram",
+            "created_at": now,
+            "updated_at": now,
+        },
+        {
+            "account_id": account_id,
+            "reference": ticket_ref,
+            "subject": details[:120],
+            "message": details,
+            "status": "open",
+            "source_channel": "telegram",
+            "created_at": now,
+            "updated_at": now,
+        },
+        {
+            "account_id": account_id,
+            "subject": details[:120],
+            "message": details,
+            "status": "open",
+            "source": "telegram",
+            "created_at": now,
+            "updated_at": now,
+        },
+        {
+            "account_id": account_id,
+            "title": details[:120],
+            "body": details,
+            "status": "open",
+            "channel_type": "telegram",
+            "created_at": now,
+            "updated_at": now,
+        },
+        {
+            "account_id": account_id,
+            "subject": details[:120],
+            "description": details,
+            "status": "open",
+            "created_at": now,
+            "updated_at": now,
+        },
+        {
+            "account_id": account_id,
+            "message": details,
+            "status": "open",
+            "created_at": now,
+        },
+    ]
+
+    saved_row = None
+    last_error = None
+    for payload in payload_attempts:
+        ok, resp, err = _safe_exec(supabase.table("support_tickets").insert(payload))
+        if ok:
+            saved_row = _first(resp) or payload
             break
-        except Exception:
-            continue
+        last_error = err
 
-    if ok:
-        send_telegram_text(chat_id, f"✅ *Support Ticket Created*\n\nTicket: {ticket_ref}\n\nOur support team will review it.\n\nReply SUP2 to view tickets or 0 for main menu.")
+    if saved_row:
+        ref = saved_row.get("ticket_ref") or saved_row.get("reference") or saved_row.get("id") or ticket_ref
+        send_telegram_text(
+            chat_id,
+            f"✅ *Support Ticket Created*\n\nTicket: {ref}\n\nOur support team will review it.\n\nReply SUP2 to view tickets or 0 for main menu.",
+        )
     else:
-        send_telegram_text(chat_id, f"⚠️ I could not save the support ticket automatically.\n\nPlease email support@naijataxguides.com and include this reference:\n{ticket_ref}")
+        logging.warning("Telegram support ticket insert failed: %s", last_error)
+        send_telegram_text(
+            chat_id,
+            "⚠️ I could not save the support ticket automatically.\n\n"
+            "Please email support@naijataxguides.com and include this reference:\n"
+            f"{ticket_ref}\n\n"
+            "Your message:\n"
+            f"{_clip_text(details, 600)}",
+        )
 
 
 def _send_support_tickets(chat_id: str, account_id: str, latest_only: bool = False) -> None:
-    rows = []
-    for table_name in ("support_tickets", "support_requests"):
-        rows = _rows_for_account(table_name, account_id, limit=1 if latest_only else 5)
-        if rows:
-            break
+    rows = _rows_for_account("support_tickets", account_id, limit=1 if latest_only else 5)
 
     if not rows:
         send_telegram_text(chat_id, "🎫 *Support Tickets*\n\nNo support ticket found yet.\n\nReply SUP1 followed by your issue to create one.")
@@ -1124,7 +1319,7 @@ def _send_support_tickets(chat_id: str, account_id: str, latest_only: bool = Fal
     for idx, row in enumerate(rows, 1):
         ref = row.get("ticket_ref") or row.get("reference") or row.get("id") or "No reference"
         status = row.get("status") or "open"
-        subject = row.get("subject") or row.get("message") or "Support ticket"
+        subject = row.get("subject") or row.get("title") or row.get("message") or row.get("description") or "Support ticket"
         created = row.get("created_at")
         lines.append(f"{idx}. {ref}")
         lines.append(f"   Status: {status}")
@@ -1232,6 +1427,10 @@ def _handle_master_command(
         return False
 
     cmd = match.group(1).upper()
+
+    if cmd == "ALL":
+        _send_all_commands(chat_id, linked=linked)
+        return True
 
     if cmd in MASTER_PLAN_CODE_TO_NUMBER:
         return _handle_plan_code_selection(
@@ -1470,6 +1669,12 @@ def _handle_credit_package_selection(
     package = validate_package_number(package_num)
     if not package:
         send_telegram_text(chat_id, "❌ Invalid add-on package. Reply 6 to see packages again, then choose T10, T50, T100, or T500.")
+        return True
+
+    package_code = next((code for code, num in MASTER_TOPUP_CODE_TO_NUMBER.items() if num == package_num), "")
+    reuse_msg = _recent_checkout_reuse_message(account_id, package_code=package_code) if package_code else None
+    if reuse_msg:
+        send_telegram_text(chat_id, reuse_msg)
         return True
 
     result = create_credit_payment(account_id, package_num, "telegram", tg_user_id)
@@ -2116,7 +2321,7 @@ def tg_webhook():
             _send_help(chat_id_str, linked=linked)
             return jsonify({"ok": True})
 
-    if INVALID_COMMAND_LIKE_RE.match(text):
+    if _looks_like_bad_command(text):
         send_telegram_text(chat_id_str, _invalid_command_text(text))
         return jsonify({"ok": True, "invalid_command": text})
 
