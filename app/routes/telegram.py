@@ -41,7 +41,7 @@ from app.services.tax_filing_service import (
 
 bp = Blueprint("telegram", __name__)
 
-TELEGRAM_ROUTE_VERSION = "2026-05-27-v35a-telegram-ai-ask-history-credit-parity"
+TELEGRAM_ROUTE_VERSION = "2026-05-27-v35b-telegram-calculator-parity"
 
 LINK_CODE_RE = re.compile(r"^[A-Z0-9]{8}$")
 MENU_NUMBER_RE = re.compile(r"^[1-8]$")
@@ -200,7 +200,7 @@ def telegram_health():
             "version": TELEGRAM_ROUTE_VERSION,
             "route_mount": "/api/telegram/*",
             "account_resolution": "channel_identities_first_accounts_auth_fallback",
-            "command_namespace": "whatsapp_master_registry_ai_ask_history_credit_parity",
+            "command_namespace": "whatsapp_master_registry_calculator_parity",
             "configured": {
                 "bot_token": _env_present("TELEGRAM_BOT_TOKEN", "TG_BOT_TOKEN", "TELEGRAM_TOKEN"),
                 "webhook_secret": _env_present("TELEGRAM_WEBHOOK_SECRET", "TG_WEBHOOK_SECRET"),
@@ -639,15 +639,26 @@ def _send_main_menu(chat_id: str, *, linked: bool = False) -> None:
 
 def _send_tax_menu(chat_id: str) -> None:
     menu = (
-        "*📋 TAX FILING & MANAGEMENT*\n\n"
-        "Reply with:\n"
-        "P - File PAYE Tax\n"
-        "V - File VAT\n"
-        "C - File CIT (Company Tax)\n"
-        "HISTORY - View my filing history\n"
-        "DEADLINES - View tax deadlines\n"
-        "BACK - Back to main menu\n\n"
-        "Type /paye, /vat, or /cit to start filing."
+        "🧰 *Tax Tools, Filing & Quiz*\n\n"
+        "Calculators:\n"
+        "F1 - Calculator menu\n"
+        "C1 - PAYE calculator\n"
+        "C2 - Company Income Tax calculator\n"
+        "C3 - VAT calculator\n"
+        "C4 - Withholding Tax calculator\n"
+        "C5 - Salary / net pay estimate\n\n"
+        "Filing assistance:\n"
+        "FT1 - Filing assistance menu\n"
+        "FT2 - PAYE filing help\n"
+        "FT3 - VAT filing help\n"
+        "FT4 - CIT filing help\n"
+        "FT7 - Request human filing assistance\n\n"
+        "Quiz and deadlines:\n"
+        "Q1 - Start tax quiz\n"
+        "D1 - Create tax reminder\n"
+        "H1 - Recent tax history\n\n"
+        "You can also type /paye, /vat, or /cit to start guided filing.\n"
+        "Reply 0 for main menu."
     )
     send_telegram_text(chat_id, menu)
 
@@ -658,6 +669,7 @@ def _send_help(chat_id: str, *, linked: bool = False) -> None:
         "*📖 Help Guide*\n\n"
         "• Ask tax questions: type your question naturally.\n"
         "  Example: What is PAYE tax?\n\n"
+        "• Calculators: reply F1, or use C1-C5\n"
         "• Check Usage Credits: reply 2 or CR1\n"
         "• View current plan: reply 3 or PAY1\n"
         "• View/upgrade plans: reply 4 then choose S1, P1, or B1\n"
@@ -2084,16 +2096,20 @@ def _handle_master_command(
         _send_renewal_expiry(chat_id, account_id)
         return True
 
-    # These modules will be expanded in later platform-parity batches.
     if cmd.startswith("F"):
         if cmd == "F1":
-            send_telegram_text(chat_id, "🧮 Calculator menu is available on WhatsApp and web. Telegram calculator parity will be handled in a later batch.\n\nUse C1-C5 if enabled, or use the website Calculator page.")
+            _send_calculator_menu(chat_id)
         else:
             _send_filing_assistance(chat_id, "ft1")
         return True
 
     if cmd.startswith("C"):
-        send_telegram_text(chat_id, "🧮 Calculator command received. Full Telegram calculator parity will be handled in a later batch. Use the website Calculator page for now.")
+        if cmd in CALCULATOR_COMMAND_TO_TYPE:
+            _start_calculator_flow(chat_id, cmd, text_raw=text_raw)
+        elif cmd == "C6":
+            send_telegram_text(chat_id, "🧠 Tax quiz will be expanded for Telegram in the quiz parity batch. For now, use Q1 when enabled or continue on WhatsApp.")
+        else:
+            _send_calculator_menu(chat_id)
         return True
 
     if cmd.startswith("Q"):
@@ -2416,6 +2432,458 @@ def _send_account_status(chat_id: str, account_id: str, tg_user_id: str, linked:
 
     msg += "\nReply ACC2 for link/unlink help or 0 for main menu."
     send_telegram_text(chat_id, msg)
+
+
+
+# ---------------------------------------------------------------------------
+# Batch 28B - Telegram calculator parity
+# ---------------------------------------------------------------------------
+
+CALCULATOR_LABELS = {
+    "paye": "PAYE",
+    "cit": "Company Income Tax",
+    "vat": "VAT",
+    "wht": "Withholding Tax",
+    "salary": "Salary / Net Pay",
+}
+
+CALCULATOR_COMMAND_TO_TYPE = {
+    "C1": "paye",
+    "C2": "cit",
+    "C3": "vat",
+    "C4": "wht",
+    "C5": "salary",
+}
+
+
+def _format_money_amount(value: Any) -> str:
+    try:
+        return f"₦{float(value or 0):,.2f}"
+    except Exception:
+        return "₦0.00"
+
+
+def _parse_percent(text: str) -> float:
+    return float(_clean_text(text).replace("%", "").replace(",", "").strip())
+
+
+def _extract_numbers(text: str) -> list[float]:
+    values: list[float] = []
+    for raw in re.findall(r"₦?\s*-?\d+(?:,\d{3})*(?:\.\d+)?%?", _clean_text(text)):
+        cleaned = raw.replace("₦", "").replace(",", "").replace("%", "").strip()
+        if not cleaned:
+            continue
+        try:
+            values.append(float(cleaned))
+        except Exception:
+            continue
+    return values
+
+
+def _paye_fallback(inputs: dict[str, Any]) -> dict[str, Any]:
+    monthly_gross = float(inputs.get("monthly_gross_income") or inputs.get("monthly_gross") or 0)
+    monthly_pension = float(inputs.get("pension_contribution") or inputs.get("pension") or 0)
+    monthly_nhf = float(inputs.get("nhf") or inputs.get("nhf_contribution") or 0)
+
+    annual_gross = monthly_gross * 12
+    annual_pension = monthly_pension * 12
+    annual_nhf = monthly_nhf * 12
+
+    consolidated_relief = max(200000.0, annual_gross * 0.01) + (annual_gross * 0.20)
+    chargeable_income = max(0.0, annual_gross - consolidated_relief - annual_pension - annual_nhf)
+
+    bands = [
+        (300000.0, 0.07),
+        (300000.0, 0.11),
+        (500000.0, 0.15),
+        (500000.0, 0.19),
+        (1600000.0, 0.21),
+        (float("inf"), 0.24),
+    ]
+
+    remaining = chargeable_income
+    annual_tax = 0.0
+    for band_amount, rate in bands:
+        if remaining <= 0:
+            break
+        taxable = min(remaining, band_amount)
+        annual_tax += taxable * rate
+        remaining -= taxable
+
+    return {
+        "monthly_gross_income": monthly_gross,
+        "annual_gross_income": annual_gross,
+        "annual_pension": annual_pension,
+        "annual_nhf": annual_nhf,
+        "consolidated_relief": consolidated_relief,
+        "chargeable_income": chargeable_income,
+        "annual_tax_payable": annual_tax,
+        "monthly_tax_payable": annual_tax / 12,
+        "net_monthly_pay": max(0.0, monthly_gross - monthly_pension - monthly_nhf - (annual_tax / 12)),
+    }
+
+
+def _vat_fallback(inputs: dict[str, Any]) -> dict[str, Any]:
+    taxable_supplies = float(inputs.get("taxable_supplies") or 0)
+    input_vat = float(inputs.get("input_vat") or 0)
+    output_vat = taxable_supplies * 0.075
+    vat_payable = max(0.0, output_vat - input_vat)
+    return {
+        "taxable_supplies": taxable_supplies,
+        "input_vat": input_vat,
+        "output_vat": output_vat,
+        "vat_payable": vat_payable,
+        "rate": 7.5,
+    }
+
+
+def _cit_fallback(inputs: dict[str, Any]) -> dict[str, Any]:
+    taxable_profit = float(inputs.get("taxable_profit") or inputs.get("assessable_profit") or 0)
+    annual_turnover = float(inputs.get("annual_turnover") or 0)
+
+    if annual_turnover <= 25000000:
+        rate = 0.0
+        company_size = "small company"
+    elif annual_turnover <= 100000000:
+        rate = 20.0
+        company_size = "medium company"
+    else:
+        rate = 30.0
+        company_size = "large company"
+
+    cit_payable = max(0.0, taxable_profit * (rate / 100.0))
+    return {
+        "taxable_profit": taxable_profit,
+        "assessable_profit": taxable_profit,
+        "annual_turnover": annual_turnover,
+        "company_size": company_size,
+        "applicable_rate": rate,
+        "cit_payable": cit_payable,
+    }
+
+
+def _wht_fallback(inputs: dict[str, Any]) -> dict[str, Any]:
+    amount = float(inputs.get("payment_amount") or 0)
+    rate = float(inputs.get("wht_rate") or 0)
+    wht_payable = max(0.0, amount * (rate / 100.0))
+    net_payment = max(0.0, amount - wht_payable)
+    return {
+        "payment_amount": amount,
+        "wht_rate": rate,
+        "wht_payable": wht_payable,
+        "net_payment": net_payment,
+    }
+
+
+def _calculator_result(calculator_type: str, inputs: dict[str, Any]) -> dict[str, Any]:
+    """
+    Use the backend tax calculator where it is compatible, but keep safe
+    local fallbacks so Telegram calculator does not fail because of one
+    service signature mismatch.
+    """
+    if calculator_type in {"paye", "salary"}:
+        fallback = _paye_fallback(inputs)
+        try:
+            service_result = calculate_tax("paye", inputs)
+            if isinstance(service_result, dict):
+                fallback.update({k: v for k, v in service_result.items() if v is not None})
+        except Exception:
+            logging.exception("Telegram PAYE calculator service fallback used")
+        return fallback
+
+    if calculator_type == "vat":
+        fallback = _vat_fallback(inputs)
+        try:
+            service_result = calculate_tax("vat", inputs)
+            if isinstance(service_result, dict):
+                fallback.update({k: v for k, v in service_result.items() if v is not None})
+        except Exception:
+            logging.exception("Telegram VAT calculator service fallback used")
+        return fallback
+
+    if calculator_type == "cit":
+        # Existing service expects filing-style fields in some versions. Use a
+        # stable Telegram fallback to avoid accidental wrong inputs.
+        return _cit_fallback(inputs)
+
+    if calculator_type == "wht":
+        return _wht_fallback(inputs)
+
+    return {}
+
+
+def _calculator_disclaimer() -> str:
+    return (
+        "\n\nNote: This is an estimate for guidance only. Confirm taxpayer-specific "
+        "facts, current law, exemptions, and filing position before submission."
+    )
+
+
+def _send_calculator_menu(chat_id: str) -> None:
+    msg = (
+        "🧮 *Tax Calculator Menu*\n\n"
+        "Reply with:\n"
+        "C1 - PAYE calculator\n"
+        "C2 - Company Income Tax calculator\n"
+        "C3 - VAT calculator\n"
+        "C4 - Withholding Tax calculator\n"
+        "C5 - Salary / net pay estimate\n\n"
+        "Fast examples:\n"
+        "C1 750000 0 0\n"
+        "C2 12000000 80000000\n"
+        "C3 5000000 120000\n"
+        "C4 1000000 5\n"
+        "C5 750000 0 0\n\n"
+        "These calculator commands do not use AI credits.\n"
+        "Reply 0 for main menu."
+    )
+    send_telegram_text(chat_id, msg)
+
+
+def _calculator_prompt(calculator_type: str, step: int) -> str:
+    if calculator_type == "paye":
+        prompts = {
+            1: "🧮 *PAYE Calculator*\n\nStep 1 of 3: Enter monthly gross salary.\nExample: 750000",
+            2: "Step 2 of 3: Enter monthly pension contribution, or 0 if none.",
+            3: "Step 3 of 3: Enter monthly NHF contribution, or 0 if none.",
+        }
+        return prompts.get(step, "Enter the amount.")
+
+    if calculator_type == "salary":
+        prompts = {
+            1: "🧮 *Salary / Net Pay Estimate*\n\nStep 1 of 3: Enter monthly gross salary.\nExample: 750000",
+            2: "Step 2 of 3: Enter monthly pension contribution, or 0 if none.",
+            3: "Step 3 of 3: Enter monthly NHF contribution, or 0 if none.",
+        }
+        return prompts.get(step, "Enter the amount.")
+
+    if calculator_type == "vat":
+        prompts = {
+            1: "🧮 *VAT Calculator*\n\nStep 1 of 2: Enter total taxable supplies/sales for the period.\nExample: 5000000",
+            2: "Step 2 of 2: Enter input VAT already paid/claimable, or 0 if none.",
+        }
+        return prompts.get(step, "Enter the amount.")
+
+    if calculator_type == "cit":
+        prompts = {
+            1: "🧮 *Company Income Tax Calculator*\n\nStep 1 of 2: Enter annual taxable profit.\nExample: 12000000",
+            2: "Step 2 of 2: Enter annual company turnover.\nExample: 80000000",
+        }
+        return prompts.get(step, "Enter the amount.")
+
+    if calculator_type == "wht":
+        prompts = {
+            1: "🧮 *Withholding Tax Calculator*\n\nStep 1 of 2: Enter payment/contract amount.\nExample: 1000000",
+            2: "Step 2 of 2: Enter WHT rate percentage.\nExample: 5",
+        }
+        return prompts.get(step, "Enter the amount.")
+
+    return "Enter the amount."
+
+
+def _calculator_step_count(calculator_type: str) -> int:
+    return {
+        "paye": 3,
+        "salary": 3,
+        "vat": 2,
+        "cit": 2,
+        "wht": 2,
+    }.get(calculator_type, 0)
+
+
+def _calculator_store_value(inputs: dict[str, Any], calculator_type: str, step: int, value: float) -> dict[str, Any]:
+    if calculator_type in {"paye", "salary"}:
+        if step == 1:
+            inputs["monthly_gross_income"] = value
+        elif step == 2:
+            inputs["pension_contribution"] = value
+        elif step == 3:
+            inputs["nhf"] = value
+        return inputs
+
+    if calculator_type == "vat":
+        if step == 1:
+            inputs["taxable_supplies"] = value
+        elif step == 2:
+            inputs["input_vat"] = value
+        return inputs
+
+    if calculator_type == "cit":
+        if step == 1:
+            inputs["taxable_profit"] = value
+        elif step == 2:
+            inputs["annual_turnover"] = value
+        return inputs
+
+    if calculator_type == "wht":
+        if step == 1:
+            inputs["payment_amount"] = value
+        elif step == 2:
+            inputs["wht_rate"] = value
+        return inputs
+
+    return inputs
+
+
+def _calculator_result_text(calculator_type: str, inputs: dict[str, Any]) -> str:
+    calc = _calculator_result(calculator_type, inputs)
+    label = CALCULATOR_LABELS.get(calculator_type, "Tax")
+
+    if calculator_type == "paye":
+        return (
+            f"✅ *{label} Estimate*\n\n"
+            f"Monthly gross salary: {_format_money_amount(inputs.get('monthly_gross_income'))}\n"
+            f"Monthly pension: {_format_money_amount(inputs.get('pension_contribution'))}\n"
+            f"Monthly NHF: {_format_money_amount(inputs.get('nhf'))}\n\n"
+            f"Annual gross income: {_format_money_amount(calc.get('annual_gross_income'))}\n"
+            f"Consolidated relief: {_format_money_amount(calc.get('consolidated_relief'))}\n"
+            f"Chargeable income: {_format_money_amount(calc.get('chargeable_income'))}\n"
+            f"Annual PAYE: {_format_money_amount(calc.get('annual_tax_payable'))}\n"
+            f"*Monthly PAYE deduction: {_format_money_amount(calc.get('monthly_tax_payable'))}*"
+            f"{_calculator_disclaimer()}\n\n"
+            "Reply C1 to calculate again, F1 for calculator menu, or 0 for main menu."
+        )
+
+    if calculator_type == "salary":
+        return (
+            f"✅ *{label} Estimate*\n\n"
+            f"Monthly gross salary: {_format_money_amount(inputs.get('monthly_gross_income'))}\n"
+            f"Monthly pension: {_format_money_amount(inputs.get('pension_contribution'))}\n"
+            f"Monthly NHF: {_format_money_amount(inputs.get('nhf'))}\n\n"
+            f"Estimated monthly PAYE: {_format_money_amount(calc.get('monthly_tax_payable'))}\n"
+            f"*Estimated net monthly pay: {_format_money_amount(calc.get('net_monthly_pay'))}*"
+            f"{_calculator_disclaimer()}\n\n"
+            "Reply C5 to calculate again, F1 for calculator menu, or 0 for main menu."
+        )
+
+    if calculator_type == "vat":
+        return (
+            f"✅ *{label} Estimate*\n\n"
+            f"Taxable supplies: {_format_money_amount(inputs.get('taxable_supplies'))}\n"
+            f"VAT rate: {calc.get('rate', 7.5)}%\n"
+            f"Output VAT: {_format_money_amount(calc.get('output_vat'))}\n"
+            f"Input VAT: {_format_money_amount(calc.get('input_vat'))}\n"
+            f"*VAT payable: {_format_money_amount(calc.get('vat_payable'))}*"
+            f"{_calculator_disclaimer()}\n\n"
+            "Reply C3 to calculate again, F1 for calculator menu, or 0 for main menu."
+        )
+
+    if calculator_type == "cit":
+        return (
+            f"✅ *{label} Estimate*\n\n"
+            f"Annual taxable profit: {_format_money_amount(calc.get('taxable_profit'))}\n"
+            f"Annual turnover: {_format_money_amount(calc.get('annual_turnover'))}\n"
+            f"Company class: {str(calc.get('company_size') or 'N/A').title()}\n"
+            f"Applicable rate: {calc.get('applicable_rate', 0)}%\n"
+            f"*Estimated CIT payable: {_format_money_amount(calc.get('cit_payable'))}*"
+            f"{_calculator_disclaimer()}\n\n"
+            "Reply C2 to calculate again, F1 for calculator menu, or 0 for main menu."
+        )
+
+    if calculator_type == "wht":
+        return (
+            f"✅ *{label} Estimate*\n\n"
+            f"Payment amount: {_format_money_amount(calc.get('payment_amount'))}\n"
+            f"WHT rate: {calc.get('wht_rate', 0)}%\n"
+            f"*WHT to deduct/remit: {_format_money_amount(calc.get('wht_payable'))}*\n"
+            f"Net payable after WHT: {_format_money_amount(calc.get('net_payment'))}"
+            f"{_calculator_disclaimer()}\n\n"
+            "Reply C4 to calculate again, F1 for calculator menu, or 0 for main menu."
+        )
+
+    return "I could not calculate that. Reply F1 for calculator menu."
+
+
+def _run_direct_calculator(chat_id: str, calculator_type: str, numbers: list[float]) -> bool:
+    inputs: dict[str, Any] = {}
+
+    if calculator_type in {"paye", "salary"} and len(numbers) >= 1:
+        inputs["monthly_gross_income"] = numbers[0]
+        inputs["pension_contribution"] = numbers[1] if len(numbers) >= 2 else 0
+        inputs["nhf"] = numbers[2] if len(numbers) >= 3 else 0
+        send_telegram_text(chat_id, _calculator_result_text(calculator_type, inputs))
+        return True
+
+    if calculator_type == "vat" and len(numbers) >= 1:
+        inputs["taxable_supplies"] = numbers[0]
+        inputs["input_vat"] = numbers[1] if len(numbers) >= 2 else 0
+        send_telegram_text(chat_id, _calculator_result_text(calculator_type, inputs))
+        return True
+
+    if calculator_type == "cit" and len(numbers) >= 2:
+        inputs["taxable_profit"] = numbers[0]
+        inputs["annual_turnover"] = numbers[1]
+        send_telegram_text(chat_id, _calculator_result_text(calculator_type, inputs))
+        return True
+
+    if calculator_type == "wht" and len(numbers) >= 2:
+        inputs["payment_amount"] = numbers[0]
+        inputs["wht_rate"] = numbers[1]
+        send_telegram_text(chat_id, _calculator_result_text(calculator_type, inputs))
+        return True
+
+    return False
+
+
+def _start_calculator_flow(chat_id: str, cmd: str, text_raw: str = "") -> bool:
+    cmd = _clean_text(cmd).upper()
+    calculator_type = CALCULATOR_COMMAND_TO_TYPE.get(cmd)
+
+    if not calculator_type:
+        _send_calculator_menu(chat_id)
+        return True
+
+    # Fast direct calculation: e.g. C1 750000 0 0, C3 5000000 120000.
+    numbers = _extract_numbers(re.sub(rf"^{re.escape(cmd)}\b", "", _clean_text(text_raw), flags=re.I).strip())
+    if numbers and _run_direct_calculator(chat_id, calculator_type, numbers):
+        user_states.pop(chat_id, None)
+        return True
+
+    user_states[chat_id] = {
+        "calculator_type": calculator_type,
+        "step": 1,
+        "inputs": {},
+    }
+    send_telegram_text(chat_id, _calculator_prompt(calculator_type, 1))
+    return True
+
+
+def _handle_calculator_step(chat_id: str, user_state: dict[str, Any], text: str) -> bool:
+    calculator_type = _clean_text(user_state.get("calculator_type"))
+    if not calculator_type:
+        return False
+
+    step = int(user_state.get("step") or 1)
+    inputs = user_state.get("inputs") or {}
+    if not isinstance(inputs, dict):
+        inputs = {}
+
+    try:
+        if calculator_type == "wht" and step == 2:
+            amount = _parse_percent(text)
+        else:
+            amount = _parse_amount(text)
+    except Exception:
+        send_telegram_text(chat_id, "❌ Please enter a valid number. Example: 750000")
+        return True
+
+    inputs = _calculator_store_value(inputs, calculator_type, step, amount)
+    total_steps = _calculator_step_count(calculator_type)
+
+    if step < total_steps:
+        next_step = step + 1
+        user_states[chat_id] = {
+            "calculator_type": calculator_type,
+            "step": next_step,
+            "inputs": inputs,
+        }
+        send_telegram_text(chat_id, f"✅ Received: {_format_money_amount(amount) if not (calculator_type == 'wht' and step == 2) else str(amount) + '%'}\n\n{_calculator_prompt(calculator_type, next_step)}")
+        return True
+
+    user_states.pop(chat_id, None)
+    send_telegram_text(chat_id, _calculator_result_text(calculator_type, inputs))
+    return True
+
 
 
 def _send_link_help(chat_id: str, *, linked: bool) -> None:
@@ -2863,6 +3331,10 @@ def tg_webhook():
             return jsonify({"ok": True})
         send_telegram_text(chat_id_str, "Please reply T10, T50, T100, T500, or 0 to cancel. Other commands like PAY1, ACC1, and SET1 also work anytime.")
         return jsonify({"ok": True})
+
+    if user_state.get("calculator_type") and user_state.get("step"):
+        _handle_calculator_step(chat_id_str, user_state, text)
+        return jsonify({"ok": True, "calculator": True})
 
     if user_state.get("filing_type") and user_state.get("step"):
         _handle_continue_filing(chat_id_str, account_id, text)
