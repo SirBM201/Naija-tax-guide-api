@@ -43,7 +43,7 @@ from app.services.tax_filing_service import (
 
 bp = Blueprint("telegram", __name__)
 
-TELEGRAM_ROUTE_VERSION = "2026-05-27-v35d1-telegram-quiz-session-persistence-fix"
+TELEGRAM_ROUTE_VERSION = "2026-05-27-v35d2-telegram-q5-credit-activity-log-cleanup"
 
 LINK_CODE_RE = re.compile(r"^[A-Z0-9]{8}$")
 MENU_NUMBER_RE = re.compile(r"^[1-8]$")
@@ -202,7 +202,7 @@ def telegram_health():
             "version": TELEGRAM_ROUTE_VERSION,
             "route_mount": "/api/telegram/*",
             "account_resolution": "channel_identities_first_accounts_auth_fallback",
-            "command_namespace": "whatsapp_master_registry_quiz_q1_q5_persistent_state",
+            "command_namespace": "whatsapp_master_registry_q5_credit_activity_log_cleanup",
             "configured": {
                 "bot_token": _env_present("TELEGRAM_BOT_TOKEN", "TG_BOT_TOKEN", "TELEGRAM_TOKEN"),
                 "webhook_secret": _env_present("TELEGRAM_WEBHOOK_SECRET", "TG_WEBHOOK_SECRET"),
@@ -1734,16 +1734,121 @@ def _send_renewal_expiry(chat_id: str, account_id: str) -> None:
     )
 
 
-def _send_credit_rows(chat_id: str, account_id: str, *, mode: str) -> None:
-    rows = _rows_for_account("credit_usage_logs", account_id, limit=8)
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(float(value or 0))
+    except Exception:
+        return default
+
+
+def _telegram_q5_credit_activity_rows(account_id: str, limit: int = 5) -> list[dict[str, Any]]:
+    """
+    Batch 28D2:
+    Fallback audit view for Q5.
+
+    Q5 already updates tax_quiz_attempts successfully after the credit debit.
+    If credit_usage_logs has an older/narrower schema, CR3 can still show Q5
+    deductions from tax_quiz_attempts instead of saying no activity exists.
+    """
+    rows: list[dict[str, Any]] = []
+
+    try:
+        resp = (
+            supabase.table("tax_quiz_attempts")
+            .select("*")
+            .eq("account_id", account_id)
+            .eq("q5_explanation_used", True)
+            .order("q5_explained_at", desc=True)
+            .limit(max(1, min(limit, 10)))
+            .execute()
+        )
+        rows = _rows(resp)
+    except Exception:
+        try:
+            resp = (
+                supabase.table("tax_quiz_attempts")
+                .select("*")
+                .eq("account_id", account_id)
+                .limit(max(1, min(limit, 10)))
+                .execute()
+            )
+            rows = [
+                r for r in _rows(resp)
+                if bool(r.get("q5_explanation_used")) or _safe_int(r.get("credits_charged")) > 0
+            ]
+        except Exception:
+            rows = []
+
+    normalized: list[dict[str, Any]] = []
+    for row in rows[:limit]:
+        charged = _safe_int(row.get("credits_charged"), 1) or 1
+        created = row.get("q5_explained_at") or row.get("answered_at") or row.get("updated_at") or row.get("created_at")
+        normalized.append(
+            {
+                "id": f"q5:{_clean_text(row.get('id'))}",
+                "account_id": account_id,
+                "action_code": "quiz_q5_saved_explanation",
+                "description": "Telegram Q5 detailed saved quiz explanation",
+                "credits_delta": -abs(charged),
+                "amount": -abs(charged),
+                "created_at": created,
+                "source": "tax_quiz_attempts",
+            }
+        )
+
+    return normalized
+
+
+def _credit_activity_row_key(row: dict[str, Any]) -> str:
+    return _clean_text(row.get("id") or row.get("reference") or row.get("created_at") or row.get("description"))
+
+
+def _combined_credit_activity_rows(account_id: str, *, mode: str, limit: int = 8) -> list[dict[str, Any]]:
+    base_rows = _rows_for_account("credit_usage_logs", account_id, limit=limit)
+    q5_rows = _telegram_q5_credit_activity_rows(account_id, limit=limit)
+
+    rows: list[dict[str, Any]] = []
 
     if mode == "ai":
-        rows = [r for r in rows if "ai" in _clean_text(r.get("action_code") or r.get("description")).lower() or int(r.get("credits_delta") or 0) < 0]
-        title = "📉 *AI Credit Deductions*"
+        for row in base_rows:
+            text = _clean_text(row.get("action_code") or row.get("description")).lower()
+            if "ai" in text or "q5" in text or _safe_int(row.get("credits_delta") or row.get("amount")) < 0:
+                rows.append(row)
+        rows.extend(q5_rows)
     elif mode == "additions":
-        rows = [r for r in rows if int(r.get("credits_delta") or 0) > 0 or "top" in _clean_text(r.get("action_code") or r.get("description")).lower()]
+        for row in base_rows:
+            text = _clean_text(row.get("action_code") or row.get("description")).lower()
+            if "top" in text or _safe_int(row.get("credits_delta") or row.get("amount")) > 0:
+                rows.append(row)
+    else:
+        rows = list(base_rows) + q5_rows
+
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in rows:
+        key = _credit_activity_row_key(row)
+        if key and key in seen:
+            continue
+        if key:
+            seen.add(key)
+        deduped.append(row)
+
+    def sort_key(row: dict[str, Any]) -> str:
+        return _clean_text(row.get("created_at") or row.get("updated_at") or row.get("q5_explained_at"))
+
+    deduped.sort(key=sort_key, reverse=True)
+    return deduped[:limit]
+
+
+def _send_credit_rows(chat_id: str, account_id: str, *, mode: str) -> None:
+    if mode == "ai":
+        rows = _combined_credit_activity_rows(account_id, mode="ai", limit=8)
+        title = "📉 *AI / Usage Credit Deductions*"
+    elif mode == "additions":
+        rows = _combined_credit_activity_rows(account_id, mode="additions", limit=8)
         title = "➕ *Credit Additions / Top-ups*"
     else:
+        rows = _combined_credit_activity_rows(account_id, mode="all", limit=8)
         title = "💎 *Recent Credit Activity*"
 
     if not rows:
@@ -1755,11 +1860,16 @@ def _send_credit_rows(chat_id: str, account_id: str, *, mode: str) -> None:
     lines = [title, ""]
     for idx, row in enumerate(rows[:5], 1):
         desc = row.get("description") or row.get("action_code") or "Credit activity"
-        delta = row.get("credits_delta") or row.get("amount") or row.get("credits") or ""
-        created = row.get("created_at") or row.get("updated_at")
+        delta = row.get("credits_delta")
+        if delta is None or delta == "":
+            delta = row.get("amount") or row.get("credits") or row.get("credit_delta") or row.get("delta") or ""
+        created = row.get("created_at") or row.get("updated_at") or row.get("q5_explained_at")
+        source = _clean_text(row.get("source"))
         lines.append(f"{idx}. {desc}")
         if delta != "":
             lines.append(f"   Credits: {delta}")
+        if source == "tax_quiz_attempts":
+            lines.append("   Source: Quiz Q5 saved explanation")
         lines.append(f"   Date: {_date_short(created)}")
         lines.append("")
 
@@ -2307,13 +2417,7 @@ def _safe_table_rows(table_name: str, account_id: str, limit: int = 5) -> list[d
 
 
 def _send_credit_activity(chat_id: str, account_id: str) -> None:
-    rows: list[dict[str, Any]] = []
-
-    for table_name in ("ai_credit_transactions", "credit_transactions", "ai_credit_deductions"):
-        rows = _safe_table_rows(table_name, account_id, limit=5)
-        if rows:
-            break
-
+    rows = _combined_credit_activity_rows(account_id, mode="ai", limit=5)
     balance = get_credit_balance(account_id)
 
     if not rows:
@@ -2329,7 +2433,9 @@ def _send_credit_activity(chat_id: str, account_id: str) -> None:
 
     msg = "*📉 Recent Usage Credit Activity*\n\n"
     for idx, row in enumerate(rows, 1):
-        amount = row.get("amount") or row.get("credits") or row.get("credit_delta") or row.get("delta") or row.get("used") or ""
+        amount = row.get("credits_delta")
+        if amount is None or amount == "":
+            amount = row.get("amount") or row.get("credits") or row.get("credit_delta") or row.get("delta") or row.get("used") or ""
         reason = row.get("reason") or row.get("description") or row.get("event_type") or row.get("type") or "Credit activity"
         created_at = row.get("created_at") or row.get("updated_at")
         msg += f"{idx}. {reason}\n"
@@ -4041,34 +4147,91 @@ def _quiz_credit_column(row: dict[str, Any]) -> str:
     return "balance"
 
 
-def _insert_quiz_credit_log(account_id: str, before: int, after: int, attempt_id: str) -> None:
-    reference = f"Q5-TG-{uuid.uuid4().hex[:12].upper()}"
-    base_payload = {
-        "account_id": account_id,
-        "reference": reference,
-        "action_code": "quiz_q5_saved_explanation",
-        "description": "Telegram Q5 detailed saved quiz explanation",
-        "channel": "telegram",
-        "credits_delta": -1,
-        "amount": -1,
-        "balance_before": before,
-        "balance_after": after,
-        "metadata": {"source": "telegram_quiz", "live_ai_called": False, "attempt_id": attempt_id},
-        "created_at": _utc_now_iso(),
-    }
+def _insert_quiz_credit_log(account_id: str, before: int, after: int, attempt_id: str) -> dict[str, Any]:
+    """
+    Batch 28D2:
+    Write Q5 deduction to the existing CR3 table without noisy 404 fallbacks.
 
-    # Try multiple possible log tables. This must never block the user's Q5 response.
-    for table in ("credit_usage_logs", "ai_credit_transactions", "credit_transactions", "ai_credit_deductions"):
-        try:
-            payload = dict(base_payload)
-            if table in {"ai_credit_transactions", "credit_transactions", "ai_credit_deductions"}:
-                payload.setdefault("type", "debit")
-                payload.setdefault("reason", "Q5 detailed saved quiz explanation")
-            ok, _resp, _err = _safe_exec(supabase.table(table).insert(payload))
-            if ok:
-                return
-        except Exception:
+    Previous version tried:
+      credit_usage_logs, ai_credit_transactions, credit_transactions, ai_credit_deductions
+
+    The last three tables are not available in the current backend and created
+    unnecessary 404 noise. credit_usage_logs exists, but its schema may be
+    narrower than the full payload, so we try progressively smaller payloads.
+    """
+    now_iso = _utc_now_iso()
+    reference = f"Q5-TG-{uuid.uuid4().hex[:12].upper()}"
+
+    payload_attempts: list[dict[str, Any]] = [
+        {
+            "account_id": account_id,
+            "reference": reference,
+            "action_code": "quiz_q5_saved_explanation",
+            "description": "Telegram Q5 detailed saved quiz explanation",
+            "channel": "telegram",
+            "credits_delta": -1,
+            "amount": -1,
+            "balance_before": before,
+            "balance_after": after,
+            "metadata": {"source": "telegram_quiz", "live_ai_called": False, "attempt_id": attempt_id},
+            "created_at": now_iso,
+        },
+        {
+            "account_id": account_id,
+            "action_code": "quiz_q5_saved_explanation",
+            "description": "Telegram Q5 detailed saved quiz explanation",
+            "credits_delta": -1,
+            "balance_before": before,
+            "balance_after": after,
+            "created_at": now_iso,
+        },
+        {
+            "account_id": account_id,
+            "action_code": "quiz_q5_saved_explanation",
+            "description": "Telegram Q5 detailed saved quiz explanation",
+            "credits_delta": -1,
+            "created_at": now_iso,
+        },
+        {
+            "account_id": account_id,
+            "description": "Telegram Q5 detailed saved quiz explanation",
+            "credits_delta": -1,
+            "created_at": now_iso,
+        },
+        {
+            "account_id": account_id,
+            "description": "Telegram Q5 detailed saved quiz explanation",
+            "amount": -1,
+            "created_at": now_iso,
+        },
+    ]
+
+    errors: list[str] = []
+    seen: set[str] = set()
+
+    for payload in payload_attempts:
+        cleaned = {k: v for k, v in payload.items() if v is not None}
+        signature = repr(sorted(cleaned.keys()))
+        if signature in seen:
             continue
+        seen.add(signature)
+
+        ok, resp, err = _safe_exec(supabase.table("credit_usage_logs").insert(cleaned))
+        if ok:
+            return {
+                "ok": True,
+                "table": "credit_usage_logs",
+                "mode": signature,
+                "reference": reference,
+                "rows": _rows(resp),
+            }
+        errors.append(str(err))
+
+    # Do not fail Q5 if the log table schema is still narrower than expected.
+    # CR3 will still show Q5 deductions from tax_quiz_attempts after the Q5
+    # attempt update succeeds.
+    logging.warning("Telegram Q5 credit_usage_logs insert failed; CR3 will use quiz-attempt fallback: %s", errors[:2])
+    return {"ok": False, "table": "credit_usage_logs", "error": errors[-1] if errors else "insert_failed", "errors": errors[:2]}
 
 
 def _debit_q5_usage_credit_telegram(account_id: str, attempt_id: str = "") -> dict[str, Any]:
@@ -4095,8 +4258,8 @@ def _debit_q5_usage_credit_telegram(account_id: str, attempt_id: str = "") -> di
     for payload in payloads:
         ok, _resp, err = _safe_exec(supabase.table("ai_credit_balances").update(payload).eq("account_id", account_id))
         if ok:
-            _insert_quiz_credit_log(account_id, before, after, attempt_id)
-            return {"ok": True, "before": before, "after": after, "column": column, "credits_consumed": 1}
+            credit_log = _insert_quiz_credit_log(account_id, before, after, attempt_id)
+            return {"ok": True, "before": before, "after": after, "column": column, "credits_consumed": 1, "credit_log": credit_log}
         errors.append(str(err))
 
     return {"ok": False, "error": errors[-1] if errors else "credit_update_failed", "before": before, "after": before, "column": column}
