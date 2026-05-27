@@ -41,7 +41,7 @@ from app.services.tax_filing_service import (
 
 bp = Blueprint("telegram", __name__)
 
-TELEGRAM_ROUTE_VERSION = "2026-05-27-v34g-telegram-support-payment-guard-fix"
+TELEGRAM_ROUTE_VERSION = "2026-05-27-v34h-telegram-checkout-guard-type-separation"
 
 LINK_CODE_RE = re.compile(r"^[A-Z0-9]{8}$")
 MENU_NUMBER_RE = re.compile(r"^[1-8]$")
@@ -200,7 +200,7 @@ def telegram_health():
             "version": TELEGRAM_ROUTE_VERSION,
             "route_mount": "/api/telegram/*",
             "account_resolution": "channel_identities_first_accounts_auth_fallback",
-            "command_namespace": "whatsapp_master_registry_stabilized_support_payment_guard",
+            "command_namespace": "whatsapp_master_registry_stabilized_checkout_type_separation",
             "configured": {
                 "bot_token": _env_present("TELEGRAM_BOT_TOKEN", "TG_BOT_TOKEN", "TELEGRAM_TOKEN"),
                 "webhook_secret": _env_present("TELEGRAM_WEBHOOK_SECRET", "TG_WEBHOOK_SECRET"),
@@ -764,52 +764,158 @@ def _row_is_open_checkout(row: dict[str, Any]) -> bool:
     return True
 
 
+def _checkout_row_text(row: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for key in (
+        "plan_code", "package_code", "product_code", "purpose", "type",
+        "metadata", "description", "reference", "payment_reference",
+        "provider_reference", "gateway_reference", "plan", "package",
+        "channel_type", "source", "status", "payment_status",
+        "transaction_status"
+    ):
+        value = row.get(key)
+        if value is None:
+            continue
+        parts.append(_clean_text(value).lower())
+
+    return " ".join(parts)
+
+
+def _checkout_row_kind(row_text: str) -> str:
+    """
+    Batch 27D3:
+    Detect whether an existing pending checkout row is most likely a
+    subscription checkout or a usage-credit top-up checkout.
+
+    This prevents a recent S1 subscription checkout from blocking T10 top-up,
+    and prevents a recent top-up checkout from blocking a plan checkout.
+    """
+    text = (row_text or "").lower().replace("-", "_")
+
+    topup_markers = (
+        "topup",
+        "top_up",
+        "ai_topup",
+        "credit_topup",
+        "usage_credit",
+        "usage credit",
+        "credit add",
+        "credit_add",
+        "add_on",
+        "addon",
+        "add on",
+        "t10",
+        "t50",
+        "t100",
+        "t500",
+    )
+
+    subscription_markers = (
+        "sub_",
+        "subscription",
+        "plan",
+        "starter_monthly",
+        "starter_quarterly",
+        "starter_yearly",
+        "professional_monthly",
+        "professional_quarterly",
+        "professional_yearly",
+        "business_monthly",
+        "business_quarterly",
+        "business_yearly",
+    )
+
+    if any(marker in text for marker in topup_markers):
+        return "topup"
+
+    if any(marker in text for marker in subscription_markers):
+        return "subscription"
+
+    return "unknown"
+
+
+def _topup_search_terms(package_code: str) -> list[str]:
+    code = _clean_text(package_code).upper()
+    credits = code.replace("T", "", 1) if code.startswith("T") else ""
+
+    terms = [code.lower()]
+    if credits:
+        terms.extend(
+            [
+                f"topup_{credits}",
+                f"top_up_{credits}",
+                f"topup-{credits}",
+                f"top-up-{credits}",
+                f"{credits} credits",
+                f"{credits}_credits",
+                f"credit_{credits}",
+            ]
+        )
+
+    return [t for t in terms if t]
+
+
+def _plan_search_terms(plan_code: str) -> list[str]:
+    code = _clean_text(plan_code).lower()
+    terms = [code]
+
+    if code:
+        terms.append(f"sub_{code}")
+        terms.append(f"subscription_{code}")
+
+    return [t for t in terms if t]
+
+
 def _recent_checkout_reuse_message(account_id: str, *, plan_code: str = "", package_code: str = "") -> Optional[str]:
     """
-    Batch 27D2:
-    Stronger duplicate checkout guard.
+    Batch 27D3:
+    Type-separated duplicate checkout guard.
 
-    D1 only reused a checkout when a URL was found in the existing row.
-    Some paystack_transactions rows do not expose/store the authorization URL,
-    so repeated S1/T10 could still create multiple pending rows.
-
-    This guard now:
-      - reuses the URL when available;
-      - otherwise blocks a very recent matching/open checkout and tells the user
-        to use the last link already shown in Telegram.
+    Rules:
+      - A recent S1/P1/B1 subscription checkout can block only a matching/recent
+        subscription checkout.
+      - A recent T10/T50/T100/T500 top-up checkout can block only a matching/recent
+        top-up checkout.
+      - Subscription checkouts must not block top-up checkouts.
+      - Top-up checkouts must not block subscription checkouts.
     """
-    rows = _rows_for_account("paystack_transactions", account_id, limit=20)
-
+    requested_kind = "subscription" if plan_code else "topup" if package_code else ""
     requested_label = (plan_code or package_code or "checkout").upper()
-    requested_terms = [x.lower() for x in (plan_code, package_code) if x]
 
-    recent_open_fallback: Optional[dict[str, Any]] = None
+    if requested_kind == "subscription":
+        requested_terms = _plan_search_terms(plan_code)
+    elif requested_kind == "topup":
+        requested_terms = _topup_search_terms(package_code)
+    else:
+        requested_terms = []
+
+    rows = _rows_for_account("paystack_transactions", account_id, limit=20)
+    recent_same_kind_fallback: Optional[dict[str, Any]] = None
 
     for row in rows:
         if not _row_is_open_checkout(row) or not _row_recent_enough(row, seconds=900):
             continue
 
-        row_text = " ".join(
-            _clean_text(row.get(k)).lower()
-            for k in (
-                "plan_code", "package_code", "product_code", "purpose", "type",
-                "metadata", "description", "reference", "payment_reference",
-                "provider_reference", "gateway_reference", "plan", "package",
-                "channel_type", "source"
-            )
-        )
+        row_text = _checkout_row_text(row)
+        row_kind = _checkout_row_kind(row_text)
 
-        is_match = False
+        # Hard separation:
+        # known subscription rows must not block top-up rows, and known top-up
+        # rows must not block subscription rows.
+        if requested_kind and row_kind not in {requested_kind, "unknown"}:
+            continue
 
-        if requested_terms:
-            is_match = any(term and term in row_text for term in requested_terms)
+        is_match = any(term and term in row_text for term in requested_terms)
 
-        # Very recent open checkout fallback.
-        # This prevents double-click / repeated-command duplicates even when the
-        # DB row does not store plan_code/package_code in a searchable field.
-        if not is_match and _row_recent_enough(row, seconds=120):
-            if recent_open_fallback is None:
-                recent_open_fallback = row
+        # Unknown rows are allowed to block only when there is a direct term match.
+        if row_kind == "unknown" and not is_match:
+            continue
+
+        # Same-kind, very recent fallback. This catches double-click/repeated
+        # command issues when the row does not store the exact plan/package code.
+        if not is_match and row_kind == requested_kind and _row_recent_enough(row, seconds=120):
+            if recent_same_kind_fallback is None:
+                recent_same_kind_fallback = row
             continue
 
         if not is_match:
@@ -827,7 +933,8 @@ def _recent_checkout_reuse_message(account_id: str, *, plan_code: str = "", pack
         if url:
             return (
                 "🧾 *Recent Checkout Found*\n\n"
-                f"I found a recent pending checkout for {requested_label}. To avoid duplicate payment records, use this existing checkout link:\n\n"
+                f"I found a recent pending {requested_kind or 'payment'} checkout for {requested_label}. "
+                "To avoid duplicate payment records, use this existing checkout link:\n\n"
                 f"{url}\n\n"
                 f"Reference: {ref}\n\n"
                 "If the link has expired, wait a few minutes or contact support."
@@ -835,27 +942,27 @@ def _recent_checkout_reuse_message(account_id: str, *, plan_code: str = "", pack
 
         return (
             "🧾 *Recent Pending Checkout Found*\n\n"
-            f"You already have a recent pending checkout for {requested_label}.\n\n"
+            f"You already have a recent pending {requested_kind or 'payment'} checkout for {requested_label}.\n\n"
             "Please use the last payment link already shown above in this chat. "
             "To avoid duplicate payment records, I will not create another checkout immediately.\n\n"
             f"Reference: {ref}\n\n"
             "If you cannot find the link, wait about 15 minutes and try again, or contact support with SUP6."
         )
 
-    if recent_open_fallback:
+    if recent_same_kind_fallback:
         ref = (
-            recent_open_fallback.get("reference")
-            or recent_open_fallback.get("payment_reference")
-            or recent_open_fallback.get("provider_reference")
-            or recent_open_fallback.get("gateway_reference")
+            recent_same_kind_fallback.get("reference")
+            or recent_same_kind_fallback.get("payment_reference")
+            or recent_same_kind_fallback.get("provider_reference")
+            or recent_same_kind_fallback.get("gateway_reference")
             or "not shown"
         )
-        url = _checkout_url_from_row(recent_open_fallback)
+        url = _checkout_url_from_row(recent_same_kind_fallback)
 
         if url:
             return (
                 "🧾 *Recent Checkout Found*\n\n"
-                "I found a very recent pending checkout on your account. "
+                f"I found a very recent pending {requested_kind or 'payment'} checkout on your account. "
                 "To avoid duplicate payment records, complete this checkout first:\n\n"
                 f"{url}\n\n"
                 f"Reference: {ref}"
@@ -863,7 +970,7 @@ def _recent_checkout_reuse_message(account_id: str, *, plan_code: str = "", pack
 
         return (
             "🧾 *Recent Pending Checkout Found*\n\n"
-            "I found a very recent pending checkout on your account. "
+            f"I found a very recent pending {requested_kind or 'payment'} checkout on your account. "
             "Please use the last payment link already shown above before creating another one.\n\n"
             f"Reference: {ref}\n\n"
             "If you cannot find the link, wait about 15 minutes and try again."
