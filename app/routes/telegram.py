@@ -43,7 +43,7 @@ from app.services.tax_filing_service import (
 
 bp = Blueprint("telegram", __name__)
 
-TELEGRAM_ROUTE_VERSION = "2026-05-27-v35f-telegram-referral-filing-request-parity"
+TELEGRAM_ROUTE_VERSION = "2026-05-27-v35g-batch28g-command-routing"
 
 LINK_CODE_RE = re.compile(r"^[A-Z0-9]{8}$")
 MENU_NUMBER_RE = re.compile(r"^[1-8]$")
@@ -642,13 +642,24 @@ def _send_main_menu(chat_id: str, *, linked: bool = False) -> None:
 def _send_tax_menu(chat_id: str) -> None:
     menu = (
         "🧰 *Tax Tools, Filing, Deadlines & Quiz*\n\n"
-        "Calculators:\n"
+        "Quick filing/tool shortcuts:\n"
         "F1 - Calculator menu\n"
+        "F2 - PAYE filing guide\n"
+        "F3 - VAT filing guide\n"
+        "F4 - CIT filing guide\n"
+        "F5 - WHT guide\n"
+        "F6 - Tax deadlines/calendar\n"
+        "F7 - Filing checklist\n"
+        "F8 - Back to main menu\n\n"
+        "Calculators:\n"
         "C1 - PAYE calculator\n"
         "C2 - Company Income Tax calculator\n"
         "C3 - VAT calculator\n"
         "C4 - Withholding Tax calculator\n"
-        "C5 - Salary / net pay estimate\n\n"
+        "C5 - Salary / net pay estimate\n"
+        "C6 - Tax quiz\n"
+        "C7 - Tax calendar/deadlines\n"
+        "C8 - Back to Tax Tools\n\n"
         "Deadline reminders:\n"
         "D1 - Create reminder\n"
         "D2 - List reminders\n"
@@ -3196,15 +3207,28 @@ def _handle_master_command(
     if cmd.startswith("F"):
         if cmd == "F1":
             _send_calculator_menu(chat_id)
+        elif cmd in {"F2", "F3", "F4", "F5"}:
+            # F2-F5 mirror the WhatsApp tool menu but reuse Telegram's filing help handlers.
+            _send_filing_assistance(chat_id, account_id, f"ft{cmd[1]}", text_raw)
+        elif cmd == "F6":
+            send_telegram_text(chat_id, _telegram_deadline_usage_text(account_id))
+        elif cmd == "F7":
+            _send_filing_assistance(chat_id, account_id, "ft6", text_raw)
+        elif cmd == "F8":
+            _send_main_menu(chat_id, linked=linked)
         else:
-            _send_filing_assistance(chat_id, "ft1")
+            _send_tax_menu(chat_id)
         return True
 
     if cmd.startswith("C"):
         if cmd in CALCULATOR_COMMAND_TO_TYPE:
             _start_calculator_flow(chat_id, cmd, text_raw=text_raw)
         elif cmd == "C6":
-            send_telegram_text(chat_id, "🧠 Tax quiz will be expanded for Telegram in the quiz parity batch. For now, use Q1 when enabled or continue on WhatsApp.")
+            _handle_quiz_command_telegram(chat_id, account_id, tg_user_id, "Q1")
+        elif cmd == "C7":
+            send_telegram_text(chat_id, _telegram_deadline_usage_text(account_id))
+        elif cmd == "C8":
+            _send_tax_menu(chat_id)
         else:
             _send_calculator_menu(chat_id)
         return True
@@ -3275,12 +3299,21 @@ def _send_all_commands(chat_id: str, *, linked: bool = False) -> None:
         "PAY6 - Renewal/expiry date\n\n"
         "Tax tools and quiz:\n"
         "F1 - Calculator menu\n"
+        "F2 - PAYE filing guide\n"
+        "F3 - VAT filing guide\n"
+        "F4 - CIT filing guide\n"
+        "F5 - WHT guide\n"
+        "F6 - Tax deadlines/calendar\n"
+        "F7 - Filing checklist\n"
+        "F8 - Back to main menu\n"
         "C1 - PAYE calculator\n"
         "C2 - Company Income Tax calculator\n"
         "C3 - VAT calculator\n"
         "C4 - Withholding Tax calculator\n"
         "C5 - Salary/net pay comparison\n"
         "C6 or Q1 - Tax quiz\n"
+        "C7 - Tax calendar/deadlines\n"
+        "C8 - Back to Tax Tools\n"
         "Q2 - Quiz categories\n"
         "Q3 - Quiz score\n"
         "Q4 - Last quiz review\n"
@@ -3720,7 +3753,10 @@ def _send_calculator_menu(chat_id: str) -> None:
         "C2 - Company Income Tax calculator\n"
         "C3 - VAT calculator\n"
         "C4 - Withholding Tax calculator\n"
-        "C5 - Salary / net pay estimate\n\n"
+        "C5 - Salary / net pay estimate\n"
+        "C6 - Tax quiz\n"
+        "C7 - Tax calendar/deadlines\n"
+        "C8 - Back to Tax Tools\n\n"
         "Fast examples:\n"
         "C1 750000 0 0\n"
         "C2 12000000 80000000\n"
