@@ -41,7 +41,7 @@ from app.services.tax_filing_service import (
 
 bp = Blueprint("telegram", __name__)
 
-TELEGRAM_ROUTE_VERSION = "2026-05-27-v34j-telegram-exact-checkout-fingerprint-guard"
+TELEGRAM_ROUTE_VERSION = "2026-05-27-v34k-telegram-fingerprint-metadata-patch-fix"
 
 LINK_CODE_RE = re.compile(r"^[A-Z0-9]{8}$")
 MENU_NUMBER_RE = re.compile(r"^[1-8]$")
@@ -200,7 +200,7 @@ def telegram_health():
             "version": TELEGRAM_ROUTE_VERSION,
             "route_mount": "/api/telegram/*",
             "account_resolution": "channel_identities_first_accounts_auth_fallback",
-            "command_namespace": "whatsapp_master_registry_stabilized_exact_checkout_fingerprint_guard",
+            "command_namespace": "whatsapp_master_registry_stabilized_fingerprint_metadata_patch_fix",
             "configured": {
                 "bot_token": _env_present("TELEGRAM_BOT_TOKEN", "TG_BOT_TOKEN", "TELEGRAM_TOKEN"),
                 "webhook_secret": _env_present("TELEGRAM_WEBHOOK_SECRET", "TG_WEBHOOK_SECRET"),
@@ -1026,14 +1026,17 @@ def _record_telegram_checkout_lock(
     metadata["last_checkout_fingerprint"] = fingerprint
 
     try:
+        # Batch 27D6:
+        # The current channel_identities table does not expose updated_at.
+        # Updating metadata + updated_at caused PGRST204 and prevented the
+        # checkout fingerprint lock from being saved. Save metadata only.
         supabase.table("channel_identities").update(
             {
                 "metadata": metadata,
-                "updated_at": _utc_now_iso(),
             }
         ).eq("id", identity_id).execute()
     except Exception:
-        logging.exception("Telegram checkout fingerprint lock update failed")
+        logging.exception("Telegram checkout fingerprint metadata update failed")
 
 
 
