@@ -40,15 +40,19 @@ from app.services.tax_filing_service import (
 )
 
 from app.services.referral_hub import (
+    extract_referral_start_code,
     format_referral_code_message,
     format_referral_invite_message,
+    format_referral_landing_message,
+    format_referral_link_message,
+    format_referral_menu_message,
 )
 
 # Batch 27B1 fix: use the imported Supabase client object directly; do not call supabase().
 
 bp = Blueprint("telegram", __name__)
 
-TELEGRAM_ROUTE_VERSION = "2026-05-28-v36d-batch30d-deadline-mode-persistence-reread"
+TELEGRAM_ROUTE_VERSION = "2026-05-28-v36e-batch32a-multi-platform-referral-hub"
 
 LINK_CODE_RE = re.compile(r"^[A-Z0-9]{8}$")
 MENU_NUMBER_RE = re.compile(r"^[1-8]$")
@@ -2752,37 +2756,23 @@ def _send_referral_menu(chat_id: str, account_id: str, action: str) -> None:
     code, link, err = _referral_code_link(account_id)
 
     if action in {"r1", "referral", "referrals"}:
-        body = (
-            "🤝 *My Referral Code*\n\n"
-            f"Code: {code}\n"
-            f"Link: {link}\n\n"
-            "Share this code or link with people who need Nigerian tax answers, calculators, reminders, and filing support.\n\n"
-            "Reply R2 for only the link, R3 for a ready-to-share invitation, or R4 for referral statistics."
+        send_telegram_text(
+            chat_id,
+            _clip_text(format_referral_code_message(code, link, channel="telegram", err=err)),
         )
-        if err:
-            body += "\n\nNote: I used a safe fallback code because the referral profile could not be fully refreshed."
-        send_telegram_text(chat_id, _clip_text(body))
         return
 
     if action == "r2":
         send_telegram_text(
             chat_id,
-            "🔗 *My Referral Link*\n\n"
-            f"{link}\n\n"
-            f"Referral code: {code}\n\n"
-            "Reply R3 for a ready-to-share invitation.",
+            _clip_text(format_referral_link_message(code, link, channel="telegram", err=err)),
         )
         return
 
     if action == "r3":
         send_telegram_text(
             chat_id,
-            "📣 *Referral Invitation*\n\n"
-            "Copy and share this message:\n\n"
-            "Hi, I use Naija Tax Guide for Nigerian tax questions, calculators, filing guidance, and reminders.\n\n"
-            f"Join with my referral link:\n{link}\n\n"
-            f"Referral code: {code}\n\n"
-            "After signup, you can use the web app and supported chat channels.",
+            _clip_text(format_referral_invite_message(code, link, channel="telegram")),
         )
         return
 
@@ -2812,7 +2802,7 @@ def _send_referral_menu(chat_id: str, account_id: str, action: str) -> None:
                 chat_id,
                 "🎁 *Referral Rewards*\n\n"
                 "No referral reward found yet.\n\n"
-                "Share your link with R3. Rewards will appear here after referred users qualify according to the referral policy.\n\n"
+                "Share your smart referral link with R3. Rewards will appear here after referred users qualify according to the referral policy.\n\n"
                 "Reply R1 for your code/link or 0 for main menu.",
             )
             return
@@ -2858,16 +2848,8 @@ def _send_referral_menu(chat_id: str, account_id: str, action: str) -> None:
 
     send_telegram_text(
         chat_id,
-        "🤝 *Referral Centre*\n\n"
-        "R1 - My referral code\n"
-        "R2 - My referral link\n"
-        "R3 - Share referral invitation\n"
-        "R4 - Referral statistics\n"
-        "R5 - Referral rewards\n"
-        "R6 - Payout status\n\n"
-        "Reply 0 for main menu.",
+        _clip_text(format_referral_menu_message(code, link, channel="telegram")),
     )
-
 
 def _filing_assistance_menu() -> str:
     return (
@@ -6472,6 +6454,16 @@ def tg_webhook():
     if not text:
         _send_welcome(chat_id_str, linked=linked)
         return jsonify({"ok": True})
+
+    referral_start_code = extract_referral_start_code(text)
+    if referral_start_code:
+        user_states.pop(chat_id_str, None)
+        _clear_telegram_quiz_state(tg_user_id)
+        send_telegram_text(
+            chat_id_str,
+            _clip_text(format_referral_landing_message(referral_start_code, channel="telegram")),
+        )
+        return jsonify({"ok": True, "handled": "referral_start", "referral_code": referral_start_code})
 
     if text_lower in ["/start", "start", "0", "menu", "/menu"]:
         user_states.pop(chat_id_str, None)
