@@ -43,7 +43,7 @@ from app.services.tax_filing_service import (
 
 bp = Blueprint("telegram", __name__)
 
-TELEGRAM_ROUTE_VERSION = "2026-05-28-v36b-batch30b-current-plan-display-sync"
+TELEGRAM_ROUTE_VERSION = "2026-05-28-v36d-batch30d-deadline-mode-persistence-reread"
 
 LINK_CODE_RE = re.compile(r"^[A-Z0-9]{8}$")
 MENU_NUMBER_RE = re.compile(r"^[1-8]$")
@@ -2298,8 +2298,6 @@ def _create_support_ticket_from_text(chat_id: str, account_id: str, text_raw: st
         "subject": details[:120],
         "message": details,
         "status": "open",
-        "channel": "telegram",
-        "source": "telegram",
         "metadata": {"created_from": "telegram", "command": "SUP1"},
         "created_at": now,
         "updated_at": now,
@@ -3007,8 +3005,6 @@ def _create_filing_request_telegram(chat_id: str, account_id: str, text_raw: str
         "subject": subject,
         "message": clean_message,
         "status": "open",
-        "channel": "telegram",
-        "source": "telegram",
         "issue_type": "filing_assistance",
         "last_message_preview": preview,
         "metadata": {"created_from": "telegram", "request_type": "filing_assistance", "command": "FT7"},
@@ -4417,18 +4413,105 @@ def _deadline_payload_core_telegram(payload: dict[str, Any], columns: Optional[s
     return cleaned
 
 
-def _telegram_deadline_insert(payload: dict[str, Any]) -> dict[str, Any]:
-    columns = _telegram_deadline_column_names_telegram(_clean_text(payload.get("account_id")))
+def _telegram_deadline_payload_for_table(payload: dict[str, Any], *, for_update: bool = False) -> dict[str, Any]:
+    """
+    Batch 30D:
+    Keep only real public.tax_deadlines columns.
 
-    # Batch 28J: schema-safe payloads first. This avoids the previous noisy
-    # sequence where the full payload caused 400, then a fallback succeeded.
+    Confirmed production table:
+    - public.tax_deadlines has reminder_mode/reminder_time/timezone.
+    - public.tax_deadlines does NOT have channel/source.
+
+    This prevents a false local display such as "via telegram" when the database
+    actually kept reminder_mode as whatsapp because a fallback payload removed
+    the mode/time fields.
+    """
+    insert_allowed = {
+        "id",
+        "user_id",
+        "account_id",
+        "tax_type",
+        "due_date",
+        "reminder_days_before",
+        "enabled",
+        "created_at",
+        "updated_at",
+        "last_reminder_sent_at",
+        "reminder_time",
+        "timezone",
+        "reminder_mode",
+        "reminder_email",
+        "reminder_phone",
+        "reminder_last_error",
+    }
+
+    update_allowed = {
+        "tax_type",
+        "due_date",
+        "reminder_days_before",
+        "enabled",
+        "updated_at",
+        "last_reminder_sent_at",
+        "reminder_time",
+        "timezone",
+        "reminder_mode",
+        "reminder_email",
+        "reminder_phone",
+        "reminder_last_error",
+    }
+
+    allowed = update_allowed if for_update else insert_allowed
+    return {k: v for k, v in payload.items() if k in allowed and v is not None}
+
+
+def _telegram_deadline_get_by_id(deadline_id: str) -> Optional[dict[str, Any]]:
+    deadline_id = _clean_text(deadline_id)
+    if not deadline_id:
+        return None
+
+    try:
+        resp = (
+            supabase.table("tax_deadlines")
+            .select("*")
+            .eq("id", deadline_id)
+            .limit(1)
+            .execute()
+        )
+        return _first(resp)
+    except Exception:
+        logging.exception("Telegram deadline re-read failed")
+        return None
+
+
+def _telegram_deadline_insert(payload: dict[str, Any]) -> dict[str, Any]:
+    safe_payload = _telegram_deadline_payload_for_table(payload, for_update=False)
+
     attempts: list[dict[str, Any]] = [
-        _deadline_payload_filtered_telegram(payload, columns, include_updated_at=True),
-        _deadline_payload_filtered_telegram(payload, columns, include_updated_at=False),
-        _deadline_payload_core_telegram(payload, columns, include_updated_at=True),
-        _deadline_payload_core_telegram(payload, columns, include_updated_at=False),
-        _deadline_payload_core_telegram(payload, None, include_updated_at=True),
-        _deadline_payload_core_telegram(payload, None, include_updated_at=False),
+        dict(safe_payload),
+
+        # Remove contact/error optional fields only. Keep reminder_mode/reminder_time.
+        {
+            k: v
+            for k, v in safe_payload.items()
+            if k not in {"reminder_email", "reminder_phone", "reminder_last_error", "last_reminder_sent_at"}
+        },
+
+        # Remove updated_at only if a legacy schema ever complains. Keep reminder_mode/reminder_time.
+        {
+            k: v
+            for k, v in safe_payload.items()
+            if k not in {"updated_at", "reminder_email", "reminder_phone", "reminder_last_error", "last_reminder_sent_at"}
+        },
+
+        # Last-resort base payload.
+        {
+            "user_id": safe_payload.get("account_id") or safe_payload.get("user_id"),
+            "account_id": safe_payload.get("account_id") or safe_payload.get("user_id"),
+            "tax_type": safe_payload.get("tax_type"),
+            "due_date": safe_payload.get("due_date"),
+            "reminder_days_before": safe_payload.get("reminder_days_before"),
+            "enabled": safe_payload.get("enabled", True),
+        },
     ]
 
     seen: set[str] = set()
@@ -4446,22 +4529,60 @@ def _telegram_deadline_insert(payload: dict[str, Any]) -> dict[str, Any]:
 
         ok, resp, err = _safe_exec(supabase.table("tax_deadlines").insert(cleaned))
         if ok:
-            return {"ok": True, "data": _rows(resp), "mode": signature, "attempt_keys": sorted(cleaned.keys())}
+            rows = _rows(resp)
+            row = rows[0] if rows else None
+            if row and row.get("id"):
+                reread = _telegram_deadline_get_by_id(str(row.get("id")))
+                if reread:
+                    row = reread
+
+            return {
+                "ok": True,
+                "data": rows,
+                "row": row,
+                "mode": signature,
+                "payload_keys": sorted(cleaned.keys()),
+            }
+
         errors.append(str(err))
 
-    return {"ok": False, "error": errors[-1] if errors else "insert_failed", "errors": errors[:3]}
+    logging.error("Telegram deadline insert failed: %s", errors[:3])
+    return {
+        "ok": False,
+        "error": errors[-1] if errors else "insert_failed",
+        "errors": errors[:3],
+    }
 
 
 def _telegram_deadline_update(deadline_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-    columns = _telegram_deadline_column_names_telegram()
+    deadline_id = _clean_text(deadline_id)
+    if not deadline_id:
+        return {"ok": False, "error": "missing_deadline_id"}
+
+    safe_payload = _telegram_deadline_payload_for_table(payload, for_update=True)
 
     attempts: list[dict[str, Any]] = [
-        _deadline_payload_filtered_telegram(payload, columns, include_updated_at=True),
-        _deadline_payload_filtered_telegram(payload, columns, include_updated_at=False),
-        _deadline_payload_core_telegram(payload, columns, include_updated_at=True),
-        _deadline_payload_core_telegram(payload, columns, include_updated_at=False),
-        _deadline_payload_core_telegram(payload, None, include_updated_at=True),
-        _deadline_payload_core_telegram(payload, None, include_updated_at=False),
+        dict(safe_payload),
+
+        # Keep reminder_mode/reminder_time. Only remove less important optional fields.
+        {
+            k: v
+            for k, v in safe_payload.items()
+            if k not in {"reminder_email", "reminder_phone", "reminder_last_error", "last_reminder_sent_at"}
+        },
+
+        # If updated_at ever fails, remove it but still keep reminder_mode/reminder_time.
+        {
+            k: v
+            for k, v in safe_payload.items()
+            if k not in {"updated_at", "reminder_email", "reminder_phone", "reminder_last_error", "last_reminder_sent_at"}
+        },
+
+        # Last-resort base update. This should normally not be reached on the current schema.
+        {
+            "reminder_days_before": safe_payload.get("reminder_days_before"),
+            "enabled": safe_payload.get("enabled", True),
+        },
     ]
 
     errors: list[str] = []
@@ -4471,18 +4592,39 @@ def _telegram_deadline_update(deadline_id: str, payload: dict[str, Any]) -> dict
         cleaned = {k: v for k, v in attempt.items() if v is not None}
         if not cleaned:
             continue
+
         signature = repr(sorted(cleaned.keys()))
         if signature in seen:
             continue
         seen.add(signature)
 
         try:
-            resp = supabase.table("tax_deadlines").update(cleaned).eq("id", deadline_id).execute()
-            return {"ok": True, "data": _rows(resp), "mode": signature, "attempt_keys": sorted(cleaned.keys())}
+            resp = (
+                supabase.table("tax_deadlines")
+                .update(cleaned)
+                .eq("id", deadline_id)
+                .execute()
+            )
+
+            persisted = _telegram_deadline_get_by_id(deadline_id)
+
+            return {
+                "ok": True,
+                "data": _rows(resp),
+                "row": persisted,
+                "mode": signature,
+                "payload_keys": sorted(cleaned.keys()),
+            }
+
         except Exception as exc:
             errors.append(str(exc))
 
-    return {"ok": False, "error": errors[-1] if errors else "update_failed", "errors": errors[:3]}
+    logging.error("Telegram deadline update failed for %s: %s", deadline_id, errors[:3])
+    return {
+        "ok": False,
+        "error": errors[-1] if errors else "update_failed",
+        "errors": errors[:3],
+    }
 
 def _telegram_deadline_delete(deadline_id: str) -> dict[str, Any]:
     try:
@@ -4541,8 +4683,6 @@ def _create_deadline_reminder_telegram(chat_id: str, account_id: str, tg_user_id
         "timezone": "Africa/Lagos",
         "reminder_mode": _valid_deadline_mode(parsed.get("reminder_mode")),
         "reminder_phone": tg_user_id,
-        "channel": "telegram",
-        "source": "telegram",
     }
 
     result = _telegram_deadline_insert(payload)
@@ -4556,14 +4696,35 @@ def _create_deadline_reminder_telegram(chat_id: str, account_id: str, tg_user_id
         )
         return
 
+    persisted = result.get("row") if isinstance(result.get("row"), dict) else None
+    if not persisted:
+        rows = result.get("data") if isinstance(result.get("data"), list) else []
+        persisted = rows[0] if rows and isinstance(rows[0], dict) else None
+
+    requested_time = _valid_deadline_time(parsed.get("reminder_time"))
+    requested_mode = _valid_deadline_mode(parsed.get("reminder_mode"))
+    saved_time = _valid_deadline_time((persisted or {}).get("reminder_time") or requested_time)
+    saved_mode = _valid_deadline_mode((persisted or {}).get("reminder_mode") or requested_mode)
+
+    if saved_time != requested_time or saved_mode != requested_mode:
+        send_telegram_text(
+            chat_id,
+            "⚠️ *Deadline Reminder Saved, But Please Confirm*\n\n"
+            "The reminder was created, but the saved time/mode did not fully match the request.\n\n"
+            f"Requested: {requested_time} via {requested_mode}\n"
+            f"Saved: {saved_time} via {saved_mode}\n\n"
+            "Reply D2 to view the saved reminder.",
+        )
+        return
+
     send_telegram_text(
         chat_id,
         "✅ *Deadline Reminder Saved*\n\n"
         f"Tax type: {parsed['tax_type']}\n"
         f"Due date: {parsed['due_date']}\n"
         f"Reminder: {parsed['reminder_days_before']} days before\n"
-        f"Time: {_valid_deadline_time(parsed.get('reminder_time'))}\n"
-        f"Mode: {_valid_deadline_mode(parsed.get('reminder_mode'))}\n"
+        f"Time: {saved_time}\n"
+        f"Mode: {saved_mode}\n"
         f"Reminder date: {validation.get('reminder_date')}\n\n"
         "Reply D2 to view reminders or 0 for menu.",
     )
@@ -4655,6 +4816,7 @@ def _update_deadline_reminder_telegram(chat_id: str, account_id: str, text_raw: 
         _clean_text(text_raw),
         flags=re.I,
     )
+
     if not match:
         send_telegram_text(
             chat_id,
@@ -4672,7 +4834,10 @@ def _update_deadline_reminder_telegram(chat_id: str, account_id: str, text_raw: 
 
     row = _telegram_deadline_by_index(account_id, idx)
     if not row:
-        send_telegram_text(chat_id, "I could not find that reminder number. Reply D2 to view your current reminders.")
+        send_telegram_text(
+            chat_id,
+            "I could not find that reminder number. Reply D2 to view your current reminders.",
+        )
         return
 
     validation = _deadline_validation_telegram(row.get("due_date"), days)
@@ -4687,7 +4852,10 @@ def _update_deadline_reminder_telegram(chat_id: str, account_id: str, text_raw: 
 
     deadline_id = _clean_text(row.get("id"))
     if not deadline_id:
-        send_telegram_text(chat_id, "I found the reminder, but it has no valid ID. Please try D2 again or contact support.")
+        send_telegram_text(
+            chat_id,
+            "I found the reminder, but it has no valid ID. Please try D2 again or contact support.",
+        )
         return
 
     payload = {
@@ -4697,30 +4865,47 @@ def _update_deadline_reminder_telegram(chat_id: str, account_id: str, text_raw: 
         "reminder_time": reminder_time,
         "timezone": "Africa/Lagos",
         "reminder_mode": reminder_mode,
-        "channel": "telegram",
-        "source": "telegram",
     }
 
     result = _telegram_deadline_update(deadline_id, payload)
     if not result.get("ok"):
-        send_telegram_text(chat_id, "⚠️ I could not update that reminder now. Reply D2 and try again.")
+        send_telegram_text(
+            chat_id,
+            "⚠️ I could not update that reminder now. Reply D2 and try again.",
+        )
         return
 
-    updated = dict(row)
-    updated["reminder_days_before"] = days
-    updated["enabled"] = True
-    updated["reminder_time"] = reminder_time
-    updated["reminder_mode"] = reminder_mode
-    updated["channel"] = "telegram"
-    updated["source"] = "telegram"
+    persisted = result.get("row") if isinstance(result.get("row"), dict) else None
+    if not persisted:
+        persisted = _telegram_deadline_get_by_id(deadline_id)
+
+    if not persisted:
+        send_telegram_text(
+            chat_id,
+            "⚠️ Reminder update was attempted, but I could not re-read the saved record. Reply D2 to confirm.",
+        )
+        return
+
+    saved_mode = _valid_deadline_mode(persisted.get("reminder_mode") or "")
+    saved_time = _valid_deadline_time(persisted.get("reminder_time") or "")
+
+    if saved_mode != reminder_mode or saved_time != reminder_time:
+        send_telegram_text(
+            chat_id,
+            "⚠️ *Reminder Partly Updated*\n\n"
+            "The reminder was saved, but the saved time/mode did not match the requested values.\n\n"
+            f"Requested: {reminder_time} via {reminder_mode}\n"
+            f"Saved: {saved_time} via {saved_mode}\n\n"
+            "Reply D2 to view your current reminders.",
+        )
+        return
 
     send_telegram_text(
         chat_id,
         "⚙️ *Reminder Updated*\n\n"
-        f"{_deadline_display_line_telegram(updated, idx)}\n\n"
+        f"{_deadline_display_line_telegram(persisted, idx)}\n\n"
         "Reply D2 to view all reminders.",
     )
-
 
 def _handle_deadline_command_telegram(chat_id: str, account_id: str, tg_user_id: str, text_raw: str) -> bool:
     text_clean = _clean_text(text_raw)
