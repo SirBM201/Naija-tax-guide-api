@@ -271,6 +271,7 @@ def create_app() -> Flask:
         "app.routes.web_ask",
         "app.routes.web_chat",
         "app.routes.paystack_webhook",
+        "app.routes.referral_hub",
     ]
 
     for dotted in optional_modules:
