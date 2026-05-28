@@ -43,7 +43,7 @@ from app.services.tax_filing_service import (
 
 bp = Blueprint("telegram", __name__)
 
-TELEGRAM_ROUTE_VERSION = "2026-05-27-v35j-batch28j-deadline-mode-schema-sync"
+TELEGRAM_ROUTE_VERSION = "2026-05-28-v36b-batch30b-current-plan-display-sync"
 
 LINK_CODE_RE = re.compile(r"^[A-Z0-9]{8}$")
 MENU_NUMBER_RE = re.compile(r"^[1-8]$")
@@ -6393,7 +6393,9 @@ def tg_webhook():
             send_telegram_text(chat_id_str, format_balance_message(get_credit_balance(account_id)))
             return jsonify({"ok": True})
         if option == 3:
-            send_telegram_text(chat_id_str, format_subscription_message(account_id))
+            # Batch 30B: keep numeric current-plan display aligned with PAY1,
+            # CR1, WhatsApp, and web workspace/ask pages.
+            send_telegram_text(chat_id_str, _billing_summary_text(account_id))
             return jsonify({"ok": True})
         if option == 4:
             send_telegram_text(chat_id_str, _master_plans_menu())
