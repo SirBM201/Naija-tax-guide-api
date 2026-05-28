@@ -7,7 +7,7 @@ from typing import Any, Optional
 from urllib.parse import quote, urlencode, urlsplit, urlunsplit, parse_qsl
 
 
-REFERRAL_HUB_VERSION = "2026-05-28-batch32a-multi-platform-referral-hub"
+REFERRAL_HUB_VERSION = "2026-05-28-batch32c-smart-referral-hub-default"
 
 
 def _clean(value: Any) -> str:
@@ -22,12 +22,26 @@ def _env_first(*names: str) -> str:
     return ""
 
 
-def _base_url() -> str:
-    return _env_first("APP_BASE_URL", "FRONTEND_BASE_URL", "PUBLIC_APP_URL", "NEXT_PUBLIC_APP_URL") or "https://www.naijataxguides.com"
+def _public_site_url() -> str:
+    # Important: use frontend/public site first, not backend APP_BASE_URL.
+    return (
+        _env_first(
+            "PUBLIC_SITE_URL",
+            "FRONTEND_BASE_URL",
+            "NEXT_PUBLIC_SITE_URL",
+            "NEXT_PUBLIC_APP_URL",
+            "PUBLIC_APP_URL",
+        )
+        or "https://www.naijataxguides.com"
+    ).rstrip("/")
+
+
+def _backend_base_url() -> str:
+    return _env_first("BACKEND_BASE_URL", "API_BASE_URL", "NEXT_PUBLIC_API_BASE_URL", "KOYEB_PUBLIC_URL").rstrip("/")
 
 
 def _safe_base_url() -> str:
-    return _base_url().rstrip("/")
+    return _public_site_url()
 
 
 def _sanitize_code(code: Any) -> str:
@@ -48,35 +62,26 @@ def _add_query(url: str, **params: str) -> str:
         if value:
             query[key] = value
 
-    return urlunsplit(
-        (
-            split.scheme,
-            split.netloc,
-            split.path,
-            urlencode(query),
-            split.fragment,
-        )
-    )
+    return urlunsplit((split.scheme, split.netloc, split.path, urlencode(query), split.fragment))
 
 
 def _format_hub_url_from_env(code: str) -> str:
     """
     Optional env support:
-      NTG_REFERRAL_HUB_URL=https://www.naijataxguides.com/referral
+      NTG_REFERRAL_HUB_URL=https://www.naijataxguides.com/ref/{code}
       or
-      NTG_REFERRAL_HUB_URL=https://www.naijataxguides.com/referral?ref={code}
+      NTG_REFERRAL_HUB_URL=https://www.naijataxguides.com/referral
 
-    If the frontend hub page is not ready, this service safely falls back to
-    the existing signup link so the link never breaks.
+    Batch 32C default: now that the frontend hub exists, fall back to /ref/{code},
+    not /signup?ref=code.
     """
     template = _env_first("NTG_REFERRAL_HUB_URL", "REFERRAL_HUB_URL", "PUBLIC_REFERRAL_HUB_URL")
-    if not template:
-        return ""
+    if template:
+        if "{code}" in template:
+            return template.replace("{code}", quote(code))
+        return _add_query(template, ref=code, source="referral_hub")
 
-    if "{code}" in template:
-        return template.replace("{code}", quote(code))
-
-    return _add_query(template, ref=code, source="referral_hub")
+    return f"{_safe_base_url()}/ref/{quote(code)}"
 
 
 def _web_signup_link(code: str, primary_link: Optional[str] = None) -> str:
@@ -94,7 +99,9 @@ def _whatsapp_bot_phone() -> str:
         "META_WHATSAPP_BOT_PHONE",
         "WHATSAPP_DISPLAY_PHONE_NUMBER",
         "META_WHATSAPP_DISPLAY_PHONE_NUMBER",
-    )
+        "WHATSAPP_BUSINESS_PHONE_NUMBER",
+        "WHATSAPP_PHONE_NUMBER",
+    ) or "2347034941158"
     phone = re.sub(r"\D+", "", phone)
     if phone.startswith("00"):
         phone = phone[2:]
@@ -102,23 +109,31 @@ def _whatsapp_bot_phone() -> str:
 
 
 def _telegram_bot_username() -> str:
-    username = _env_first("TELEGRAM_BOT_USERNAME", "TG_BOT_USERNAME", "TELEGRAM_USERNAME", "TG_USERNAME")
+    username = _env_first("TELEGRAM_BOT_USERNAME", "TG_BOT_USERNAME", "TELEGRAM_USERNAME", "TG_USERNAME") or "naija_tax_guide_bot"
     username = username.lstrip("@").strip()
     username = re.sub(r"[^A-Za-z0-9_]+", "", username)
     return username
+
+
+def _track_and_go_link(code: str, platform: str, fallback: str) -> str:
+    backend = _backend_base_url()
+    if not backend:
+        return fallback
+    return f"{backend}/api/referral/track-and-go/{quote(code)}/{quote(platform)}"
 
 
 def build_referral_platform_links(code: Any, primary_link: Optional[str] = None) -> dict[str, str]:
     """
     Build safe, shareable platform entry links for the same referral code.
 
-    The web signup link remains the safest universal fallback.
-    WhatsApp and Telegram links are only shown when their public bot details
-    are available in environment variables.
+    Batch 32C:
+    - `hub`/`smart` now points to the public referral hub page.
+    - `web` remains direct signup fallback.
+    - `track_*` links go through backend analytics when BACKEND_BASE_URL/API_BASE_URL is configured.
     """
     ref_code = _sanitize_code(code)
+    hub_link = _format_hub_url_from_env(ref_code)
     web_link = _web_signup_link(ref_code, primary_link=primary_link)
-    hub_link = _format_hub_url_from_env(ref_code) or web_link
 
     wa_phone = _whatsapp_bot_phone()
     wa_text = f"START REF {ref_code}"
@@ -130,9 +145,15 @@ def build_referral_platform_links(code: Any, primary_link: Optional[str] = None)
     return {
         "code": ref_code,
         "hub": hub_link,
+        "smart": hub_link,
         "web": web_link,
+        "website": web_link,
         "whatsapp": whatsapp_link,
         "telegram": telegram_link,
+        "track_web": _track_and_go_link(ref_code, "website", web_link),
+        "track_website": _track_and_go_link(ref_code, "website", web_link),
+        "track_whatsapp": _track_and_go_link(ref_code, "whatsapp", whatsapp_link or web_link),
+        "track_telegram": _track_and_go_link(ref_code, "telegram", telegram_link or web_link),
         "whatsapp_fallback_text": wa_text,
         "telegram_fallback_text": f"START REF {ref_code}",
     }
@@ -140,7 +161,8 @@ def build_referral_platform_links(code: Any, primary_link: Optional[str] = None)
 
 def _platform_lines(links: dict[str, str]) -> str:
     lines = [
-        f"🌐 Website signup: {links.get('web') or links.get('hub')}",
+        f"🌐 Smart referral hub: {links.get('hub') or links.get('web')}",
+        f"🖥️ Website signup: {links.get('web') or links.get('hub')}",
     ]
 
     if links.get("whatsapp"):
@@ -189,10 +211,10 @@ def format_referral_code_message(
         f"Smart link: {links['hub']}\n\n"
         "Choose where to continue:\n"
         f"{_platform_lines(links)}\n\n"
-        "Share this code or any of the links with someone who wants Nigerian tax answers, calculators, reminders, filing guidance, or chat access.\n"
-        "Referral rewards apply according to the active referral policy after a successful paid subscription.\n\n"
+        "Share this code or the smart link with someone who wants Nigerian tax answers, calculators, reminders, filing guidance, or chat access.\n"
+        "Referral rewards apply according to the active referral policy after a successful paid subscription."
+        f"{warning}\n\n"
         "Reply R2 for only the smart link, R3 for a ready-to-share invitation, or R4 for referral statistics."
-        f"{warning}"
     )
 
 
@@ -201,19 +223,13 @@ def format_referral_link_message(
     link: Optional[str] = None,
     *,
     channel: str = "generic",
-    err: Optional[str] = None,
 ) -> str:
     links = build_referral_platform_links(code, primary_link=link)
-    warning = "\n\nNote: I used a safe fallback link because the referral profile could not be fully refreshed." if err else ""
-
     return (
-        "🔗 *My Smart Referral Link*\n\n"
+        "🔗 *Smart Referral Link*\n\n"
         f"{links['hub']}\n\n"
-        f"Referral code: {links['code']}\n\n"
-        "Platform options:\n"
-        f"{_platform_lines(links)}\n\n"
-        "Copy and share with friends, colleagues, small business owners, or tax learners."
-        f"{warning}"
+        "This link lets the invited user choose Website, WhatsApp, or Telegram from one simple hub.\n\n"
+        "Reply R1 for all platform links, R3 for a ready-to-share invitation, or 0 for main menu."
     )
 
 
@@ -229,9 +245,11 @@ def format_referral_invite_message(
         "📣 *Referral Invitation*\n\n"
         "Copy and share this message:\n\n"
         "Hi, I use Naija Tax Guide for Nigerian tax questions, calculators, filing guidance, reminders, and chat support.\n\n"
-        "You can join through any platform you prefer:\n"
-        f"{_platform_lines(links)}\n\n"
+        "Join through this smart referral hub and choose Website, WhatsApp, or Telegram:\n"
+        f"{links['hub']}\n\n"
         f"Referral code: {links['code']}\n\n"
+        "Direct options are also available:\n"
+        f"{_platform_lines(links)}\n\n"
         "After signup, you can use the website, WhatsApp, and Telegram channels where supported."
     )
 
@@ -249,7 +267,7 @@ def format_referral_landing_message(
         f"You were invited with referral code: {links['code']}.\n\n"
         "Choose where you want to continue:\n"
         f"{_platform_lines(links)}\n\n"
-        "For the referral reward to track correctly, use the website signup link or keep the referral code during signup.\n\n"
+        "For the referral reward to track correctly, use the smart hub or website signup link and keep the referral code during signup.\n\n"
         "Reply 0 for the main menu."
     )
 
