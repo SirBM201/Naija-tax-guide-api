@@ -1,3 +1,4 @@
+# app/routes/referral_hub.py
 from __future__ import annotations
 
 import os
@@ -9,22 +10,26 @@ from urllib.parse import quote_plus
 from flask import Blueprint, jsonify, redirect, request
 
 try:
-    from supabase import create_client
+    from app.core.supabase_client import get_supabase_client
 except Exception:  # pragma: no cover
-    create_client = None  # type: ignore
+    get_supabase_client = None  # type: ignore
 
 
-referral_hub_bp = Blueprint("referral_hub", __name__, url_prefix="/api/referral")
+bp = Blueprint("referral_hub", __name__)
 
-ROUTE_VERSION = "2026-05-28-v32b-referral-hub-tracking"
+ROUTE_VERSION = "2026-05-28-v32b1-referral-hub-get-method-fix"
 
 
-# ------------------------------------------------------------
-# Environment / client helpers
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------
+def _clean(value: Any) -> str:
+    return str(value or "").strip()
+
+
 def _clean_base_url(value: Optional[str], fallback: str) -> str:
-    base = (value or fallback or "").strip()
-    return base.rstrip("/")
+    raw = _clean(value) or fallback
+    return raw.rstrip("/")
 
 
 def _public_site_url() -> str:
@@ -32,16 +37,17 @@ def _public_site_url() -> str:
         os.getenv("PUBLIC_SITE_URL")
         or os.getenv("FRONTEND_BASE_URL")
         or os.getenv("NEXT_PUBLIC_SITE_URL")
-        or os.getenv("APP_PUBLIC_URL"),
+        or os.getenv("APP_PUBLIC_URL")
+        or os.getenv("APP_BASE_URL"),
         "https://naijataxguides.com",
     )
 
 
 def _backend_base_url() -> str:
+    # Used only for optional tracking redirects.
     return _clean_base_url(
         os.getenv("BACKEND_BASE_URL")
         or os.getenv("API_BASE_URL")
-        or os.getenv("APP_BASE_URL")
         or os.getenv("KOYEB_PUBLIC_URL"),
         "",
     )
@@ -52,20 +58,30 @@ def _whatsapp_bot_number() -> str:
         os.getenv("WHATSAPP_BOT_PHONE_NUMBER")
         or os.getenv("WHATSAPP_BUSINESS_PHONE_NUMBER")
         or os.getenv("WHATSAPP_PHONE_NUMBER")
+        or os.getenv("META_WHATSAPP_DISPLAY_PHONE_NUMBER")
         or "2347034941158"
     )
     digits = re.sub(r"\D+", "", raw)
+    if digits.startswith("00"):
+        digits = digits[2:]
     return digits
 
 
 def _telegram_bot_username() -> str:
-    raw = os.getenv("TELEGRAM_BOT_USERNAME") or os.getenv("TELEGRAM_BOT_NAME") or "naija_tax_guide_bot"
-    return raw.strip().lstrip("@")
+    raw = (
+        os.getenv("TELEGRAM_BOT_USERNAME")
+        or os.getenv("TELEGRAM_BOT_NAME")
+        or os.getenv("TG_BOT_USERNAME")
+        or "naija_tax_guide_bot"
+    )
+    username = raw.strip().lstrip("@")
+    username = re.sub(r"[^A-Za-z0-9_]+", "", username)
+    return username or "naija_tax_guide_bot"
 
 
 def _normalize_ref_code(value: Any) -> str:
-    code = str(value or "").strip().upper()
-    code = re.sub(r"[^A-Z0-9_-]", "", code)
+    code = _clean(value).upper()
+    code = re.sub(r"[^A-Z0-9_-]+", "", code)
     return code[:80]
 
 
@@ -76,58 +92,37 @@ def _request_ip() -> str:
     return request.remote_addr or ""
 
 
-def _get_supabase_client():
-    """
-    Tries existing project helpers first, then falls back to direct Supabase client.
-    This keeps the route compatible with different versions of your backend.
-    """
-    for module_path, attr_name in (
-        ("app.core.supabase_client", "get_supabase_client"),
-        ("app.core.supabase_client", "supabase"),
-        ("app.core.supabase_client", "client"),
-    ):
+def _sb():
+    if get_supabase_client is None:
+        return None
+    try:
+        return get_supabase_client(admin=True)
+    except TypeError:
         try:
-            module = __import__(module_path, fromlist=[attr_name])
-            attr = getattr(module, attr_name, None)
-            if callable(attr):
-                client = attr()
-                if client is not None:
-                    return client
-            if attr is not None:
-                return attr
+            return get_supabase_client()
         except Exception:
-            pass
-
-    if create_client is None:
+            return None
+    except Exception:
         return None
 
-    url = os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL")
-    key = (
-        os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-        or os.getenv("SUPABASE_SERVICE_KEY")
-        or os.getenv("SUPABASE_ANON_KEY")
-        or os.getenv("NEXT_PUBLIC_SUPABASE_ANON_KEY")
-    )
-    if not url or not key:
-        return None
-    return create_client(url, key)
 
-
-# ------------------------------------------------------------
-# Public link builder
-# ------------------------------------------------------------
-def build_referral_links(ref_code: str) -> Dict[str, str]:
+# ---------------------------------------------------------------------
+# Link builder
+# ---------------------------------------------------------------------
+def build_referral_links(ref_code: Any) -> Dict[str, str]:
     code = _normalize_ref_code(ref_code)
     site = _public_site_url()
     backend = _backend_base_url()
-    wa_number = _whatsapp_bot_number()
-    tg_username = _telegram_bot_username()
 
     website = f"{site}/signup?ref={quote_plus(code)}"
     smart = f"{site}/r/{quote_plus(code)}"
+
+    wa_number = _whatsapp_bot_number()
     whatsapp_text = quote_plus(f"START REF {code}")
-    whatsapp = f"https://wa.me/{wa_number}?text={whatsapp_text}"
-    telegram = f"https://t.me/{tg_username}?start=ref_{quote_plus(code)}"
+    whatsapp = f"https://wa.me/{wa_number}?text={whatsapp_text}" if wa_number else website
+
+    tg_username = _telegram_bot_username()
+    telegram = f"https://t.me/{tg_username}?start=ref_{quote_plus(code)}" if tg_username else website
 
     if backend:
         track_website = f"{backend}/api/referral/track-and-go/{quote_plus(code)}/website"
@@ -150,69 +145,104 @@ def build_referral_links(ref_code: str) -> Dict[str, str]:
     }
 
 
-def _platform_destination(ref_code: str, platform: str) -> str:
+def _platform_destination(ref_code: Any, platform: Any) -> str:
     links = build_referral_links(ref_code)
-    key = (platform or "website").strip().lower()
-    if key in {"web", "website", "site", "signup"}:
+    chosen = _clean(platform).lower()
+
+    if chosen in {"web", "website", "site", "signup"}:
         return links["website"]
-    if key in {"wa", "whatsapp"}:
+    if chosen in {"wa", "whatsapp"}:
         return links["whatsapp"]
-    if key in {"tg", "telegram"}:
+    if chosen in {"tg", "telegram"}:
         return links["telegram"]
-    if key in {"smart", "hub"}:
+    if chosen in {"smart", "hub"}:
         return links["smart"]
+
     return links["website"]
 
 
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------
 # Tracking
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------
 def _safe_insert_referral_event(payload: Dict[str, Any]) -> Dict[str, Any]:
-    sb = _get_supabase_client()
+    """
+    Tracking must never break the public referral hub.
+    If the SQL table is missing or Supabase is unavailable, the route still works.
+    """
+    sb = _sb()
     if sb is None:
         return {"ok": False, "error": "supabase_client_unavailable"}
 
     try:
-        row = {
+        row: Dict[str, Any] = {
             "referral_code": _normalize_ref_code(payload.get("referral_code")),
-            "event_type": str(payload.get("event_type") or "hub_view")[:80],
-            "selected_platform": (payload.get("selected_platform") or None),
-            "visitor_token": (payload.get("visitor_token") or None),
-            "channel_type": (payload.get("channel_type") or None),
-            "provider_user_id": (payload.get("provider_user_id") or None),
-            "account_id": (payload.get("account_id") or None),
-            "landing_url": (payload.get("landing_url") or None),
-            "user_agent": (payload.get("user_agent") or request.headers.get("user-agent") or None),
-            "ip_address": (payload.get("ip_address") or _request_ip() or None),
+            "event_type": _clean(payload.get("event_type") or "hub_view")[:80],
+            "selected_platform": _clean(payload.get("selected_platform")) or None,
+            "visitor_token": _clean(payload.get("visitor_token")) or None,
+            "channel_type": _clean(payload.get("channel_type")) or None,
+            "provider_user_id": _clean(payload.get("provider_user_id")) or None,
+            "account_id": _clean(payload.get("account_id")) or None,
+            "landing_url": _clean(payload.get("landing_url")) or None,
+            "user_agent": _clean(payload.get("user_agent") or request.headers.get("user-agent")) or None,
+            "ip_address": _clean(payload.get("ip_address") or _request_ip()) or None,
             "metadata": payload.get("metadata") or {},
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
-        # Remove blank account_id to avoid UUID cast failures.
+
+        # Avoid UUID cast failures when blank.
         if not row.get("account_id"):
             row.pop("account_id", None)
-        result = sb.table("referral_hub_events").insert(row).execute()
-        return {"ok": True, "inserted": True, "data": getattr(result, "data", None)}
+
+        res = sb.table("referral_hub_events").insert(row).execute()
+        return {"ok": True, "inserted": True, "data": getattr(res, "data", None)}
     except Exception as exc:
-        # Tracking must never break referral routing.
-        return {"ok": False, "error": str(exc)[:500]}
+        return {"ok": False, "error": repr(exc)[:700]}
 
 
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------
 # Routes
-# ------------------------------------------------------------
-@referral_hub_bp.get("/health")
+# Important:
+# This project registers route modules under /api from app/__init__.py.
+# Therefore this blueprint has NO url_prefix.
+# Final URLs:
+#   GET  /api/referral/health
+#   GET  /api/referral/hub/<code>
+#   POST /api/referral/track
+#   GET  /api/referral/track-and-go/<code>/<platform>
+# ---------------------------------------------------------------------
+@bp.get("/referral/health")
 def referral_hub_health():
-    return jsonify({"ok": True, "route_version": ROUTE_VERSION})
+    return jsonify(
+        {
+            "ok": True,
+            "route_version": ROUTE_VERSION,
+            "message": "Referral hub route is active.",
+            "expected_urls": [
+                "/api/referral/health",
+                "/api/referral/hub/NTGR6RKUG",
+                "/api/referral/track-and-go/NTGR6RKUG/website",
+                "/api/referral/track-and-go/NTGR6RKUG/whatsapp",
+                "/api/referral/track-and-go/NTGR6RKUG/telegram",
+            ],
+        }
+    ), 200
 
 
-@referral_hub_bp.get("/hub/<ref_code>")
+@bp.get("/referral/hub/<ref_code>")
 def referral_hub_payload(ref_code: str):
     code = _normalize_ref_code(ref_code)
     if not code:
-        return jsonify({"ok": False, "error": "missing_referral_code", "route_version": ROUTE_VERSION}), 400
+        return jsonify(
+            {
+                "ok": False,
+                "route_version": ROUTE_VERSION,
+                "error": "missing_referral_code",
+            }
+        ), 400
 
     links = build_referral_links(code)
-    tracking_result = _safe_insert_referral_event(
+
+    tracking = _safe_insert_referral_event(
         {
             "referral_code": code,
             "event_type": "hub_view",
@@ -232,32 +262,49 @@ def referral_hub_payload(ref_code: str):
             "route_version": ROUTE_VERSION,
             "referral_code": code,
             "links": links,
-            "tracking": {"ok": bool(tracking_result.get("ok"))},
+            "tracking": {
+                "ok": bool(tracking.get("ok")),
+                "non_blocking": True,
+            },
         }
-    )
+    ), 200
 
 
-@referral_hub_bp.post("/track")
+@bp.route("/referral/track", methods=["GET", "POST"])
 def referral_hub_track():
-    body = request.get_json(silent=True) or {}
-    code = _normalize_ref_code(body.get("referral_code") or body.get("code"))
-    platform = str(body.get("selected_platform") or body.get("platform") or "").strip().lower()
+    if request.method == "GET":
+        code = _normalize_ref_code(request.args.get("referral_code") or request.args.get("code"))
+        platform = _clean(request.args.get("selected_platform") or request.args.get("platform")).lower()
+        event_type = _clean(request.args.get("event_type") or "platform_select")[:80]
+        body: Dict[str, Any] = {}
+    else:
+        body = request.get_json(silent=True) or {}
+        code = _normalize_ref_code(body.get("referral_code") or body.get("code"))
+        platform = _clean(body.get("selected_platform") or body.get("platform")).lower()
+        event_type = _clean(body.get("event_type") or "platform_select")[:80]
 
     if not code:
-        return jsonify({"ok": False, "error": "missing_referral_code", "route_version": ROUTE_VERSION}), 400
+        return jsonify(
+            {
+                "ok": False,
+                "route_version": ROUTE_VERSION,
+                "error": "missing_referral_code",
+            }
+        ), 400
 
-    event_type = str(body.get("event_type") or "platform_select")[:80]
-    tracking_result = _safe_insert_referral_event(
+    tracking = _safe_insert_referral_event(
         {
             "referral_code": code,
             "event_type": event_type,
             "selected_platform": platform or None,
-            "visitor_token": body.get("visitor_token"),
-            "channel_type": body.get("channel_type"),
-            "provider_user_id": body.get("provider_user_id"),
-            "account_id": body.get("account_id"),
-            "landing_url": body.get("landing_url") or request.referrer,
+            "visitor_token": body.get("visitor_token") if body else request.args.get("visitor_token"),
+            "channel_type": body.get("channel_type") if body else request.args.get("channel_type"),
+            "provider_user_id": body.get("provider_user_id") if body else request.args.get("provider_user_id"),
+            "account_id": body.get("account_id") if body else request.args.get("account_id"),
+            "landing_url": (body.get("landing_url") if body else request.args.get("landing_url")) or request.referrer,
             "metadata": {
+                "method": request.method,
+                "query": dict(request.args),
                 "body": body,
                 "route": "/api/referral/track",
             },
@@ -271,15 +318,19 @@ def referral_hub_track():
             "referral_code": code,
             "selected_platform": platform,
             "destination": _platform_destination(code, platform),
-            "tracking": {"ok": bool(tracking_result.get("ok"))},
+            "tracking": {
+                "ok": bool(tracking.get("ok")),
+                "non_blocking": True,
+            },
         }
-    )
+    ), 200
 
 
-@referral_hub_bp.get("/track-and-go/<ref_code>/<platform>")
+@bp.get("/referral/track-and-go/<ref_code>/<platform>")
 def referral_track_and_go(ref_code: str, platform: str):
     code = _normalize_ref_code(ref_code)
-    chosen = str(platform or "website").strip().lower()
+    chosen = _clean(platform).lower()
+
     if not code:
         return redirect(_public_site_url(), code=302)
 
@@ -297,4 +348,5 @@ def referral_track_and_go(ref_code: str, platform: str):
         }
     )
 
-    return redirect(_platform_destination(code, chosen), code=302)
+    return redirect(_platform_destination(code, chosen), code=302
+    )
