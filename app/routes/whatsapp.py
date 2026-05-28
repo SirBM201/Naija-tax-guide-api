@@ -55,9 +55,27 @@ except Exception:  # pragma: no cover
     build_referral_link = None  # type: ignore
 
 
+try:
+    from app.services.referral_hub import (
+        extract_referral_start_code,
+        format_referral_code_message,
+        format_referral_invite_message,
+        format_referral_landing_message,
+        format_referral_link_message,
+        format_referral_menu_message,
+    )
+except Exception:  # pragma: no cover
+    extract_referral_start_code = None  # type: ignore
+    format_referral_code_message = None  # type: ignore
+    format_referral_invite_message = None  # type: ignore
+    format_referral_landing_message = None  # type: ignore
+    format_referral_link_message = None  # type: ignore
+    format_referral_menu_message = None  # type: ignore
+
+
 bp = Blueprint("whatsapp", __name__)
 
-WHATSAPP_FLOW_VERSION = "2026-05-25-v33d-quiz-q5-value-separation"
+WHATSAPP_FLOW_VERSION = "2026-05-28-v34a-batch32a-multi-platform-referral-hub"
 
 
 # =============================================================================
@@ -4909,10 +4927,13 @@ def _handle_credit_activity_command(wa_id: str, account_id: str, text: str) -> D
 # =============================================================================
 
 def _referral_menu() -> str:
+    if callable(format_referral_menu_message):
+        return format_referral_menu_message("YOURCODE", channel="whatsapp")  # type: ignore[misc]
+
     return (
         "🤝 *Referral Centre*\n\n"
-        "R1 - My referral code\n"
-        "R2 - My referral link\n"
+        "R1 - My referral code + platform links\n"
+        "R2 - Smart referral link\n"
         "R3 - Share referral invitation\n"
         "R4 - Referral statistics\n"
         "R5 - Referral rewards\n"
@@ -4920,7 +4941,6 @@ def _referral_menu() -> str:
         "Reply with R1, R2, R3, R4, R5, or R6.\n"
         "Reply 0 for main menu."
     )
-
 
 def _referral_fallback_code(account_id: str) -> str:
     clean_id = _clean(account_id).replace("-", "")
@@ -5043,6 +5063,13 @@ def _referral_totals(summary: Dict[str, Any]) -> Dict[str, Any]:
 
 def _referral_code_text(account_id: str) -> str:
     code, link, err = _referral_profile_code_link(account_id)
+
+    if callable(format_referral_code_message):
+        return _clip(
+            format_referral_code_message(code, link, channel="whatsapp", err=err),  # type: ignore[misc]
+            3900,
+        )
+
     warning = ""
     if err and _debug_enabled():
         warning = f"\n\nDebug note: {_clip(err, 300)}"
@@ -5057,9 +5084,15 @@ def _referral_code_text(account_id: str) -> str:
         f"{warning}"
     )
 
-
 def _referral_link_text(account_id: str) -> str:
     code, link, err = _referral_profile_code_link(account_id)
+
+    if callable(format_referral_link_message):
+        return _clip(
+            format_referral_link_message(code, link, channel="whatsapp", err=err),  # type: ignore[misc]
+            3900,
+        )
+
     warning = ""
     if err and _debug_enabled():
         warning = f"\n\nDebug note: {_clip(err, 300)}"
@@ -5073,9 +5106,15 @@ def _referral_link_text(account_id: str) -> str:
         f"{warning}"
     )
 
-
 def _referral_share_text(account_id: str) -> str:
     code, link, _err = _referral_profile_code_link(account_id)
+
+    if callable(format_referral_invite_message):
+        return _clip(
+            format_referral_invite_message(code, link, channel="whatsapp"),  # type: ignore[misc]
+            3900,
+        )
+
     return (
         "📣 *Share Referral Invitation*\n\n"
         "You can copy and forward this message:\n\n"
@@ -5084,7 +5123,6 @@ def _referral_share_text(account_id: str) -> str:
         f"Referral code: {code}\n\n"
         "After signup, you can use the web app and supported chat channels."
     )
-
 
 def _referral_stats_text(account_id: str) -> str:
     summary, err = _referral_summary_data(account_id)
@@ -6559,6 +6597,21 @@ def _handle_text_message(msg: Dict[str, Any]) -> Dict[str, Any]:
             "debug": account_debug if _debug_enabled() else None,
         }
 
+    referral_start_code = extract_referral_start_code(text) if callable(extract_referral_start_code) else ""
+    if referral_start_code:
+        _set_session_state(wa_id, "main")
+        body = (
+            format_referral_landing_message(referral_start_code, channel="whatsapp")  # type: ignore[misc]
+            if callable(format_referral_landing_message)
+            else f"🎉 Welcome to Naija Tax Guide\n\nReferral code: {referral_start_code}\n\nReply 0 for the main menu."
+        )
+        return {
+            "ok": True,
+            "handled": "referral_start",
+            "referral_code": referral_start_code,
+            "send_result": _send_whatsapp_text(wa_id, _clip(body, 3900)),
+        }
+
     if context == "collect_email":
         if not _is_valid_email(text):
             return {
@@ -7009,4 +7062,3 @@ def whatsapp_test_reply():
     data = _safe_json()
     result = _send_whatsapp_text(_normalize_phone(data.get("to")), _clean(data.get("text") or "Naija Tax Guide WhatsApp test message."))
     return jsonify(result), 200 if result.get("ok") else 400
-
