@@ -39,6 +39,11 @@ from app.services.tax_filing_service import (
     submit_tax_filing,
 )
 
+from app.services.referral_hub import (
+    format_referral_code_message,
+    format_referral_invite_message,
+)
+
 # Batch 27B1 fix: use the imported Supabase client object directly; do not call supabase().
 
 bp = Blueprint("telegram", __name__)
