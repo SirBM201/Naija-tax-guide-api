@@ -4,10 +4,10 @@ from __future__ import annotations
 import os
 import re
 from typing import Any, Optional
-from urllib.parse import quote, urlencode, urlsplit, urlunsplit, parse_qsl
+from urllib.parse import parse_qsl, quote, unquote_plus, urlencode, urlsplit, urlunsplit
 
 
-REFERRAL_HUB_VERSION = "2026-05-28-batch32c-smart-referral-hub-default"
+REFERRAL_HUB_VERSION = "2026-05-28-batch32d-whatsapp-referral-parser-hardening"
 
 
 def _clean(value: Any) -> str:
@@ -37,7 +37,12 @@ def _public_site_url() -> str:
 
 
 def _backend_base_url() -> str:
-    return _env_first("BACKEND_BASE_URL", "API_BASE_URL", "NEXT_PUBLIC_API_BASE_URL", "KOYEB_PUBLIC_URL").rstrip("/")
+    return _env_first(
+        "BACKEND_BASE_URL",
+        "API_BASE_URL",
+        "NEXT_PUBLIC_API_BASE_URL",
+        "KOYEB_PUBLIC_URL",
+    ).rstrip("/")
 
 
 def _safe_base_url() -> str:
@@ -109,7 +114,10 @@ def _whatsapp_bot_phone() -> str:
 
 
 def _telegram_bot_username() -> str:
-    username = _env_first("TELEGRAM_BOT_USERNAME", "TG_BOT_USERNAME", "TELEGRAM_USERNAME", "TG_USERNAME") or "naija_tax_guide_bot"
+    username = (
+        _env_first("TELEGRAM_BOT_USERNAME", "TG_BOT_USERNAME", "TELEGRAM_USERNAME", "TG_USERNAME")
+        or "naija_tax_guide_bot"
+    )
     username = username.lstrip("@").strip()
     username = re.sub(r"[^A-Za-z0-9_]+", "", username)
     return username
@@ -272,28 +280,87 @@ def format_referral_landing_message(
     )
 
 
+def _decode_user_text_once_or_twice(value: str) -> str:
+    """
+    WhatsApp deep links can deliver:
+      START REF NTGR6RKUG
+      START%20REF%20NTGR6RKUG
+      START+REF+NTGR6RKUG
+
+    Decode gently without breaking normal typed commands.
+    """
+    text = _clean(value)
+    if not text:
+        return ""
+
+    decoded = text
+    for _ in range(2):
+        try:
+            candidate = unquote_plus(decoded)
+        except Exception:
+            break
+        if candidate == decoded:
+            break
+        decoded = candidate
+
+    return decoded.strip()
+
+
+def _first_valid_referral_code_from_text(value: str) -> str:
+    """
+    Extract the first valid referral code from a noisy referral start string.
+
+    This intentionally uses search-based matching, not only full-line matching, because
+    WhatsApp sometimes duplicates the prefilled text, for example:
+      START REF NTGR6RKUGSTART REF NTGR6RKUG
+    """
+    text = _decode_user_text_once_or_twice(value)
+    if not text:
+        return ""
+
+    # Normalize common separators while preserving code characters.
+    normalized = text.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+
+    # Add spacing between a code and an accidentally repeated START token:
+    # NTGR6RKUGSTART REF NTGR6RKUG -> NTGR6RKUG START REF NTGR6RKUG
+    normalized = re.sub(r"([A-Za-z0-9_-]{4,80})(START\s+REF\b)", r"\1 \2", normalized, flags=re.I)
+    normalized = re.sub(r"([A-Za-z0-9_-]{4,80})(REF\b)", r"\1 \2", normalized, flags=re.I)
+
+    patterns = [
+        r"(?:^|\b)/start\s+(?:ref|referral|r|ntgref)?[_:\-\s]+([A-Za-z0-9_-]{4,80})(?=\b|$)",
+        r"(?:^|\b)(?:start\s+)?(?:ref|referral|ntgref)[_:\-\s]+([A-Za-z0-9_-]{4,80})(?=\b|$)",
+        r"(?:^|\b)(?:join|invite)[_:\-\s]+([A-Za-z0-9_-]{4,80})(?=\b|$)",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, normalized, flags=re.I)
+        if match:
+            code = _sanitize_code(match.group(1))
+            if len(code) >= 4:
+                return code
+
+    return ""
+
+
 def extract_referral_start_code(text: Any) -> str:
     """
     Accept direct bot referral starts:
       /start ref_NTGR6RKUG
+      /start ref NTGR6RKUG
       START REF NTGR6RKUG
+      START%20REF%20NTGR6RKUG
       REF NTGR6RKUG
       JOIN NTGR6RKUG
+
+    Batch 32D:
+    - Handles WhatsApp duplicated prefilled text:
+        START REF NTGR6RKUGSTART REF NTGR6RKUG
+    - Handles URL-encoded and plus-encoded text.
+    - Uses first valid referral token only, so duplicate text cannot create a bad code.
     """
     raw = _clean(text)
     if not raw:
         return ""
 
-    patterns = [
-        r"^/start\s+(?:ref|referral|r|ntgref)[_:\-\s]+([A-Za-z0-9_-]{4,80})$",
-        r"^/start\s+([A-Za-z0-9_-]{4,80})$",
-        r"^(?:start\s+)?(?:ref|referral|ntgref)[_:\-\s]+([A-Za-z0-9_-]{4,80})$",
-        r"^(?:join|invite)\s+([A-Za-z0-9_-]{4,80})$",
-    ]
-
-    for pattern in patterns:
-        match = re.match(pattern, raw, flags=re.I)
-        if match:
-            return _sanitize_code(match.group(1))
-
-    return ""
+    return _first_valid_referral_code_from_text(raw)
