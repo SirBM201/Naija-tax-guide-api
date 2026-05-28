@@ -1,1046 +1,1228 @@
 # app/routes/cron.py
 from __future__ import annotations
 
-import logging
 import os
-import hmac
-from datetime import date, datetime, time, timezone
-from decimal import Decimal
-from typing import Any, Dict, List, Optional, Tuple
+import re
+from datetime import date, datetime, time, timedelta, timezone
+from typing import Any
 
-from flask import Blueprint, jsonify, request
-
-try:
-    from zoneinfo import ZoneInfo
-except Exception:  # pragma: no cover
-    ZoneInfo = None  # type: ignore
+import requests
+from flask import Blueprint, current_app, jsonify, request
+from zoneinfo import ZoneInfo
 
 
-bp = Blueprint("cron", __name__)
-
-ROUTE_VERSION = "2026-05-28-v31a-cron-auth-deadline-safe-delivery"
-logger = logging.getLogger(__name__)
+cron_bp = Blueprint("cron", __name__)
+bp = cron_bp
 
 
-# -----------------------------------------------------------------------------
+# ============================================================
+# Batch 31D: Final production cron monitoring response cleanup
+# Route version:
+# 2026-05-28-v31d-production-cron-monitoring-cleanup
+#
+# Purpose:
+# - Keep cron-job.org history clean in production.
+# - Keep full debug output available only with debug=1.
+# - Preserve Batch 31A safe deadline delivery behavior.
+# - Prevent duplicate same-day reminder delivery using sent keys.
+# - Support Telegram and WhatsApp reminder delivery.
+# ============================================================
+
+CRON_ROUTE_VERSION = "2026-05-28-v31d-production-cron-monitoring-cleanup"
+
+DEFAULT_TIMEZONE = os.getenv("APP_TIMEZONE", "Africa/Lagos")
+DEFAULT_LIMIT = 50
+MAX_LIMIT = 200
+
+SUPPORTED_REMINDER_MODES = {"telegram", "whatsapp"}
+
+
+# ============================================================
 # Generic helpers
-# -----------------------------------------------------------------------------
-
-def _clean(value: Any) -> str:
-    return str(value or "").strip()
-
-
-def _lower(value: Any) -> str:
-    return _clean(value).lower()
-
+# ============================================================
 
 def _truthy(value: Any) -> bool:
-    return _lower(value) in {"1", "true", "yes", "y", "on", "send", "live"}
-
-
-def _now_utc() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def _now_lagos() -> datetime:
-    """
-    Default business time for Nigerian tax reminders.
-
-    If ZoneInfo is unavailable for any reason, UTC is used as a safe fallback.
-    """
-    if ZoneInfo is None:
-        return _now_utc()
-    try:
-        return datetime.now(ZoneInfo("Africa/Lagos"))
-    except Exception:
-        return _now_utc()
-
-
-def _now_iso() -> str:
-    return _now_utc().isoformat()
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
     try:
-        if value is None or value == "":
-            return default
         return int(value)
     except Exception:
         return default
 
 
-def _to_decimal(value: Any, default: Decimal = Decimal("0")) -> Decimal:
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _app_now() -> datetime:
     try:
-        if value is None:
-            return default
-        return Decimal(str(value))
+        return datetime.now(ZoneInfo(DEFAULT_TIMEZONE))
     except Exception:
-        return default
+        return datetime.now(timezone.utc)
 
 
-def _clip(value: Any, limit: int = 900) -> str:
-    text = str(value or "")
-    return text if len(text) <= limit else text[:limit] + "..."
-
-
-def _parse_json() -> Dict[str, Any]:
-    try:
-        body = request.get_json(silent=True)
-        return body if isinstance(body, dict) else {}
-    except Exception:
-        return {}
-
-
-def _json_error(error: str, status: int = 400, **extra: Any):
-    payload: Dict[str, Any] = {
-        "ok": False,
-        "error": error,
-        "route_version": ROUTE_VERSION,
-    }
-    payload.update(extra)
-    return jsonify(payload), status
-
-
-def _get_supabase():
-    from app.core.supabase_client import get_supabase_client
-
-    return get_supabase_client(admin=True)
-
-
-def _response_data(response: Any) -> List[Dict[str, Any]]:
-    rows = getattr(response, "data", None) or []
-    return rows if isinstance(rows, list) else []
-
-
-def _request_value(body: Dict[str, Any], key: str, default: Any = None) -> Any:
-    if key in body:
-        return body.get(key)
-    return request.args.get(key, default)
-
-
-# -----------------------------------------------------------------------------
-# Cron authorization
-# -----------------------------------------------------------------------------
-
-def _cron_secret() -> str:
+def _arg(name: str, default: Any = None) -> Any:
     """
-    Use CRON_SECRET as the official production env variable.
-
-    ADMIN_CRON_SECRET and CRON_JOB_SECRET remain supported so older deployments
-    do not break during transition.
+    Reads from query string first, then JSON body, then form body.
+    Useful for GET from cron-job.org and manual POST tests.
     """
-    return _clean(
-        os.getenv("CRON_SECRET")
-        or os.getenv("ADMIN_CRON_SECRET")
-        or os.getenv("CRON_JOB_SECRET")
-    )
-
-
-def _get_supplied_cron_secret(body: Optional[Dict[str, Any]] = None) -> str:
-    body = body if isinstance(body, dict) else {}
-
-    authorization = _clean(request.headers.get("Authorization"))
-    bearer_value = ""
-    if authorization.lower().startswith("bearer "):
-        bearer_value = authorization[7:].strip()
-
-    header_value = (
-        request.headers.get("X-Cron-Secret")
-        or request.headers.get("X-Cron-Token")
-        or request.headers.get("X-Webhook-Secret")
-        or request.headers.get("X-Admin-Key")
-        or ""
-    )
-
-    body_value = _clean(body.get("cron_secret") or body.get("cron_token") or body.get("token"))
-
-    # Query-string tokens can leak into logs. Keep disabled unless intentionally enabled.
-    query_value = ""
-    if _truthy(os.getenv("CRON_ALLOW_QUERY_SECRET")):
-        query_value = _clean(
-            request.args.get("cron_secret")
-            or request.args.get("cron_token")
-            or request.args.get("token")
-            or ""
-        )
-
-    return _clean(bearer_value or header_value or body_value or query_value)
-
-
-def _cron_authorized(body: Optional[Dict[str, Any]] = None) -> bool:
-    expected = _cron_secret()
-    supplied = _get_supplied_cron_secret(body)
-    if not expected or not supplied:
-        return False
-    return hmac.compare_digest(supplied, expected)
-
-
-def _require_cron_auth(body: Optional[Dict[str, Any]] = None):
-    if _cron_authorized(body):
-        return None
-
-    return _json_error(
-        "unauthorized",
-        401,
-        message=(
-            "Missing or invalid cron secret. Use Authorization: Bearer <CRON_SECRET> "
-            "or X-Cron-Secret: <CRON_SECRET>."
-        ),
-        secret_configured=bool(_cron_secret()),
-        accepted_headers=["Authorization: Bearer ...", "X-Cron-Secret", "X-Cron-Token"],
-        query_secret_allowed=_truthy(os.getenv("CRON_ALLOW_QUERY_SECRET")),
-    )
-
-
-# -----------------------------------------------------------------------------
-# Health / diagnostics
-# -----------------------------------------------------------------------------
-
-@bp.route("/cron/health", methods=["GET"])
-def cron_health():
-    return jsonify(
-        {
-            "ok": True,
-            "service": "cron",
-            "route_version": ROUTE_VERSION,
-            "cron_secret_configured": bool(_cron_secret()),
-            "query_secret_allowed": _truthy(os.getenv("CRON_ALLOW_QUERY_SECRET")),
-            "deadline_send_enabled_env": _truthy(os.getenv("DEADLINE_REMINDER_SEND_ENABLED")),
-            "payout_enabled_env": _truthy(os.getenv("REFERRAL_PAYOUT_ENABLED") or os.getenv("PAYOUT_ENABLED")),
-            "server_time_utc": _now_iso(),
-            "server_time_lagos": _now_lagos().isoformat(),
-        }
-    ), 200
-
-
-@bp.route("/cron/test", methods=["GET", "POST"])
-def cron_test():
-    body = _parse_json()
-    auth_error = _require_cron_auth(body)
-    if auth_error:
-        return auth_error
-
-    return jsonify(
-        {
-            "ok": True,
-            "service": "cron",
-            "route_version": ROUTE_VERSION,
-            "method": request.method,
-            "timestamp_utc": _now_iso(),
-            "timestamp_lagos": _now_lagos().isoformat(),
-            "message": "Cron blueprint is working and authentication passed.",
-        }
-    ), 200
-
-
-# -----------------------------------------------------------------------------
-# Deadline reminder cron
-# -----------------------------------------------------------------------------
-
-def _parse_date(value: Any) -> Optional[date]:
-    raw = _clean(value)
-    if not raw:
-        return None
-    try:
-        if "T" in raw:
-            return datetime.fromisoformat(raw.replace("Z", "+00:00")).date()
-        return date.fromisoformat(raw[:10])
-    except Exception:
-        return None
-
-
-def _parse_time(value: Any, default: time = time(9, 0)) -> time:
-    raw = _clean(value)
-    if not raw:
-        return default
+    if name in request.args:
+        return request.args.get(name)
 
     try:
-        part = raw[:5]
-        hh, mm = part.split(":", 1)
-        hour = int(hh)
-        minute = int(mm)
-        if 0 <= hour <= 23 and 0 <= minute <= 59:
-            return time(hour, minute)
+        payload = request.get_json(silent=True) or {}
+        if isinstance(payload, dict) and name in payload:
+            return payload.get(name)
     except Exception:
         pass
+
+    if name in request.form:
+        return request.form.get(name)
 
     return default
 
 
-def _display_time(value: Any) -> str:
-    parsed = _parse_time(value)
-    return f"{parsed.hour:02d}:{parsed.minute:02d}"
+def _cron_debug_requested() -> bool:
+    """
+    Debug mode is manual only.
+    Do not add debug=1 to cron-job.org production URL.
+    """
+    return _truthy(_arg("debug"))
 
 
-def _business_today(body: Dict[str, Any]) -> date:
-    override = _parse_date(_request_value(body, "today"))
-    if override:
-        return override
-    return _now_lagos().date()
-
-
-def _business_now_time(body: Dict[str, Any]) -> time:
-    override = _clean(_request_value(body, "now_time"))
-    if override:
-        return _parse_time(override, default=time(23, 59))
-    return _now_lagos().time().replace(second=0, microsecond=0)
-
-
-def _deadline_reminder_date(row: Dict[str, Any]) -> Optional[date]:
-    due = _parse_date(row.get("due_date") or row.get("deadline_date"))
-    if not due:
+def _normalize_date(value: Any) -> str | None:
+    if value is None:
         return None
-    days_before = max(0, _safe_int(row.get("reminder_days_before"), 7))
-    try:
-        from datetime import timedelta
 
-        return due - timedelta(days=days_before)
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value.isoformat()
+
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    # Accept "2026-09-18", "2026-09-18T00:00:00", etc.
+    match = re.search(r"\d{4}-\d{2}-\d{2}", text)
+    if not match:
+        return None
+
+    return match.group(0)
+
+
+def _parse_date(value: Any) -> date | None:
+    normalized = _normalize_date(value)
+    if not normalized:
+        return None
+
+    try:
+        return date.fromisoformat(normalized)
     except Exception:
         return None
 
 
-def _deadline_sent_key(row: Dict[str, Any], today: date) -> str:
-    deadline_id = _clean(row.get("id"))
-    due = _clean(row.get("due_date") or row.get("deadline_date"))[:10]
-    days_before = _safe_int(row.get("reminder_days_before"), 7)
-    mode = _clean(row.get("reminder_mode") or row.get("mode") or "whatsapp").lower()
-    return f"deadline:{deadline_id}:{due}:{days_before}:{mode}:{today.isoformat()}"
+def _normalize_time(value: Any, default: str = "09:00") -> str:
+    if value is None:
+        return default
+
+    if isinstance(value, time):
+        return value.strftime("%H:%M")
+
+    text = str(value).strip()
+    if not text:
+        return default
+
+    # Accept "09:00", "09:00:00", "9:00"
+    match = re.search(r"(\d{1,2}):(\d{2})", text)
+    if not match:
+        return default
+
+    hour = max(0, min(23, _safe_int(match.group(1), 9)))
+    minute = max(0, min(59, _safe_int(match.group(2), 0)))
+
+    return f"{hour:02d}:{minute:02d}"
 
 
-def _already_sent_today(row: Dict[str, Any], sent_key: str, today: date) -> bool:
-    existing_key = _clean(row.get("last_reminder_sent_key") or row.get("reminder_sent_key"))
-    if existing_key and existing_key == sent_key:
-        return True
+def _normalize_mode(value: Any) -> list[str]:
+    """
+    Supports:
+    - "telegram"
+    - "whatsapp"
+    - "telegram,whatsapp"
+    - ["telegram", "whatsapp"]
+    """
+    if value is None:
+        return []
 
-    sent_at = _parse_date(row.get("last_reminder_sent_at") or row.get("reminder_sent_at"))
-    return bool(sent_at and sent_at == today)
+    if isinstance(value, list):
+        raw_items = value
+    else:
+        raw_items = re.split(r"[,/| ]+", str(value or "").strip())
+
+    modes: list[str] = []
+    for item in raw_items:
+        mode = str(item or "").strip().lower()
+        if not mode:
+            continue
+
+        if mode in {"wa", "whats_app", "whatsapp"}:
+            mode = "whatsapp"
+        elif mode in {"tg", "tele", "telegram"}:
+            mode = "telegram"
+
+        if mode and mode not in modes:
+            modes.append(mode)
+
+    return modes
 
 
-def _deadline_due_now(
-    row: Dict[str, Any],
-    today: date,
-    now_time: time,
-    *,
-    ignore_time: bool = False,
-    force: bool = False,
-) -> Tuple[bool, Dict[str, Any]]:
-    due = _parse_date(row.get("due_date") or row.get("deadline_date"))
-    days_before = max(0, _safe_int(row.get("reminder_days_before"), 7))
-    reminder_date = _deadline_reminder_date(row)
-    reminder_time = _parse_time(row.get("reminder_time"), default=time(9, 0))
-    sent_key = _deadline_sent_key(row, today)
+def _mask_target(value: Any) -> str | None:
+    """
+    Masks phone numbers / chat IDs in debug response.
+    Example:
+      96566805262 -> 965****5262
+      5351975324  -> 535****5324
+    """
+    if value is None:
+        return None
 
-    debug = {
-        "due_date": due.isoformat() if due else None,
-        "reminder_days_before": days_before,
-        "reminder_date": reminder_date.isoformat() if reminder_date else None,
-        "reminder_time": f"{reminder_time.hour:02d}:{reminder_time.minute:02d}",
-        "today": today.isoformat(),
-        "now_time": f"{now_time.hour:02d}:{now_time.minute:02d}",
-        "sent_key": sent_key,
+    text = str(value).strip()
+    if not text:
+        return None
+
+    if len(text) <= 6:
+        return "***"
+
+    return f"{text[:3]}****{text[-4:]}"
+
+
+def _compact_delivery(delivery: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "channel": delivery.get("channel"),
+        "ok": bool(delivery.get("ok")),
+        "to": _mask_target(delivery.get("to")),
+        "error": delivery.get("error") or delivery.get("reason"),
     }
 
-    if not due:
-        debug["reason"] = "missing_or_invalid_due_date"
-        return False, debug
 
-    if not bool(row.get("enabled", True)):
-        debug["reason"] = "disabled"
-        return False, debug
+def _json_error(
+    *,
+    message: str,
+    status_code: int = 400,
+    extra: dict[str, Any] | None = None,
+):
+    payload: dict[str, Any] = {
+        "ok": False,
+        "route_version": CRON_ROUTE_VERSION,
+        "error": message,
+    }
 
-    if due < today:
-        debug["reason"] = "deadline_already_passed"
-        return False, debug
+    if _cron_debug_requested() and extra:
+        payload["debug"] = extra
 
-    if reminder_date != today:
-        debug["reason"] = "not_reminder_date"
-        return False, debug
-
-    if not ignore_time and now_time < reminder_time:
-        debug["reason"] = "before_reminder_time"
-        return False, debug
-
-    if not force and _already_sent_today(row, sent_key, today):
-        debug["reason"] = "already_sent_today"
-        return False, debug
-
-    debug["reason"] = "due_now"
-    return True, debug
+    return jsonify(payload), status_code
 
 
-def _deadline_message(row: Dict[str, Any]) -> str:
-    tax_type = _clean(row.get("tax_type") or row.get("tax_name") or "Tax").upper()
-    due_date = _clean(row.get("due_date") or row.get("deadline_date"))[:10]
-    days = max(0, _safe_int(row.get("reminder_days_before"), 7))
+def _build_cron_response(
+    *,
+    today: str,
+    now_time: str,
+    send_enabled: bool,
+    dry_run: bool,
+    force: bool,
+    ignore_time: bool,
+    checked_count: int,
+    due_count: int,
+    delivery_count: int,
+    already_sent_count: int,
+    skipped_count: int,
+    deliveries: list[dict[str, Any]] | None = None,
+    due_items: list[dict[str, Any]] | None = None,
+    skipped_sample: list[dict[str, Any]] | None = None,
+    failed_count: int = 0,
+    extra_debug: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """
+    Production default:
+      Clean summary only.
+
+    Debug mode:
+      Shows detailed diagnostics only when debug=1 is passed manually.
+    """
+    deliveries = deliveries or []
+    due_items = due_items or []
+    skipped_sample = skipped_sample or []
+    extra_debug = extra_debug or {}
+
+    debug = _cron_debug_requested()
+
+    if failed_count <= 0:
+        failed_count = sum(1 for item in deliveries if not bool(item.get("ok")))
+
+    if delivery_count > 0 and failed_count == 0:
+        status = "delivered"
+    elif delivery_count > 0 and failed_count > 0:
+        status = "completed_with_delivery_errors"
+    elif due_count > 0 and dry_run:
+        status = "due_dry_run"
+    elif already_sent_count > 0 and due_count == 0:
+        status = "already_sent_or_no_new_due"
+    elif checked_count == 0:
+        status = "no_active_reminders_checked"
+    elif due_count == 0:
+        status = "no_due_reminders"
+    else:
+        status = "completed"
+
+    response: dict[str, Any] = {
+        "ok": True,
+        "route_version": CRON_ROUTE_VERSION,
+        "mode": "debug" if debug else "production",
+        "status": status,
+        "today": today,
+        "now_time": now_time,
+        "send_enabled": bool(send_enabled),
+        "dry_run": bool(dry_run),
+        "force": bool(force),
+        "ignore_time": bool(ignore_time),
+        "summary": {
+            "checked": _safe_int(checked_count),
+            "due": _safe_int(due_count),
+            "delivered": _safe_int(delivery_count),
+            "already_sent": _safe_int(already_sent_count),
+            "skipped": _safe_int(skipped_count),
+            "failed": _safe_int(failed_count),
+        },
+    }
+
+    if debug:
+        response["debug"] = {
+            "deliveries": [_compact_delivery(item) for item in deliveries],
+            "due_items": due_items,
+            "skipped_sample": skipped_sample,
+            **extra_debug,
+        }
+
+    return response
+
+
+# ============================================================
+# Supabase client helper
+# ============================================================
+
+def _get_supabase_client():
+    """
+    Flexible Supabase loader.
+
+    Supports common project patterns:
+    - app.core.supabase_client.get_supabase_admin_client()
+    - app.core.supabase_client.get_supabase_client()
+    - app.core.supabase_client.supabase_admin
+    - app.core.supabase_client.supabase
+    - direct create_client fallback from env
+    """
+    try:
+        from app.core import supabase_client as sc  # type: ignore
+
+        for name in (
+            "get_supabase_admin_client",
+            "get_admin_supabase_client",
+            "get_service_supabase_client",
+            "get_supabase_client",
+        ):
+            fn = getattr(sc, name, None)
+            if callable(fn):
+                client = fn()
+                if client is not None:
+                    return client
+
+        for name in (
+            "supabase_admin",
+            "admin_supabase",
+            "service_supabase",
+            "supabase",
+            "client",
+        ):
+            client = getattr(sc, name, None)
+            if client is not None:
+                return client
+
+    except Exception as exc:
+        current_app.logger.warning("cron.supabase_import_warning: %s", exc)
+
+    try:
+        from supabase import create_client  # type: ignore
+
+        url = os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL")
+        key = (
+            os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+            or os.getenv("SUPABASE_SERVICE_KEY")
+            or os.getenv("SUPABASE_KEY")
+            or os.getenv("NEXT_PUBLIC_SUPABASE_ANON_KEY")
+        )
+
+        if not url or not key:
+            raise RuntimeError(
+                "Missing SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY/SUPABASE_KEY env vars."
+            )
+
+        return create_client(url, key)
+
+    except Exception as exc:
+        raise RuntimeError(f"Could not create Supabase client: {exc}") from exc
+
+
+def _execute_data(query) -> list[dict[str, Any]]:
+    result = query.execute()
+    data = getattr(result, "data", None)
+    if data is None:
+        return []
+    if isinstance(data, list):
+        return data
+    return []
+
+
+def _safe_update_deadline(
+    sb,
+    deadline_id: str,
+    values: dict[str, Any],
+) -> tuple[bool, str | None]:
+    try:
+        sb.table("tax_deadlines").update(values).eq("id", deadline_id).execute()
+        return True, None
+    except Exception as exc:
+        current_app.logger.warning(
+            "cron.deadline_update_failed id=%s error=%s",
+            deadline_id,
+            exc,
+        )
+        return False, str(exc)
+
+
+# ============================================================
+# Cron authentication
+# ============================================================
+
+def _configured_cron_secret() -> str | None:
+    return (
+        os.getenv("DEADLINE_CRON_SECRET")
+        or os.getenv("CRON_SECRET")
+        or os.getenv("CRON_JOB_SECRET")
+        or os.getenv("NTG_CRON_SECRET")
+    )
+
+
+def _provided_cron_secret() -> str | None:
+    auth_header = request.headers.get("Authorization") or ""
+    bearer = ""
+
+    if auth_header.lower().startswith("bearer "):
+        bearer = auth_header.split(" ", 1)[1].strip()
+
+    return (
+        request.headers.get("X-Cron-Secret")
+        or request.headers.get("X-CRON-SECRET")
+        or request.headers.get("X-NTG-Cron-Secret")
+        or bearer
+        or _arg("cron_secret")
+        or _arg("secret")
+        or _arg("token")
+    )
+
+
+def _authorize_cron() -> tuple[bool, str | None]:
+    configured = _configured_cron_secret()
+
+    if not configured:
+        return False, "cron_secret_not_configured"
+
+    provided = _provided_cron_secret()
+
+    if not provided:
+        return False, "cron_secret_missing"
+
+    if str(provided).strip() != str(configured).strip():
+        return False, "cron_secret_invalid"
+
+    return True, None
+
+
+# ============================================================
+# Channel target resolution
+# ============================================================
+
+CHANNEL_TABLE_CANDIDATES = [
+    "linked_channels",
+    "channel_links",
+    "account_channels",
+    "account_channel_links",
+    "user_channels",
+    "user_channel_links",
+    "communication_channels",
+    "messaging_channels",
+    "channel_connections",
+    "linked_messaging_channels",
+]
+
+
+def _row_text(row: dict[str, Any], keys: list[str]) -> str:
+    parts = []
+    for key in keys:
+        value = row.get(key)
+        if value is not None:
+            parts.append(str(value))
+    return " ".join(parts).lower()
+
+
+def _row_is_inactive(row: dict[str, Any]) -> bool:
+    status_text = _row_text(
+        row,
+        [
+            "status",
+            "state",
+            "link_status",
+            "verification_status",
+            "connection_status",
+        ],
+    )
+
+    if any(word in status_text for word in ["deleted", "inactive", "disabled", "revoked", "unlinked"]):
+        return True
+
+    for key in ["enabled", "is_active", "active"]:
+        if key in row and row.get(key) is False:
+            return True
+
+    return False
+
+
+def _row_is_verified(row: dict[str, Any]) -> bool:
+    if _row_is_inactive(row):
+        return False
+
+    for key in ["verified", "is_verified", "channel_verified"]:
+        if key in row:
+            return bool(row.get(key))
+
+    status_text = _row_text(
+        row,
+        [
+            "status",
+            "state",
+            "link_status",
+            "verification_status",
+            "connection_status",
+        ],
+    )
+
+    if not status_text:
+        return True
+
+    return any(word in status_text for word in ["verified", "linked", "active", "connected"])
+
+
+def _row_matches_channel(row: dict[str, Any], channel: str) -> bool:
+    channel = channel.lower().strip()
+
+    descriptor = _row_text(
+        row,
+        [
+            "platform",
+            "channel",
+            "channel_type",
+            "provider",
+            "type",
+            "mode",
+            "source",
+            "service",
+        ],
+    )
+
+    if channel in descriptor:
+        return True
+
+    if channel == "telegram":
+        return any(
+            row.get(key)
+            for key in [
+                "telegram_chat_id",
+                "telegram_user_id",
+                "chat_id",
+                "telegram_id",
+            ]
+        )
+
+    if channel == "whatsapp":
+        return any(
+            row.get(key)
+            for key in [
+                "whatsapp_number",
+                "whatsapp_phone",
+                "phone",
+                "phone_number",
+                "linked_number",
+            ]
+        )
+
+    return False
+
+
+def _extract_channel_target(row: dict[str, Any], channel: str) -> str | None:
+    if channel == "telegram":
+        keys = [
+            "telegram_chat_id",
+            "telegram_user_id",
+            "chat_id",
+            "telegram_id",
+            "provider_user_id",
+            "external_id",
+            "external_user_id",
+            "linked_account",
+            "linked_account_id",
+            "channel_user_id",
+            "recipient",
+            "destination",
+            "identifier",
+            "value",
+        ]
+    elif channel == "whatsapp":
+        keys = [
+            "whatsapp_number",
+            "whatsapp_phone",
+            "phone",
+            "phone_number",
+            "linked_number",
+            "mobile",
+            "msisdn",
+            "provider_user_id",
+            "external_id",
+            "external_user_id",
+            "channel_user_id",
+            "recipient",
+            "destination",
+            "identifier",
+            "value",
+        ]
+    else:
+        return None
+
+    for key in keys:
+        value = row.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+
+    return None
+
+
+def _fetch_channel_rows(sb, account_id: str) -> list[dict[str, Any]]:
+    all_rows: list[dict[str, Any]] = []
+
+    for table_name in CHANNEL_TABLE_CANDIDATES:
+        try:
+            rows = _execute_data(
+                sb.table(table_name)
+                .select("*")
+                .eq("account_id", account_id)
+                .limit(20)
+            )
+
+            for row in rows:
+                row_copy = dict(row)
+                row_copy["_source_table"] = table_name
+                all_rows.append(row_copy)
+
+            if rows:
+                # Stop at first real channel table with results.
+                break
+
+        except Exception:
+            continue
+
+    return all_rows
+
+
+def _fallback_account_target(sb, account_id: str, channel: str) -> tuple[str | None, str | None]:
+    try:
+        rows = _execute_data(
+            sb.table("accounts")
+            .select("*")
+            .eq("id", account_id)
+            .limit(1)
+        )
+    except Exception:
+        return None, None
+
+    if not rows:
+        return None, None
+
+    row = rows[0]
+
+    if channel == "telegram":
+        keys = [
+            "telegram_chat_id",
+            "telegram_user_id",
+            "telegram_id",
+            "chat_id",
+        ]
+    else:
+        keys = [
+            "whatsapp_number",
+            "whatsapp_phone",
+            "phone",
+            "phone_number",
+            "mobile",
+        ]
+
+    for key in keys:
+        value = row.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip(), "accounts"
+
+    return None, None
+
+
+def _resolve_channel_target(
+    sb,
+    *,
+    account_id: str,
+    channel: str,
+) -> tuple[str | None, str | None]:
+    rows = _fetch_channel_rows(sb, account_id)
+
+    for row in rows:
+        if not _row_matches_channel(row, channel):
+            continue
+
+        if not _row_is_verified(row):
+            continue
+
+        target = _extract_channel_target(row, channel)
+        if target:
+            return target, str(row.get("_source_table") or "channel_table")
+
+    return _fallback_account_target(sb, account_id, channel)
+
+
+# ============================================================
+# Message delivery
+# ============================================================
+
+def _deadline_message(item: dict[str, Any]) -> str:
+    tax_type = str(item.get("tax_type") or "Tax").upper()
+    due_date = _normalize_date(item.get("due_date")) or str(item.get("due_date") or "")
+    days_before = _safe_int(item.get("reminder_days_before"), 0)
 
     return (
         "🔔 Naija Tax Guide Deadline Reminder\n\n"
         f"Tax type: {tax_type}\n"
         f"Due date: {due_date}\n"
-        f"Reminder: {days} day(s) before due date\n\n"
+        f"Reminder: {days_before} day(s) before due date\n\n"
         "Please prepare early, keep your supporting records, and confirm the exact "
         "requirement with the relevant Nigerian tax authority where needed."
     )
 
 
-def _send_whatsapp(phone: str, message: str) -> Dict[str, Any]:
-    phone = _clean(phone)
-    if not phone:
-        return {"ok": False, "channel": "whatsapp", "error": "missing_whatsapp_phone"}
+def _send_telegram_message(chat_id: str, text: str) -> tuple[bool, str | None]:
+    token = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
+
+    if not token:
+        return False, "missing_telegram_bot_token"
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
 
     try:
-        from app.services.outbound_service import send_whatsapp_text
+        response = requests.post(
+            url,
+            json={
+                "chat_id": str(chat_id),
+                "text": text,
+                "disable_web_page_preview": True,
+            },
+            timeout=20,
+        )
 
-        sent = send_whatsapp_text(phone, message)
-        return {"ok": bool(sent), "channel": "whatsapp", "to": phone}
+        if response.ok:
+            payload = response.json()
+            if payload.get("ok") is True:
+                return True, None
+            return False, str(payload)
+
+        return False, f"telegram_http_{response.status_code}: {response.text[:300]}"
+
     except Exception as exc:
-        logger.exception("WhatsApp reminder send failed")
-        return {"ok": False, "channel": "whatsapp", "to": phone, "error": f"{type(exc).__name__}: {_clip(exc)}"}
+        return False, f"telegram_exception: {exc}"
 
 
-def _send_telegram(chat_id: str, message: str) -> Dict[str, Any]:
-    chat_id = _clean(chat_id)
-    if not chat_id:
-        return {"ok": False, "channel": "telegram", "error": "missing_telegram_chat_id"}
-
-    try:
-        from app.services.outbound_service import send_telegram_text
-
-        sent = send_telegram_text(chat_id, message)
-        return {"ok": bool(sent), "channel": "telegram", "to": chat_id}
-    except Exception as exc:
-        logger.exception("Telegram reminder send failed")
-        return {"ok": False, "channel": "telegram", "to": chat_id, "error": f"{type(exc).__name__}: {_clip(exc)}"}
+def _normalize_whatsapp_to(value: str) -> str:
+    text = str(value or "").strip()
+    text = text.replace("+", "")
+    text = re.sub(r"\D+", "", text)
+    return text
 
 
-def _send_email(email: str, message: str) -> Dict[str, Any]:
-    email = _clean(email)
-    if not email:
-        return {"ok": False, "channel": "email", "error": "missing_email"}
+def _send_whatsapp_message(to_number: str, text: str) -> tuple[bool, str | None]:
+    access_token = (
+        os.getenv("WHATSAPP_ACCESS_TOKEN")
+        or os.getenv("META_WHATSAPP_ACCESS_TOKEN")
+        or os.getenv("WHATSAPP_TOKEN")
+    )
 
-    try:
-        from app.core.mailer import send_mail
+    phone_number_id = (
+        os.getenv("WHATSAPP_PHONE_NUMBER_ID")
+        or os.getenv("META_WHATSAPP_PHONE_NUMBER_ID")
+        or os.getenv("WHATSAPP_FROM_PHONE_NUMBER_ID")
+    )
 
-        result = send_mail(
-            to=email,
-            subject="Naija Tax Guide Deadline Reminder",
-            text=message,
-            html=f"<pre>{message}</pre>",
-            debug=False,
-        )
-        return {"ok": bool(result.get("ok")), "channel": "email", "to": email, "result": result}
-    except Exception as exc:
-        logger.exception("Email reminder send failed")
-        return {"ok": False, "channel": "email", "to": email, "error": f"{type(exc).__name__}: {_clip(exc)}"}
+    graph_version = os.getenv("META_GRAPH_VERSION", "v20.0")
 
+    if not access_token:
+        return False, "missing_whatsapp_access_token"
 
-def _normalize_modes(row: Dict[str, Any]) -> List[str]:
-    raw = _lower(row.get("reminder_mode") or row.get("mode") or "whatsapp")
-    modes = [part.strip() for part in raw.replace(";", ",").split(",") if part.strip()]
-    allowed = {"whatsapp", "email", "telegram", "sms"}
-    normalized = [mode for mode in modes if mode in allowed]
-    return normalized or ["whatsapp"]
+    if not phone_number_id:
+        return False, "missing_whatsapp_phone_number_id"
 
+    to = _normalize_whatsapp_to(to_number)
 
-def _identity_targets(account_id: str, mode: str) -> List[str]:
-    account_id = _clean(account_id)
-    mode = _lower(mode)
-    if not account_id or mode not in {"whatsapp", "telegram"}:
-        return []
+    if not to:
+        return False, "invalid_whatsapp_recipient"
 
-    try:
-        res = (
-            _get_supabase()
-            .table("channel_identities")
-            .select("provider_user_id,metadata,channel_type,is_verified,verified")
-            .eq("account_id", account_id)
-            .eq("channel_type", mode)
-            .limit(5)
-            .execute()
-        )
-        rows = _response_data(res)
-    except Exception:
-        logger.exception("Could not load channel_identities for deadline target fallback")
-        return []
-
-    targets: List[str] = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-
-        # Prefer verified identities where the column exists, but do not block older rows
-        # if the field is absent.
-        if row.get("is_verified") is False or row.get("verified") is False:
-            continue
-
-        provider_user_id = _clean(row.get("provider_user_id"))
-        if provider_user_id:
-            targets.append(provider_user_id)
-
-        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
-        if isinstance(metadata, dict):
-            for key in ("chat_id", "telegram_chat_id", "wa_id", "phone", "provider_user_id"):
-                value = _clean(metadata.get(key))
-                if value:
-                    targets.append(value)
-
-    seen = set()
-    unique: List[str] = []
-    for target in targets:
-        if target and target not in seen:
-            seen.add(target)
-            unique.append(target)
-    return unique
-
-
-def _targets_for_mode(row: Dict[str, Any], mode: str) -> List[str]:
-    mode = _lower(mode)
-    account_id = _clean(row.get("account_id") or row.get("user_id"))
-
-    candidates: List[str] = []
-    if mode == "whatsapp":
-        candidates.extend(
-            [
-                _clean(row.get("reminder_phone")),
-                _clean(row.get("whatsapp_phone")),
-                _clean(row.get("phone")),
-                _clean(row.get("provider_user_id")),
-            ]
-        )
-        candidates.extend(_identity_targets(account_id, "whatsapp"))
-
-    elif mode == "telegram":
-        candidates.extend(
-            [
-                _clean(row.get("reminder_telegram_chat_id")),
-                _clean(row.get("telegram_chat_id")),
-                _clean(row.get("telegram_user_id")),
-                _clean(row.get("reminder_phone")),
-                _clean(row.get("provider_user_id")),
-            ]
-        )
-        candidates.extend(_identity_targets(account_id, "telegram"))
-
-    elif mode == "email":
-        candidates.extend(
-            [
-                _clean(row.get("reminder_email")),
-                _clean(row.get("email")),
-            ]
-        )
-
-    seen = set()
-    out: List[str] = []
-    for item in candidates:
-        if item and item not in seen:
-            seen.add(item)
-            out.append(item)
-    return out
-
-
-def _update_deadline_attempt(deadline_id: str, *, error: Optional[str] = None) -> None:
-    deadline_id = _clean(deadline_id)
-    if not deadline_id:
-        return
+    url = f"https://graph.facebook.com/{graph_version}/{phone_number_id}/messages"
 
     payload = {
-        "reminder_last_attempt_at": _now_iso(),
-        "reminder_last_error": _clip(error) if error else None,
-        "updated_at": _now_iso(),
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "text",
+        "text": {
+            "preview_url": False,
+            "body": text,
+        },
     }
 
     try:
-        _get_supabase().table("tax_deadlines").update(payload).eq("id", deadline_id).execute()
-    except Exception:
-        # Optional tracking columns may not exist until the Batch 31A SQL is run.
-        try:
-            _get_supabase().table("tax_deadlines").update({"updated_at": _now_iso()}).eq("id", deadline_id).execute()
-        except Exception:
-            logger.exception("Could not update deadline attempt tracking")
+        response = requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=25,
+        )
+
+        if response.ok:
+            return True, None
+
+        return False, f"whatsapp_http_{response.status_code}: {response.text[:300]}"
+
+    except Exception as exc:
+        return False, f"whatsapp_exception: {exc}"
 
 
-def _mark_deadline_sent(deadline_id: str, sent_key: str) -> None:
-    deadline_id = _clean(deadline_id)
-    if not deadline_id:
-        return
+def _send_channel_message(
+    *,
+    channel: str,
+    target: str,
+    text: str,
+) -> tuple[bool, str | None]:
+    channel = channel.lower().strip()
 
-    payload = {
-        "last_reminder_sent_at": _now_iso(),
-        "last_reminder_sent_key": sent_key,
-        "reminder_last_attempt_at": _now_iso(),
-        "reminder_last_error": None,
-        "updated_at": _now_iso(),
-    }
+    if channel == "telegram":
+        return _send_telegram_message(target, text)
 
-    try:
-        _get_supabase().table("tax_deadlines").update(payload).eq("id", deadline_id).execute()
-    except Exception:
-        # If optional columns have not been added, never fail the send.
-        logger.exception("Could not mark deadline reminder as sent; run Batch 31A SQL optional columns")
+    if channel == "whatsapp":
+        return _send_whatsapp_message(target, text)
+
+    return False, f"unsupported_channel:{channel}"
 
 
-def _select_deadline_rows(body: Dict[str, Any], limit: int) -> List[Dict[str, Any]]:
+# ============================================================
+# Deadline reminder selection
+# ============================================================
+
+def _fetch_active_deadlines(
+    sb,
+    *,
+    account_id: str | None,
+    limit: int,
+) -> list[dict[str, Any]]:
     query = (
-        _get_supabase()
-        .table("tax_deadlines")
+        sb.table("tax_deadlines")
         .select("*")
         .eq("enabled", True)
+        .order("due_date", desc=False)
         .limit(limit)
     )
 
-    account_id = _clean(_request_value(body, "account_id"))
-    deadline_id = _clean(_request_value(body, "deadline_id") or _request_value(body, "id"))
-    tax_type = _clean(_request_value(body, "tax_type")).upper()
-
     if account_id:
         query = query.eq("account_id", account_id)
-    if deadline_id:
-        query = query.eq("id", deadline_id)
-    if tax_type:
-        query = query.eq("tax_type", tax_type)
 
-    try:
-        query = query.order("created_at", desc=True)
-    except Exception:
-        pass
-
-    res = query.execute()
-    return _response_data(res)
+    return _execute_data(query)
 
 
-@bp.route("/cron/send-deadline-reminders", methods=["GET", "POST"])
-def cron_send_deadline_reminders():
-    """
-    Finds and optionally sends due deadline reminders from public.tax_deadlines.
+def _sent_key(
+    *,
+    deadline_id: str,
+    due_date: str,
+    days_before: int,
+    mode: str,
+    today: str,
+) -> str:
+    return f"deadline:{deadline_id}:{due_date}:{days_before}:{mode}:{today}"
 
-    Safety rules:
-    - Authentication is mandatory.
-    - Dry run is the default.
-    - Actual sending requires send=1 in query/body OR DEADLINE_REMINDER_SEND_ENABLED=true.
-    - Optional Batch 31A tracking columns prevent duplicate same-day sends.
-    """
-    body = _parse_json()
-    auth_error = _require_cron_auth(body)
-    if auth_error:
-        return auth_error
+
+def _append_skip(
+    skipped: list[dict[str, Any]],
+    *,
+    reason: str,
+    row: dict[str, Any],
+    today: str,
+    now_time: str,
+    reminder_date: str | None = None,
+    mode: str | None = None,
+    sent_key: str | None = None,
+):
+    if len(skipped) >= 25:
+        return
+
+    skipped.append(
+        {
+            "id": row.get("id"),
+            "tax_type": row.get("tax_type"),
+            "due_date": _normalize_date(row.get("due_date")),
+            "reminder_days_before": row.get("reminder_days_before"),
+            "reminder_time": _normalize_time(row.get("reminder_time")),
+            "reminder_mode": mode or row.get("reminder_mode"),
+            "reminder_date": reminder_date,
+            "today": today,
+            "now_time": now_time,
+            "sent_key": sent_key,
+            "reason": reason,
+        }
+    )
+
+
+# ============================================================
+# Main cron route
+# ============================================================
+
+@cron_bp.route("/cron/send-deadline-reminders", methods=["GET", "POST"])
+@cron_bp.route("/api/cron/send-deadline-reminders", methods=["GET", "POST"])
+def send_deadline_reminders():
+    ok, auth_error = _authorize_cron()
+    if not ok:
+        return _json_error(
+            message=auth_error or "cron_auth_failed",
+            status_code=401,
+        )
+
+    app_now = _app_now()
+
+    today = str(_arg("today") or app_now.date().isoformat()).strip()
+    now_time = _normalize_time(_arg("now_time") or app_now.strftime("%H:%M"))
+
+    account_id = _arg("account_id")
+    account_id = str(account_id).strip() if account_id else None
+
+    limit = _safe_int(_arg("limit"), DEFAULT_LIMIT)
+    limit = max(1, min(limit, MAX_LIMIT))
+
+    force = _truthy(_arg("force"))
+    ignore_time = _truthy(_arg("ignore_time"))
 
     send_enabled = (
-        _truthy(_request_value(body, "send"))
+        _truthy(_arg("send"))
         or _truthy(os.getenv("DEADLINE_REMINDER_SEND_ENABLED"))
+        or _truthy(os.getenv("CRON_SEND_ENABLED"))
     )
-    force = _truthy(_request_value(body, "force"))
-    ignore_time = _truthy(_request_value(body, "ignore_time"))
 
-    limit = max(1, min(_safe_int(_request_value(body, "limit"), 500), 5000))
-    today = _business_today(body)
-    now_time = _business_now_time(body)
+    dry_run = not send_enabled
 
     try:
-        rows = _select_deadline_rows(body, limit)
-    except Exception as exc:
-        logger.exception("Deadline reminder query failed")
+        today_date = date.fromisoformat(today)
+    except Exception:
         return _json_error(
-            "deadline_reminder_query_failed",
-            500,
-            root_cause=f"{type(exc).__name__}: {_clip(exc)}",
-            hint="Confirm public.tax_deadlines exists and Supabase service key has access.",
+            message="invalid_today_date",
+            status_code=400,
+            extra={"today": today},
         )
 
-    due_items: List[Dict[str, Any]] = []
-    skipped: List[Dict[str, Any]] = []
-    deliveries: List[Dict[str, Any]] = []
+    try:
+        sb = _get_supabase_client()
+    except Exception as exc:
+        return _json_error(
+            message="supabase_client_unavailable",
+            status_code=500,
+            extra={"detail": str(exc)},
+        )
+
+    try:
+        rows = _fetch_active_deadlines(sb, account_id=account_id, limit=limit)
+    except Exception as exc:
+        return _json_error(
+            message="deadline_fetch_failed",
+            status_code=500,
+            extra={"detail": str(exc)},
+        )
+
+    checked_count = len(rows)
     already_sent_count = 0
+    skipped: list[dict[str, Any]] = []
+    due_items: list[dict[str, Any]] = []
+    deliveries: list[dict[str, Any]] = []
 
     for row in rows:
-        row = row if isinstance(row, dict) else {}
-        deadline_id = _clean(row.get("id"))
+        deadline_id = str(row.get("id") or "").strip()
+        row_account_id = str(row.get("account_id") or "").strip()
 
-        due_now, due_debug = _deadline_due_now(
-            row,
-            today,
-            now_time,
-            ignore_time=ignore_time,
-            force=force,
-        )
-
-        if not due_now:
-            if due_debug.get("reason") == "already_sent_today":
-                already_sent_count += 1
-            skipped.append({"id": deadline_id, **due_debug})
+        if not deadline_id:
+            _append_skip(
+                skipped,
+                reason="missing_deadline_id",
+                row=row,
+                today=today,
+                now_time=now_time,
+            )
             continue
 
-        modes = _normalize_modes(row)
-        message = _deadline_message(row)
-        sent_key = _deadline_sent_key(row, today)
-
-        item = {
-            "id": deadline_id,
-            "account_id": _clean(row.get("account_id") or row.get("user_id")),
-            "tax_type": _clean(row.get("tax_type") or row.get("tax_name")),
-            "due_date": _clean(row.get("due_date") or row.get("deadline_date"))[:10],
-            "reminder_days_before": max(0, _safe_int(row.get("reminder_days_before"), 7)),
-            "reminder_time": _display_time(row.get("reminder_time")),
-            "reminder_mode": modes,
-            "sent_key": sent_key,
-        }
-        due_items.append(item)
-
-        if not send_enabled:
+        if not row_account_id:
+            _append_skip(
+                skipped,
+                reason="missing_account_id",
+                row=row,
+                today=today,
+                now_time=now_time,
+            )
             continue
 
-        row_delivery_results: List[Dict[str, Any]] = []
+        due_date_obj = _parse_date(row.get("due_date"))
+        if not due_date_obj:
+            _append_skip(
+                skipped,
+                reason="invalid_due_date",
+                row=row,
+                today=today,
+                now_time=now_time,
+            )
+            continue
+
+        due_date_str = due_date_obj.isoformat()
+        reminder_days_before = _safe_int(row.get("reminder_days_before"), 0)
+        reminder_date_obj = due_date_obj - timedelta(days=reminder_days_before)
+        reminder_date_str = reminder_date_obj.isoformat()
+
+        reminder_time = _normalize_time(row.get("reminder_time"))
+
+        modes = _normalize_mode(row.get("reminder_mode"))
+        if not modes:
+            _append_skip(
+                skipped,
+                reason="missing_reminder_mode",
+                row=row,
+                today=today,
+                now_time=now_time,
+                reminder_date=reminder_date_str,
+            )
+            continue
+
+        if due_date_obj < today_date:
+            _append_skip(
+                skipped,
+                reason="deadline_already_passed",
+                row=row,
+                today=today,
+                now_time=now_time,
+                reminder_date=reminder_date_str,
+            )
+            continue
+
+        if reminder_date_obj != today_date:
+            _append_skip(
+                skipped,
+                reason="not_reminder_date",
+                row=row,
+                today=today,
+                now_time=now_time,
+                reminder_date=reminder_date_str,
+            )
+            continue
+
+        if not ignore_time and now_time < reminder_time:
+            _append_skip(
+                skipped,
+                reason="not_yet_reminder_time",
+                row=row,
+                today=today,
+                now_time=now_time,
+                reminder_date=reminder_date_str,
+            )
+            continue
+
         for mode in modes:
-            if mode == "sms":
-                result = {"ok": False, "id": deadline_id, "channel": "sms", "error": "sms_not_configured"}
-                deliveries.append(result)
-                row_delivery_results.append(result)
+            mode = mode.lower().strip()
+
+            if mode not in SUPPORTED_REMINDER_MODES:
+                _append_skip(
+                    skipped,
+                    reason="unsupported_reminder_mode",
+                    row=row,
+                    today=today,
+                    now_time=now_time,
+                    reminder_date=reminder_date_str,
+                    mode=mode,
+                )
                 continue
 
-            targets = _targets_for_mode(row, mode)
-            if not targets:
-                result = {"ok": False, "id": deadline_id, "channel": mode, "error": "missing_delivery_target"}
-                deliveries.append(result)
-                row_delivery_results.append(result)
+            current_sent_key = _sent_key(
+                deadline_id=deadline_id,
+                due_date=due_date_str,
+                days_before=reminder_days_before,
+                mode=mode,
+                today=today,
+            )
+
+            last_sent_key = str(row.get("last_reminder_sent_key") or "").strip()
+
+            if not force and last_sent_key == current_sent_key:
+                already_sent_count += 1
+                _append_skip(
+                    skipped,
+                    reason="already_sent_today",
+                    row=row,
+                    today=today,
+                    now_time=now_time,
+                    reminder_date=reminder_date_str,
+                    mode=mode,
+                    sent_key=current_sent_key,
+                )
                 continue
 
-            # Use the first available target for each mode to avoid duplicate sends
-            # when both reminder_phone and channel_identities point to the same user.
-            target = targets[0]
-            if mode == "whatsapp":
-                result = _send_whatsapp(target, message)
-            elif mode == "telegram":
-                result = _send_telegram(target, message)
-            elif mode == "email":
-                result = _send_email(target, message)
+            due_item = {
+                "id": deadline_id,
+                "account_id": row_account_id,
+                "tax_type": str(row.get("tax_type") or "").upper(),
+                "due_date": due_date_str,
+                "reminder_days_before": reminder_days_before,
+                "reminder_time": reminder_time,
+                "reminder_mode": [mode],
+                "sent_key": current_sent_key,
+            }
+            due_items.append(due_item)
+
+            if dry_run:
+                continue
+
+            target, target_source = _resolve_channel_target(
+                sb,
+                account_id=row_account_id,
+                channel=mode,
+            )
+
+            attempt_at = _utc_now_iso()
+            _safe_update_deadline(
+                sb,
+                deadline_id,
+                {
+                    "reminder_last_attempt_at": attempt_at,
+                    "reminder_last_error": None,
+                    "updated_at": attempt_at,
+                },
+            )
+
+            if not target:
+                error_message = f"missing_{mode}_target"
+                deliveries.append(
+                    {
+                        "id": deadline_id,
+                        "channel": mode,
+                        "ok": False,
+                        "to": None,
+                        "error": error_message,
+                    }
+                )
+                _safe_update_deadline(
+                    sb,
+                    deadline_id,
+                    {
+                        "reminder_last_attempt_at": _utc_now_iso(),
+                        "reminder_last_error": error_message,
+                    },
+                )
+                continue
+
+            message = _deadline_message(due_item)
+            delivered, delivery_error = _send_channel_message(
+                channel=mode,
+                target=target,
+                text=message,
+            )
+
+            deliveries.append(
+                {
+                    "id": deadline_id,
+                    "channel": mode,
+                    "ok": bool(delivered),
+                    "to": target,
+                    "target_source": target_source,
+                    "error": delivery_error,
+                }
+            )
+
+            if delivered:
+                sent_at = _utc_now_iso()
+                _safe_update_deadline(
+                    sb,
+                    deadline_id,
+                    {
+                        "last_reminder_sent_at": sent_at,
+                        "last_reminder_sent_key": current_sent_key,
+                        "reminder_last_attempt_at": sent_at,
+                        "reminder_last_error": None,
+                        "updated_at": sent_at,
+                    },
+                )
             else:
-                result = {"ok": False, "channel": mode, "to": target, "error": "unsupported_mode"}
+                _safe_update_deadline(
+                    sb,
+                    deadline_id,
+                    {
+                        "reminder_last_attempt_at": _utc_now_iso(),
+                        "reminder_last_error": delivery_error or "delivery_failed",
+                    },
+                )
 
-            result["id"] = deadline_id
-            deliveries.append(result)
-            row_delivery_results.append(result)
+    delivery_count = len(deliveries)
+    failed_count = sum(1 for item in deliveries if not bool(item.get("ok")))
+    due_count = len(due_items)
+    skipped_count = len(skipped)
 
-        if any(bool(result.get("ok")) for result in row_delivery_results):
-            _mark_deadline_sent(deadline_id, sent_key)
-        else:
-            joined_errors = "; ".join(
-                _clean(result.get("error") or "send_failed")
-                for result in row_delivery_results
-                if not result.get("ok")
-            )
-            _update_deadline_attempt(deadline_id, error=joined_errors or "send_failed")
-
-    return jsonify(
-        {
-            "ok": True,
-            "route_version": ROUTE_VERSION,
-            "today": today.isoformat(),
-            "now_time": f"{now_time.hour:02d}:{now_time.minute:02d}",
-            "dry_run": not send_enabled,
-            "send_enabled": send_enabled,
-            "force": force,
-            "ignore_time": ignore_time,
-            "checked_count": len(rows),
-            "due_count": len(due_items),
-            "skipped_count": len(skipped),
-            "already_sent_count": already_sent_count,
-            "delivery_count": len(deliveries),
-            "due_items": due_items,
-            "deliveries": deliveries,
-            "skipped_sample": skipped[:20],
-            "note": (
-                "Actual sending is disabled unless send=1 or DEADLINE_REMINDER_SEND_ENABLED=true. "
-                "Run Batch 31A SQL optional tracking columns to prevent duplicate same-day sends."
-            ),
-        }
-    ), 200
-
-
-@bp.route("/cron/deadlines/upcoming", methods=["GET"])
-def cron_get_upcoming_deadlines():
-    """Public helper for general upcoming Nigerian tax calendar items."""
-    days_ahead = max(1, min(_safe_int(request.args.get("days"), 30), 366))
-    try:
-        from app.services.tax_deadline_service import get_upcoming_deadlines
-
-        deadlines = get_upcoming_deadlines(days_ahead)
-        return jsonify(
-            {
-                "ok": True,
-                "route_version": ROUTE_VERSION,
-                "days_ahead": days_ahead,
-                "count": len(deadlines),
-                "deadlines": deadlines,
-            }
-        ), 200
-    except Exception as exc:
-        logger.exception("Upcoming deadline lookup failed")
-        return _json_error(
-            "upcoming_deadlines_failed",
-            500,
-            root_cause=f"{type(exc).__name__}: {_clip(exc)}",
-        )
-
-
-# -----------------------------------------------------------------------------
-# Referral maturity / payout cron
-# -----------------------------------------------------------------------------
-
-def _payout_days() -> List[int]:
-    raw = _clean(os.getenv("REFERRAL_PAYOUT_DAYS") or "15,30")
-    out: List[int] = []
-    for part in raw.split(","):
-        day = _safe_int(part.strip(), 0)
-        if 1 <= day <= 31:
-            out.append(day)
-    return out or [15, 30]
-
-
-def _is_payout_window_today() -> bool:
-    return _now_lagos().day in _payout_days()
-
-
-def _unique_account_ids_from_rewards(status: str = "approved") -> List[str]:
-    resp = (
-        _get_supabase()
-        .table("referral_rewards")
-        .select("account_id")
-        .eq("status", status)
-        .execute()
+    response = _build_cron_response(
+        today=today,
+        now_time=now_time,
+        send_enabled=send_enabled,
+        dry_run=dry_run,
+        force=force,
+        ignore_time=ignore_time,
+        checked_count=checked_count,
+        due_count=due_count,
+        delivery_count=delivery_count,
+        already_sent_count=already_sent_count,
+        skipped_count=skipped_count,
+        failed_count=failed_count,
+        deliveries=deliveries,
+        due_items=due_items,
+        skipped_sample=skipped[:10],
+        extra_debug={
+            "account_id_filter": account_id,
+            "timezone": DEFAULT_TIMEZONE,
+            "limit": limit,
+        },
     )
-    rows = _response_data(resp)
 
-    seen = set()
-    account_ids: List[str] = []
-    for row in rows:
-        aid = _clean((row or {}).get("account_id"))
-        if aid and aid not in seen:
-            seen.add(aid)
-            account_ids.append(aid)
-    return account_ids
+    return jsonify(response), 200
 
 
-def _pick_account_ids(body: Dict[str, Any]) -> List[str]:
-    raw = body.get("account_ids")
-    if raw is None:
-        raw = request.args.getlist("account_id")
-
-    if raw is None or raw == []:
-        single = _clean(body.get("account_id") or request.args.get("account_id"))
-        return [single] if single else []
-
-    values = raw if isinstance(raw, list) else [raw]
-
-    out: List[str] = []
-    seen = set()
-    for value in values:
-        text = _clean(value)
-        if text and text not in seen:
-            seen.add(text)
-            out.append(text)
-    return out
-
-
-@bp.route("/cron/referrals/mature", methods=["GET", "POST"])
-def cron_referrals_mature():
-    body = _parse_json()
-    auth_error = _require_cron_auth(body)
-    if auth_error:
-        return auth_error
-
-    reward_ids = body.get("reward_ids") or request.args.getlist("reward_id") or []
-    if not isinstance(reward_ids, list):
-        reward_ids = [reward_ids]
-
-    account_id = _clean(body.get("account_id") or request.args.get("account_id")) or None
-    limit = max(1, min(_safe_int(body.get("limit") or request.args.get("limit"), 2000), 10000))
-    force = _truthy(body.get("force")) or _truthy(request.args.get("force"))
-
-    try:
-        from app.services.referral_service import mature_pending_rewards
-
-        result = mature_pending_rewards(
-            account_id=account_id,
-            reward_ids=reward_ids,
-            limit=limit,
-            force=force,
-        )
-        return jsonify(
-            {
-                "ok": True,
-                "route_version": ROUTE_VERSION,
-                "result": result,
-            }
-        ), 200
-    except Exception as exc:
-        logger.exception("Referral maturity cron failed")
-        return _json_error(
-            "cron_referrals_mature_failed",
-            500,
-            root_cause=f"{type(exc).__name__}: {_clip(exc)}",
-            debug={
-                "account_id": account_id,
-                "reward_ids": reward_ids,
-                "limit": limit,
-                "force": force,
-            },
-        )
-
-
-@bp.route("/cron/referrals/payout-batch", methods=["GET", "POST"])
-def cron_referrals_payout_batch():
-    body = _parse_json()
-    auth_error = _require_cron_auth(body)
-    if auth_error:
-        return auth_error
-
-    force = _truthy(body.get("force")) or _truthy(request.args.get("force"))
-    limit = max(1, min(_safe_int(body.get("limit") or request.args.get("limit"), 5000), 20000))
-    requested_account_ids = _pick_account_ids(body)
-
-    try:
-        from app.services.referral_service import mature_pending_rewards
-        from app.services.payout_service import (
-            approved_balance_for_account,
-            create_payout_row,
-            get_pending_or_processing_payout,
-            get_payout_account,
-            min_payout_amount,
-            payout_currency,
-            payout_enabled,
-            payout_provider,
-        )
-    except Exception as exc:
-        logger.exception("Referral payout imports failed")
-        return _json_error(
-            "referral_payout_import_failed",
-            500,
-            root_cause=f"{type(exc).__name__}: {_clip(exc)}",
-        )
-
-    if not payout_enabled():
-        return jsonify(
-            {
-                "ok": True,
-                "route_version": ROUTE_VERSION,
-                "skipped": True,
-                "reason": "payout_disabled",
-                "hint": "Set REFERRAL_PAYOUT_ENABLED=true or PAYOUT_ENABLED=true only when ready.",
-            }
-        ), 200
-
-    try:
-        maturity_result = mature_pending_rewards(limit=limit)
-
-        if not force and not _is_payout_window_today():
-            return jsonify(
-                {
-                    "ok": True,
-                    "route_version": ROUTE_VERSION,
-                    "skipped": True,
-                    "reason": "not_payout_window_today",
-                    "allowed_days": _payout_days(),
-                    "today": _now_lagos().day,
-                    "force": force,
-                    "maturity_result": maturity_result,
-                }
-            ), 200
-
-        account_ids = requested_account_ids or _unique_account_ids_from_rewards(status="approved")
-        prepared: List[Dict[str, Any]] = []
-        skipped: List[Dict[str, Any]] = []
-        minimum = min_payout_amount()
-
-        for account_id in account_ids:
-            payout_account = get_payout_account(account_id)
-            if not payout_account:
-                skipped.append({"account_id": account_id, "reason": "missing_payout_account"})
-                continue
-
-            if not bool(payout_account.get("is_verified")):
-                skipped.append(
-                    {
-                        "account_id": account_id,
-                        "reason": "missing_verified_payout_account",
-                        "payout_account_id": payout_account.get("id"),
-                    }
-                )
-                continue
-
-            existing = get_pending_or_processing_payout(account_id)
-            if existing:
-                skipped.append(
-                    {
-                        "account_id": account_id,
-                        "reason": "existing_pending_or_processing_payout",
-                        "payout": existing,
-                    }
-                )
-                continue
-
-            amount = approved_balance_for_account(account_id)
-            if amount <= Decimal("0"):
-                skipped.append(
-                    {
-                        "account_id": account_id,
-                        "reason": "no_approved_balance",
-                        "amount": str(amount),
-                    }
-                )
-                continue
-
-            if amount < minimum:
-                skipped.append(
-                    {
-                        "account_id": account_id,
-                        "reason": "below_minimum_payout_amount",
-                        "amount": str(amount),
-                        "minimum": str(minimum),
-                    }
-                )
-                continue
-
-            payout = create_payout_row(
-                account_id=account_id,
-                amount=_to_decimal(amount),
-                currency=payout_currency(),
-                provider=payout_provider(),
-                status="pending",
-            )
-            prepared.append(
-                {
-                    "account_id": account_id,
-                    "amount": str(amount),
-                    "payout": payout,
-                }
-            )
-
-        return jsonify(
-            {
-                "ok": True,
-                "route_version": ROUTE_VERSION,
-                "force": force,
-                "payout_provider": payout_provider(),
-                "currency": payout_currency(),
-                "minimum_payout_amount": str(minimum),
-                "account_scope": "explicit" if requested_account_ids else "all_approved_accounts",
-                "account_count": len(account_ids),
-                "prepared_count": len(prepared),
-                "skipped_count": len(skipped),
-                "prepared": prepared,
-                "skipped": skipped,
-                "maturity_result": maturity_result,
-            }
-        ), 200
-
-    except Exception as exc:
-        logger.exception("Referral payout batch cron failed")
-        return _json_error(
-            "cron_referrals_payout_batch_failed",
-            500,
-            root_cause=f"{type(exc).__name__}: {_clip(exc)}",
-            debug={
-                "force": force,
-                "limit": limit,
-                "requested_account_ids": requested_account_ids,
-            },
-        )
+__all__ = ["cron_bp", "bp"]
