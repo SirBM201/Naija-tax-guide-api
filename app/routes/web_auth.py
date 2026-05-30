@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 bp = Blueprint("web_auth", __name__)
 
-WEB_AUTH_ROUTE_VERSION = "2026-05-29-batch35A-signup-acquisition-source"
+WEB_AUTH_ROUTE_VERSION = "2026-05-30-batch35B2-logout-request-fix"
 
 
 def _truthy(v: str | None) -> bool:
@@ -397,7 +397,7 @@ def verify_otp():
 @bp.get("/web/auth/me")
 def web_auth_me():
     """Get current authenticated user info - for web auth routes"""
-    account_id = get_account_id_from_request()
+    account_id, _debug = get_account_id_from_request(request)
     if not account_id:
         return jsonify({"ok": False, "error": "unauthorized"}), 401
 
@@ -417,12 +417,13 @@ def logout():
     account_id = session.get('account_id')
     session.clear()
 
-    r = logout_web_session()
+    r = logout_web_session(request)
     resp = make_response(jsonify({
         "ok": True,
         "message": "Logged out successfully",
         "account_id": account_id,
         "web_auth_route_version": WEB_AUTH_ROUTE_VERSION,
+"logout_result": r,
     }))
 
     resp.delete_cookie(WEB_AUTH_COOKIE_NAME, path="/", domain=_cookie_domain())
