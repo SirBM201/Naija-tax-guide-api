@@ -2,10 +2,15 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict
+import os
+from datetime import datetime, timezone
+from decimal import Decimal
+from typing import Any, Dict, Optional
 
 from flask import Blueprint, jsonify, redirect, request
 
+from app.core.supabase_client import supabase
+from app.services.web_auth_service import get_account_id_from_request
 from app.services.promo_service import (
     PROMO_SERVICE_VERSION,
     build_promo_links,
@@ -19,7 +24,11 @@ from app.services.promo_service import (
 bp = Blueprint("promo", __name__)
 logger = logging.getLogger(__name__)
 
-PROMO_ROUTE_VERSION = "2026-05-30-batch35B-promo-checkout-direct-upload"
+PROMO_ROUTE_VERSION = "2026-05-30-batch35C-promo-admin-visibility-owner"
+
+
+def _sb():
+    return supabase() if callable(supabase) else supabase
 
 
 def _clean(value: Any) -> str:
@@ -39,21 +48,129 @@ def _clip(value: Any, limit: int = 900) -> str:
     return text if len(text) <= limit else text[:limit] + "...<truncated>"
 
 
-def _is_api_path(*paths: str) -> bool:
-    current = request.path.rstrip("/")
-    return current in {p.rstrip("/") for p in paths}
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
+
+def _to_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None:
+            return default
+        raw = str(value).replace(",", "").strip()
+        if not raw:
+            return default
+        return int(Decimal(raw))
+    except Exception:
+        return default
+
+
+def _to_decimal_string(value: Any, default: str = "0") -> str:
+    try:
+        if value is None or str(value).strip() == "":
+            return default
+        return str(Decimal(str(value).replace(",", "").strip()))
+    except Exception:
+        return default
+
+
+def _response_data(resp: Any):
+    data = getattr(resp, "data", None)
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        return [data]
+    return []
+
+
+def _first(resp: Any) -> Optional[Dict[str, Any]]:
+    rows = _response_data(resp)
+    return rows[0] if rows else None
+
+
+def _normalize_code(value: Any) -> str:
+    code = _upper(value)
+    return "".join(ch for ch in code if ch.isalnum() or ch in {"_", "-"})[:80]
+
+
+def _get_expected_admin_key() -> str:
+    return (
+        os.getenv("ADMIN_API_KEY")
+        or os.getenv("INTERNAL_ADMIN_API_KEY")
+        or os.getenv("PROMO_ADMIN_API_KEY")
+        or os.getenv("REFERRAL_ADMIN_API_KEY")
+        or ""
+    ).strip()
+
+
+def _get_supplied_admin_key() -> str:
+    header_key = (request.headers.get("X-Admin-Key") or "").strip()
+    if header_key:
+        return header_key
+
+    auth_header = (request.headers.get("Authorization") or "").strip()
+    if auth_header.lower().startswith("bearer "):
+        return auth_header[7:].strip()
+
+    query_key = (request.args.get("admin_key") or "").strip()
+    if query_key:
+        return query_key
+
+    body = request.get_json(silent=True) or {}
+    return str(body.get("admin_key") or "").strip()
+
+
+def _require_admin():
+    expected = _get_expected_admin_key()
+    supplied = _get_supplied_admin_key()
+
+    if not expected:
+        return jsonify({
+            "ok": False,
+            "error": "admin_api_key_not_configured",
+            "message": "Set ADMIN_API_KEY on Koyeb before using promo admin endpoints.",
+            "route_version": PROMO_ROUTE_VERSION,
+        }), 500
+
+    if not supplied or supplied != expected:
+        return jsonify({
+            "ok": False,
+            "error": "invalid_or_missing_admin_key",
+            "message": "Provide X-Admin-Key header or admin_key query/body value.",
+            "route_version": PROMO_ROUTE_VERSION,
+        }), 403
+
+    return None
+
+
+def _get_code_row(code: str) -> Optional[Dict[str, Any]]:
+    code = _normalize_code(code)
+    if not code:
+        return None
+    try:
+        resp = _sb().table("promo_codes").select("*").eq("code", code).limit(1).execute()
+        return _first(resp)
+    except Exception:
+        return None
+
+
+def _update_code_by_id(row_id: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
+    resp = _sb().table("promo_codes").update(payload).eq("id", row_id).execute()
+    return _first(resp) or payload
+
+
+def _insert_code(payload: Dict[str, Any]) -> Dict[str, Any]:
+    resp = _sb().table("promo_codes").insert(payload).execute()
+    return _first(resp) or payload
+
+
+# ---------------------------------------------------------------------
+# Batch 35B/35C billing interceptor: keeps promo discount logic active
+# without replacing the large existing app/routes/billing.py file.
+# ---------------------------------------------------------------------
 
 def _billing():
-    # Import lazily so this optional promo blueprint does not break boot if billing imports later.
     from app.routes import billing as billing_route
-
     return billing_route
-
-
-def _json_error_from_billing(message: str, status: int, *, error: str, **extra: Any):
-    billing_route = _billing()
-    return billing_route._json_error(message, status, error=error, **extra)
 
 
 def _qualify_promo_after_billing_application(reference: str, paystack_data: Dict[str, Any], application: Dict[str, Any]) -> Dict[str, Any]:
@@ -224,7 +341,7 @@ def _intercept_billing_checkout():
     return billing_route.jsonify(
         {
             "ok": True,
-            "billing_route_version": "2026-05-30-v35B-promo-checkout-discount-reward",
+            "billing_route_version": "2026-05-30-v35C-promo-admin-visibility-owner",
             "promo_route_version": PROMO_ROUTE_VERSION,
             "action": "checkout_started",
             "authorization_url": auth_url,
@@ -250,7 +367,6 @@ def _intercept_billing_checkout():
 
 def _intercept_billing_verify():
     billing_route = _billing()
-
     reference = billing_route._clean(request.args.get("reference") or request.args.get("trxref"))
     debug_requested = billing_route._lower(request.args.get("debug")) in {"1", "true", "yes"}
 
@@ -284,7 +400,7 @@ def _intercept_billing_verify():
 
     payload: Dict[str, Any] = {
         "ok": True,
-        "billing_route_version": "2026-05-30-v35B-promo-checkout-discount-reward",
+        "billing_route_version": "2026-05-30-v35C-promo-admin-visibility-owner",
         "promo_route_version": PROMO_ROUTE_VERSION,
         "reference": reference,
         "status": status or "unknown",
@@ -314,7 +430,6 @@ def _intercept_billing_verify():
 
 def _intercept_billing_callback():
     billing_route = _billing()
-
     reference = billing_route._clean(request.args.get("reference") or request.args.get("trxref"))
     plan_hint = billing_route._clean(request.args.get("plan"))
 
@@ -348,7 +463,6 @@ def _intercept_billing_callback():
 
 def _intercept_billing_webhook():
     billing_route = _billing()
-
     payload = request.get_json(silent=True) or {}
     if not isinstance(payload, dict) or not payload:
         return billing_route._json_error("No webhook payload received.", 400, error="empty_webhook_payload")
@@ -390,7 +504,7 @@ def _intercept_billing_webhook():
     return billing_route.jsonify(
         {
             "ok": True,
-            "billing_route_version": "2026-05-30-v35B-promo-checkout-discount-reward",
+            "billing_route_version": "2026-05-30-v35C-promo-admin-visibility-owner",
             "promo_route_version": PROMO_ROUTE_VERSION,
             "message": "Webhook received",
             "event": event,
@@ -404,13 +518,6 @@ def _intercept_billing_webhook():
 
 @bp.before_app_request
 def _promo_billing_interceptor():
-    """
-    Batch 35B direct-upload override.
-
-    Because this app already registers app.routes.promo as an optional blueprint,
-    this interceptor lets us upgrade billing checkout safely without replacing
-    the large existing app/routes/billing.py file.
-    """
     path = request.path.rstrip("/")
     method = request.method.upper()
 
@@ -454,21 +561,70 @@ def promo_health():
         "route_version": PROMO_ROUTE_VERSION,
         "service_version": PROMO_SERVICE_VERSION,
         "rule": "Promo code is captured at signup/onboarding, not at payment form.",
-        "batch35b": {
-            "checkout_interceptor": True,
-            "discount_source": "existing promo_redemptions row attached during signup",
-            "payment_rule": "No promo code entry at payment.",
+        "batch35c": {
+            "admin_management": True,
+            "owner_assignment": True,
+            "active_user_promo_preview": True,
         },
         "expected_urls": [
             "/api/promo/health",
-            "/api/promo/validate/TAXWITHBM",
-            "/api/promo/hub/TAXWITHBM",
-            "/api/promo/track?code=TAXWITHBM&platform=website",
-            "/api/promo/track-and-go/TAXWITHBM/website",
-            "/api/billing/initialize",
-            "/api/billing/verify",
-            "/api/billing/callback",
+            "/api/promo/my-active",
+            "/api/promo/admin/health",
+            "/api/promo/admin/codes",
+            "/api/promo/admin/redemptions",
+            "/api/promo/admin/rewards",
         ],
+    }), 200
+
+
+@bp.get("/promo/my-active")
+def promo_my_active():
+    account_id, auth_debug = get_account_id_from_request(request)
+    if not account_id:
+        return jsonify({
+            "ok": False,
+            "error": "unauthorized",
+            "route_version": PROMO_ROUTE_VERSION,
+            "auth_debug": auth_debug,
+        }), 401
+
+    plan_code = _lower(request.args.get("plan_code"))
+    amount_kobo = _to_int(request.args.get("amount_kobo"), 0)
+
+    try:
+        resp = (
+            _sb()
+            .table("promo_redemptions")
+            .select("*")
+            .eq("account_id", account_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        redemption = _first(resp)
+    except Exception as exc:
+        return jsonify({
+            "ok": False,
+            "error": "promo_redemption_lookup_failed",
+            "root_cause": f"{type(exc).__name__}: {_clip(exc)}",
+            "route_version": PROMO_ROUTE_VERSION,
+        }), 500
+
+    preview = None
+    if redemption and amount_kobo > 0:
+        preview = calculate_promo_checkout_preview(
+            account_id=account_id,
+            plan_code=plan_code or "unknown",
+            original_amount_kobo=amount_kobo,
+        )
+
+    return jsonify({
+        "ok": True,
+        "route_version": PROMO_ROUTE_VERSION,
+        "account_id": account_id,
+        "has_promo": bool(redemption),
+        "redemption": redemption,
+        "preview": preview,
     }), 200
 
 
@@ -570,3 +726,240 @@ def promo_track_and_go(code: str, platform: str):
         metadata={"query": dict(request.args), "route": "/api/promo/track-and-go/<code>/<platform>"},
     )
     return redirect(destination, code=302)
+
+
+@bp.get("/promo/admin/health")
+def promo_admin_health():
+    auth_error = _require_admin()
+    if auth_error:
+        return auth_error
+
+    return jsonify({
+        "ok": True,
+        "route_version": PROMO_ROUTE_VERSION,
+        "message": "Promo admin endpoints are active.",
+        "admin_key_configured": bool(_get_expected_admin_key()),
+        "endpoints": [
+            "GET /api/promo/admin/codes",
+            "POST /api/promo/admin/codes",
+            "POST /api/promo/admin/codes/<code>/assign-owner",
+            "GET /api/promo/admin/redemptions",
+            "GET /api/promo/admin/rewards",
+            "POST /api/promo/admin/rewards/<reward_id>/mark-status",
+        ],
+    }), 200
+
+
+@bp.get("/promo/admin/codes")
+def promo_admin_codes():
+    auth_error = _require_admin()
+    if auth_error:
+        return auth_error
+
+    limit = _to_int(request.args.get("limit"), 100)
+    try:
+        resp = _sb().table("promo_codes").select("*").order("created_at", desc=True).limit(max(1, min(limit, 500))).execute()
+        rows = _response_data(resp)
+        return jsonify({"ok": True, "route_version": PROMO_ROUTE_VERSION, "count": len(rows), "rows": rows}), 200
+    except Exception as exc:
+        return jsonify({"ok": False, "error": "promo_codes_list_failed", "root_cause": f"{type(exc).__name__}: {_clip(exc)}"}), 500
+
+
+@bp.post("/promo/admin/codes")
+def promo_admin_create_or_update_code():
+    auth_error = _require_admin()
+    if auth_error:
+        return auth_error
+
+    body = request.get_json(silent=True) or {}
+    code = _normalize_code(body.get("code") or body.get("promo_code"))
+    if not code:
+        return jsonify({"ok": False, "error": "code_required", "message": "Promo code is required."}), 400
+
+    now_iso = _now_iso()
+    payload = {
+        "code": code,
+        "name": _clean(body.get("name")) or code,
+        "description": _clean(body.get("description")) or None,
+        "status": _lower(body.get("status")) or "active",
+        "promo_type": _lower(body.get("promo_type")) or "influencer",
+        "benefit_type": _lower(body.get("benefit_type")) or "percent_discount",
+        "discount_percent": _to_decimal_string(body.get("discount_percent"), "0"),
+        "discount_amount_ngn": _to_decimal_string(body.get("discount_amount_ngn"), "0"),
+        "bonus_credits": _to_int(body.get("bonus_credits"), 0),
+        "reward_type": _lower(body.get("reward_type")) or "cash",
+        "reward_amount_ngn": _to_decimal_string(body.get("reward_amount_ngn"), "0"),
+        "reward_percent": _to_decimal_string(body.get("reward_percent"), "0"),
+        "owner_account_id": _clean(body.get("owner_account_id")) or None,
+        "owner_name": _clean(body.get("owner_name")) or None,
+        "owner_email": _clean(body.get("owner_email")).lower() or None,
+        "starts_at": _clean(body.get("starts_at")) or None,
+        "expires_at": _clean(body.get("expires_at")) or None,
+        "max_uses": body.get("max_uses") if body.get("max_uses") not in ("", None) else None,
+        "metadata": body.get("metadata") if isinstance(body.get("metadata"), dict) else {},
+        "updated_at": now_iso,
+    }
+
+    try:
+        existing = _get_code_row(code)
+        if existing:
+            row = _update_code_by_id(existing.get("id"), payload)
+            action = "updated"
+        else:
+            payload["used_count"] = _to_int(body.get("used_count"), 0)
+            payload["paid_conversion_count"] = _to_int(body.get("paid_conversion_count"), 0)
+            payload["created_at"] = now_iso
+            row = _insert_code(payload)
+            action = "created"
+
+        return jsonify({
+            "ok": True,
+            "route_version": PROMO_ROUTE_VERSION,
+            "action": action,
+            "code": code,
+            "row": row,
+            "links": build_promo_links(code),
+        }), 200
+    except Exception as exc:
+        return jsonify({
+            "ok": False,
+            "error": "promo_code_upsert_failed",
+            "root_cause": f"{type(exc).__name__}: {_clip(exc)}",
+            "payload": payload,
+        }), 500
+
+
+@bp.post("/promo/admin/codes/<code>/assign-owner")
+def promo_admin_assign_owner(code: str):
+    auth_error = _require_admin()
+    if auth_error:
+        return auth_error
+
+    code = _normalize_code(code)
+    body = request.get_json(silent=True) or {}
+    row = _get_code_row(code)
+    if not row:
+        return jsonify({"ok": False, "error": "promo_code_not_found", "code": code}), 404
+
+    payload = {
+        "owner_account_id": _clean(body.get("owner_account_id")) or None,
+        "owner_name": _clean(body.get("owner_name")) or None,
+        "owner_email": _clean(body.get("owner_email")).lower() or None,
+        "updated_at": _now_iso(),
+    }
+
+    try:
+        updated = _update_code_by_id(row.get("id"), payload)
+        return jsonify({
+            "ok": True,
+            "route_version": PROMO_ROUTE_VERSION,
+            "message": "Promo code owner assigned.",
+            "code": code,
+            "row": updated,
+        }), 200
+    except Exception as exc:
+        return jsonify({"ok": False, "error": "promo_owner_assignment_failed", "root_cause": f"{type(exc).__name__}: {_clip(exc)}"}), 500
+
+
+@bp.get("/promo/admin/redemptions")
+def promo_admin_redemptions():
+    auth_error = _require_admin()
+    if auth_error:
+        return auth_error
+
+    limit = _to_int(request.args.get("limit"), 100)
+    code = _normalize_code(request.args.get("code"))
+    status = _lower(request.args.get("status"))
+
+    try:
+        query = _sb().table("promo_redemptions").select("*").order("created_at", desc=True)
+        if code:
+            query = query.eq("promo_code", code)
+        if status:
+            query = query.eq("status", status)
+        resp = query.limit(max(1, min(limit, 500))).execute()
+        rows = _response_data(resp)
+        return jsonify({"ok": True, "route_version": PROMO_ROUTE_VERSION, "count": len(rows), "rows": rows}), 200
+    except Exception as exc:
+        return jsonify({"ok": False, "error": "promo_redemptions_list_failed", "root_cause": f"{type(exc).__name__}: {_clip(exc)}"}), 500
+
+
+@bp.get("/promo/admin/rewards")
+def promo_admin_rewards():
+    auth_error = _require_admin()
+    if auth_error:
+        return auth_error
+
+    limit = _to_int(request.args.get("limit"), 100)
+    code = _normalize_code(request.args.get("code"))
+    status = _lower(request.args.get("status"))
+
+    try:
+        query = _sb().table("promo_rewards").select("*").order("created_at", desc=True)
+        if code:
+            query = query.eq("promo_code", code)
+        if status:
+            query = query.eq("status", status)
+        resp = query.limit(max(1, min(limit, 500))).execute()
+        rows = _response_data(resp)
+
+        total_pending = 0
+        for row in rows:
+            if _lower(row.get("status")) == "pending":
+                try:
+                    total_pending += float(row.get("reward_amount_ngn") or 0)
+                except Exception:
+                    pass
+
+        return jsonify({
+            "ok": True,
+            "route_version": PROMO_ROUTE_VERSION,
+            "count": len(rows),
+            "summary": {"pending_reward_amount_ngn": total_pending},
+            "rows": rows,
+        }), 200
+    except Exception as exc:
+        return jsonify({"ok": False, "error": "promo_rewards_list_failed", "root_cause": f"{type(exc).__name__}: {_clip(exc)}"}), 500
+
+
+@bp.post("/promo/admin/rewards/<reward_id>/mark-status")
+def promo_admin_reward_mark_status(reward_id: str):
+    auth_error = _require_admin()
+    if auth_error:
+        return auth_error
+
+    body = request.get_json(silent=True) or {}
+    status = _lower(body.get("status"))
+    allowed = {"pending", "processing", "approved", "paid", "failed", "reversed", "cancelled", "canceled"}
+    if status not in allowed:
+        return jsonify({"ok": False, "error": "invalid_reward_status", "allowed": sorted(allowed)}), 400
+
+    now_iso = _now_iso()
+    payload: Dict[str, Any] = {
+        "status": status,
+        "updated_at": now_iso,
+    }
+
+    if status == "approved":
+        payload["approved_at"] = now_iso
+    elif status == "paid":
+        payload["paid_at"] = now_iso
+    elif status in {"failed", "reversed", "cancelled", "canceled"}:
+        payload["reversed_at"] = now_iso
+        payload["reversal_reason"] = _clean(body.get("reason")) or _clean(body.get("failure_reason")) or status
+
+    if isinstance(body.get("metadata"), dict):
+        payload["metadata"] = body.get("metadata")
+
+    try:
+        resp = _sb().table("promo_rewards").update(payload).eq("id", reward_id).execute()
+        row = _first(resp)
+        return jsonify({
+            "ok": True,
+            "route_version": PROMO_ROUTE_VERSION,
+            "reward_id": reward_id,
+            "status": status,
+            "row": row,
+        }), 200
+    except Exception as exc:
+        return jsonify({"ok": False, "error": "promo_reward_status_update_failed", "root_cause": f"{type(exc).__name__}: {_clip(exc)}"}), 500
