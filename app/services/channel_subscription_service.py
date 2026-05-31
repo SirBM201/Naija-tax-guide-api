@@ -1,4 +1,4 @@
-# app/services/channel_subscription_service.py
+﻿# app/services/channel_subscription_service.py
 from __future__ import annotations
 
 import uuid
@@ -84,14 +84,14 @@ def get_plans_list_menu() -> str:
     plans = get_plans_from_db()
     
     if not plans:
-        return "📋 *Available Plans*\n\nNo plans available at the moment. Please check back later."
+        return "ðŸ“‹ *Available Plans*\n\nNo plans available at the moment. Please check back later."
     
-    menu_lines = ["📋 *AVAILABLE SUBSCRIPTION PLANS*\n", "Reply with the plan number (e.g., '1'):\n"]
+    menu_lines = ["ðŸ“‹ *AVAILABLE SUBSCRIPTION PLANS*\n", "Reply with the plan number (e.g., '1'):\n"]
     
     for num, plan in plans.items():
-        emoji = {1: "1️⃣", 2: "2️⃣", 3: "3️⃣", 4: "4️⃣", 5: "5️⃣", 6: "6️⃣", 7: "7️⃣", 8: "8️⃣", 9: "9️⃣"}.get(num, f"{num}️⃣")
+        emoji = {1: "1ï¸âƒ£", 2: "2ï¸âƒ£", 3: "3ï¸âƒ£", 4: "4ï¸âƒ£", 5: "5ï¸âƒ£", 6: "6ï¸âƒ£", 7: "7ï¸âƒ£", 8: "8ï¸âƒ£", 9: "9ï¸âƒ£"}.get(num, f"{num}ï¸âƒ£")
         billing_display = {"monthly": "Monthly", "quarterly": "Quarterly", "yearly": "Yearly"}.get(plan["billing_cycle"], plan["billing_cycle"])
-        menu_lines.append(f"{emoji} - *{plan['name']} {billing_display}* - ₦{plan['amount_ngn']:,} - {plan['credits']} credits")
+        menu_lines.append(f"{emoji} - *{plan['name']} {billing_display}* - â‚¦{plan['amount_ngn']:,} - {plan['credits']} credits")
     
     menu_lines.append("\nEnter 0 to cancel.")
     return "\n".join(menu_lines)
@@ -177,7 +177,7 @@ def store_user_email(account_id: str, email: str) -> bool:
 def request_email_message() -> str:
     """Message to request email from user"""
     return (
-        "📧 *Email Required for Subscription*\n\n"
+        "ðŸ“§ *Email Required for Subscription*\n\n"
         "To activate your subscription, please provide your email address.\n"
         "We need this for payment receipts and subscription management.\n\n"
         "Send your email address (e.g., example@gmail.com):"
@@ -207,7 +207,7 @@ def create_subscription_payment(
         return {
             "ok": False,
             "error": "invalid_email",
-            "message": "❌ Invalid email address. Please send a valid email (e.g., name@example.com)"
+            "message": "âŒ Invalid email address. Please send a valid email (e.g., name@example.com)"
         }
     
     reference = f"SUB_{plan['code']}_{uuid.uuid4().hex[:8]}"
@@ -268,27 +268,27 @@ def create_subscription_payment(
                 "plan_name": plan["full_name"],
                 "credits": plan["credits"],
                 "monthly_credits": plan.get("monthly_credits", plan["credits"]),
-                "message": f"💎 *{plan['full_name']} Subscription*\n\n"
-                          f"💰 Amount: ₦{plan['amount_ngn']:,}\n"
-                          f"🎯 Credits: {plan['credits']} AI credits per {billing_display}\n"
-                          f"✨ No daily limits - unlimited questions!\n"
-                          f"🔄 Auto-renews {plan['billing_cycle']}\n\n"
-                          f"🔗 Click to pay:\n{result['data']['authorization_url']}\n\n"
-                          f"✅ Payment confirms your subscription\n"
-                          f"📧 Receipts will be sent to: {email}"
+                "message": f"ðŸ’Ž *{plan['full_name']} Subscription*\n\n"
+                          f"ðŸ’° Amount: â‚¦{plan['amount_ngn']:,}\n"
+                          f"ðŸŽ¯ Credits: {plan['credits']} AI credits per {billing_display}\n"
+                          f"âœ¨ No daily limits - unlimited questions!\n"
+                          f"ðŸ”„ Auto-renews {plan['billing_cycle']}\n\n"
+                          f"ðŸ”— Click to pay:\n{result['data']['authorization_url']}\n\n"
+                          f"âœ… Payment confirms your subscription\n"
+                          f"ðŸ“§ Receipts will be sent to: {email}"
             }
         else:
             return {
                 "ok": False,
                 "error": "payment_link_failed",
-                "message": "❌ Could not generate payment link. Please try again."
+                "message": "âŒ Could not generate payment link. Please try again."
             }
     except Exception as e:
         logger.error(f"Error creating subscription: {e}")
         return {
             "ok": False,
             "error": str(e),
-            "message": "❌ Payment service error. Please try again later."
+            "message": "âŒ Payment service error. Please try again later."
         }
 
 
@@ -423,33 +423,33 @@ def format_subscription_message(account_id: str) -> str:
         if current_period_end:
             try:
                 dt = datetime.fromisoformat(current_period_end.replace('Z', '+00:00'))
-                expiry_text = f"\n📅 Next billing: {dt.strftime('%b %d, %Y')}"
+                expiry_text = f"\nðŸ“… Next billing: {dt.strftime('%b %d, %Y')}"
             except:
                 pass
         
         # Format credit display based on billing cycle - NO DAILY LIMIT
         if billing_cycle == "monthly":
             credit_display = f"{credits} AI credits per month"
-            access_text = f"✨ You have {credits} AI credits to use this month."
+            access_text = f"âœ¨ You have {credits} AI credits to use this month."
         elif billing_cycle == "quarterly":
             credit_display = f"{credits} AI credits per quarter ({monthly_credits} per month)"
-            access_text = f"✨ You have {credits} AI credits to use over the next 3 months."
+            access_text = f"âœ¨ You have {credits} AI credits to use over the next 3 months."
         else:  # yearly
             credit_display = f"{credits} AI credits per year ({monthly_credits} per month)"
-            access_text = f"✨ You have {credits} AI credits to use over the next year."
+            access_text = f"âœ¨ You have {credits} AI credits to use over the next year."
         
-        return (f"📋 *YOUR SUBSCRIPTION*\n\n"
-                f"✅ Plan: {plan_name}\n"
-                f"🎯 Credits: {credit_display}\n"
-                f"📊 Daily limit: Unlimited ✨\n"
+        return (f"ðŸ“‹ *YOUR SUBSCRIPTION*\n\n"
+                f"âœ… Plan: {plan_name}\n"
+                f"ðŸŽ¯ Credits: {credit_display}\n"
+                f"ðŸ“Š Daily limit: Unlimited âœ¨\n"
                 f"{expiry_text}\n\n"
                 f"{access_text}\n"
-                f"🔄 Auto-renews {billing_cycle}\n\n"
+                f"ðŸ”„ Auto-renews {billing_cycle}\n\n"
                 f"To cancel, contact support.")
     else:
-        return ("📋 *NO ACTIVE SUBSCRIPTION*\n\n"
+        return ("ðŸ“‹ *NO ACTIVE SUBSCRIPTION*\n\n"
                 "You are on the Free plan.\n"
-                "🎯 Free: 10 AI credits\n\n"
+                "ðŸŽ¯ Free: 10 AI credits\n\n"
                 "Reply with 4 to see available plans and upgrade.")
 
 
@@ -462,3 +462,4 @@ def get_credit_balance_with_subscription(account_id: str, base_balance: int) -> 
             return plan.get("credits", 0), "subscription"
         return base_balance, "subscription"
     return base_balance, "free"
+
