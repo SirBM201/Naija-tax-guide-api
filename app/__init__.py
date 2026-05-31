@@ -273,6 +273,7 @@ def create_app() -> Flask:
         "app.routes.paystack_webhook",
         "app.routes.referral_hub",
         "app.routes.promo",
+        "app.routes.channel_promo",
     ]
 
     for dotted in optional_modules:
