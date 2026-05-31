@@ -9,7 +9,7 @@ from typing import Dict, Any, Optional, List, Tuple
 
 from app.core.supabase_client import supabase
 from app.services.paystack_service import initialize_transaction
-from app.services.credits_service import init_credits_for_plan
+from app.services.credits_service import add_plan_credits_for_payment
 
 logger = logging.getLogger(__name__)
 
@@ -334,9 +334,10 @@ def activate_subscription(account_id: str, plan_code: str, reference: str) -> Di
     """
     Activate a subscription for a channel user.
 
-    Batch 36E:
-    After the subscription row is activated, initialize the paid plan AI credits
-    so WhatsApp/Telegram users do not become active subscribers with 0 credits.
+    Batch 36F:
+    After the subscription row is activated, add the paid plan credits to any
+    existing unused balance. This preserves old credits during upgrades/renewals
+    and prevents duplicate crediting by using the Paystack reference.
     """
     try:
         now = datetime.now(timezone.utc)
@@ -391,7 +392,12 @@ def activate_subscription(account_id: str, plan_code: str, reference: str) -> Di
 
         credit_initialization: Dict[str, Any] = {}
         try:
-            credit_initialization = init_credits_for_plan(account_id, plan_code)
+            credit_initialization = add_plan_credits_for_payment(
+                account_id,
+                plan_code,
+                reference,
+                source="channel_subscription_payment",
+            )
             if not isinstance(credit_initialization, dict):
                 credit_initialization = {
                     "ok": False,
@@ -408,12 +414,13 @@ def activate_subscription(account_id: str, plan_code: str, reference: str) -> Di
 
         if credit_initialization.get("ok"):
             logger.info(
-                f"Subscription activated and credits initialized for account {account_id}: "
-                f"{plan_code}, credits={credit_initialization.get('balance')}"
+                f"Subscription activated and credits applied for account {account_id}: "
+                f"{plan_code}, balance={credit_initialization.get('balance')}, "
+                f"added={credit_initialization.get('credits_added')}"
             )
         else:
             logger.error(
-                f"Subscription activated but credit initialization failed for account {account_id}: "
+                f"Subscription activated but credit application failed for account {account_id}: "
                 f"{plan_code}, result={credit_initialization}"
             )
 
@@ -428,7 +435,7 @@ def activate_subscription(account_id: str, plan_code: str, reference: str) -> Di
             "billing_cycle": billing_cycle,
             "credits": credit_initialization,
             "credit_balance": credit_initialization.get("balance"),
-            "route_version": "2026-05-31-batch36E-channel-subscription-credit-init",
+            "route_version": "2026-06-01-batch36F-additive-idempotent-credit-init",
         }
 
     except Exception as e:
