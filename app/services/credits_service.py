@@ -32,6 +32,7 @@ Schema assumed:
     - UNIQUE(account_id, day)
 """
 
+import json
 from datetime import datetime, timezone, date
 from typing import Any, Dict, Optional
 
@@ -209,8 +210,12 @@ def _set_credit_balance(account_id: str, new_balance: int) -> None:
 
 def init_credits_for_plan(account_id: str, plan_code: str) -> Dict[str, Any]:
     """
-    Called after a subscription is activated/changed.
-    Overwrites balance to plan's ai_credits_total.
+    Legacy initializer called by older web billing paths.
+
+    Important:
+    This still overwrites balance to plan.ai_credits_total for backward compatibility.
+    New WhatsApp/Telegram paid purchases must use add_plan_credits_for_payment()
+    because it preserves existing credits and prevents duplicate crediting.
     """
     account_id = (account_id or "").strip()
     plan_code = (plan_code or "").strip().lower()
@@ -260,6 +265,92 @@ def init_credits_for_plan(account_id: str, plan_code: str) -> Dict[str, Any]:
         }
 
     return {"ok": True, "account_id": account_id, "plan_code": plan_code, "balance": total}
+
+
+def _extract_rpc_json(resp: Any) -> Dict[str, Any]:
+    data = getattr(resp, "data", None)
+
+    if isinstance(data, dict):
+        return data
+
+    if isinstance(data, list) and data:
+        first = data[0]
+        return first if isinstance(first, dict) else {"ok": True, "data": first}
+
+    if isinstance(data, str):
+        try:
+            parsed = json.loads(data)
+            return parsed if isinstance(parsed, dict) else {"ok": True, "data": parsed}
+        except Exception:
+            return {"ok": True, "data": data}
+
+    if data is None:
+        return {"ok": False, "error": "empty_rpc_response"}
+
+    return {"ok": True, "data": data}
+
+
+def add_plan_credits_for_payment(
+    account_id: str,
+    plan_code: str,
+    payment_reference: str,
+    *,
+    source: str = "subscription_payment",
+) -> Dict[str, Any]:
+    """
+    Batch 36F paid-plan credit rule:
+    - Add new plan credits to any existing balance.
+    - Do not overwrite existing unused credits.
+    - Do not add credits twice for the same payment_reference.
+
+    Requires Supabase SQL function:
+      public.apply_plan_credit_purchase(uuid, text, text, text)
+    """
+    account_id = (account_id or "").strip()
+    plan_code = (plan_code or "").strip().lower()
+    payment_reference = (payment_reference or "").strip()
+    source = (source or "subscription_payment").strip()
+
+    if not account_id or not plan_code or not payment_reference:
+        return {
+            "ok": False,
+            "error": "missing_credit_application_input",
+            "root_cause": "account_id, plan_code, or payment_reference was empty",
+            "account_id": account_id,
+            "plan_code": plan_code,
+            "payment_reference": payment_reference,
+        }
+
+    try:
+        resp = _sb().rpc(
+            "apply_plan_credit_purchase",
+            {
+                "p_account_id": account_id,
+                "p_plan_code": plan_code,
+                "p_payment_reference": payment_reference,
+                "p_source": source,
+            },
+        ).execute()
+
+        result = _extract_rpc_json(resp)
+        if not isinstance(result, dict):
+            return {"ok": False, "error": "invalid_rpc_result", "raw": str(result)}
+
+        if result.get("ok") and "balance" not in result and "balance_after" in result:
+            result["balance"] = result.get("balance_after")
+
+        return result
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": "apply_plan_credit_purchase_rpc_failed",
+            "root_cause": f"{type(e).__name__}: {_clip(str(e))}",
+            "fix": "Run Batch 36F SQL migration and confirm apply_plan_credit_purchase RPC exists.",
+            "account_id": account_id,
+            "plan_code": plan_code,
+            "payment_reference": payment_reference,
+        }
 
 
 def consume_credits(account_id: str, cost: int = 1) -> Dict[str, Any]:
