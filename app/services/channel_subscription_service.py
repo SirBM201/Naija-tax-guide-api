@@ -1,4 +1,4 @@
-﻿# app/services/channel_subscription_service.py
+# app/services/channel_subscription_service.py
 from __future__ import annotations
 
 import uuid
@@ -9,6 +9,7 @@ from typing import Dict, Any, Optional, List, Tuple
 
 from app.core.supabase_client import supabase
 from app.services.paystack_service import initialize_transaction
+from app.services.credits_service import init_credits_for_plan
 
 logger = logging.getLogger(__name__)
 
@@ -24,42 +25,45 @@ def get_plans_from_db() -> Dict[int, Dict[str, Any]]:
             .select("plan_code, name, price, ai_credits_total, daily_answers_limit, duration_days") \
             .eq("active", True) \
             .execute()
-        
-        plans = {}
+
+        plans: Dict[int, Dict[str, Any]] = {}
         index = 1
+
         for row in (result.data or []):
             plan_code = row.get("plan_code", "")
             duration_days = row.get("duration_days", 30)
-            
-            # Determine billing cycle
+
             if "yearly" in plan_code or duration_days >= 365:
                 billing_cycle = "yearly"
             elif "quarterly" in plan_code or duration_days >= 90:
                 billing_cycle = "quarterly"
             else:
                 billing_cycle = "monthly"
-            
-            # Get base name
-            base_name = row.get("name", plan_code.split("_")[0] if "_" in plan_code else plan_code).title()
-            
-            # Calculate credits based on billing cycle
-            monthly_credits = row.get("ai_credits_total", 0)
+
+            base_name = row.get(
+                "name",
+                plan_code.split("_")[0] if "_" in plan_code else plan_code,
+            ).title()
+
+            monthly_credits = int(row.get("ai_credits_total") or 0)
             if billing_cycle == "quarterly":
                 credits = monthly_credits * 3
             elif billing_cycle == "yearly":
                 credits = monthly_credits * 12
             else:
                 credits = monthly_credits
-            
+
+            amount_ngn = int(row.get("price") or 0)
+
             plans[index] = {
                 "code": plan_code,
                 "name": base_name,
                 "full_name": f"{base_name} {billing_cycle.capitalize()}",
-                "amount_ngn": row.get("price", 0),
-                "amount_kobo": row.get("price", 0) * 100,
+                "amount_ngn": amount_ngn,
+                "amount_kobo": amount_ngn * 100,
                 "credits": credits,
                 "monthly_credits": monthly_credits,
-                "daily_limit": 0,  # NO DAILY LIMIT - unlimited for subscribers
+                "daily_limit": 0,
                 "duration_days": duration_days,
                 "billing_cycle": billing_cycle,
                 "cycle_text": f"per {billing_cycle}",
@@ -68,12 +72,13 @@ def get_plans_from_db() -> Dict[int, Dict[str, Any]]:
                     plan_code.lower(),
                     f"{base_name} {billing_cycle}".lower(),
                     billing_cycle,
-                    str(row.get("price", 0))
-                ]
+                    str(amount_ngn),
+                ],
             }
             index += 1
-        
+
         return plans
+
     except Exception as e:
         logger.error(f"Error fetching plans: {e}")
         return {}
@@ -82,17 +87,36 @@ def get_plans_from_db() -> Dict[int, Dict[str, Any]]:
 def get_plans_list_menu() -> str:
     """Simple numbered list of all plans - NO DAILY LIMIT displayed"""
     plans = get_plans_from_db()
-    
+
     if not plans:
-        return "ðŸ“‹ *Available Plans*\n\nNo plans available at the moment. Please check back later."
-    
-    menu_lines = ["ðŸ“‹ *AVAILABLE SUBSCRIPTION PLANS*\n", "Reply with the plan number (e.g., '1'):\n"]
-    
+        return "📋 *Available Plans*\n\nNo plans available at the moment. Please check back later."
+
+    menu_lines = [
+        "📋 *AVAILABLE SUBSCRIPTION PLANS*\n",
+        "Reply with the plan number (e.g., '1'):\n",
+    ]
+
     for num, plan in plans.items():
-        emoji = {1: "1ï¸âƒ£", 2: "2ï¸âƒ£", 3: "3ï¸âƒ£", 4: "4ï¸âƒ£", 5: "5ï¸âƒ£", 6: "6ï¸âƒ£", 7: "7ï¸âƒ£", 8: "8ï¸âƒ£", 9: "9ï¸âƒ£"}.get(num, f"{num}ï¸âƒ£")
-        billing_display = {"monthly": "Monthly", "quarterly": "Quarterly", "yearly": "Yearly"}.get(plan["billing_cycle"], plan["billing_cycle"])
-        menu_lines.append(f"{emoji} - *{plan['name']} {billing_display}* - â‚¦{plan['amount_ngn']:,} - {plan['credits']} credits")
-    
+        emoji = {
+            1: "1️⃣",
+            2: "2️⃣",
+            3: "3️⃣",
+            4: "4️⃣",
+            5: "5️⃣",
+            6: "6️⃣",
+            7: "7️⃣",
+            8: "8️⃣",
+            9: "9️⃣",
+        }.get(num, f"{num}️⃣")
+        billing_display = {
+            "monthly": "Monthly",
+            "quarterly": "Quarterly",
+            "yearly": "Yearly",
+        }.get(plan["billing_cycle"], plan["billing_cycle"])
+        menu_lines.append(
+            f"{emoji} - *{plan['name']} {billing_display}* - ₦{plan['amount_ngn']:,} - {plan['credits']} credits"
+        )
+
     menu_lines.append("\nEnter 0 to cancel.")
     return "\n".join(menu_lines)
 
@@ -105,10 +129,13 @@ def validate_plan_number(plan_num: int) -> Optional[Dict[str, Any]]:
 
 def validate_plan_code(plan_code: str) -> Optional[Dict[str, Any]]:
     """Validate plan code and return plan details"""
+    plan_code = str(plan_code or "").strip()
     plans = get_plans_from_db()
+
     for plan in plans.values():
         if plan["code"] == plan_code:
             return plan
+
     return None
 
 
@@ -116,19 +143,17 @@ def detect_plan_from_text(text: str) -> Tuple[Optional[int], Optional[Dict[str, 
     """Detect plan from user input (number, name, or amount)"""
     text_lower = text.lower().strip()
     plans = get_plans_from_db()
-    
-    # Check by number first
+
     if text_lower.isdigit():
         num = int(text_lower)
         if num in plans:
             return num, plans[num]
-    
-    # Check by name keywords
+
     for num, plan in plans.items():
         for keyword in plan.get("keywords", []):
-            if keyword in text_lower:
+            if keyword and keyword in text_lower:
                 return num, plan
-    
+
     return None, None
 
 
@@ -140,10 +165,12 @@ def get_user_email(account_id: str) -> Optional[str]:
             .eq("account_id", account_id) \
             .limit(1) \
             .execute()
-        
+
         if result.data and result.data[0].get("email"):
             return result.data[0]["email"]
+
         return None
+
     except Exception:
         return None
 
@@ -151,33 +178,31 @@ def get_user_email(account_id: str) -> Optional[str]:
 def store_user_email(account_id: str, email: str) -> bool:
     """Store user's email for future subscription use - handles duplicate gracefully"""
     try:
-        # Check if email already exists in another account
         existing = _sb().table("accounts") \
             .select("account_id, email") \
             .eq("email", email.lower()) \
             .execute()
-        
+
         if existing.data:
-            # Email exists in another account - don't store, just return success
-            # The user can still proceed with subscription
             logger.info(f"Email {email} already exists in another account")
             return True
-        
-        # Update the user's account with email
+
         _sb().table("accounts") \
             .update({"email": email.lower()}) \
             .eq("account_id", account_id) \
             .execute()
+
         return True
+
     except Exception as e:
         logger.error(f"Error storing email: {e}")
-        return True  # Return True anyway - email is optional
+        return True
 
 
 def request_email_message() -> str:
     """Message to request email from user"""
     return (
-        "ðŸ“§ *Email Required for Subscription*\n\n"
+        "📧 *Email Required for Subscription*\n\n"
         "To activate your subscription, please provide your email address.\n"
         "We need this for payment receipts and subscription management.\n\n"
         "Send your email address (e.g., example@gmail.com):"
@@ -189,34 +214,31 @@ def create_subscription_payment(
     plan: Dict[str, Any],
     channel_type: str,
     provider_user_id: str,
-    email: Optional[str] = None
+    email: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create a Paystack subscription payment"""
-    
+
     if not email:
         return {
             "ok": False,
             "error": "email_required",
             "message": request_email_message(),
             "awaiting_email": True,
-            "plan": plan
+            "plan": plan,
         }
-    
-    # Validate email format
+
     if "@" not in email or "." not in email or len(email) < 5:
         return {
             "ok": False,
             "error": "invalid_email",
-            "message": "âŒ Invalid email address. Please send a valid email (e.g., name@example.com)"
+            "message": "❌ Invalid email address. Please send a valid email (e.g., name@example.com)",
         }
-    
+
     reference = f"SUB_{plan['code']}_{uuid.uuid4().hex[:8]}"
-    amount_kobo = plan["amount_kobo"]
-    
-    # Store user's email (handles duplicate gracefully)
+    amount_kobo = int(plan["amount_kobo"])
+
     store_user_email(account_id, email)
-    
-    # Store transaction record
+
     try:
         _sb().table("paystack_transactions").insert({
             "reference": reference,
@@ -232,16 +254,24 @@ def create_subscription_payment(
                 "type": "subscription",
                 "channel_type": channel_type,
                 "provider_user_id": provider_user_id,
-                "amount_ngn": plan["amount_ngn"]
-            }
+                "amount_ngn": plan["amount_ngn"],
+            },
         }).execute()
     except Exception as e:
         logger.error(f"Error storing transaction: {e}")
-    
-    # Build callback URL
-    base_url = os.getenv("PUBLIC_BACKEND_BASE_URL", "https://incredible-nonie-bmsconcept-37359733.koyeb.app")
-    callback_url = f"{base_url}/api/channel/payment/return?channel_type={channel_type}&provider_user_id={provider_user_id}&account_id={account_id}&plan_code={plan['code']}"
-    
+
+    base_url = os.getenv(
+        "PUBLIC_BACKEND_BASE_URL",
+        "https://incredible-nonie-bmsconcept-37359733.koyeb.app",
+    )
+    callback_url = (
+        f"{base_url}/api/channel/payment/return"
+        f"?channel_type={channel_type}"
+        f"&provider_user_id={provider_user_id}"
+        f"&account_id={account_id}"
+        f"&plan_code={plan['code']}"
+    )
+
     try:
         result = initialize_transaction(
             amount_kobo=amount_kobo,
@@ -253,13 +283,18 @@ def create_subscription_payment(
                 "type": "subscription",
                 "channel_type": channel_type,
                 "provider_user_id": provider_user_id,
-                "amount_ngn": plan["amount_ngn"]
+                "amount_ngn": plan["amount_ngn"],
             },
-            callback_url=callback_url
+            callback_url=callback_url,
         )
-        
+
         if result.get("status") and result.get("data", {}).get("authorization_url"):
-            billing_display = {"monthly": "month", "quarterly": "3 months", "yearly": "year"}.get(plan["billing_cycle"], "month")
+            billing_display = {
+                "monthly": "month",
+                "quarterly": "3 months",
+                "yearly": "year",
+            }.get(plan["billing_cycle"], "month")
+
             return {
                 "ok": True,
                 "payment_link": result["data"]["authorization_url"],
@@ -268,36 +303,44 @@ def create_subscription_payment(
                 "plan_name": plan["full_name"],
                 "credits": plan["credits"],
                 "monthly_credits": plan.get("monthly_credits", plan["credits"]),
-                "message": f"ðŸ’Ž *{plan['full_name']} Subscription*\n\n"
-                          f"ðŸ’° Amount: â‚¦{plan['amount_ngn']:,}\n"
-                          f"ðŸŽ¯ Credits: {plan['credits']} AI credits per {billing_display}\n"
-                          f"âœ¨ No daily limits - unlimited questions!\n"
-                          f"ðŸ”„ Auto-renews {plan['billing_cycle']}\n\n"
-                          f"ðŸ”— Click to pay:\n{result['data']['authorization_url']}\n\n"
-                          f"âœ… Payment confirms your subscription\n"
-                          f"ðŸ“§ Receipts will be sent to: {email}"
+                "message": (
+                    f"💎 *{plan['full_name']} Subscription*\n\n"
+                    f"💰 Amount: ₦{plan['amount_ngn']:,}\n"
+                    f"🎯 Credits: {plan['credits']} AI credits per {billing_display}\n"
+                    f"✨ No daily limits - unlimited questions!\n"
+                    f"🔄 Auto-renews {plan['billing_cycle']}\n\n"
+                    f"🔗 Click to pay:\n{result['data']['authorization_url']}\n\n"
+                    f"✅ Payment confirms your subscription\n"
+                    f"📧 Receipts will be sent to: {email}"
+                ),
             }
-        else:
-            return {
-                "ok": False,
-                "error": "payment_link_failed",
-                "message": "âŒ Could not generate payment link. Please try again."
-            }
+
+        return {
+            "ok": False,
+            "error": "payment_link_failed",
+            "message": "❌ Could not generate payment link. Please try again.",
+        }
+
     except Exception as e:
         logger.error(f"Error creating subscription: {e}")
         return {
             "ok": False,
             "error": str(e),
-            "message": "âŒ Payment service error. Please try again later."
+            "message": "❌ Payment service error. Please try again later.",
         }
 
 
 def activate_subscription(account_id: str, plan_code: str, reference: str) -> Dict[str, Any]:
-    """Activate a subscription for a user"""
+    """
+    Activate a subscription for a channel user.
+
+    Batch 36E:
+    After the subscription row is activated, initialize the paid plan AI credits
+    so WhatsApp/Telegram users do not become active subscribers with 0 credits.
+    """
     try:
         now = datetime.now(timezone.utc)
-        
-        # Determine duration and get plan details
+
         if "yearly" in plan_code:
             duration_days = 365
             billing_cycle = "yearly"
@@ -307,52 +350,87 @@ def activate_subscription(account_id: str, plan_code: str, reference: str) -> Di
         else:
             duration_days = 30
             billing_cycle = "monthly"
-        
+
         current_period_end = (now + timedelta(days=duration_days)).isoformat()
         now_iso = now.isoformat()
-        
-        # First, deactivate any existing active subscriptions for this account
+
         _sb().table("user_subscriptions") \
             .update({"is_active": False, "status": "inactive", "updated_at": now_iso}) \
             .eq("account_id", account_id) \
             .eq("is_active", True) \
             .execute()
-        
-        # Check if a subscription already exists for this account
+
         existing = _sb().table("user_subscriptions") \
             .select("*") \
             .eq("account_id", account_id) \
             .order("created_at", desc=True) \
             .limit(1) \
             .execute()
-        
+
         if existing.data:
-            # Update existing subscription
-            result = _sb().table("user_subscriptions") \
+            _sb().table("user_subscriptions") \
                 .update({
                     "plan_code": plan_code,
                     "status": "active",
                     "is_active": True,
                     "current_period_end": current_period_end,
-                    "updated_at": now_iso
+                    "updated_at": now_iso,
                 }) \
                 .eq("id", existing.data[0]["id"]) \
                 .execute()
         else:
-            # Create new subscription
-            result = _sb().table("user_subscriptions").insert({
+            _sb().table("user_subscriptions").insert({
                 "account_id": account_id,
                 "plan_code": plan_code,
                 "status": "active",
                 "is_active": True,
                 "current_period_end": current_period_end,
                 "created_at": now_iso,
-                "updated_at": now_iso
+                "updated_at": now_iso,
             }).execute()
-        
+
+        credit_initialization: Dict[str, Any] = {}
+        try:
+            credit_initialization = init_credits_for_plan(account_id, plan_code)
+            if not isinstance(credit_initialization, dict):
+                credit_initialization = {
+                    "ok": False,
+                    "error": "invalid_credit_initialization_response",
+                    "raw": str(credit_initialization),
+                }
+        except Exception as credit_exc:
+            logger.exception("Channel subscription credit initialization failed")
+            credit_initialization = {
+                "ok": False,
+                "error": "credit_initialization_exception",
+                "root_cause": f"{type(credit_exc).__name__}: {credit_exc}",
+            }
+
+        if credit_initialization.get("ok"):
+            logger.info(
+                f"Subscription activated and credits initialized for account {account_id}: "
+                f"{plan_code}, credits={credit_initialization.get('balance')}"
+            )
+        else:
+            logger.error(
+                f"Subscription activated but credit initialization failed for account {account_id}: "
+                f"{plan_code}, result={credit_initialization}"
+            )
+
         logger.info(f"Subscription activated for account {account_id}: {plan_code} until {current_period_end}")
-        return {"ok": True, "plan_code": plan_code, "expires_at": current_period_end, "duration_days": duration_days, "billing_cycle": billing_cycle}
-        
+
+        return {
+            "ok": True,
+            "plan_code": plan_code,
+            "expires_at": current_period_end,
+            "current_period_end": current_period_end,
+            "duration_days": duration_days,
+            "billing_cycle": billing_cycle,
+            "credits": credit_initialization,
+            "credit_balance": credit_initialization.get("balance"),
+            "route_version": "2026-05-31-batch36E-channel-subscription-credit-init",
+        }
+
     except Exception as e:
         logger.error(f"Error activating subscription: {e}")
         return {"ok": False, "error": str(e)}
@@ -369,10 +447,12 @@ def get_user_subscription(account_id: str) -> Optional[Dict[str, Any]]:
             .order("created_at", desc=True) \
             .limit(1) \
             .execute()
-        
+
         if result.data:
             return result.data[0]
+
         return None
+
     except Exception as e:
         logger.error(f"Error getting subscription: {e}")
         return None
@@ -381,33 +461,33 @@ def get_user_subscription(account_id: str) -> Optional[Dict[str, Any]]:
 def has_active_subscription(account_id: str) -> bool:
     """Check if user has an active subscription"""
     sub = get_user_subscription(account_id)
+
     if not sub:
         return False
-    
-    # Check if subscription is still valid
+
     current_period_end = sub.get("current_period_end")
+
     if current_period_end:
         try:
-            exp_dt = datetime.fromisoformat(current_period_end.replace('Z', '+00:00'))
+            exp_dt = datetime.fromisoformat(current_period_end.replace("Z", "+00:00"))
             if exp_dt < datetime.now(timezone.utc):
                 return False
-        except:
+        except Exception:
             pass
-    
+
     return True
 
 
 def format_subscription_message(account_id: str) -> str:
     """Format subscription status message - NO DAILY LIMIT for subscribers"""
     subscription = get_user_subscription(account_id)
-    
+
     if subscription and subscription.get("is_active"):
         plan_code = subscription.get("plan_code", "unknown")
         current_period_end = subscription.get("current_period_end", "")
-        
-        # Get plan details
+
         plan = validate_plan_code(plan_code)
-        
+
         if plan:
             plan_name = plan["full_name"]
             credits = plan["credits"]
@@ -418,39 +498,42 @@ def format_subscription_message(account_id: str) -> str:
             credits = "?"
             monthly_credits = "?"
             billing_cycle = "monthly"
-        
+
         expiry_text = ""
         if current_period_end:
             try:
-                dt = datetime.fromisoformat(current_period_end.replace('Z', '+00:00'))
-                expiry_text = f"\nðŸ“… Next billing: {dt.strftime('%b %d, %Y')}"
-            except:
+                dt = datetime.fromisoformat(current_period_end.replace("Z", "+00:00"))
+                expiry_text = f"\n📅 Next billing: {dt.strftime('%b %d, %Y')}"
+            except Exception:
                 pass
-        
-        # Format credit display based on billing cycle - NO DAILY LIMIT
+
         if billing_cycle == "monthly":
             credit_display = f"{credits} AI credits per month"
-            access_text = f"âœ¨ You have {credits} AI credits to use this month."
+            access_text = f"✨ You have {credits} AI credits to use this month."
         elif billing_cycle == "quarterly":
             credit_display = f"{credits} AI credits per quarter ({monthly_credits} per month)"
-            access_text = f"âœ¨ You have {credits} AI credits to use over the next 3 months."
-        else:  # yearly
+            access_text = f"✨ You have {credits} AI credits to use over the next 3 months."
+        else:
             credit_display = f"{credits} AI credits per year ({monthly_credits} per month)"
-            access_text = f"âœ¨ You have {credits} AI credits to use over the next year."
-        
-        return (f"ðŸ“‹ *YOUR SUBSCRIPTION*\n\n"
-                f"âœ… Plan: {plan_name}\n"
-                f"ðŸŽ¯ Credits: {credit_display}\n"
-                f"ðŸ“Š Daily limit: Unlimited âœ¨\n"
-                f"{expiry_text}\n\n"
-                f"{access_text}\n"
-                f"ðŸ”„ Auto-renews {billing_cycle}\n\n"
-                f"To cancel, contact support.")
-    else:
-        return ("ðŸ“‹ *NO ACTIVE SUBSCRIPTION*\n\n"
-                "You are on the Free plan.\n"
-                "ðŸŽ¯ Free: 10 AI credits\n\n"
-                "Reply with 4 to see available plans and upgrade.")
+            access_text = f"✨ You have {credits} AI credits to use over the next year."
+
+        return (
+            "📋 *YOUR SUBSCRIPTION*\n\n"
+            f"✅ Plan: {plan_name}\n"
+            f"🎯 Credits: {credit_display}\n"
+            "📊 Daily limit: Unlimited ✨\n"
+            f"{expiry_text}\n\n"
+            f"{access_text}\n"
+            f"🔄 Auto-renews {billing_cycle}\n\n"
+            "To cancel, contact support."
+        )
+
+    return (
+        "📋 *NO ACTIVE SUBSCRIPTION*\n\n"
+        "You are on the Free plan.\n"
+        "🎯 Free: 10 AI credits\n\n"
+        "Reply with 4 to see available plans and upgrade."
+    )
 
 
 def get_credit_balance_with_subscription(account_id: str, base_balance: int) -> Tuple[int, str]:
@@ -461,5 +544,5 @@ def get_credit_balance_with_subscription(account_id: str, base_balance: int) -> 
         if plan:
             return plan.get("credits", 0), "subscription"
         return base_balance, "subscription"
-    return base_balance, "free"
 
+    return base_balance, "free"
