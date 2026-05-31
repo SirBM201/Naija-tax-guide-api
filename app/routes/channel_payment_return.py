@@ -1,72 +1,16 @@
-# app/routes/channel_promo.py
 from __future__ import annotations
 
-import logging
 import os
-import re
-from datetime import datetime, timezone
-from decimal import Decimal
-from typing import Any, Dict, Optional, Tuple
-from urllib.parse import urlencode
+from html import escape
+from typing import Any, Dict
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, Response, jsonify, request
 
-from app.core.supabase_client import supabase
-from app.services.outbound_service import send_whatsapp_text, send_telegram_text
-from app.services.paystack_service import create_reference, initialize_transaction
-from app.services.promo_service import (
-    bootstrap_account_promo_state,
-    calculate_promo_checkout_preview,
-    record_promo_checkout_started,
-    validate_promo_code,
-)
+from app.services.paystack_service import verify_transaction
 
-logger = logging.getLogger(__name__)
+bp = Blueprint("channel_payment_return", __name__)
 
-bp = Blueprint("channel_promo", __name__)
-
-CHANNEL_PROMO_ROUTE_VERSION = "2026-05-31-batch36C1-direct-channel-promo-bridge"
-
-PLAN_CODE_MAP: Dict[str, str] = {
-    "S1": "starter_monthly",
-    "S2": "starter_quarterly",
-    "S3": "starter_yearly",
-    "P1": "professional_monthly",
-    "P2": "professional_quarterly",
-    "P3": "professional_yearly",
-    "B1": "business_monthly",
-    "B2": "business_quarterly",
-    "B3": "business_yearly",
-    "1": "starter_monthly",
-    "2": "starter_quarterly",
-    "3": "starter_yearly",
-    "4": "professional_monthly",
-    "5": "professional_quarterly",
-    "6": "professional_yearly",
-    "7": "business_monthly",
-    "8": "business_quarterly",
-    "9": "business_yearly",
-}
-
-DEFAULT_PLAN_FALLBACKS: Dict[str, Dict[str, Any]] = {
-    "starter_monthly": {"plan_code": "starter_monthly", "name": "Starter Monthly", "price": 5000, "credits": 100, "duration_days": 30, "family": "starter", "billing_cycle": "monthly"},
-    "starter_quarterly": {"plan_code": "starter_quarterly", "name": "Starter Quarterly", "price": 14000, "credits": 300, "duration_days": 90, "family": "starter", "billing_cycle": "quarterly"},
-    "starter_yearly": {"plan_code": "starter_yearly", "name": "Starter Yearly", "price": 51000, "credits": 1200, "duration_days": 365, "family": "starter", "billing_cycle": "yearly"},
-    "professional_monthly": {"plan_code": "professional_monthly", "name": "Professional Monthly", "price": 12000, "credits": 300, "duration_days": 30, "family": "professional", "billing_cycle": "monthly"},
-    "professional_quarterly": {"plan_code": "professional_quarterly", "name": "Professional Quarterly", "price": 33600, "credits": 900, "duration_days": 90, "family": "professional", "billing_cycle": "quarterly"},
-    "professional_yearly": {"plan_code": "professional_yearly", "name": "Professional Yearly", "price": 122400, "credits": 3600, "duration_days": 365, "family": "professional", "billing_cycle": "yearly"},
-    "business_monthly": {"plan_code": "business_monthly", "name": "Business Monthly", "price": 25000, "credits": 800, "duration_days": 30, "family": "business", "billing_cycle": "monthly"},
-    "business_quarterly": {"plan_code": "business_quarterly", "name": "Business Quarterly", "price": 70000, "credits": 2400, "duration_days": 90, "family": "business", "billing_cycle": "quarterly"},
-    "business_yearly": {"plan_code": "business_yearly", "name": "Business Yearly", "price": 255000, "credits": 9600, "duration_days": 365, "family": "business", "billing_cycle": "yearly"},
-}
-
-
-def _sb():
-    return supabase() if callable(supabase) else supabase
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+CHANNEL_PAYMENT_RETURN_ROUTE_VERSION = "2026-05-31-batch36C2-channel-payment-return-get-fix"
 
 
 def _clean(value: Any) -> str:
@@ -77,590 +21,376 @@ def _lower(value: Any) -> str:
     return _clean(value).lower()
 
 
-def _upper(value: Any) -> str:
-    return _clean(value).upper()
+def _humanize_plan_code(plan_code: str) -> str:
+    code = _lower(plan_code)
+    if not code:
+        return "Not available"
+    return code.replace("_", " ").title()
 
 
-def _clip(value: Any, limit: int = 1200) -> str:
-    text = str(value or "")
-    return text if len(text) <= limit else text[:limit] + "...<truncated>"
+def _telegram_bot_username() -> str:
+    bot_username = _clean(
+        request.args.get("bot")
+        or request.form.get("bot")
+        or (request.get_json(silent=True) or {}).get("bot")
+        or os.getenv("TELEGRAM_BOT_USERNAME")
+    )
+    if bot_username.startswith("@"):
+        bot_username = bot_username[1:]
+    return bot_username
 
 
-def _to_int(value: Any, default: int = 0) -> int:
+def _build_telegram_app_link() -> str:
+    bot_username = _telegram_bot_username()
+    if bot_username:
+        return f"tg://resolve?domain={bot_username}"
+    return "tg://resolve"
+
+
+def _build_telegram_web_link() -> str:
+    bot_username = _telegram_bot_username()
+    if bot_username:
+        return f"https://t.me/{bot_username}"
+    return "https://t.me"
+
+
+def _build_whatsapp_return_link(provider_user_id: str) -> str:
+    phone = "".join(ch for ch in _clean(provider_user_id) if ch.isdigit())
+    if phone:
+        return f"https://wa.me/{phone}?text=Hi"
+    return "https://wa.me/"
+
+
+def _request_value(name: str, default: str = "") -> str:
+    """
+    Read from querystring first, then form/body JSON.
+    Paystack returns to callback_url with GET, but this route also accepts POST
+    for safety and manual testing.
+    """
+    if name in request.args:
+        return _clean(request.args.get(name))
+    if request.form and name in request.form:
+        return _clean(request.form.get(name))
+    body = request.get_json(silent=True) or {}
+    if isinstance(body, dict):
+        return _clean(body.get(name))
+    return default
+
+
+def _button_for_channel(channel_type: str, provider_user_id: str) -> tuple[str, str]:
+    channel = _lower(channel_type)
+
+    if channel == "telegram":
+        return "Return to Telegram", _build_telegram_web_link()
+    if channel == "whatsapp":
+        return "Return to WhatsApp", _build_whatsapp_return_link(provider_user_id)
+
+    return "Return to Naija Tax Guide", "https://www.naijataxguides.com/dashboard"
+
+
+def _channel_button_html(channel_type: str, button_label: str, button_url: str) -> tuple[str, str]:
+    channel = _lower(channel_type)
+
+    if channel == "telegram":
+        telegram_app_link = _build_telegram_app_link()
+        telegram_web_link = button_url or _build_telegram_web_link()
+        button_html = f"""
+        <a
+          class="btn"
+          href="{escape(telegram_web_link)}"
+          onclick="return openTelegramApp(event)"
+        >
+          {escape(button_label)}
+        </a>
+        """
+        extra_script = f"""
+        <script>
+          function openTelegramApp(event) {{
+            event.preventDefault();
+
+            var appUrl = {telegram_app_link!r};
+            var webUrl = {telegram_web_link!r};
+
+            try {{
+              window.location.href = appUrl;
+              setTimeout(function() {{
+                window.location.href = webUrl;
+              }}, 900);
+            }} catch (e) {{
+              window.location.href = webUrl;
+            }}
+
+            return false;
+          }}
+        </script>
+        """
+        return button_html, extra_script
+
+    return f'<a class="btn" href="{escape(button_url)}">{escape(button_label)}</a>', ""
+
+
+def _render_page(
+    *,
+    title: str,
+    message: str,
+    badge: str,
+    badge_class: str,
+    button_label: str,
+    button_url: str,
+    reference: str,
+    plan_code: str,
+    status_text: str,
+    channel_type: str,
+    amount_text: str = "",
+    promo_text: str = "",
+) -> Response:
+    pretty_plan = _humanize_plan_code(plan_code)
+    button_html, extra_script = _channel_button_html(channel_type, button_label, button_url)
+
+    html = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>{escape(title)}</title>
+  <style>
+    :root {{
+      color-scheme: dark;
+    }}
+    body {{
+      margin: 0;
+      padding: 0;
+      font-family: Arial, sans-serif;
+      background: #0f172a;
+      color: #e5e7eb;
+    }}
+    .wrap {{
+      max-width: 680px;
+      margin: 0 auto;
+      padding: 32px 20px 48px;
+    }}
+    .card {{
+      background: #111827;
+      border: 1px solid #1f2937;
+      border-radius: 20px;
+      padding: 24px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.25);
+    }}
+    .badge {{
+      display: inline-block;
+      padding: 8px 12px;
+      border-radius: 999px;
+      font-weight: 800;
+      margin-bottom: 16px;
+    }}
+    .success {{
+      background: #052e16;
+      color: #86efac;
+    }}
+    .pending {{
+      background: #3b2f0b;
+      color: #fde68a;
+    }}
+    .error {{
+      background: #3b0a0a;
+      color: #fca5a5;
+    }}
+    h1 {{
+      margin: 0 0 12px;
+      font-size: 28px;
+      line-height: 1.2;
+    }}
+    p {{
+      margin: 0 0 14px;
+      font-size: 17px;
+      line-height: 1.6;
+      color: #d1d5db;
+    }}
+    .meta {{
+      margin-top: 20px;
+      padding: 16px;
+      border-radius: 14px;
+      background: #0b1220;
+      border: 1px solid #1f2937;
+      font-size: 15px;
+      line-height: 1.7;
+      overflow-wrap: anywhere;
+    }}
+    .btn {{
+      display: inline-block;
+      margin-top: 22px;
+      padding: 14px 18px;
+      border-radius: 12px;
+      background: #4f46e5;
+      color: white;
+      text-decoration: none;
+      font-weight: 800;
+      font-size: 16px;
+    }}
+    .small {{
+      margin-top: 16px;
+      font-size: 14px;
+      color: #9ca3af;
+      line-height: 1.6;
+    }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div class="badge {escape(badge_class)}">{escape(badge)}</div>
+      <h1>{escape(title)}</h1>
+      <p>{escape(message)}</p>
+
+      <div class="meta">
+        <div><strong>Status:</strong> {escape(status_text or "unknown")}</div>
+        <div><strong>Plan:</strong> {escape(pretty_plan)}</div>
+        <div><strong>Reference:</strong> {escape(reference or "Not available")}</div>
+        {f'<div><strong>Amount:</strong> {escape(amount_text)}</div>' if amount_text else ''}
+        {f'<div><strong>Promo:</strong> {escape(promo_text)}</div>' if promo_text else ''}
+      </div>
+
+      {button_html}
+
+      <div class="small">
+        You can now return to your channel and continue using Naija Tax Guide.<br>
+        Your channel may also receive an automatic confirmation message after webhook processing.
+      </div>
+    </div>
+  </div>
+  {extra_script}
+</body>
+</html>"""
+    return Response(html, status=200, mimetype="text/html")
+
+
+def _kobo_to_naira_text(value: Any) -> str:
     try:
-        if value is None or value == "":
-            return default
-        return int(Decimal(str(value).replace(",", "")))
+        kobo = int(str(value or "0").replace(",", ""))
+        if kobo <= 0:
+            return ""
+        return f"₦{(kobo / 100):,.0f}"
     except Exception:
-        return default
-
-
-def _money_from_kobo(kobo: Any) -> str:
-    amount = _to_int(kobo, 0) / 100
-    return f"₦{amount:,.0f}"
-
-
-def _rows(resp: Any) -> list[dict[str, Any]]:
-    data = getattr(resp, "data", None)
-    if isinstance(data, list):
-        return [x for x in data if isinstance(x, dict)]
-    if isinstance(data, dict):
-        return [data]
-    return []
-
-
-def _first(resp: Any) -> Optional[dict[str, Any]]:
-    rows = _rows(resp)
-    return rows[0] if rows else None
-
-
-def _safe_exec(builder: Any) -> tuple[bool, Any, str]:
-    try:
-        resp = builder.execute()
-        return True, resp, ""
-    except Exception as exc:
-        return False, None, f"{type(exc).__name__}: {_clip(exc)}"
-
-
-def _normalize_promo_code(value: Any) -> str:
-    code = _upper(value)
-    return re.sub(r"[^A-Z0-9_-]+", "", code)[:80]
-
-
-def _extract_promo_code(text: str) -> str:
-    raw = _clean(text)
-    if not raw:
         return ""
 
-    patterns = [
-        r"(?:^|\s)/(?:start)\s+promo[_\-\s:]+([A-Za-z0-9_-]{3,80})\b",
-        r"(?:^|\s)start\s+promo[_\-\s:]+([A-Za-z0-9_-]{3,80})\b",
-        r"(?:^|\s)promo\s+([A-Za-z0-9_-]{3,80})\b",
-        r"(?:^|\s)promo[_\-]([A-Za-z0-9_-]{3,80})\b",
-        r"(?:^|\s)start\s+([A-Za-z0-9_-]{3,80})\b",
-    ]
-    for pat in patterns:
-        m = re.search(pat, raw, flags=re.I)
-        if m:
-            candidate = _normalize_promo_code(m.group(1))
-            if candidate:
-                check = validate_promo_code(candidate)
-                if check.get("valid"):
-                    return candidate
 
-    # Bare promo code support. Only accept if it is a valid active promo code.
-    bare = _normalize_promo_code(raw)
-    if 3 <= len(bare) <= 80 and bare not in {"MENU", "START", "HELP", "BACK", "CANCEL"}:
-        try:
-            check = validate_promo_code(bare)
-            if check.get("valid"):
-                return bare
-        except Exception:
-            return ""
-    return ""
-
-
-def _extract_plan_code(text: str) -> str:
-    token = _upper((_clean(text).split() or [""])[0])
-    token = re.sub(r"[^A-Z0-9]+", "", token)
-    return PLAN_CODE_MAP.get(token, "")
-
-
-def _extract_email(text: str) -> str:
-    m = re.search(r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}", _clean(text), flags=re.I)
-    return m.group(0).lower() if m else ""
-
-
-def _extract_whatsapp_message(payload: Dict[str, Any]) -> Optional[Dict[str, str]]:
-    try:
-        entry = (payload.get("entry") or [])[0]
-        change = (entry.get("changes") or [])[0]
-        value = change.get("value") or {}
-        messages = value.get("messages") or []
-        contacts = value.get("contacts") or []
-        if not messages:
-            return None
-        message = messages[0] or {}
-        contact = contacts[0] if contacts else {}
-        wa_id = re.sub(r"\D+", "", str(message.get("from") or contact.get("wa_id") or ""))
-        text = ""
-        msg_type = _lower(message.get("type"))
-        if msg_type == "text":
-            text = _clean(((message.get("text") or {}).get("body")))
-        elif msg_type == "button":
-            btn = message.get("button") or {}
-            text = _clean(btn.get("text") or btn.get("payload"))
-        elif msg_type == "interactive":
-            interactive = message.get("interactive") or {}
-            if _lower(interactive.get("type")) == "button_reply":
-                reply = interactive.get("button_reply") or {}
-                text = _clean(reply.get("title") or reply.get("id"))
-            elif _lower(interactive.get("type")) == "list_reply":
-                reply = interactive.get("list_reply") or {}
-                text = _clean(reply.get("title") or reply.get("id"))
-        if not wa_id or not text:
-            return None
-        return {"channel_type": "whatsapp", "provider_user_id": wa_id, "text": text, "display_name": _clean(((contact.get("profile") or {}).get("name")))}
-    except Exception:
-        return None
-
-
-def _extract_telegram_message(payload: Dict[str, Any]) -> Optional[Dict[str, str]]:
-    try:
-        msg = payload.get("message") or payload.get("edited_message") or {}
-        if not isinstance(msg, dict):
-            return None
-        chat = msg.get("chat") or {}
-        user = msg.get("from") or {}
-        chat_id = _clean(chat.get("id") or user.get("id"))
-        user_id = _clean(user.get("id") or chat_id)
-        text = _clean(msg.get("text") or "")
-        if not chat_id or not user_id or not text:
-            return None
-        name = _clean(" ".join([_clean(user.get("first_name")), _clean(user.get("last_name"))]).strip() or user.get("username"))
-        return {"channel_type": "telegram", "provider_user_id": user_id, "chat_id": chat_id, "text": text, "display_name": name}
-    except Exception:
-        return None
-
-
-def _get_channel_message() -> Optional[Dict[str, str]]:
-    path = request.path.rstrip("/").lower()
-    if request.method.upper() != "POST":
-        return None
-    payload = request.get_json(silent=True) or {}
-    if path in {"/api/whatsapp/webhook", "/api/webhook", "/api/whatsapp/whatsapp/webhook"}:
-        return _extract_whatsapp_message(payload)
-    if path in {"/api/telegram/webhook", "/api/telegram", "/api/telegram/update"}:
-        return _extract_telegram_message(payload)
-    return None
-
-
-def _send_channel_text(channel_type: str, provider_user_id: str, text: str) -> Dict[str, Any]:
-    if request.args.get("dry_run") in {"1", "true", "yes"}:
-        return {"ok": True, "dry_run": True, "text": text[:1200]}
-    try:
-        if channel_type == "whatsapp":
-            return {"ok": bool(send_whatsapp_text(provider_user_id, text))}
-        if channel_type == "telegram":
-            return {"ok": bool(send_telegram_text(provider_user_id, text))}
-        return {"ok": False, "error": "unsupported_channel"}
-    except Exception as exc:
-        return {"ok": False, "error": f"{type(exc).__name__}: {_clip(exc)}"}
-
-
-def _account_row_by_channel(channel_type: str, provider_user_id: str) -> Optional[Dict[str, Any]]:
-    aliases = [channel_type]
-    if channel_type == "whatsapp":
-        aliases = ["whatsapp", "wa"]
-    elif channel_type == "telegram":
-        aliases = ["telegram", "tg"]
-
-    for ch in aliases:
-        ok, resp, _ = _safe_exec(_sb().table("channel_identities").select("*").eq("channel_type", ch).eq("provider_user_id", provider_user_id).limit(1))
-        if ok:
-            row = _first(resp)
-            if row and row.get("account_id"):
-                account_id = _clean(row.get("account_id"))
-                ok2, resp2, _ = _safe_exec(_sb().table("accounts").select("*").eq("account_id", account_id).limit(1))
-                acct = _first(resp2) if ok2 else None
-                if acct:
-                    return acct
-                return {"account_id": account_id, "id": account_id, "provider": ch, "provider_user_id": provider_user_id}
-
-    providers = ["wa", "whatsapp"] if channel_type == "whatsapp" else ["tg", "telegram"]
-    for provider in providers:
-        ok, resp, _ = _safe_exec(_sb().table("accounts").select("*").eq("provider", provider).eq("provider_user_id", provider_user_id).limit(1))
-        if ok:
-            row = _first(resp)
-            if row:
-                owner = _clean(row.get("auth_user_id") or row.get("owner_account_id") or row.get("linked_account_id"))
-                if owner:
-                    ok2, resp2, _ = _safe_exec(_sb().table("accounts").select("*").eq("account_id", owner).limit(1))
-                    acct = _first(resp2) if ok2 else None
-                    return acct or {"account_id": owner, "id": owner, "provider": "web", "provider_user_id": owner}
-                return row
-    return None
-
-
-def _account_id_from_row(row: Dict[str, Any]) -> str:
-    return _clean(row.get("account_id") or row.get("id") or row.get("auth_user_id"))
-
-
-def _account_from_known_account_id(account_id: str) -> Dict[str, Any]:
+@bp.route("/channel/payment/return", methods=["GET", "POST"])
+def channel_payment_return():
     """
-    Batch 36C1 bridge helper.
+    Channel-aware Paystack return page.
 
-    WhatsApp and Telegram routes already resolve the correct effective account_id
-    before command handling.  When they call the promo handler directly, prefer
-    that account_id so the promo redemption attaches to the web owner account,
-    not a temporary channel shell account.
+    Important:
+    - This route is UX only.
+    - Paystack webhook and /api/billing/verify remain the source of truth.
+    - Paystack redirects browser callback_url using GET, so GET must be allowed.
     """
-    account_id = _clean(account_id)
-    if not account_id:
-        return {"ok": False, "account_id": "", "row": {}, "created": False}
+    reference = _request_value("reference") or _request_value("trxref")
+    channel_type = _lower(_request_value("channel_type"))
+    provider_user_id = _request_value("provider_user_id")
+    plan_code = _request_value("plan_code")
 
-    try:
-        ok, resp, _ = _safe_exec(_sb().table("accounts").select("*").eq("account_id", account_id).limit(1))
-        row = _first(resp) if ok else None
-    except Exception:
-        row = None
+    button_label, button_url = _button_for_channel(channel_type, provider_user_id)
 
-    return {"ok": True, "account_id": account_id, "row": row or {"account_id": account_id, "id": account_id}, "created": False}
-
-
-def _ensure_channel_account(channel_type: str, provider_user_id: str, display_name: str = "") -> Dict[str, Any]:
-    row = _account_row_by_channel(channel_type, provider_user_id)
-    if row:
-        return {"ok": True, "account_id": _account_id_from_row(row), "row": row, "created": False}
-
-    provider = "wa" if channel_type == "whatsapp" else "tg"
-    account_id = str(provider_user_id)
-    payload = {
-        "provider": provider,
-        "provider_user_id": provider_user_id,
-        "display_name": display_name or f"{channel_type.title()} User",
-        "created_at": _now_iso(),
-        "updated_at": _now_iso(),
-    }
-    if channel_type == "whatsapp":
-        payload["phone"] = provider_user_id
-        payload["phone_e164"] = provider_user_id
-
-    try:
-        _sb().table("accounts").upsert(payload, on_conflict="provider,provider_user_id").execute()
-    except Exception:
-        try:
-            _sb().table("accounts").insert(payload).execute()
-        except Exception:
-            logger.exception("Channel promo account upsert failed")
-
-    row = _account_row_by_channel(channel_type, provider_user_id) or payload
-    return {"ok": True, "account_id": _account_id_from_row(row) or account_id, "row": row, "created": True}
-
-
-def _get_or_create_session(channel_type: str, provider_user_id: str, account_id: str = "") -> Dict[str, Any]:
-    try:
-        ok, resp, _ = _safe_exec(_sb().table("promo_channel_sessions").select("*").eq("channel_type", channel_type).eq("provider_user_id", provider_user_id).limit(1))
-        row = _first(resp) if ok else None
-        if row:
-            return row
-        payload = {"channel_type": channel_type, "provider_user_id": provider_user_id, "account_id": account_id or None, "created_at": _now_iso(), "updated_at": _now_iso(), "metadata": {}}
-        ok2, resp2, _ = _safe_exec(_sb().table("promo_channel_sessions").insert(payload))
-        return _first(resp2) if ok2 else payload
-    except Exception:
-        return {"channel_type": channel_type, "provider_user_id": provider_user_id, "account_id": account_id}
-
-
-def _update_session(channel_type: str, provider_user_id: str, patch: Dict[str, Any]) -> None:
-    try:
-        payload = {**patch, "updated_at": _now_iso()}
-        _sb().table("promo_channel_sessions").upsert({"channel_type": channel_type, "provider_user_id": provider_user_id, **payload}, on_conflict="channel_type,provider_user_id").execute()
-    except Exception:
-        logger.exception("Promo channel session update failed")
-
-
-def _get_active_promo_redemption(account_id: str) -> Optional[Dict[str, Any]]:
-    if not account_id:
-        return None
-    try:
-        ok, resp, _ = _safe_exec(
-            _sb().table("promo_redemptions")
-            .select("*")
-            .eq("account_id", account_id)
-            .in_("status", ["pending", "applied"])
-            .order("created_at", desc=True)
-            .limit(1)
+    if not reference:
+        return _render_page(
+            title="Payment reference missing",
+            message="We could not find the payment reference in the return URL.",
+            badge="Missing reference",
+            badge_class="error",
+            button_label=button_label,
+            button_url=button_url,
+            reference="",
+            plan_code=plan_code,
+            status_text="missing_reference",
+            channel_type=channel_type,
         )
-        return _first(resp) if ok else None
-    except Exception:
-        return None
 
-
-def _get_plan(plan_code: str) -> Dict[str, Any]:
-    fallback = DEFAULT_PLAN_FALLBACKS.get(plan_code) or {"plan_code": plan_code, "name": plan_code.replace("_", " ").title(), "price": 0, "credits": 0, "family": plan_code.split("_", 1)[0], "billing_cycle": "monthly", "duration_days": 30}
     try:
-        ok, resp, _ = _safe_exec(_sb().table("plans").select("*").eq("plan_code", plan_code).limit(1))
-        row = _first(resp) if ok else None
-        if not row:
-            return fallback
-        price = _to_int(row.get("price"), _to_int(fallback.get("price"), 0))
-        duration = _to_int(row.get("duration_days"), _to_int(fallback.get("duration_days"), 30))
-        cycle = "yearly" if duration >= 365 or "yearly" in plan_code else "quarterly" if duration >= 90 or "quarterly" in plan_code else "monthly"
-        monthly_credits = _to_int(row.get("ai_credits_total"), _to_int(fallback.get("credits"), 0))
-        multiplier = 12 if cycle == "yearly" else 3 if cycle == "quarterly" else 1
-        return {
-            "plan_code": plan_code,
-            "name": _clean(row.get("name")) or fallback.get("name"),
-            "price": price,
-            "credits": monthly_credits * multiplier,
-            "duration_days": duration,
-            "family": plan_code.split("_", 1)[0],
-            "billing_cycle": cycle,
+        verified = verify_transaction(reference)
+        tx = (verified or {}).get("data") or {}
+        status_text = _lower(tx.get("status"))
+        metadata = tx.get("metadata") or {}
+
+        if not plan_code:
+            plan_code = _clean(metadata.get("plan_code"))
+        if not channel_type:
+            channel_type = _lower(metadata.get("channel_type"))
+        if not provider_user_id:
+            provider_user_id = _clean(metadata.get("provider_user_id"))
+
+        button_label, button_url = _button_for_channel(channel_type, provider_user_id)
+
+        amount_text = _kobo_to_naira_text(
+            metadata.get("final_amount_kobo")
+            or metadata.get("amount_kobo")
+            or tx.get("amount")
+        )
+        promo_code = _clean(metadata.get("promo_code"))
+        promo_text = promo_code if promo_code else ""
+
+        if status_text == "success":
+            return _render_page(
+                title="Payment successful",
+                message=(
+                    "Your payment was received successfully. Your subscription activation "
+                    "and channel confirmation are being finalized."
+                ),
+                badge="Payment processed",
+                badge_class="success",
+                button_label=button_label,
+                button_url=button_url,
+                reference=reference,
+                plan_code=plan_code,
+                status_text=status_text,
+                channel_type=channel_type,
+                amount_text=amount_text,
+                promo_text=promo_text,
+            )
+
+        return _render_page(
+            title="Payment not completed",
+            message=(
+                "The payment has not returned with a successful status yet. "
+                "If you completed payment, wait a moment and check your channel confirmation."
+            ),
+            badge="Verification pending",
+            badge_class="pending",
+            button_label=button_label,
+            button_url=button_url,
+            reference=reference,
+            plan_code=plan_code,
+            status_text=status_text or "pending",
+            channel_type=channel_type,
+            amount_text=amount_text,
+            promo_text=promo_text,
+        )
+
+    except Exception as exc:
+        return _render_page(
+            title="Payment verification pending",
+            message=(
+                "Your payment is being checked. If payment was completed successfully, "
+                "your channel confirmation message should arrive shortly."
+            ),
+            badge="Verification pending",
+            badge_class="pending",
+            button_label=button_label,
+            button_url=button_url,
+            reference=reference,
+            plan_code=plan_code,
+            status_text=f"verify_error: {type(exc).__name__}",
+            channel_type=channel_type,
+        )
+
+
+@bp.get("/channel/payment/return/health")
+def channel_payment_return_health():
+    return jsonify(
+        {
+            "ok": True,
+            "route_version": CHANNEL_PAYMENT_RETURN_ROUTE_VERSION,
+            "message": "Channel payment return GET/POST route is active.",
+            "methods": ["GET", "POST"],
+            "example": "/api/channel/payment/return?reference=NTG-xxx&channel_type=whatsapp",
         }
-    except Exception:
-        return fallback
-
-
-def _public_backend_base_url() -> str:
-    for key in ("PUBLIC_BACKEND_BASE_URL", "BACKEND_PUBLIC_URL", "APP_BASE_URL", "KOYEB_PUBLIC_DOMAIN"):
-        value = _clean(os.getenv(key))
-        if value:
-            return value.rstrip("/") if value.startswith("http") else f"https://{value.rstrip('/')}"
-    return "https://incredible-nonie-bmsconcept-37359733.koyeb.app"
-
-
-def _transaction_insert(payload: Dict[str, Any]) -> Dict[str, Any]:
-    attempts = [payload, {k: v for k, v in payload.items() if k != "amount_kobo"}, {k: v for k, v in payload.items() if k not in {"amount_kobo", "metadata"}}]
-    last = ""
-    for item in attempts:
-        ok, resp, err = _safe_exec(_sb().table("paystack_transactions").insert(item))
-        if ok:
-            return {"ok": True, "row": _first(resp)}
-        last = err
-    return {"ok": False, "error": last}
-
-
-def _create_discounted_channel_checkout(channel_type: str, provider_user_id: str, account_id: str, plan_code: str, email: str = "") -> Dict[str, Any]:
-    plan = _get_plan(plan_code)
-    original_amount_kobo = _to_int(plan.get("price"), 0) * 100
-    if original_amount_kobo <= 0:
-        return {"ok": False, "error": "invalid_plan_price", "message": "❌ This plan price is not available right now. Please try again later."}
-
-    promo_preview = calculate_promo_checkout_preview(account_id=account_id, plan_code=plan_code, original_amount_kobo=original_amount_kobo)
-    if not promo_preview.get("applies"):
-        return {"ok": False, "error": "promo_not_applicable", "message": "No active promo discount was found for this account. Reply PROMO TAXWITHBM first, or use the normal plan menu."}
-
-    final_amount_kobo = _to_int(promo_preview.get("final_amount_kobo"), original_amount_kobo)
-    discount_amount_kobo = _to_int(promo_preview.get("discount_amount_kobo"), 0)
-    redemption = promo_preview.get("redemption") if isinstance(promo_preview.get("redemption"), dict) else {}
-    promo_code = _clean(redemption.get("promo_code") or promo_preview.get("promo_code"))
-    reference = create_reference("NTG")
-
-    metadata = {
-        "account_id": account_id,
-        "plan_code": plan_code,
-        "plan_name": plan.get("name"),
-        "plan_family": plan.get("family"),
-        "type": "subscription",
-        "source": "channel_promo_batch36C",
-        "channel_type": channel_type,
-        "provider_user_id": provider_user_id,
-        "amount_ngn": int(final_amount_kobo / 100),
-        "amount_kobo": final_amount_kobo,
-        "original_amount_ngn": int(original_amount_kobo / 100),
-        "original_amount_kobo": original_amount_kobo,
-        "discount_amount_ngn": int(discount_amount_kobo / 100),
-        "discount_amount_kobo": discount_amount_kobo,
-        "final_amount_ngn": int(final_amount_kobo / 100),
-        "final_amount_kobo": final_amount_kobo,
-        "promo_applied": True,
-        "promo_code": promo_code,
-        "promo_redemption_id": redemption.get("id") if redemption else None,
-        "promo_benefit_type": redemption.get("benefit_type") if redemption else None,
-        "promo_discount_percent": redemption.get("discount_percent") if redemption else None,
-        "channel_promo_route_version": CHANNEL_PROMO_ROUTE_VERSION,
-        "currency": "NGN",
-    }
-
-    qs = urlencode({"reference": reference, "channel_type": channel_type, "provider_user_id": provider_user_id, "account_id": account_id, "plan_code": plan_code})
-    callback_url = f"{_public_backend_base_url()}/api/channel/payment/return?{qs}"
-
-    tx_payload = {
-        "reference": reference,
-        "account_id": account_id,
-        "amount": final_amount_kobo,
-        "amount_kobo": final_amount_kobo,
-        "currency": "NGN",
-        "status": "pending",
-        "plan_code": plan_code,
-        "created_at": _now_iso(),
-        "updated_at": _now_iso(),
-        "metadata": metadata,
-    }
-    tx_note = _transaction_insert(tx_payload)
-
-    result = initialize_transaction(email=email or None, amount_kobo=final_amount_kobo, reference=reference, metadata=metadata, callback_url=callback_url)
-    auth_url = ((result or {}).get("data") or {}).get("authorization_url") or (result or {}).get("authorization_url")
-    if not auth_url:
-        return {"ok": False, "error": "paystack_authorization_url_missing", "message": "❌ Could not create payment link. Please try again shortly.", "tx_note": tx_note}
-
-    checkout_note = record_promo_checkout_started(
-        account_id=account_id,
-        payment_reference=reference,
-        plan_code=plan_code,
-        original_amount_kobo=original_amount_kobo,
-        discount_amount_kobo=discount_amount_kobo,
-        final_amount_kobo=final_amount_kobo,
-        metadata=metadata,
-    )
-
-    cycle = plan.get("billing_cycle") or "monthly"
-    body = (
-        f"🎟️ *Promo Applied: {promo_code}*\n\n"
-        f"📋 Plan: {plan.get('name')}\n"
-        f"Original price: {_money_from_kobo(original_amount_kobo)}\n"
-        f"Promo discount: -{_money_from_kobo(discount_amount_kobo)}\n"
-        f"Amount to pay: {_money_from_kobo(final_amount_kobo)}\n"
-        f"Credits: {plan.get('credits')} AI credits per {cycle}\n"
-        f"Reference: {reference}\n\n"
-        f"Click to pay:\n{auth_url}\n\n"
-        "After successful payment, your plan will activate automatically."
-    )
-    return {"ok": True, "message": body, "payment_link": auth_url, "reference": reference, "pricing": promo_preview, "transaction_note": tx_note, "checkout_note": checkout_note}
-
-
-def _promo_success_message(code: str, result: Dict[str, Any]) -> str:
-    captured = bool(result.get("captured"))
-    reason = _clean(result.get("reason"))
-    if captured or reason == "promo_already_attached_to_account":
-        return (
-            f"✅ *Promo code applied: {code}*\n\n"
-            "You are eligible for the promo discount on your first paid subscription.\n\n"
-            "Choose a plan to continue:\n"
-            "S1 - Starter Monthly\nS2 - Starter Quarterly\nS3 - Starter Yearly\n"
-            "P1 - Professional Monthly\nB1 - Business Monthly\n\n"
-            "Example: reply S1 to get your discounted payment link."
-        )
-    if reason == "referral_already_attached_to_account":
-        return (
-            "⚠️ A referral is already attached to this account.\n\n"
-            "To avoid double rewards, this account cannot also use a promo code. You can still continue with the normal plan menu."
-        )
-    if result.get("ok") is False:
-        return "⚠️ I could not apply this promo code right now. Please try again shortly."
-    return f"⚠️ Promo code {code} could not be applied. Reason: {reason or 'not eligible'}."
-
-
-def _handle_promo_capture(msg: Dict[str, str], code: str) -> Dict[str, Any]:
-    channel_type = msg["channel_type"]
-    provider_user_id = msg["provider_user_id"]
-    provided_account_id = _clean(msg.get("account_id"))
-    account = _account_from_known_account_id(provided_account_id) if provided_account_id else _ensure_channel_account(channel_type, provider_user_id, msg.get("display_name") or "")
-    account_id = _clean(account.get("account_id"))
-
-    if request.args.get("dry_run") in {"1", "true", "yes"}:
-        return {"ok": True, "handled": "promo_capture_dry_run", "channel_type": channel_type, "provider_user_id": provider_user_id, "account_id": account_id, "promo_code": code}
-
-    result = bootstrap_account_promo_state(account_id=account_id, promo_code=code, source=f"{channel_type}_promo_capture_batch36C")
-    _update_session(channel_type, provider_user_id, {"account_id": account_id, "promo_code": code, "last_promo_capture_result": result})
-    body = _promo_success_message(code, result)
-    send_result = _send_channel_text(channel_type, msg.get("chat_id") or provider_user_id, body)
-    return {"ok": True, "handled": "promo_capture", "channel_type": channel_type, "provider_user_id": provider_user_id, "account_id": account_id, "promo_code": code, "bootstrap": result, "send_result": send_result}
-
-
-def _handle_promo_plan(msg: Dict[str, str], plan_code: str) -> Optional[Dict[str, Any]]:
-    channel_type = msg["channel_type"]
-    provider_user_id = msg["provider_user_id"]
-    provided_account_id = _clean(msg.get("account_id"))
-    account = _account_from_known_account_id(provided_account_id) if provided_account_id else _ensure_channel_account(channel_type, provider_user_id, msg.get("display_name") or "")
-    account_id = _clean(account.get("account_id"))
-    if not account_id:
-        return None
-
-    redemption = _get_active_promo_redemption(account_id)
-    if not redemption:
-        return None
-
-    if request.args.get("dry_run") in {"1", "true", "yes"}:
-        return {"ok": True, "handled": "promo_plan_dry_run", "channel_type": channel_type, "provider_user_id": provider_user_id, "account_id": account_id, "plan_code": plan_code, "promo_code": redemption.get("promo_code")}
-
-    email = _clean((account.get("row") or {}).get("email") if isinstance(account.get("row"), dict) else "")
-    try:
-        result = _create_discounted_channel_checkout(channel_type, provider_user_id, account_id, plan_code, email=email)
-        _update_session(channel_type, provider_user_id, {"account_id": account_id, "promo_code": redemption.get("promo_code"), "pending_plan_code": plan_code, "last_checkout_result": result})
-        message = result.get("message") if result.get("ok") else result.get("message") or "❌ Could not create promo payment link. Please try again."
-        send_result = _send_channel_text(channel_type, msg.get("chat_id") or provider_user_id, message)
-        return {"ok": True, "handled": "promo_discounted_checkout", "channel_type": channel_type, "provider_user_id": provider_user_id, "account_id": account_id, "plan_code": plan_code, "checkout": result, "send_result": send_result}
-    except Exception as exc:
-        logger.exception("Channel promo checkout failed")
-        body = "❌ I could not create your promo payment link right now. Please try again shortly or use the website."
-        send_result = _send_channel_text(channel_type, msg.get("chat_id") or provider_user_id, body)
-        return {"ok": True, "handled": "promo_checkout_failed", "error": f"{type(exc).__name__}: {_clip(exc)}", "send_result": send_result}
-
-
-def process_channel_promo_text(
-    *,
-    channel_type: str,
-    provider_user_id: str,
-    text: str,
-    account_id: str = "",
-    display_name: str = "",
-    chat_id: str = "",
-) -> Optional[Dict[str, Any]]:
-    """
-    Direct bridge used by app.routes.whatsapp and app.routes.telegram.
-
-    This is intentionally callable from inside the existing bot routes. It means
-    promo commands are handled before the normal AI question fallback, so commands
-    like START PROMO TAXWITHBM cannot consume Usage Credits.
-    """
-    channel_type = _lower(channel_type)
-    provider_user_id = _clean(provider_user_id)
-    text = _clean(text)
-
-    if channel_type not in {"whatsapp", "telegram"} or not provider_user_id or not text:
-        return None
-
-    msg: Dict[str, str] = {
-        "channel_type": channel_type,
-        "provider_user_id": provider_user_id,
-        "text": text,
-        "display_name": _clean(display_name),
-        "chat_id": _clean(chat_id) or provider_user_id,
-        "account_id": _clean(account_id),
-    }
-
-    promo_code = _extract_promo_code(text)
-    if promo_code:
-        return _handle_promo_capture(msg, promo_code)
-
-    plan_code = _extract_plan_code(text)
-    if plan_code:
-        return _handle_promo_plan(msg, plan_code)
-
-    return None
-
-
-@bp.before_app_request
-def _channel_promo_interceptor():
-    msg = _get_channel_message()
-    if not msg:
-        return None
-
-    text = msg.get("text") or ""
-    promo_code = _extract_promo_code(text)
-    if promo_code:
-        result = _handle_promo_capture(msg, promo_code)
-        return jsonify({"ok": True, "intercepted": True, "route_version": CHANNEL_PROMO_ROUTE_VERSION, **result}), 200
-
-    plan_code = _extract_plan_code(text)
-    if plan_code:
-        result = _handle_promo_plan(msg, plan_code)
-        if result:
-            return jsonify({"ok": True, "intercepted": True, "route_version": CHANNEL_PROMO_ROUTE_VERSION, **result}), 200
-
-    return None
-
-
-@bp.get("/channel-promo/health")
-def channel_promo_health():
-    return jsonify({
-        "ok": True,
-        "route_version": CHANNEL_PROMO_ROUTE_VERSION,
-        "message": "WhatsApp and Telegram promo interceptor/direct bridge is active.",
-        "captures": ["START PROMO TAXWITHBM", "PROMO TAXWITHBM", "/start promo_TAXWITHBM", "TAXWITHBM"],
-        "discount_rule": "If account has pending/applied promo_redemption, channel plan checkout gets promo discount.",
-        "webhook_paths_intercepted": ["/api/whatsapp/webhook", "/api/webhook", "/api/telegram/webhook"],
-    }), 200
-
-
-@bp.get("/channel-promo/test-extract")
-def channel_promo_test_extract():
-    text = request.args.get("text") or ""
-    return jsonify({
-        "ok": True,
-        "route_version": CHANNEL_PROMO_ROUTE_VERSION,
-        "text": text,
-        "promo_code": _extract_promo_code(text),
-        "plan_code": _extract_plan_code(text),
-    }), 200
+    ), 200
