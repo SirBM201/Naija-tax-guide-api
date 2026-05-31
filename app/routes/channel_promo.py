@@ -1,4 +1,4 @@
-# app/routes/channel_promo.py
+﻿# app/routes/channel_promo.py
 from __future__ import annotations
 
 import logging
@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 bp = Blueprint("channel_promo", __name__)
 
-CHANNEL_PROMO_ROUTE_VERSION = "2026-05-31-batch36C-channel-promo-wa-tg"
+CHANNEL_PROMO_ROUTE_VERSION = "2026-05-31-batch36D-channel-menu-polish"
 
 PLAN_CODE_MAP: Dict[str, str] = {
     "S1": "starter_monthly",
@@ -97,7 +97,7 @@ def _to_int(value: Any, default: int = 0) -> int:
 
 def _money_from_kobo(kobo: Any) -> str:
     amount = _to_int(kobo, 0) / 100
-    return f"₦{amount:,.0f}"
+    return f"â‚¦{amount:,.0f}"
 
 
 def _rows(resp: Any) -> list[dict[str, Any]]:
@@ -402,7 +402,7 @@ def _create_discounted_channel_checkout(channel_type: str, provider_user_id: str
     plan = _get_plan(plan_code)
     original_amount_kobo = _to_int(plan.get("price"), 0) * 100
     if original_amount_kobo <= 0:
-        return {"ok": False, "error": "invalid_plan_price", "message": "❌ This plan price is not available right now. Please try again later."}
+        return {"ok": False, "error": "invalid_plan_price", "message": "âŒ This plan price is not available right now. Please try again later."}
 
     promo_preview = calculate_promo_checkout_preview(account_id=account_id, plan_code=plan_code, original_amount_kobo=original_amount_kobo)
     if not promo_preview.get("applies"):
@@ -460,7 +460,7 @@ def _create_discounted_channel_checkout(channel_type: str, provider_user_id: str
     result = initialize_transaction(email=email or None, amount_kobo=final_amount_kobo, reference=reference, metadata=metadata, callback_url=callback_url)
     auth_url = ((result or {}).get("data") or {}).get("authorization_url") or (result or {}).get("authorization_url")
     if not auth_url:
-        return {"ok": False, "error": "paystack_authorization_url_missing", "message": "❌ Could not create payment link. Please try again shortly.", "tx_note": tx_note}
+        return {"ok": False, "error": "paystack_authorization_url_missing", "message": "âŒ Could not create payment link. Please try again shortly.", "tx_note": tx_note}
 
     checkout_note = record_promo_checkout_started(
         account_id=account_id,
@@ -474,8 +474,8 @@ def _create_discounted_channel_checkout(channel_type: str, provider_user_id: str
 
     cycle = plan.get("billing_cycle") or "monthly"
     body = (
-        f"🎟️ *Promo Applied: {promo_code}*\n\n"
-        f"📋 Plan: {plan.get('name')}\n"
+        f"ðŸŽŸï¸ *Promo Applied: {promo_code}*\n\n"
+        f"ðŸ“‹ Plan: {plan.get('name')}\n"
         f"Original price: {_money_from_kobo(original_amount_kobo)}\n"
         f"Promo discount: -{_money_from_kobo(discount_amount_kobo)}\n"
         f"Amount to pay: {_money_from_kobo(final_amount_kobo)}\n"
@@ -492,21 +492,22 @@ def _promo_success_message(code: str, result: Dict[str, Any]) -> str:
     reason = _clean(result.get("reason"))
     if captured or reason == "promo_already_attached_to_account":
         return (
-            f"✅ *Promo code applied: {code}*\n\n"
+            f"âœ… *Promo code applied: {code}*\n\n"
             "You are eligible for the promo discount on your first paid subscription.\n\n"
             "Choose a plan to continue:\n"
-            "S1 - Starter Monthly\nS2 - Starter Quarterly\nS3 - Starter Yearly\n"
-            "P1 - Professional Monthly\nB1 - Business Monthly\n\n"
-            "Example: reply S1 to get your discounted payment link."
+            "S1 - Starter Monthly\nS2 - Starter Quarterly\nS3 - Starter Yearly\n\n"
+            "P1 - Professional Monthly\nP2 - Professional Quarterly\nP3 - Professional Yearly\n\n"
+            "B1 - Business Monthly\nB2 - Business Quarterly\nB3 - Business Yearly\n\n"
+            "Example: reply S1, P2, or B2 to get your discounted payment link."
         )
     if reason == "referral_already_attached_to_account":
         return (
-            "⚠️ A referral is already attached to this account.\n\n"
+            "âš ï¸ A referral is already attached to this account.\n\n"
             "To avoid double rewards, this account cannot also use a promo code. You can still continue with the normal plan menu."
         )
     if result.get("ok") is False:
-        return "⚠️ I could not apply this promo code right now. Please try again shortly."
-    return f"⚠️ Promo code {code} could not be applied. Reason: {reason or 'not eligible'}."
+        return "âš ï¸ I could not apply this promo code right now. Please try again shortly."
+    return f"âš ï¸ Promo code {code} could not be applied. Reason: {reason or 'not eligible'}."
 
 
 def _handle_promo_capture(msg: Dict[str, str], code: str) -> Dict[str, Any]:
@@ -544,12 +545,12 @@ def _handle_promo_plan(msg: Dict[str, str], plan_code: str) -> Optional[Dict[str
     try:
         result = _create_discounted_channel_checkout(channel_type, provider_user_id, account_id, plan_code, email=email)
         _update_session(channel_type, provider_user_id, {"account_id": account_id, "promo_code": redemption.get("promo_code"), "pending_plan_code": plan_code, "last_checkout_result": result})
-        message = result.get("message") if result.get("ok") else result.get("message") or "❌ Could not create promo payment link. Please try again."
+        message = result.get("message") if result.get("ok") else result.get("message") or "âŒ Could not create promo payment link. Please try again."
         send_result = _send_channel_text(channel_type, msg.get("chat_id") or provider_user_id, message)
         return {"ok": True, "handled": "promo_discounted_checkout", "channel_type": channel_type, "provider_user_id": provider_user_id, "account_id": account_id, "plan_code": plan_code, "checkout": result, "send_result": send_result}
     except Exception as exc:
         logger.exception("Channel promo checkout failed")
-        body = "❌ I could not create your promo payment link right now. Please try again shortly or use the website."
+        body = "âŒ I could not create your promo payment link right now. Please try again shortly or use the website."
         send_result = _send_channel_text(channel_type, msg.get("chat_id") or provider_user_id, body)
         return {"ok": True, "handled": "promo_checkout_failed", "error": f"{type(exc).__name__}: {_clip(exc)}", "send_result": send_result}
 
@@ -597,3 +598,4 @@ def channel_promo_test_extract():
         "promo_code": _extract_promo_code(text),
         "plan_code": _extract_plan_code(text),
     }), 200
+
