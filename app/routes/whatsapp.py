@@ -1590,7 +1590,7 @@ def _plan_label(account_id: str) -> str:
 
     name = _clean(sub.get("plan_name") or sub.get("plan_code") or "Free Forever")
     status = _clean(sub.get("status") or "active")
-    expires = _subscription_expiry_value(sub)
+    expires = _subscription_expiry(account_id)
 
     if expires:
         return f"{name} ({status})\nExpires: {expires[:10]}"
@@ -1615,7 +1615,7 @@ def _subscription_expiry(account_id: str) -> str:
     sub = _get_subscription(account_id)
     if not sub:
         return ""
-    return _clean(sub.get("expires_at") or sub.get("current_period_end") or sub.get("valid_until") or "")
+    return _clean(sub.get("current_period_end") or sub.get("expires_at") or sub.get("valid_until") or "")
 
 
 def _same_active_plan(account_id: str, selected_plan_code: str) -> bool:
