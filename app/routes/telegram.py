@@ -1585,11 +1585,84 @@ def _handle_telegram_tax_question(
 
 
 def _subscription_row(account_id: str) -> Optional[dict[str, Any]]:
+    """
+    Batch 36G1:
+    Return the safest active subscription row.
+
+    Fixes:
+    - Avoids stale subscription display.
+    - Prioritizes active rows.
+    - Uses current_period_end as the main paid-plan validity field.
+    """
+    account_id = _clean_text(account_id)
+    if not account_id:
+        return None
+
     try:
-        resp = supabase.table("user_subscriptions").select("*").eq("account_id", account_id).order("created_at", desc=True).limit(1).execute()
+        resp = (
+            supabase.table("user_subscriptions")
+            .select("*")
+            .eq("account_id", account_id)
+            .eq("is_active", True)
+            .order("current_period_end", desc=True)
+            .order("updated_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        row = _first(resp)
+        if row:
+            return row
+    except Exception:
+        pass
+
+    try:
+        resp = (
+            supabase.table("user_subscriptions")
+            .select("*")
+            .eq("account_id", account_id)
+            .eq("status", "active")
+            .order("current_period_end", desc=True)
+            .order("updated_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        row = _first(resp)
+        if row:
+            return row
+    except Exception:
+        pass
+
+    try:
+        resp = (
+            supabase.table("user_subscriptions")
+            .select("*")
+            .eq("account_id", account_id)
+            .order("current_period_end", desc=True)
+            .order("updated_at", desc=True)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
         return _first(resp)
     except Exception:
         return None
+
+
+def _subscription_expiry_value(sub: Optional[dict[str, Any]]) -> str:
+    """
+    Batch 36G1:
+    current_period_end is the authoritative paid-plan expiry.
+
+    expires_at is kept only as fallback for old records.
+    """
+    if not sub:
+        return ""
+    return _clean_text(
+        sub.get("current_period_end")
+        or sub.get("expires_at")
+        or sub.get("valid_until")
+        or ""
+    )
 
 
 def _credit_balance_value(balance: Any) -> int:
@@ -1657,7 +1730,7 @@ def _billing_summary_text(account_id: str) -> str:
 
     plan_name = _clean_text(sub.get("plan_name") or sub.get("plan_code") or "Current plan")
     status = _clean_text(sub.get("status") or "active")
-    expiry = _clean_text(sub.get("expires_at") or sub.get("current_period_end") or sub.get("valid_until") or "")
+    expiry = _subscription_expiry_value(sub)
     ref = _clean_text(sub.get("provider_ref") or sub.get("paystack_ref") or sub.get("payment_reference") or sub.get("reference") or "")
 
     body = (
@@ -1795,7 +1868,7 @@ def _send_renewal_expiry(chat_id: str, account_id: str) -> None:
         send_telegram_text(chat_id, "📅 *Renewal / Expiry Date*\n\nNo active paid subscription found.\n\nReply 4 to view subscription plans.")
         return
 
-    expiry = _clean_text(sub.get("expires_at") or sub.get("current_period_end") or sub.get("valid_until") or "")
+    expiry = _subscription_expiry_value(sub)
     plan_name = _clean_text(sub.get("plan_name") or sub.get("plan_code") or "Current plan")
     send_telegram_text(
         chat_id,
