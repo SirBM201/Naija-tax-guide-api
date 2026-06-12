@@ -38,82 +38,87 @@ def get_paye_brackets() -> List[Dict[str, Any]]:
 
 def calculate_paye(gross_income: float, pension_contribution: float = 0, nhf: float = 0) -> Dict[str, Any]:
     """
-    Calculate PAYE tax for an employee
-    
+    Calculate PAYE tax for an employee using one canonical formula for
+    web, WhatsApp, and Telegram calculators.
+
     Args:
         gross_income: Monthly gross income in Naira
-        pension_contribution: Monthly pension contribution (max 8% of gross)
-        nhf: National Housing Fund contribution
-    
+        pension_contribution: Monthly pension contribution supplied by the user
+        nhf: Monthly National Housing Fund contribution supplied by the user
+
     Returns:
         Dict with tax breakdown and total payable
     """
+    gross_income = max(0.0, float(gross_income or 0))
+    pension_contribution = max(0.0, float(pension_contribution or 0))
+    nhf = max(0.0, float(nhf or 0))
+
     gross_annual = gross_income * 12
-    
-    # Consolidated Relief Allowance (CRA)
-    # Higher of ₦200,000 OR 1% of gross income, plus 20% of gross income
-    cra_fixed = max(200000, gross_annual * 0.01)
-    cra_percentage = gross_annual * 0.20
-    cra_total = cra_fixed + cra_percentage
-    
-    # Pension deduction (max 8% of annual gross)
-    pension_annual = min(pension_contribution * 12, gross_annual * 0.08)
-    
-    # NHF deduction
+    pension_annual = pension_contribution * 12
     nhf_annual = nhf * 12
-    
-    # Total deductions
-    total_deductions = cra_total + pension_annual + nhf_annual
-    
-    # Chargeable Income
-    chargeable_income = max(0, gross_annual - total_deductions)
-    
-    # Calculate tax using bands
-    brackets = get_paye_brackets()
-    tax_payable = 0
-    tax_breakdown = []
+
+    # Consolidated Relief Allowance (CRA): higher of ₦200,000 or 1%
+    # of annual gross income, plus 20% of annual gross income.
+    cra_total = max(200000.0, gross_annual * 0.01) + (gross_annual * 0.20)
+
+    payroll_deductions = pension_annual + nhf_annual
+    total_deductions = cra_total + payroll_deductions
+    chargeable_income = max(0.0, gross_annual - total_deductions)
+
+    # Nigerian PAYE bands are annual bands. Keep the band widths fixed so
+    # all channels produce the same result without database rounding variance.
+    bands = [
+        (300000.0, 0.07),
+        (300000.0, 0.11),
+        (500000.0, 0.15),
+        (500000.0, 0.19),
+        (1600000.0, 0.21),
+        (float("inf"), 0.24),
+    ]
+
     remaining = chargeable_income
-    
-    for bracket in brackets:
-        band_min = bracket.get("band_min", 0)
-        band_max = bracket.get("band_max")
-        rate = bracket.get("rate", 0) / 100
-        
+    tax_payable = 0.0
+    tax_breakdown = []
+
+    for band_amount, rate in bands:
         if remaining <= 0:
             break
-        
-        if band_max is not None:
-            band_amount = min(remaining, band_max - band_min + 1)
-        else:
-            band_amount = remaining
-        
-        if band_amount > 0:
-            band_tax = band_amount * rate
-            tax_payable += band_tax
-            tax_breakdown.append({
-                "band_min": band_min,
-                "band_max": band_max,
-                "rate": rate * 100,
-                "taxable_amount": band_amount,
-                "tax": band_tax
-            })
-            remaining -= band_amount
-    
+        taxable_in_band = min(remaining, band_amount)
+        band_tax = taxable_in_band * rate
+        tax_payable += band_tax
+        tax_breakdown.append({
+            "band_amount": band_amount,
+            "rate": rate * 100,
+            "taxable_amount": taxable_in_band,
+            "tax": band_tax,
+        })
+        remaining -= taxable_in_band
+
     monthly_tax = tax_payable / 12
-    
+    net_monthly_pay = max(0.0, gross_income - pension_contribution - nhf - monthly_tax)
+
     return {
         "ok": True,
+        # Canonical keys used by backend services.
         "annual_gross": gross_annual,
         "monthly_gross": gross_income,
         "cra_deduction": cra_total,
         "pension_deduction": pension_annual,
         "nhf_deduction": nhf_annual,
+        "payroll_deductions": payroll_deductions,
         "total_deductions": total_deductions,
         "chargeable_income": chargeable_income,
         "annual_tax_payable": tax_payable,
         "monthly_tax_payable": monthly_tax,
         "effective_rate": (tax_payable / gross_annual * 100) if gross_annual > 0 else 0,
         "tax_breakdown": tax_breakdown,
+        "net_monthly_pay": net_monthly_pay,
+        # Compatibility aliases used by channel formatters.
+        "annual_gross_income": gross_annual,
+        "consolidated_relief": cra_total,
+        "annual_pension": pension_annual,
+        "annual_nhf": nhf_annual,
+        "tax_deductible_payroll_deductions": payroll_deductions,
         "explanation": f"Annual Gross: ₦{gross_annual:,.2f}\n"
                        f"CRA Deduction: ₦{cra_total:,.2f}\n"
                        f"Pension: ₦{pension_annual:,.2f}\n"
@@ -129,7 +134,7 @@ def calculate_vat(taxable_supplies: float, input_vat: float = 0, vat_rate: float
     Calculate VAT for a business
     
     Args:
-        taxable_supplies: Value of taxable supplies (sales)
+        taxable_supplies: Value of taxable goods/services supplied
         input_vat: VAT paid on purchases (deductible)
         vat_rate: VAT rate (default 7.5%)
     
