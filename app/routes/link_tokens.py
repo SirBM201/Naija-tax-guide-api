@@ -31,7 +31,7 @@ SAFE_CODE_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
 
 WHATSAPP_TEST_LINE_E164 = (os.getenv("WHATSAPP_TEST_LINE_E164") or "").strip()
 WHATSAPP_DEEP_LINK = (os.getenv("WHATSAPP_DEEP_LINK") or "").strip()
-TELEGRAM_BOT_USERNAME = (os.getenv("TELEGRAM_BOT_USERNAME") or "").strip().lstrip("@")
+TELEGRAM_BOT_USERNAME = (os.getenv("TELEGRAM_BOT_USERNAME") or "naija_tax_guide_bot").strip().lstrip("@")
 TELEGRAM_BOT_URL = (os.getenv("TELEGRAM_BOT_URL") or "").strip()
 
 
@@ -103,19 +103,19 @@ def _build_whatsapp_link(code: str) -> Optional[str]:
     return f"https://wa.me/?text={message}"
 
 
-def _build_telegram_link(code: str) -> Optional[str]:
+def _build_telegram_link(code: str) -> str:
     message = quote(code)
 
     if TELEGRAM_BOT_URL:
         separator = "&" if "?" in TELEGRAM_BOT_URL else "?"
-        if "start=" in TELEGRAM_BOT_URL or "text=" in TELEGRAM_BOT_URL:
+        if "start=" in TELEGRAM_BOT_URL:
             return TELEGRAM_BOT_URL
-        return f"{TELEGRAM_BOT_URL}{separator}text={message}"
+        if "text=" in TELEGRAM_BOT_URL:
+            return TELEGRAM_BOT_URL
+        return f"{TELEGRAM_BOT_URL}{separator}start={message}"
 
-    if TELEGRAM_BOT_USERNAME:
-        return f"https://t.me/{TELEGRAM_BOT_USERNAME}?text={message}"
-
-    return None
+    username = TELEGRAM_BOT_USERNAME or "naija_tax_guide_bot"
+    return f"https://t.me/{username}?start={message}"
 
 
 def _find_channel_identity_for_account(account_id: str, provider: str) -> Optional[Dict[str, Any]]:
@@ -256,46 +256,3 @@ def unlink_linked_channel():
     if not result.get("ok"):
         return _json_error("Failed to unlink channel", 400, details=result)
     return jsonify({"ok": True, "unlinked": True, "provider": provider, "provider_user_id": provider_user_id})
-
-
-@bp.post("/consume")
-def consume_link_code():
-    body = request.get_json(silent=True) or {}
-
-    code = (body.get("code") or "").strip().upper()
-    provider = _requested_provider()
-    provider_user_id = str(body.get("provider_user_id") or "").strip()
-    display_name = (body.get("display_name") or "").strip() or None
-    phone = (body.get("phone") or "").strip() or None
-    phone_e164 = (body.get("phone_e164") or "").strip() or None
-
-    if provider == "__mismatch__":
-        return _json_error("Provider mismatch between query and body", 400)
-
-    if not code or provider not in {"wa", "tg", "msgr", "ig"} or not provider_user_id:
-        return _json_error("Invalid request", 400)
-
-    link = consume_and_link(
-        provider=provider,
-        code=code,
-        provider_user_id=provider_user_id,
-        display_name=display_name,
-        phone=phone_e164 or phone,
-    )
-
-    if not link.get("ok"):
-        reason = str(link.get("reason") or link.get("error") or "link_failed").strip()
-        if reason in {"invalid_code", "expired_code", "used_code"}:
-            return _json_error("Invalid or expired code", 404, details=link)
-        return _json_error("Failed to link account", 400, details=link)
-
-    return jsonify(
-        {
-            "ok": True,
-            "linked": True,
-            "account_id": link.get("account_id"),
-            "provider": provider,
-            "provider_user_id": provider_user_id,
-            "link": link,
-        }
-    )
