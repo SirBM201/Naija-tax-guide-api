@@ -40,7 +40,6 @@ def _parse_origins(
 
     if not raw:
         if cookie_mode:
-            # Default to frontend domain if not specified
             return ["https://www.naijataxguides.com", "https://naijataxguides.com"], True, None
         return "*", False, None
 
@@ -113,7 +112,6 @@ def create_app() -> Flask:
     if cors_err:
         raise RuntimeError(f"[CORS] {cors_err}")
 
-    # Ensure frontend domains are included for cookie auth
     if cookie_mode and origins != "*":
         frontend_domains = ["https://www.naijataxguides.com", "https://naijataxguides.com"]
         if isinstance(origins, list):
@@ -263,7 +261,7 @@ def create_app() -> Flask:
         _register_bp(dotted, "bp", required=True, url_prefix=api_prefix)
 
     # ============================================================
-    # RUNTIME DISPLAY PATCHES
+    # RUNTIME PATCHES
     # ============================================================
     try:
         from app.services.whatsapp_display_patch import apply_whatsapp_display_patch
@@ -284,6 +282,31 @@ def create_app() -> Flask:
                 "module": "app.services.whatsapp_display_patch",
                 "attr": "apply_whatsapp_display_patch",
                 "alias_name": "whatsapp_display_patch",
+                "url_prefix": None,
+                "required": False,
+                "error": repr(e),
+            }
+        )
+
+    try:
+        from app.services.ask_relevance_patch import apply_ask_relevance_patch
+
+        apply_ask_relevance_patch()
+        boot["registered"].append(
+            {
+                "module": "app.services.ask_relevance_patch",
+                "attr": "apply_ask_relevance_patch",
+                "alias_name": "ask_relevance_patch",
+                "url_prefix": None,
+                "required": False,
+            }
+        )
+    except Exception as e:
+        boot["failed"].append(
+            {
+                "module": "app.services.ask_relevance_patch",
+                "attr": "apply_ask_relevance_patch",
+                "alias_name": "ask_relevance_patch",
                 "url_prefix": None,
                 "required": False,
                 "error": repr(e),
