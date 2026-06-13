@@ -263,6 +263,34 @@ def create_app() -> Flask:
         _register_bp(dotted, "bp", required=True, url_prefix=api_prefix)
 
     # ============================================================
+    # RUNTIME DISPLAY PATCHES
+    # ============================================================
+    try:
+        from app.services.whatsapp_display_patch import apply_whatsapp_display_patch
+
+        apply_whatsapp_display_patch()
+        boot["registered"].append(
+            {
+                "module": "app.services.whatsapp_display_patch",
+                "attr": "apply_whatsapp_display_patch",
+                "alias_name": "whatsapp_display_patch",
+                "url_prefix": None,
+                "required": False,
+            }
+        )
+    except Exception as e:
+        boot["failed"].append(
+            {
+                "module": "app.services.whatsapp_display_patch",
+                "attr": "apply_whatsapp_display_patch",
+                "alias_name": "whatsapp_display_patch",
+                "url_prefix": None,
+                "required": False,
+                "error": repr(e),
+            }
+        )
+
+    # ============================================================
     # OPTIONAL BLUEPRINTS (WON'T CRASH IF MISSING)
     # ============================================================
     optional_modules = [
