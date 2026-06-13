@@ -5,12 +5,19 @@ import re
 from typing import Any, Dict, Optional
 
 
-ASK_REVIEW_PATCH_VERSION = "2026-06-14-v3-second-ai-low-medium-auto-approval"
+ASK_REVIEW_PATCH_VERSION = "2026-06-14-v4-cost-aware-review-policy"
 
 STANDARD_DISCLAIMER = (
     "Note: This is general information for guidance only. Tax outcomes depend on the taxpayer's facts, "
     "records, current law, and the relevant tax authority. Confirm the position before filing, paying, "
     "objecting, or relying on it for a real compliance decision."
+)
+
+STRONG_DISCLAIMER = (
+    "Important: This is high-risk general guidance only, not a final tax/legal opinion. Exact deadlines, "
+    "penalties, enforcement steps, objections, appeals, waivers, and liabilities can depend on the facts, "
+    "documents, tax year, applicable law, and the relevant tax authority. Confirm with FIRS, the State IRS, "
+    "or a qualified tax professional before taking action."
 )
 
 HIGH_RISK_TERMS = {
@@ -55,6 +62,26 @@ MEDIUM_RISK_TERMS = {
     "filing deadline",
 }
 
+MEDIUM_REVIEW_TRIGGER_TERMS = {
+    "exact",
+    "how much",
+    "calculate",
+    "appeal",
+    "tribunal",
+    "court",
+    "freeze",
+    "bank account",
+    "enforcement",
+    "personal liability",
+    "director",
+    "criminal",
+    "fraud",
+    "waive",
+    "waiver",
+    "object within",
+    "days",
+}
+
 
 _json_object_re = re.compile(r"\{[\s\S]*\}")
 
@@ -82,6 +109,15 @@ def _append_disclaimer(answer: str) -> str:
     return f"{clean}\n\n{STANDARD_DISCLAIMER}"
 
 
+def _append_strong_disclaimer(answer: str) -> str:
+    clean = (answer or "").strip()
+    if not clean:
+        return STRONG_DISCLAIMER
+    if "high-risk general guidance" in clean.lower() or "qualified tax professional" in clean.lower():
+        return clean
+    return f"{clean}\n\n{STRONG_DISCLAIMER}"
+
+
 def _fallback_risk(question: str, answer: str) -> str:
     joined = f"{question}\n{answer}".lower()
     if _contains_any(joined, HIGH_RISK_TERMS):
@@ -89,6 +125,40 @@ def _fallback_risk(question: str, answer: str) -> str:
     if _contains_any(joined, MEDIUM_RISK_TERMS):
         return "medium"
     return "low"
+
+
+def _looks_incomplete_or_uncertain(answer: str) -> bool:
+    clean = (answer or "").strip()
+    lower = clean.lower()
+    if len(clean) < 180:
+        return True
+    uncertain_terms = {
+        "i am not sure",
+        "i'm not sure",
+        "may be wrong",
+        "unclear",
+        "cannot determine",
+        "not enough information",
+        "depends" ,
+    }
+    if any(term in lower for term in uncertain_terms):
+        return True
+    if "direct answer" not in lower and "key points" not in lower:
+        return True
+    return False
+
+
+def _medium_needs_second_ai(question: str, answer: str) -> bool:
+    joined = f"{question}\n{answer}".lower()
+    if _contains_any(joined, MEDIUM_REVIEW_TRIGGER_TERMS):
+        return True
+    if _looks_incomplete_or_uncertain(answer):
+        return True
+    if not _has_disclaimer(answer):
+        # Medium answers can still be auto-approved with disclaimer added by code;
+        # this alone should not force a second AI call.
+        return False
+    return False
 
 
 def _parse_json_object(text: str) -> Optional[Dict[str, Any]]:
@@ -111,14 +181,6 @@ def _parse_json_object(text: str) -> Optional[Dict[str, Any]]:
 
 
 def _second_ai_review(question: str, answer: str, fallback_risk: str) -> Dict[str, Any]:
-    """
-    Use a second AI pass as a lightweight quality gate.
-
-    Approval policy:
-    - low + relevant + not misleading => auto approve
-    - medium + relevant + not misleading + disclaimer => auto approve
-    - high/reject/uncertain => keep in human review queue
-    """
     try:
         from app.services.ai_service import ask_ai_chat, last_ai_error
     except Exception as exc:
@@ -136,20 +198,22 @@ Review the candidate answer for reuse in a Nigerian tax guidance app.
 Classify risk:
 - low: basic definition, glossary, app usage, non-actionable general explanation.
 - medium: routine compliance guidance, deadlines, penalties, interest, WHT credit, filings, documents, assessment notices, or FIRS/State IRS process guidance where a disclaimer is enough.
-- high: exact legal strategy, litigation/appeal risk, enforcement, criminal/fraud issue, bank-freezing, personal liability, disputed facts, exact penalty amount with uncertainty, objection/appeal deadline with serious consequence, or anything that should be checked by a human tax professional before reuse.
+- high: legal strategy, appeal/objection consequences, enforcement, bank-freezing, personal liability, disputed facts, exact penalty amount with uncertainty, or guidance that can materially affect taxpayer action.
 - reject: answer is irrelevant to the question, clearly wrong, overconfident, unsafe, or not Nigerian-tax-specific enough.
 
-Auto-approval rule:
-- Approve low risk only if relevant and not misleading.
-- Approve medium risk only if relevant and not misleading; it will be saved with a disclaimer.
-- Do not approve high risk or reject.
+Approval rule:
+- low can be approved if relevant and not misleading.
+- medium can be approved if relevant and not misleading; disclaimer will be attached.
+- high can be approved only if converted to safe general guidance with a strong disclaimer. Do not approve high-risk text that sounds like final tax/legal advice.
+- reject must not be approved.
 
-Return ONLY valid JSON with these keys:
+Return ONLY valid JSON:
 {{
   "risk": "low" | "medium" | "high" | "reject",
   "relevant": true | false,
   "misleading": true | false,
   "auto_approve": true | false,
+  "safe_answer": "optional safer answer or empty string",
   "reason": "short reason"
 }}
 
@@ -196,12 +260,15 @@ Candidate answer:
     relevant = bool(data.get("relevant") is True)
     misleading = bool(data.get("misleading") is True)
     auto_approve = bool(data.get("auto_approve") is True)
+    safe_answer = str(data.get("safe_answer") or "").strip()
 
-    if risk in {"high", "reject"} or not relevant or misleading:
+    if risk == "reject" or not relevant or misleading:
         decision = "queue"
         auto_approve = False
     elif risk in {"low", "medium"} and auto_approve:
         decision = "approve"
+    elif risk == "high" and auto_approve:
+        decision = "approve_safe_guidance"
     else:
         decision = "queue"
         auto_approve = False
@@ -213,6 +280,7 @@ Candidate answer:
         "auto_approve": auto_approve,
         "relevant": relevant,
         "misleading": misleading,
+        "safe_answer": safe_answer[:4000],
         "reason": str(data.get("reason") or "").strip()[:500],
     }
 
@@ -259,7 +327,7 @@ def apply_ask_review_patch() -> None:
             except Exception:
                 trust_score = 0.0
 
-            if status not in {"approved", "active", "published", "ok", "enabled"}:
+            if status not in {"approved", "active", "published", "ok", "enabled", "ai_reviewed_safe"}:
                 return False
             if enabled in {"false", "0", "no", "off", ""}:
                 return False
@@ -272,21 +340,62 @@ def apply_ask_review_patch() -> None:
         canonical = svc._canonical_key(question)
         clean_answer = svc._ensure_professional_answer_shape(answer, question)
         fallback_risk = _fallback_risk(question, clean_answer)
-        review = _second_ai_review(question, clean_answer, fallback_risk)
+        review: Dict[str, Any] = {
+            "ok": True,
+            "risk": fallback_risk,
+            "decision": "rule_auto_approve",
+            "auto_approve": True,
+            "reason": "Rule-based approval without second AI review.",
+        }
 
-        risk = str(review.get("risk") or fallback_risk).lower()
-        approved = review.get("decision") == "approve" and risk in {"low", "medium"}
-        answer_to_store = _append_disclaimer(clean_answer) if risk == "medium" else clean_answer
+        if fallback_risk == "low":
+            risk = "low"
+            approved = True
+            answer_to_store = clean_answer
+            schema_mode = "rule_auto_approved_low"
+        elif fallback_risk == "medium" and not _medium_needs_second_ai(question, clean_answer):
+            risk = "medium"
+            approved = True
+            answer_to_store = _append_disclaimer(clean_answer)
+            schema_mode = "rule_auto_approved_medium_with_disclaimer"
+        else:
+            review = _second_ai_review(question, clean_answer, fallback_risk)
+            risk = str(review.get("risk") or fallback_risk).lower()
+            decision = str(review.get("decision") or "queue")
+            approved = decision in {"approve", "approve_safe_guidance"} and risk in {"low", "medium", "high"}
+            safe_answer = str(review.get("safe_answer") or "").strip()
+            if risk == "medium":
+                answer_to_store = _append_disclaimer(safe_answer or clean_answer)
+                schema_mode = "second_ai_approved_medium_with_disclaimer" if approved else "review_queue_medium"
+            elif risk == "high":
+                answer_to_store = _append_strong_disclaimer(safe_answer or clean_answer)
+                schema_mode = "second_ai_approved_high_safe_guidance" if approved else "review_queue_high"
+            elif risk == "low":
+                answer_to_store = safe_answer or clean_answer
+                schema_mode = "second_ai_approved_low" if approved else "review_queue_low"
+            else:
+                answer_to_store = _append_strong_disclaimer(clean_answer)
+                schema_mode = "review_queue_reject"
+                approved = False
+
         now_iso = svc._now_iso()
 
         if approved:
-            trust_score = 0.9 if risk == "low" else 0.82
-            status = "approved"
+            if risk == "low":
+                trust_score = 0.9
+                status = "approved"
+                priority = 30
+            elif risk == "medium":
+                trust_score = 0.82
+                status = "approved"
+                priority = 22
+            else:
+                trust_score = 0.8
+                status = "ai_reviewed_safe"
+                priority = 12
             enabled = True
-            priority = 30 if risk == "low" else 22
-            tags = ["ai", "ai-reviewed", f"risk-{risk}"]
+            tags = ["ai", "auto-reviewed", f"risk-{risk}"]
             reusable = True
-            schema_mode = f"second_ai_auto_approved_{risk}"
         else:
             trust_score = 0.25 if risk == "reject" else 0.35
             status = "candidate"
@@ -294,8 +403,6 @@ def apply_ask_review_patch() -> None:
             priority = 5
             tags = ["ai", "review-candidate", f"risk-{risk}"]
             reusable = False
-            schema_mode = f"review_queue_{risk}"
-            answer_to_store = _append_disclaimer(clean_answer) if risk in {"medium", "high"} else clean_answer
 
         existing, err = svc._query_rows("qa_cache", "*", limit=10, normalized_question=normalized)
         errors = [err] if err else []
