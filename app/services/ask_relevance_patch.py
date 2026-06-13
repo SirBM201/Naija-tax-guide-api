@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict
 
 
-ASK_RELEVANCE_PATCH_VERSION = "2026-06-13-v1-exact-cache-library-before-ai-plus-review-patch"
+ASK_RELEVANCE_PATCH_VERSION = "2026-06-14-v2-exact-cache-review-format-patches"
 
 
 def apply_ask_relevance_patch() -> None:
@@ -22,6 +22,13 @@ def apply_ask_relevance_patch() -> None:
         from app.services import ask_service as svc
     except Exception:
         return
+
+    try:
+        from app.services.ask_answer_format_patch import apply_ask_answer_format_patch
+
+        apply_ask_answer_format_patch()
+    except Exception:
+        pass
 
     try:
         from app.services.ask_review_patch import apply_ask_review_patch
