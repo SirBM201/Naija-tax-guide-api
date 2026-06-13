@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
@@ -18,7 +19,94 @@ except Exception:  # pragma: no cover
 
 bp = Blueprint("ask", __name__)
 
-ASK_ROUTE_VERSION = "2026-05-23-v6-web-whatsapp-telegram-credit-safe"
+ASK_ROUTE_VERSION = "2026-06-13-v7-web-answer-clarity-curated-starters"
+
+CURATED_STARTER_ANSWERS: Dict[str, str] = {
+    "what is personal income tax": (
+        "Direct answer: Personal Income Tax is tax paid by individuals on income such as salary, business profit, professional fees, rent, and other personal earnings in Nigeria.\n\n"
+        "Key points:\n"
+        "1. Employees usually pay through PAYE deductions by their employer.\n"
+        "2. Self-employed individuals and business owners usually file directly with the relevant State Internal Revenue Service.\n"
+        "3. The tax authority depends mainly on the taxpayer's state of residence."
+    ),
+    "what is the personal income tax rate": (
+        "Direct answer: Nigeria uses graduated Personal Income Tax rates, so the rate increases as taxable income increases.\n\n"
+        "Key points:\n"
+        "1. The taxable income bands are commonly taxed from 7% up to 24%.\n"
+        "2. Reliefs and allowable deductions can reduce the final taxable income.\n"
+        "3. The final amount depends on the taxpayer's income, deductions, and state treatment."
+    ),
+    "which tax authority handles personal income tax": (
+        "Direct answer: Personal Income Tax is generally handled by the State Internal Revenue Service of the taxpayer's state of residence.\n\n"
+        "Key points:\n"
+        "1. PAYE for employees is usually remitted to the relevant state tax authority.\n"
+        "2. Self-employed individuals normally file with their State Internal Revenue Service.\n"
+        "3. FIRS generally handles federal taxes such as Company Income Tax and VAT."
+    ),
+    "what is paye": (
+        "Direct answer: PAYE means Pay As You Earn. It is the system where an employer deducts Personal Income Tax from an employee's salary and remits it to the relevant State Internal Revenue Service.\n\n"
+        "Key points:\n"
+        "1. PAYE applies to employees who earn salaries or wages.\n"
+        "2. The employer deducts the tax before paying the employee's net salary.\n"
+        "3. The deduction is normally remitted monthly to the employee's state tax authority."
+    ),
+    "who must deduct paye": (
+        "Direct answer: Employers must deduct PAYE from employees' salaries and remit it to the relevant State Internal Revenue Service.\n\n"
+        "Key points:\n"
+        "1. The employer acts as a collecting agent for the tax authority.\n"
+        "2. PAYE should be calculated from taxable employment income after allowable reliefs and deductions.\n"
+        "3. Employees should receive payslips or records showing the deduction."
+    ),
+    "when should paye be remitted": (
+        "Direct answer: PAYE is generally expected to be remitted by the 10th day of the month following the month in which the salary was paid.\n\n"
+        "Key points:\n"
+        "1. For example, PAYE deducted from June salary is usually remitted by 10 July.\n"
+        "2. Employers should also keep proper payroll and PAYE records.\n"
+        "3. Confirm any state-specific filing portal or administrative requirement with the relevant State Internal Revenue Service."
+    ),
+    "what is vat in nigeria": (
+        "Direct answer: VAT means Value Added Tax. It is a consumption tax charged on taxable goods and services in Nigeria and remitted to FIRS by VAT-registered businesses.\n\n"
+        "Key points:\n"
+        "1. VAT is usually charged at the applicable VAT rate on taxable supplies.\n"
+        "2. Businesses collect VAT from customers and remit it to FIRS.\n"
+        "3. Some goods and services may be exempt or zero-rated, depending on the law."
+    ),
+    "who should register for vat": (
+        "Direct answer: Businesses or individuals that make taxable supplies of goods or services in Nigeria and meet the VAT registration threshold should register for VAT.\n\n"
+        "Key points:\n"
+        "1. VAT registration is mainly for persons or businesses making taxable supplies.\n"
+        "2. Businesses should confirm the current turnover threshold and registration rules before filing.\n"
+        "3. Once registered, the business must charge VAT where applicable and remit to FIRS."
+    ),
+    "when is vat due": (
+        "Direct answer: VAT returns and payment are generally due monthly, usually by the 21st day of the month following the transaction month.\n\n"
+        "Key points:\n"
+        "1. VAT collected in June is usually reported and remitted by 21 July.\n"
+        "2. Businesses should keep VAT invoices and records of input and output VAT.\n"
+        "3. Confirm current FIRS portal requirements before filing."
+    ),
+    "what is company income tax": (
+        "Direct answer: Company Income Tax is tax charged on the taxable profits of companies in Nigeria and administered by FIRS.\n\n"
+        "Key points:\n"
+        "1. The applicable rate depends on company size and turnover.\n"
+        "2. Taxable profit is usually determined after allowable business deductions.\n"
+        "3. Small-company exemptions and other reliefs should be confirmed before filing."
+    ),
+    "when should a company file income tax": (
+        "Direct answer: A company normally files Company Income Tax returns with FIRS annually. New companies and existing companies can have different filing timelines.\n\n"
+        "Key points:\n"
+        "1. Existing companies commonly file within six months after the accounting year end.\n"
+        "2. New companies may have special first-return timing rules.\n"
+        "3. Confirm the company's accounting year end and FIRS requirements before filing."
+    ),
+    "can company salary reduce taxable profit": (
+        "Direct answer: Salary paid by a company can reduce taxable profit if it is a genuine, reasonable, and properly documented business expense.\n\n"
+        "Key points:\n"
+        "1. The salary should relate to actual work done for the company.\n"
+        "2. Payroll records, PAYE deduction, and payment evidence should be kept.\n"
+        "3. Excessive or unsupported salary claims may be challenged during review or audit."
+    ),
+}
 
 
 def _sb():
@@ -61,6 +149,79 @@ def _normalize_lang(value: Any) -> str:
 
 def _normalize_channel(value: Any) -> str:
     return _safe_text(value).lower() or "web"
+
+
+def _normalize_question_key(value: Any) -> str:
+    text = _safe_text(value).lower()
+    text = re.sub(r"[^a-z0-9\s]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _clean_repeated_answer_labels(value: Any) -> str:
+    text = _safe_text(value)
+    if not text:
+        return ""
+
+    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
+    for _ in range(10):
+        next_text = re.sub(
+            r"\b(?:Direct answer|Short answer)\s*:\s*(?:Direct answer|Short answer)\s*:",
+            "Direct answer:",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if next_text == text:
+            break
+        text = next_text
+
+    text = re.sub(
+        r"^(?:\s*(?:Direct answer|Short answer)\s*:\s*){2,}",
+        "Direct answer: ",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _curated_starter_result(question: str, lang: str, channel: str, account_id: str) -> Optional[Dict[str, Any]]:
+    if (lang or "en").lower() not in {"en", "english"}:
+        return None
+
+    key = _normalize_question_key(question)
+    answer = CURATED_STARTER_ANSWERS.get(key)
+    if not answer:
+        return None
+
+    return {
+        "ok": True,
+        "answer": answer,
+        "source": "library",
+        "mode": "curated_starter",
+        "meta": {
+            "account_id": account_id,
+            "channel": channel,
+            "provider": channel,
+            "source_kind": "library",
+            "usage_charged": False,
+            "credits_consumed": 0,
+            "credit_cost": 0,
+            "normalized_question": key,
+            "canonical_key": key.replace(" ", "_"),
+            "curated": True,
+        },
+    }
+
+
+def _sanitize_result_answer(result: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(result, dict):
+        return result
+    answer = _safe_text(result.get("answer"))
+    if answer:
+        result = dict(result)
+        result["answer"] = _clean_repeated_answer_labels(answer)
+    return result
 
 
 def _as_int(value: Any, default: int = 0) -> int:
@@ -109,21 +270,19 @@ def _extract_account_id(auth_result: Any) -> Tuple[Optional[str], Dict[str, Any]
 
 def _resolve_account_id_from_request(payload: Dict[str, Any]) -> Tuple[Optional[str], Dict[str, Any]]:
     debug: Dict[str, Any] = {
-        "resolver": "ask_route_v6_session_web_token_payload",
+        "resolver": "ask_route_v7_session_web_token_payload",
         "payload_account_checked": False,
         "flask_session_checked": False,
         "auth_service_checked": False,
         "web_token_checked": False,
     }
 
-    # 1. Explicit account_id in payload, used by WhatsApp/Telegram internal calls.
     payload_account_id = _safe_text(payload.get("account_id"))
     if payload_account_id:
         debug["payload_account_checked"] = True
         debug["account_source"] = "payload"
         return payload_account_id, debug
 
-    # 2. Flask session values.
     debug["flask_session_checked"] = True
     for key in ("account_id", "user_id", "id"):
         value = _safe_text(session.get(key))
@@ -131,7 +290,6 @@ def _resolve_account_id_from_request(payload: Dict[str, Any]) -> Tuple[Optional[
             debug["account_source"] = f"flask_session.{key}"
             return value, debug
 
-    # 3. Optional legacy auth service.
     if get_current_user is not None:
         try:
             debug["auth_service_checked"] = True
@@ -145,7 +303,6 @@ def _resolve_account_id_from_request(payload: Dict[str, Any]) -> Tuple[Optional[
         except Exception as exc:
             debug["auth_service_error"] = f"{exc.__class__.__name__}: {_clip(exc)}"
 
-    # 4. Web token/cookie resolver.
     try:
         debug["web_token_checked"] = True
         auth_raw = get_account_id_from_request(request)
@@ -183,7 +340,7 @@ def _history_flags_from_result(result: Dict[str, Any]) -> Tuple[bool, int, bool,
     source = _safe_text(result.get("source")).lower()
     meta = dict(result.get("meta") or {})
 
-    from_cache = mode in {"direct_cache", "library_match"} or source in {"database", "library", "cache"}
+    from_cache = mode in {"direct_cache", "library_match", "curated_starter"} or source in {"database", "library", "cache"}
     credits_consumed = _as_int(meta.get("credits_consumed"), 0)
 
     if credits_consumed <= 0:
@@ -217,8 +374,6 @@ def _insert_history_direct(
     from_cache, credits_consumed, usage_charged, plan_code = _history_flags_from_result(result)
     now_iso = _now_iso()
 
-    # Keep the route self-contained and schema-tolerant. Full payload first,
-    # then smaller fallbacks if the current qa_history table has fewer columns.
     full_payload: Dict[str, Any] = {
         "account_id": account_id or None,
         "question": question,
@@ -316,7 +471,7 @@ def _handle_ask():
         return _build_unauthorized(auth_debug)
 
     try:
-        result = ask_guarded(
+        result = _curated_starter_result(question, lang, channel, account_id) or ask_guarded(
             account_id=account_id,
             question=question,
             lang=lang,
@@ -340,6 +495,7 @@ def _handle_ask():
                 }
             return jsonify(body), 500
 
+        result = _sanitize_result_answer(result)
         answer_text = _safe_text(result.get("answer"))
         if result.get("ok") and question and answer_text:
             history_result = _insert_history_direct(
