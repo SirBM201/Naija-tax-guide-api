@@ -15,7 +15,17 @@ def apply_ask_review_patch() -> None:
         src = svc._lower(row.get("source") or row.get("source_type") or "")
         if src.startswith("ai"):
             status = svc._lower(row.get("review_status") or row.get("status") or "")
+            enabled = str(row.get("enabled") if row.get("enabled") is not None else "").strip().lower()
+            try:
+                trust_score = float(row.get("trust_score") if row.get("trust_score") is not None else 0)
+            except Exception:
+                trust_score = 0.0
+
             if status not in {"approved", "active", "published", "ok", "enabled"}:
+                return False
+            if enabled in {"false", "0", "no", "off", ""}:
+                return False
+            if trust_score < 0.8:
                 return False
         return base_ok(row)
 
@@ -39,6 +49,7 @@ def apply_ask_review_patch() -> None:
                 "id": row.get("id"),
                 "review_status": row.get("review_status") or row.get("status") or "unknown",
                 "enabled": row.get("enabled"),
+                "trust_score": row.get("trust_score"),
                 "reusable_without_credit": bool(row_ok(row)),
             }
 
@@ -81,6 +92,7 @@ def apply_ask_review_patch() -> None:
                     "schema_mode": "review_candidate",
                     "review_status": "candidate",
                     "enabled": False,
+                    "trust_score": 0.35,
                     "reusable_without_credit": False,
                     "normalized_question": normalized,
                     "canonical_key": canonical,
