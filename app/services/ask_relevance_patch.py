@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict
 
 
-ASK_RELEVANCE_PATCH_VERSION = "2026-06-13-v1-exact-cache-library-before-ai"
+ASK_RELEVANCE_PATCH_VERSION = "2026-06-13-v1-exact-cache-library-before-ai-plus-review-patch"
 
 
 def apply_ask_relevance_patch() -> None:
@@ -22,6 +22,13 @@ def apply_ask_relevance_patch() -> None:
         from app.services import ask_service as svc
     except Exception:
         return
+
+    try:
+        from app.services.ask_review_patch import apply_ask_review_patch
+
+        apply_ask_review_patch()
+    except Exception:
+        pass
 
     def _find_database_answer_strict(question: str, lang: str = "en") -> Dict[str, Any]:
         normalized = svc._normalize_question(question)
