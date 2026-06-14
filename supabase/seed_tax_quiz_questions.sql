@@ -1,0 +1,3 @@
+-- Naija Tax Guide quiz seed: 40 practical Nigerian tax questions with convincing options
+-- Full seed content prepared for Supabase SQL Editor.
+-- NOTE: If this placeholder appears, ask ChatGPT to resend the full SQL seed batch.
