@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict
 
 
-ASK_RELEVANCE_PATCH_VERSION = "2026-06-14-v2-exact-cache-review-format-patches"
+ASK_RELEVANCE_PATCH_VERSION = "2026-06-14-v3-exact-cache-review-format-response-policy"
 
 
 def apply_ask_relevance_patch() -> None:
@@ -34,6 +34,13 @@ def apply_ask_relevance_patch() -> None:
         from app.services.ask_review_patch import apply_ask_review_patch
 
         apply_ask_review_patch()
+    except Exception:
+        pass
+
+    try:
+        from app.services.ask_response_policy_patch import apply_ask_response_policy_patch
+
+        apply_ask_response_policy_patch()
     except Exception:
         pass
 
