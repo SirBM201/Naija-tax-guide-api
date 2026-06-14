@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict
 
 
-ASK_RELEVANCE_PATCH_VERSION = "2026-06-14-v4-exact-cache-review-format-response-high-risk-reuse"
+ASK_RELEVANCE_PATCH_VERSION = "2026-06-14-v5-prioritize-approved-cache-rows"
 
 
 def apply_ask_relevance_patch() -> None:
@@ -51,24 +51,44 @@ def apply_ask_relevance_patch() -> None:
     except Exception:
         pass
 
+    def _row_rank(row: Dict[str, Any]) -> tuple:
+        status = svc._lower(row.get("review_status") or row.get("status") or "")
+        enabled = str(row.get("enabled") if row.get("enabled") is not None else "").strip().lower() in {"true", "1", "yes", "on"}
+        source = svc._lower(row.get("source") or row.get("source_type") or "")
+        try:
+            trust = float(row.get("trust_score") if row.get("trust_score") is not None else 0)
+        except Exception:
+            trust = 0.0
+        reusable = str(row.get("reusable_without_credit") if row.get("reusable_without_credit") is not None else "").strip().lower() in {"true", "1", "yes", "on"}
+        approved_status = status in {"approved", "active", "published", "ok", "enabled", "ai_reviewed_safe"}
+        return (1 if enabled else 0, 1 if approved_status else 0, 1 if reusable else 0, trust, 1 if source.startswith("ai") else 0)
+
+    def _sorted_rows(rows: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
+        try:
+            return sorted([r for r in rows if isinstance(r, dict)], key=_row_rank, reverse=True)
+        except Exception:
+            return [r for r in rows if isinstance(r, dict)]
+
     def _find_database_answer_strict(question: str, lang: str = "en") -> Dict[str, Any]:
         normalized = svc._normalize_question(question)
         canonical = svc._canonical_key(question)
         errors: list[str] = []
 
-        # 1. Exact qa_cache matches only.
+        # 1. Exact qa_cache matches only. Pull enough rows and rank approved
+        # reusable rows first so older pending candidates do not hide a newer
+        # approved high-risk safe-guidance row.
         for filters in (
             {"normalized_question": normalized, "lang": lang, "jurisdiction": "nigeria"},
             {"canonical_key": canonical, "lang": lang, "jurisdiction": "nigeria"},
             {"normalized_question": normalized},
             {"canonical_key": canonical},
         ):
-            rows, err = svc._query_rows("qa_cache", "*", limit=10, **filters)
+            rows, err = svc._query_rows("qa_cache", "*", limit=50, **filters)
             if err:
                 errors.append(err)
                 continue
 
-            for row in rows:
+            for row in _sorted_rows(rows):
                 answer = svc._answer_from_row(row)
                 if answer and svc._row_review_ok(row):
                     return {
@@ -92,12 +112,12 @@ def apply_ask_relevance_patch() -> None:
             {"normalized_question": normalized},
             {"canonical_key": canonical},
         ):
-            rows, err = svc._query_rows("qa_library", "*", limit=10, **filters)
+            rows, err = svc._query_rows("qa_library", "*", limit=50, **filters)
             if err:
                 errors.append(err)
                 continue
 
-            for row in rows:
+            for row in _sorted_rows(rows):
                 answer = svc._answer_from_row(row)
                 if answer and svc._row_review_ok(row):
                     return {
