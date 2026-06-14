@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 
-ASK_HIGH_RISK_REUSE_PATCH_VERSION = "2026-06-14-v2-always-write-reusable-row"
+ASK_HIGH_RISK_REUSE_PATCH_VERSION = "2026-06-14-v3-update-existing-by-normalized-question"
 
 STRONG_NOTE = (
     "Important: This is high-risk general guidance only, not a final tax or legal opinion. Exact deadlines, "
@@ -28,6 +28,8 @@ HIGH_MARKERS = (
     "refuse to pay",
     "waiver",
     "waive",
+    "payment terms",
+    "outstanding tax",
 )
 
 
@@ -55,11 +57,6 @@ def _with_strong_note(answer: str) -> str:
 
 
 def _review_is_clear_reject(review: Any) -> bool:
-    """
-    Keep this deliberately narrow for MVP cost control.
-    High-risk answers should become reusable when saved with a strong disclaimer,
-    except where the second AI explicitly flags the answer as irrelevant or misleading.
-    """
     if not isinstance(review, dict) or not review:
         return False
     if review.get("misleading") is True:
@@ -71,26 +68,34 @@ def _review_is_clear_reject(review: Any) -> bool:
     return False
 
 
-def _try_update_cache_row(svc: Any, *, row_id: Any, normalized: str, canonical: str, payload: Dict[str, Any]) -> Optional[str]:
+def _execute_update(query) -> tuple[Optional[str], int]:
     try:
-        q = svc._sb().table("qa_cache").update(payload)
-        if row_id:
-            q = q.eq("id", row_id)
-        else:
-            q = q.eq("normalized_question", normalized)
-            if canonical:
-                q = q.eq("canonical_key", canonical)
-        q.execute()
-        return None
+        res = query.execute()
+        data = getattr(res, "data", None)
+        if isinstance(data, list):
+            return None, len(data)
+        return None, -1
     except Exception as exc:
-        return f"{type(exc).__name__}: {str(exc)[:500]}"
+        return f"{type(exc).__name__}: {str(exc)[:500]}", 0
+
+
+def _update_by_id(svc: Any, *, row_id: Any, payload: Dict[str, Any]) -> tuple[Optional[str], int]:
+    try:
+        q = svc._sb().table("qa_cache").update(payload).eq("id", row_id)
+        return _execute_update(q)
+    except Exception as exc:
+        return f"{type(exc).__name__}: {str(exc)[:500]}", 0
+
+
+def _update_by_normalized(svc: Any, *, normalized: str, payload: Dict[str, Any]) -> tuple[Optional[str], int]:
+    try:
+        q = svc._sb().table("qa_cache").update(payload).eq("normalized_question", normalized)
+        return _execute_update(q)
+    except Exception as exc:
+        return f"{type(exc).__name__}: {str(exc)[:500]}", 0
 
 
 def _insert_reusable_cache_row(svc: Any, *, full_payload: Dict[str, Any], core_payload: Dict[str, Any]) -> Optional[str]:
-    """
-    Insert a reusable row even if an earlier update silently matched no rows.
-    This avoids repeated AI charges when a candidate row was not actually updated.
-    """
     for payload in (full_payload, core_payload):
         err = svc._safe_insert("qa_cache", payload)
         if not err:
@@ -170,14 +175,35 @@ def apply_ask_high_risk_reuse_patch() -> None:
             "last_used_at": now_iso,
         }
 
-        row_id = result.get("id")
         update_errors: list[str] = []
-        for payload in (full_payload, core_payload):
-            err = _try_update_cache_row(svc, row_id=row_id, normalized=normalized, canonical=canonical, payload=payload)
-            if err:
-                update_errors.append(err)
+        updated_count = 0
 
-        insert_err = _insert_reusable_cache_row(svc, full_payload=full_payload, core_payload=core_payload)
+        # Prefer direct row id when the underlying save returned it.
+        row_id = result.get("id")
+        if row_id:
+            for payload in (full_payload, core_payload):
+                err, count = _update_by_id(svc, row_id=row_id, payload=payload)
+                if err:
+                    update_errors.append(err)
+                elif count != 0:
+                    updated_count += 1
+                    break
+
+        # Critical fix: update by normalized_question only. Older candidate rows
+        # may have a null/different canonical_key, and filtering by canonical_key
+        # can silently match zero rows, causing repeated AI charges.
+        if updated_count == 0:
+            for payload in (full_payload, core_payload):
+                err, count = _update_by_normalized(svc, normalized=normalized, payload=payload)
+                if err:
+                    update_errors.append(err)
+                elif count != 0:
+                    updated_count += 1
+                    break
+
+        insert_err = None
+        if updated_count == 0:
+            insert_err = _insert_reusable_cache_row(svc, full_payload=full_payload, core_payload=core_payload)
 
         updated = dict(result)
         updated.update(
@@ -190,11 +216,12 @@ def apply_ask_high_risk_reuse_patch() -> None:
                 "reusable_without_credit": True,
                 "normalized_question": normalized,
                 "canonical_key": canonical,
-                "high_risk_reuse_inserted": insert_err is None,
+                "high_risk_reuse_updated_count": updated_count,
+                "high_risk_reuse_inserted": insert_err is None and updated_count == 0,
             }
         )
         if update_errors:
-            updated["high_risk_reuse_update_warnings"] = update_errors[:2]
+            updated["high_risk_reuse_update_warnings"] = update_errors[:3]
         if insert_err:
             updated["high_risk_reuse_insert_error"] = insert_err
         return updated
