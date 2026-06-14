@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import random
 import re
-import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -14,8 +13,9 @@ except Exception:  # pragma: no cover
     has_active_subscription = None  # type: ignore
 
 
-WEB_QUIZ_SERVICE_VERSION = "2026-06-14-v1-web-quiz"
+WEB_QUIZ_SERVICE_VERSION = "2026-06-14-v2-rotating-plausible-quiz"
 QUIZ_FREE_DAILY_LIMIT = 12
+RECENT_QUESTION_AVOID_LIMIT = 8
 
 FALLBACK_QUIZ_BANK: List[Dict[str, Any]] = [
     {
@@ -24,10 +24,10 @@ FALLBACK_QUIZ_BANK: List[Dict[str, Any]] = [
         "difficulty": "basic",
         "question": "Which Nigerian tax is normally deducted from employee salaries by the employer?",
         "options": [
-            {"option_id": "web_q_paye_1_A", "option_text": "Value Added Tax charged on sales invoices", "is_correct": False},
-            {"option_id": "web_q_paye_1_B", "option_text": "PAYE deducted from employment income", "is_correct": True},
-            {"option_id": "web_q_paye_1_C", "option_text": "Company Income Tax charged on company profit", "is_correct": False},
-            {"option_id": "web_q_paye_1_D", "option_text": "Withholding Tax deducted from supplier invoices only", "is_correct": False},
+            {"option_id": "web_q_paye_1_A", "option_text": "PAYE deducted from employment income", "is_correct": True},
+            {"option_id": "web_q_paye_1_B", "option_text": "VAT charged on taxable sales invoices", "is_correct": False},
+            {"option_id": "web_q_paye_1_C", "option_text": "Company Income Tax on company profits", "is_correct": False},
+            {"option_id": "web_q_paye_1_D", "option_text": "Withholding Tax on qualifying supplier payments", "is_correct": False},
         ],
         "short_explanation": "PAYE is deducted from employment income and remitted by the employer to the relevant State Internal Revenue Service.",
         "premium_explanation": "PAYE means Pay-As-You-Earn. It is a payroll tax mechanism where the employer deducts tax from salaries and remits it to the relevant State Internal Revenue Service.",
@@ -39,9 +39,9 @@ FALLBACK_QUIZ_BANK: List[Dict[str, Any]] = [
         "question": "VAT in Nigeria is best described as which type of tax?",
         "options": [
             {"option_id": "web_q_vat_1_A", "option_text": "A consumption tax on taxable supplies of goods and services", "is_correct": True},
-            {"option_id": "web_q_vat_1_B", "option_text": "A tax on only company net profit after expenses", "is_correct": False},
-            {"option_id": "web_q_vat_1_C", "option_text": "A salary tax deducted only from employees", "is_correct": False},
-            {"option_id": "web_q_vat_1_D", "option_text": "A penalty charged only when returns are filed late", "is_correct": False},
+            {"option_id": "web_q_vat_1_B", "option_text": "A tax on company taxable profit after adjustments", "is_correct": False},
+            {"option_id": "web_q_vat_1_C", "option_text": "A payroll tax deducted from employment income", "is_correct": False},
+            {"option_id": "web_q_vat_1_D", "option_text": "A deduction at source from qualifying payments", "is_correct": False},
         ],
         "short_explanation": "VAT is a consumption tax charged on many taxable goods and services.",
         "premium_explanation": "VAT is charged on taxable supplies. Businesses may charge output VAT and claim allowable input VAT before remitting net VAT where applicable.",
@@ -126,6 +126,7 @@ def _daily_attempt_count(account_id: str) -> int:
             .table("tax_quiz_attempts")
             .select("id")
             .eq("account_id", account_id)
+            .eq("status", "answered")
             .gte("created_at", start)
             .lt("created_at", end)
             .limit(500)
@@ -133,7 +134,20 @@ def _daily_attempt_count(account_id: str) -> int:
         )
         return len(_rows(res))
     except Exception:
-        return 0
+        try:
+            res = (
+                _sb()
+                .table("tax_quiz_attempts")
+                .select("id")
+                .eq("account_id", account_id)
+                .gte("created_at", start)
+                .lt("created_at", end)
+                .limit(500)
+                .execute()
+            )
+            return len(_rows(res))
+        except Exception:
+            return 0
 
 
 def _limit_state(account_id: str) -> Dict[str, Any]:
@@ -158,6 +172,7 @@ def _category_alias(value: Any) -> str:
         "company tax": "Company Tax",
         "company income tax": "Company Tax",
         "paye": "PAYE",
+        "pay as you earn": "PAYE",
         "personal income tax": "PAYE",
         "vat": "VAT",
         "wht": "WHT",
@@ -171,8 +186,52 @@ def _category_alias(value: Any) -> str:
         "penalty": "Penalties",
         "audit": "Audit",
         "assessment": "Assessment",
+        "sme": "SME Basics",
+        "sme basics": "SME Basics",
     }
     return aliases.get(norm, _clean(value))
+
+
+def _question_key(question: Dict[str, Any]) -> str:
+    return _clean(question.get("question_code") or question.get("id") or question.get("db_id") or question.get("question"))
+
+
+def _parse_exclude_codes(value: Any) -> set[str]:
+    if value is None:
+        return set()
+    if isinstance(value, (list, tuple, set)):
+        raw_items = list(value)
+    else:
+        raw_items = re.split(r"[,\s]+", _clean(value))
+    return {_clean(item) for item in raw_items if _clean(item)}
+
+
+def _recent_question_codes(account_id: str, category: str = "") -> List[str]:
+    account_id = _clean(account_id)
+    if not account_id:
+        return []
+    try:
+        query = (
+            _sb()
+            .table("tax_quiz_attempts")
+            .select("question_code,category,created_at,status")
+            .eq("account_id", account_id)
+            .order("created_at", desc=True)
+            .limit(RECENT_QUESTION_AVOID_LIMIT * 3)
+        )
+        if category:
+            query = query.eq("category", category)
+        res = query.execute()
+        out: List[str] = []
+        for row in _rows(res):
+            code = _clean(row.get("question_code"))
+            if code and code not in out:
+                out.append(code)
+            if len(out) >= RECENT_QUESTION_AVOID_LIMIT:
+                break
+        return out
+    except Exception:
+        return []
 
 
 def get_quiz_categories() -> Dict[str, Any]:
@@ -237,6 +296,20 @@ def _load_question_pool(category: str = "") -> List[Dict[str, Any]]:
     return fallback
 
 
+def _choose_question(account_id: str, pool: List[Dict[str, Any]], category: str = "", exclude_codes: Any = None) -> Dict[str, Any]:
+    if not pool:
+        return dict(FALLBACK_QUIZ_BANK[0])
+
+    blocked = set(_recent_question_codes(account_id, _category_alias(category)))
+    blocked.update(_parse_exclude_codes(exclude_codes))
+
+    available = [row for row in pool if _question_key(row) not in blocked]
+    if not available:
+        available = list(pool)
+
+    return dict(random.SystemRandom().choice(available))
+
+
 def _load_db_options(question: Dict[str, Any]) -> List[Dict[str, Any]]:
     db_id = _clean(question.get("db_id"))
     if not db_id:
@@ -285,7 +358,7 @@ def _load_static_options(question: Dict[str, Any]) -> List[Dict[str, Any]]:
     return []
 
 
-def _randomized_payload(question: Dict[str, Any], reveal: bool = False) -> Dict[str, Any]:
+def _canonical_options(question: Dict[str, Any]) -> List[Dict[str, Any]]:
     options = _load_db_options(question) if question.get("source") == "db" else []
     if not options:
         options = _load_static_options(question)
@@ -294,13 +367,28 @@ def _randomized_payload(question: Dict[str, Any], reveal: bool = False) -> Dict[
             {"option_id": f"{_clean(question.get('id'))}_A", "option_text": "True", "is_correct": True, "source_code": "A"},
             {"option_id": f"{_clean(question.get('id'))}_B", "option_text": "False", "is_correct": False, "source_code": "B"},
         ]
+    return options
+
+
+def _randomized_payload(question: Dict[str, Any], reveal: bool = False) -> Dict[str, Any]:
+    options = _canonical_options(question)
     rng = random.SystemRandom()
     shuffled = list(options)
-    rng.shuffle(shuffled)
+
+    # Try a few times so the display order is not merely the source A/B/C/D order.
+    source_signature = [_clean(opt.get("option_id") or opt.get("source_code")) for opt in shuffled]
+    for _ in range(8):
+        rng.shuffle(shuffled)
+        new_signature = [_clean(opt.get("option_id") or opt.get("source_code")) for opt in shuffled]
+        if new_signature != source_signature or len(shuffled) <= 2:
+            break
+
     labels = ["A", "B", "C", "D"]
     display = []
     correct_label = ""
     correct_option_id = ""
+    option_order: List[Dict[str, str]] = []
+
     for label, option in zip(labels, shuffled[:4]):
         option_id = _clean(option.get("option_id") or option.get("source_code") or label)
         option_text = _clean(option.get("option_text"))
@@ -310,15 +398,19 @@ def _randomized_payload(question: Dict[str, Any], reveal: bool = False) -> Dict[
         if reveal:
             item["is_correct"] = bool(option.get("is_correct"))
         display.append(item)
+        option_order.append({"label": label, "option_id": option_id})
         if bool(option.get("is_correct")):
             correct_label = label
             correct_option_id = option_id
+
     if not correct_label and display:
         correct_label = display[0]["label"]
         correct_option_id = display[0]["option_id"]
+
     return {
         **question,
         "options": display,
+        "option_order": option_order,
         "correct_label": correct_label,
         "correct_option_id": correct_option_id,
     }
@@ -342,7 +434,7 @@ def _public_question(payload: Dict[str, Any], limit: Dict[str, Any]) -> Dict[str
     }
 
 
-def get_quiz_question(account_id: str, category: str = "") -> Dict[str, Any]:
+def get_quiz_question(account_id: str, category: str = "", exclude_codes: Any = None) -> Dict[str, Any]:
     account_id = _clean(account_id)
     if not account_id:
         return {"ok": False, "error": "account_required", "message": "Please log in to take the quiz."}
@@ -350,7 +442,7 @@ def get_quiz_question(account_id: str, category: str = "") -> Dict[str, Any]:
     if limit.get("limit_reached"):
         return {"ok": False, "error": "daily_quiz_limit_reached", "message": f"Free users can take {QUIZ_FREE_DAILY_LIMIT} non-AI quiz attempts daily. Paid users get unlimited attempts.", "limit": limit}
     pool = _load_question_pool(category)
-    question = random.SystemRandom().choice(pool) if pool else dict(FALLBACK_QUIZ_BANK[0])
+    question = _choose_question(account_id, pool, category, exclude_codes)
     return _public_question(_randomized_payload(question, reveal=False), limit)
 
 
@@ -381,10 +473,43 @@ def _find_question_by_id_or_code(question_id: str = "", question_code: str = "")
     return None
 
 
+def _option_order_map(raw: Any) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    if isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            label = _clean(item.get("label")).upper()[:1]
+            option_id = _clean(item.get("option_id"))
+            if label and option_id:
+                out[option_id] = label
+    elif isinstance(raw, dict):
+        for key, value in raw.items():
+            k = _clean(key)
+            v = _clean(value)
+            if not k or not v:
+                continue
+            if len(k) == 1 and k.upper() in {"A", "B", "C", "D"}:
+                out[v] = k.upper()
+            else:
+                out[k] = v.upper()[:1]
+    return out
+
+
+def _label_for_option(option_id: str, option: Optional[Dict[str, Any]], order: Dict[str, str], fallback: str = "") -> str:
+    option_id = _clean(option_id)
+    if option_id and option_id in order:
+        return order[option_id]
+    source = _clean((option or {}).get("source_code")).upper()[:1]
+    if source:
+        return source
+    return _clean(fallback).upper()[:1]
+
+
 def _safe_insert_attempt(payload: Dict[str, Any]) -> Dict[str, Any]:
     payloads = [
         dict(payload),
-        {k: v for k, v in payload.items() if k not in {"metadata", "selected_option_id", "correct_option_id"}},
+        {k: v for k, v in payload.items() if k not in {"metadata", "selected_option_id", "correct_option_id", "displayed_option_order"}},
         {k: v for k, v in payload.items() if k in {"account_id", "question_id", "question_code", "category", "status", "created_at", "channel"}},
     ]
     errors: List[str] = []
@@ -415,51 +540,60 @@ def submit_quiz_answer(account_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
     if not question:
         return {"ok": False, "error": "question_not_found", "message": "Quiz question could not be found. Please load a new question."}
 
-    payload = _randomized_payload(question, reveal=True)
+    options = _canonical_options(question)
     selected_label = _clean(body.get("selected_label") or body.get("answer")).upper()[:1]
     selected_option_id = _clean(body.get("selected_option_id"))
-    if not selected_label and selected_option_id:
-        for opt in payload.get("options") or []:
-            if _clean(opt.get("option_id")) == selected_option_id:
-                selected_label = _clean(opt.get("label")).upper()[:1]
-                break
+    order_map = _option_order_map(body.get("option_order") or body.get("displayed_option_order") or body.get("options_order"))
+
     selected_option = None
-    for opt in payload.get("options") or []:
-        if selected_option_id and _clean(opt.get("option_id")) == selected_option_id:
+    for opt in options:
+        opt_id = _clean(opt.get("option_id"))
+        if selected_option_id and opt_id == selected_option_id:
             selected_option = opt
             break
-        if selected_label and _clean(opt.get("label")).upper()[:1] == selected_label:
+        if selected_label and _clean(opt.get("source_code")).upper()[:1] == selected_label:
             selected_option = opt
+            selected_option_id = opt_id
             break
+
     if not selected_option:
         return {"ok": False, "error": "invalid_answer", "message": "Please select one of the available options."}
 
+    correct_option = next((opt for opt in options if bool(opt.get("is_correct"))), None)
     is_correct = bool(selected_option.get("is_correct"))
-    correct_option = next((opt for opt in payload.get("options") or [] if bool(opt.get("is_correct"))), None)
+    correct_option_id = _clean((correct_option or {}).get("option_id"))
+    selected_label = _label_for_option(selected_option_id, selected_option, order_map, selected_label)
+    correct_label = _label_for_option(correct_option_id, correct_option, order_map, _clean((correct_option or {}).get("source_code")))
+    channel = _clean(body.get("channel") or "web").lower() or "web"
     now_iso = _now_iso()
+
     attempt_payload = {
         "account_id": account_id,
         "question_id": _clean(question.get("db_id")) or None,
         "question_code": _clean(question.get("question_code") or question.get("id")),
         "category": _clean(question.get("category") or "General"),
         "status": "answered",
-        "channel": "web",
-        "selected_answer": _clean(selected_option.get("label")),
-        "selected_option_id": _clean(selected_option.get("option_id")),
-        "correct_option_id": _clean((correct_option or {}).get("option_id")),
+        "channel": channel,
+        "selected_answer": selected_label,
+        "selected_option_id": selected_option_id,
+        "correct_option_id": correct_option_id,
         "is_correct": is_correct,
         "answered_at": now_iso,
         "created_at": now_iso,
         "updated_at": now_iso,
-        "metadata": {"source": _clean(question.get("source") or "db"), "difficulty": _clean(question.get("difficulty") or "basic")},
+        "metadata": {
+            "source": _clean(question.get("source") or "db"),
+            "difficulty": _clean(question.get("difficulty") or "basic"),
+            "displayed_option_order": order_map,
+        },
     }
     attempt = _safe_insert_attempt(attempt_payload)
     new_limit = _limit_state(account_id)
     return {
         "ok": True,
         "is_correct": is_correct,
-        "selected": {"label": selected_option.get("label"), "text": selected_option.get("text")},
-        "correct": {"label": (correct_option or {}).get("label"), "text": (correct_option or {}).get("text")},
+        "selected": {"label": selected_label, "text": _clean(selected_option.get("option_text"))},
+        "correct": {"label": correct_label, "text": _clean((correct_option or {}).get("option_text"))},
         "explanation": _clean(question.get("short_explanation")) or "Review the rule and try another question.",
         "premium_explanation": _clean(question.get("premium_explanation") or question.get("short_explanation")),
         "source_reference": question.get("source_reference") or "Naija Tax Guide quiz bank",
@@ -480,6 +614,7 @@ def get_quiz_score(account_id: str) -> Dict[str, Any]:
             .table("tax_quiz_attempts")
             .select("id,is_correct,status,category,created_at")
             .eq("account_id", account_id)
+            .eq("status", "answered")
             .gte("created_at", start)
             .lt("created_at", end)
             .limit(500)
@@ -487,9 +622,37 @@ def get_quiz_score(account_id: str) -> Dict[str, Any]:
         )
         rows = _rows(res)
     except Exception:
-        rows = []
+        try:
+            res = (
+                _sb()
+                .table("tax_quiz_attempts")
+                .select("id,is_correct,status,category,created_at")
+                .eq("account_id", account_id)
+                .gte("created_at", start)
+                .lt("created_at", end)
+                .limit(500)
+                .execute()
+            )
+            rows = _rows(res)
+        except Exception:
+            rows = []
     attempts = len(rows)
     correct = len([r for r in rows if r.get("is_correct") is True])
     wrong = max(0, attempts - correct)
     limit = _limit_state(account_id)
     return {"ok": True, "score": {"attempts_today": attempts, "correct_today": correct, "wrong_today": wrong}, "limit": limit, "version": WEB_QUIZ_SERVICE_VERSION}
+
+
+def format_quiz_question_for_channel(result: Dict[str, Any]) -> str:
+    question = result.get("question") if isinstance(result.get("question"), dict) else {}
+    options = question.get("options") if isinstance(question.get("options"), list) else []
+    lines = [
+        f"🧠 Tax Quiz ({_clean(question.get('category')) or 'General'})",
+        "",
+        f"Question: {_clean(question.get('question'))}",
+        "",
+    ]
+    for option in options:
+        lines.append(f"{_clean(option.get('label'))}. {_clean(option.get('text'))}")
+    lines.extend(["", "Reply A, B, C, or D."])
+    return "\n".join(lines)
