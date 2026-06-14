@@ -112,6 +112,7 @@ def create_app() -> Flask:
     if cors_err:
         raise RuntimeError(f"[CORS] {cors_err}")
 
+    # Ensure frontend domains are included for cookie auth
     if cookie_mode and origins != "*":
         frontend_domains = ["https://www.naijataxguides.com", "https://naijataxguides.com"]
         if isinstance(origins, list):
@@ -320,6 +321,7 @@ def create_app() -> Flask:
         "app.routes.cron",
         "app.routes.telegram",
         "app.routes.web_ask",
+        "app.routes.web_quiz",
         "app.routes.web_chat",
         "app.routes.paystack_webhook",
         "app.routes.referral_hub",
