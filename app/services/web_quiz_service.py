@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import random
 import re
+import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -13,7 +14,7 @@ except Exception:  # pragma: no cover
     has_active_subscription = None  # type: ignore
 
 
-WEB_QUIZ_SERVICE_VERSION = "2026-06-14-v2-rotating-plausible-quiz"
+WEB_QUIZ_SERVICE_VERSION = "2026-06-14-v3-display-order-q5-parity"
 QUIZ_FREE_DAILY_LIMIT = 12
 RECENT_QUESTION_AVOID_LIMIT = 8
 
@@ -24,13 +25,14 @@ FALLBACK_QUIZ_BANK: List[Dict[str, Any]] = [
         "difficulty": "basic",
         "question": "Which Nigerian tax is normally deducted from employee salaries by the employer?",
         "options": [
-            {"option_id": "web_q_paye_1_A", "option_text": "PAYE deducted from employment income", "is_correct": True},
-            {"option_id": "web_q_paye_1_B", "option_text": "VAT charged on taxable sales invoices", "is_correct": False},
-            {"option_id": "web_q_paye_1_C", "option_text": "Company Income Tax on company profits", "is_correct": False},
-            {"option_id": "web_q_paye_1_D", "option_text": "Withholding Tax on qualifying supplier payments", "is_correct": False},
+            {"option_id": "web_q_paye_1_A", "option_text": "PAYE deducted from employment income", "is_correct": True, "source_code": "A"},
+            {"option_id": "web_q_paye_1_B", "option_text": "VAT charged on taxable sales invoices", "is_correct": False, "source_code": "B"},
+            {"option_id": "web_q_paye_1_C", "option_text": "Company Income Tax on company profits", "is_correct": False, "source_code": "C"},
+            {"option_id": "web_q_paye_1_D", "option_text": "Withholding Tax on qualifying supplier payments", "is_correct": False, "source_code": "D"},
         ],
         "short_explanation": "PAYE is deducted from employment income and remitted by the employer to the relevant State Internal Revenue Service.",
         "premium_explanation": "PAYE means Pay-As-You-Earn. It is a payroll tax mechanism where the employer deducts tax from salaries and remits it to the relevant State Internal Revenue Service.",
+        "source_reference": "Naija Tax Guide fallback quiz bank",
     },
     {
         "id": "web_q_vat_1",
@@ -38,13 +40,14 @@ FALLBACK_QUIZ_BANK: List[Dict[str, Any]] = [
         "difficulty": "basic",
         "question": "VAT in Nigeria is best described as which type of tax?",
         "options": [
-            {"option_id": "web_q_vat_1_A", "option_text": "A consumption tax on taxable supplies of goods and services", "is_correct": True},
-            {"option_id": "web_q_vat_1_B", "option_text": "A tax on company taxable profit after adjustments", "is_correct": False},
-            {"option_id": "web_q_vat_1_C", "option_text": "A payroll tax deducted from employment income", "is_correct": False},
-            {"option_id": "web_q_vat_1_D", "option_text": "A deduction at source from qualifying payments", "is_correct": False},
+            {"option_id": "web_q_vat_1_A", "option_text": "A consumption tax on taxable supplies of goods and services", "is_correct": True, "source_code": "A"},
+            {"option_id": "web_q_vat_1_B", "option_text": "A tax on company taxable profit after adjustments", "is_correct": False, "source_code": "B"},
+            {"option_id": "web_q_vat_1_C", "option_text": "A payroll tax deducted from employment income", "is_correct": False, "source_code": "C"},
+            {"option_id": "web_q_vat_1_D", "option_text": "A deduction at source from qualifying payments", "is_correct": False, "source_code": "D"},
         ],
         "short_explanation": "VAT is a consumption tax charged on many taxable goods and services.",
         "premium_explanation": "VAT is charged on taxable supplies. Businesses may charge output VAT and claim allowable input VAT before remitting net VAT where applicable.",
+        "source_reference": "Naija Tax Guide fallback quiz bank",
     },
 ]
 
@@ -63,6 +66,19 @@ def _norm(value: Any) -> str:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_dt(value: Any) -> Optional[datetime]:
+    text = _clean(value)
+    if not text:
+        return None
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
 
 
 def _today_bounds() -> Tuple[str, str]:
@@ -89,30 +105,109 @@ def _safe_exec(builder: Any) -> Tuple[bool, Any, Optional[str]]:
         return False, None, f"{type(exc).__name__}: {str(exc)[:600]}"
 
 
-def _is_paid(account_id: str) -> bool:
-    if not _clean(account_id):
+def _as_bool(value: Any) -> Optional[bool]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    text = _norm(value)
+    if text in {"true", "1", "yes", "y", "active", "enabled"}:
+        return True
+    if text in {"false", "0", "no", "n", "inactive", "disabled"}:
         return False
+    return None
+
+
+def _plan_family(row: Dict[str, Any]) -> str:
+    text = _norm(row.get("plan_code") or row.get("plan") or row.get("tier") or row.get("package_code") or row.get("name"))
+    if "business" in text:
+        return "business"
+    if "professional" in text or text.startswith("pro"):
+        return "professional"
+    if "starter" in text:
+        return "starter"
+    return "free"
+
+
+def _subscription_is_active(row: Dict[str, Any]) -> bool:
+    status = _norm(row.get("status") or row.get("subscription_status") or row.get("payment_status"))
+    if status in {"inactive", "expired", "cancelled", "canceled", "disabled", "paused", "failed"}:
+        return False
+
+    for key in ("is_active", "active", "enabled"):
+        explicit = _as_bool(row.get(key))
+        if explicit is False:
+            return False
+        if explicit is True and status in {"", "active", "paid", "successful", "success", "trial", "trialing", "grace", "past_due"}:
+            break
+
+    for key in ("expires_at", "current_period_end", "valid_until", "ends_at", "period_end"):
+        dt = _parse_dt(row.get(key))
+        if dt is not None:
+            return dt >= datetime.now(timezone.utc)
+
+    if status:
+        return status in {"active", "paid", "successful", "success", "trial", "trialing", "grace", "past_due"}
+
+    return _as_bool(row.get("is_active")) is True or _as_bool(row.get("active")) is True
+
+
+def _subscription_sort_key(row: Dict[str, Any]) -> str:
+    for key in ("updated_at", "created_at", "activated_at", "paid_at", "current_period_start"):
+        value = _clean(row.get(key))
+        if value:
+            return value
+    return ""
+
+
+def _subscription_rows(account_id: str) -> List[Dict[str, Any]]:
+    account_id = _clean(account_id)
+    if not account_id:
+        return []
+
+    all_rows: List[Dict[str, Any]] = []
+    for table in ("user_subscriptions", "subscriptions"):
+        for order_col in ("updated_at", "created_at", "id", ""):
+            try:
+                q = _sb().table(table).select("*").eq("account_id", account_id)
+                if order_col:
+                    q = q.order(order_col, desc=True)
+                res = q.limit(20).execute()
+                rows = _rows(res)
+                if rows:
+                    all_rows.extend(rows)
+                    break
+            except Exception:
+                continue
+
+    deduped: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in all_rows:
+        key = _clean(row.get("id") or repr(sorted(row.items())))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(row)
+
+    return sorted(deduped, key=_subscription_sort_key, reverse=True)
+
+
+def _is_paid(account_id: str) -> bool:
+    account_id = _clean(account_id)
+    if not account_id:
+        return False
+
     if has_active_subscription is not None:
         try:
-            return bool(has_active_subscription(account_id))
+            if bool(has_active_subscription(account_id)):
+                return True
         except Exception:
             pass
-    for table in ("user_subscriptions", "subscriptions"):
-        try:
-            res = (
-                _sb()
-                .table(table)
-                .select("id,status,is_active,active,expires_at,current_period_end")
-                .eq("account_id", account_id)
-                .limit(3)
-                .execute()
-            )
-            for row in _rows(res):
-                status = _norm(row.get("status"))
-                if row.get("is_active") is True or row.get("active") is True or status == "active":
-                    return True
-        except Exception:
-            continue
+
+    rows = _subscription_rows(account_id)
+    for row in rows:
+        if _plan_family(row) in {"starter", "professional", "business"} and _subscription_is_active(row):
+            return True
     return False
 
 
@@ -120,46 +215,26 @@ def _daily_attempt_count(account_id: str) -> int:
     if not _clean(account_id):
         return 0
     start, end = _today_bounds()
-    try:
-        res = (
-            _sb()
-            .table("tax_quiz_attempts")
-            .select("id")
-            .eq("account_id", account_id)
-            .eq("status", "answered")
-            .gte("created_at", start)
-            .lt("created_at", end)
-            .limit(500)
-            .execute()
-        )
-        return len(_rows(res))
-    except Exception:
+    for with_status in (True, False):
         try:
-            res = (
-                _sb()
-                .table("tax_quiz_attempts")
-                .select("id")
-                .eq("account_id", account_id)
-                .gte("created_at", start)
-                .lt("created_at", end)
-                .limit(500)
-                .execute()
-            )
-            return len(_rows(res))
+            q = _sb().table("tax_quiz_attempts").select("id").eq("account_id", account_id)
+            if with_status:
+                q = q.eq("status", "answered")
+            q = q.gte("created_at", start).lt("created_at", end).limit(500)
+            return len(_rows(q.execute()))
         except Exception:
-            return 0
+            continue
+    return 0
 
 
 def _limit_state(account_id: str) -> Dict[str, Any]:
     paid = _is_paid(account_id)
     used = _daily_attempt_count(account_id)
-    limit = None if paid else QUIZ_FREE_DAILY_LIMIT
-    remaining = None if paid else max(0, QUIZ_FREE_DAILY_LIMIT - used)
     return {
         "paid": paid,
-        "daily_limit": limit,
+        "daily_limit": None if paid else QUIZ_FREE_DAILY_LIMIT,
         "attempts_today": used,
-        "remaining_today": remaining,
+        "remaining_today": None if paid else max(0, QUIZ_FREE_DAILY_LIMIT - used),
         "limit_reached": False if paid else used >= QUIZ_FREE_DAILY_LIMIT,
     }
 
@@ -221,24 +296,25 @@ def _recent_question_codes(account_id: str, category: str = "") -> List[str]:
         )
         if category:
             query = query.eq("category", category)
-        res = query.execute()
-        out: List[str] = []
-        for row in _rows(res):
-            code = _clean(row.get("question_code"))
-            if code and code not in out:
-                out.append(code)
-            if len(out) >= RECENT_QUESTION_AVOID_LIMIT:
-                break
-        return out
+        rows = _rows(query.execute())
     except Exception:
-        return []
+        rows = []
+
+    out: List[str] = []
+    for row in rows:
+        code = _clean(row.get("question_code"))
+        if code and code not in out:
+            out.append(code)
+        if len(out) >= RECENT_QUESTION_AVOID_LIMIT:
+            break
+    return out
 
 
 def get_quiz_categories() -> Dict[str, Any]:
     categories: set[str] = set()
     try:
-        res = _sb().table("tax_quiz_questions").select("category").eq("is_active", True).limit(500).execute()
-        for row in _rows(res):
+        rows = _rows(_sb().table("tax_quiz_questions").select("category").eq("is_active", True).limit(500).execute())
+        for row in rows:
             category = _clean(row.get("category"))
             if category:
                 categories.add(category)
@@ -281,13 +357,14 @@ def _load_question_pool(category: str = "") -> List[Dict[str, Any]]:
         )
         if category:
             query = query.eq("category", category)
-        res = query.limit(250).execute()
-        db_rows = [row for row in _rows(res) if _clean(row.get("question"))]
+        db_rows = [row for row in _rows(query.limit(250).execute()) if _clean(row.get("question"))]
     except Exception:
         db_rows = []
+
     questions = [_question_from_row(row) for row in db_rows]
     if questions:
         return questions
+
     fallback = [dict(row) for row in FALLBACK_QUIZ_BANK]
     if category:
         wanted = _norm(category)
@@ -302,11 +379,9 @@ def _choose_question(account_id: str, pool: List[Dict[str, Any]], category: str 
 
     blocked = set(_recent_question_codes(account_id, _category_alias(category)))
     blocked.update(_parse_exclude_codes(exclude_codes))
-
     available = [row for row in pool if _question_key(row) not in blocked]
     if not available:
         available = list(pool)
-
     return dict(random.SystemRandom().choice(available))
 
 
@@ -315,7 +390,7 @@ def _load_db_options(question: Dict[str, Any]) -> List[Dict[str, Any]]:
     if not db_id:
         return []
     try:
-        res = (
+        rows = _rows(
             _sb()
             .table("tax_quiz_options")
             .select("id,option_code,option_text,is_correct,created_at")
@@ -323,9 +398,9 @@ def _load_db_options(question: Dict[str, Any]) -> List[Dict[str, Any]]:
             .limit(20)
             .execute()
         )
-        rows = _rows(res)
     except Exception:
         rows = []
+
     options: List[Dict[str, Any]] = []
     for row in rows:
         text = _clean(row.get("option_text"))
@@ -374,9 +449,8 @@ def _randomized_payload(question: Dict[str, Any], reveal: bool = False) -> Dict[
     options = _canonical_options(question)
     rng = random.SystemRandom()
     shuffled = list(options)
-
-    # Try a few times so the display order is not merely the source A/B/C/D order.
     source_signature = [_clean(opt.get("option_id") or opt.get("source_code")) for opt in shuffled]
+
     for _ in range(8):
         rng.shuffle(shuffled)
         new_signature = [_clean(opt.get("option_id") or opt.get("source_code")) for opt in shuffled]
@@ -451,16 +525,28 @@ def _find_question_by_id_or_code(question_id: str = "", question_code: str = "")
     question_code = _clean(question_code)
     if question_id:
         try:
-            res = _sb().table("tax_quiz_questions").select("id,question_code,category,difficulty,question,short_explanation,premium_explanation,source_reference,is_active").eq("id", question_id).limit(1).execute()
-            rows = _rows(res)
+            rows = _rows(
+                _sb()
+                .table("tax_quiz_questions")
+                .select("id,question_code,category,difficulty,question,short_explanation,premium_explanation,source_reference,is_active")
+                .eq("id", question_id)
+                .limit(1)
+                .execute()
+            )
             if rows:
                 return _question_from_row(rows[0])
         except Exception:
             pass
     if question_code:
         try:
-            res = _sb().table("tax_quiz_questions").select("id,question_code,category,difficulty,question,short_explanation,premium_explanation,source_reference,is_active").eq("question_code", question_code).limit(1).execute()
-            rows = _rows(res)
+            rows = _rows(
+                _sb()
+                .table("tax_quiz_questions")
+                .select("id,question_code,category,difficulty,question,short_explanation,premium_explanation,source_reference,is_active")
+                .eq("question_code", question_code)
+                .limit(1)
+                .execute()
+            )
             if rows:
                 return _question_from_row(rows[0])
         except Exception:
@@ -473,8 +559,9 @@ def _find_question_by_id_or_code(question_id: str = "", question_code: str = "")
     return None
 
 
-def _option_order_map(raw: Any) -> Dict[str, str]:
-    out: Dict[str, str] = {}
+def _option_order_maps(raw: Any) -> Tuple[Dict[str, str], Dict[str, str]]:
+    by_id: Dict[str, str] = {}
+    by_label: Dict[str, str] = {}
     if isinstance(raw, list):
         for item in raw:
             if not isinstance(item, dict):
@@ -482,7 +569,8 @@ def _option_order_map(raw: Any) -> Dict[str, str]:
             label = _clean(item.get("label")).upper()[:1]
             option_id = _clean(item.get("option_id"))
             if label and option_id:
-                out[option_id] = label
+                by_id[option_id] = label
+                by_label[label] = option_id
     elif isinstance(raw, dict):
         for key, value in raw.items():
             k = _clean(key)
@@ -490,16 +578,37 @@ def _option_order_map(raw: Any) -> Dict[str, str]:
             if not k or not v:
                 continue
             if len(k) == 1 and k.upper() in {"A", "B", "C", "D"}:
-                out[v] = k.upper()
+                by_label[k.upper()] = v
+                by_id[v] = k.upper()
             else:
-                out[k] = v.upper()[:1]
-    return out
+                by_id[k] = v.upper()[:1]
+                by_label[v.upper()[:1]] = k
+    return by_id, by_label
 
 
-def _label_for_option(option_id: str, option: Optional[Dict[str, Any]], order: Dict[str, str], fallback: str = "") -> str:
+def _displayed_option_maps(raw: Any) -> Tuple[Dict[str, Dict[str, str]], Dict[str, Dict[str, str]]]:
+    by_id: Dict[str, Dict[str, str]] = {}
+    by_label: Dict[str, Dict[str, str]] = {}
+    if not isinstance(raw, list):
+        return by_id, by_label
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        label = _clean(item.get("label")).upper()[:1]
+        option_id = _clean(item.get("option_id"))
+        text = _clean(item.get("text") or item.get("option_text"))
+        value = {"label": label, "option_id": option_id, "text": text}
+        if option_id:
+            by_id[option_id] = value
+        if label:
+            by_label[label] = value
+    return by_id, by_label
+
+
+def _label_for_option(option_id: str, option: Optional[Dict[str, Any]], order_by_id: Dict[str, str], fallback: str = "") -> str:
     option_id = _clean(option_id)
-    if option_id and option_id in order:
-        return order[option_id]
+    if option_id and option_id in order_by_id:
+        return order_by_id[option_id]
     source = _clean((option or {}).get("source_code")).upper()[:1]
     if source:
         return source
@@ -541,32 +650,53 @@ def submit_quiz_answer(account_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": False, "error": "question_not_found", "message": "Quiz question could not be found. Please load a new question."}
 
     options = _canonical_options(question)
-    selected_label = _clean(body.get("selected_label") or body.get("answer")).upper()[:1]
+    options_by_id = {_clean(opt.get("option_id")): opt for opt in options if _clean(opt.get("option_id"))}
+    selected_label_from_client = _clean(body.get("selected_label") or body.get("answer")).upper()[:1]
     selected_option_id = _clean(body.get("selected_option_id"))
-    order_map = _option_order_map(body.get("option_order") or body.get("displayed_option_order") or body.get("options_order"))
+    selected_text_from_client = _clean(body.get("selected_text") or body.get("selected_option_text"))
+    order_by_id, order_by_label = _option_order_maps(body.get("option_order") or body.get("displayed_option_order") or body.get("options_order"))
+    display_by_id, display_by_label = _displayed_option_maps(body.get("displayed_options") or body.get("options"))
 
-    selected_option = None
-    for opt in options:
-        opt_id = _clean(opt.get("option_id"))
-        if selected_option_id and opt_id == selected_option_id:
-            selected_option = opt
-            break
-        if selected_label and _clean(opt.get("source_code")).upper()[:1] == selected_label:
-            selected_option = opt
-            selected_option_id = opt_id
-            break
+    if not selected_option_id and selected_label_from_client in order_by_label:
+        selected_option_id = order_by_label[selected_label_from_client]
+
+    selected_option = options_by_id.get(selected_option_id)
+
+    if not selected_option and selected_text_from_client:
+        wanted = _norm(selected_text_from_client)
+        selected_option = next((opt for opt in options if _norm(opt.get("option_text")) == wanted), None)
+        if selected_option:
+            selected_option_id = _clean(selected_option.get("option_id"))
+
+    if not selected_option and selected_label_from_client:
+        # Last-resort compatibility only. Displayed option_order above must win.
+        selected_option = next((opt for opt in options if _clean(opt.get("source_code")).upper()[:1] == selected_label_from_client), None)
+        if selected_option:
+            selected_option_id = _clean(selected_option.get("option_id"))
 
     if not selected_option:
         return {"ok": False, "error": "invalid_answer", "message": "Please select one of the available options."}
 
     correct_option = next((opt for opt in options if bool(opt.get("is_correct"))), None)
-    is_correct = bool(selected_option.get("is_correct"))
     correct_option_id = _clean((correct_option or {}).get("option_id"))
-    selected_label = _label_for_option(selected_option_id, selected_option, order_map, selected_label)
-    correct_label = _label_for_option(correct_option_id, correct_option, order_map, _clean((correct_option or {}).get("source_code")))
+
+    selected_label = selected_label_from_client or _label_for_option(selected_option_id, selected_option, order_by_id, _clean(selected_option.get("source_code")))
+    if selected_option_id in order_by_id:
+        selected_label = order_by_id[selected_option_id]
+
+    selected_display = display_by_id.get(selected_option_id) or display_by_label.get(selected_label) or {}
+    selected_text = _clean(selected_display.get("text")) or selected_text_from_client or _clean(selected_option.get("option_text"))
+
+    correct_label = _label_for_option(correct_option_id, correct_option, order_by_id, _clean((correct_option or {}).get("source_code")))
+    correct_display = display_by_id.get(correct_option_id) or display_by_label.get(correct_label) or {}
+    correct_text = _clean(correct_display.get("text")) or _clean((correct_option or {}).get("option_text"))
+
+    is_correct = bool(selected_option_id and correct_option_id and selected_option_id == correct_option_id)
+    if not selected_option_id or not correct_option_id:
+        is_correct = bool(selected_option.get("is_correct"))
+
     channel = _clean(body.get("channel") or "web").lower() or "web"
     now_iso = _now_iso()
-
     attempt_payload = {
         "account_id": account_id,
         "question_id": _clean(question.get("db_id")) or None,
@@ -584,21 +714,134 @@ def submit_quiz_answer(account_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
         "metadata": {
             "source": _clean(question.get("source") or "db"),
             "difficulty": _clean(question.get("difficulty") or "basic"),
-            "displayed_option_order": order_map,
+            "displayed_option_order": order_by_id,
+            "displayed_options": body.get("displayed_options") or body.get("options") or [],
+            "selected_label_from_client": selected_label_from_client,
+            "selected_text_from_client": selected_text_from_client,
         },
     }
     attempt = _safe_insert_attempt(attempt_payload)
-    new_limit = _limit_state(account_id)
     return {
         "ok": True,
         "is_correct": is_correct,
-        "selected": {"label": selected_label, "text": _clean(selected_option.get("option_text"))},
-        "correct": {"label": correct_label, "text": _clean((correct_option or {}).get("option_text"))},
+        "selected": {"label": selected_label, "text": selected_text},
+        "correct": {"label": correct_label, "text": correct_text},
         "explanation": _clean(question.get("short_explanation")) or "Review the rule and try another question.",
         "premium_explanation": _clean(question.get("premium_explanation") or question.get("short_explanation")),
         "source_reference": question.get("source_reference") or "Naija Tax Guide quiz bank",
         "attempt": attempt,
-        "limit": new_limit,
+        "limit": _limit_state(account_id),
+    }
+
+
+def _credit_balance_row(account_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    try:
+        rows = _rows(_sb().table("ai_credit_balances").select("*").eq("account_id", account_id).limit(1).execute())
+        if rows:
+            return rows[0], None
+        return None, None
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {str(exc)[:500]}"
+
+
+def _credit_column(row: Dict[str, Any]) -> str:
+    for col in ("balance", "credits", "credit_balance"):
+        if col in row:
+            return col
+    return "balance"
+
+
+def _insert_credit_log(payload: Dict[str, Any]) -> Dict[str, Any]:
+    errors: List[str] = []
+    for table in ("credit_usage_logs", "credit_transactions", "ai_credit_transactions"):
+        ok, resp, err = _safe_exec(_sb().table(table).insert(payload))
+        if ok:
+            return {"ok": True, "table": table, "data": _rows(resp)}
+        errors.append(str(err))
+    return {"ok": False, "errors": errors[:3], "payload": payload}
+
+
+def unlock_quiz_detailed_explanation(account_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
+    account_id = _clean(account_id)
+    if not account_id:
+        return {"ok": False, "error": "account_required", "message": "Please log in to use Q5."}
+
+    question = _find_question_by_id_or_code(_clean(body.get("question_id") or body.get("db_id")), _clean(body.get("question_code") or body.get("id")))
+    if not question:
+        return {"ok": False, "error": "question_not_found", "message": "Quiz question could not be found. Please answer a new question and try again."}
+
+    explanation = _clean(question.get("premium_explanation") or question.get("short_explanation"))
+    if not explanation:
+        return {"ok": False, "error": "explanation_not_available", "message": "A saved detailed explanation is not available for this question yet."}
+
+    if not _is_paid(account_id):
+        return {"ok": False, "error": "paid_plan_required", "message": "Q5 detailed explanation requires an active paid plan."}
+
+    row, row_error = _credit_balance_row(account_id)
+    if not row:
+        return {"ok": False, "error": "insufficient_credits", "message": "Q5 costs 1 Usage Credit, but your balance is not enough.", "balance": 0, "lookup_error": row_error}
+
+    col = _credit_column(row)
+    try:
+        before = int(row.get(col) or 0)
+    except Exception:
+        before = 0
+    if before < 1:
+        return {"ok": False, "error": "insufficient_credits", "message": "Q5 costs 1 Usage Credit, but your balance is not enough.", "balance": before}
+
+    after = before - 1
+    update_payloads = [
+        {col: after, "updated_at": _now_iso()},
+        {col: after},
+    ]
+    update_errors: List[str] = []
+    updated = False
+    for payload in update_payloads:
+        ok, _resp, err = _safe_exec(_sb().table("ai_credit_balances").update(payload).eq("account_id", account_id))
+        if ok:
+            updated = True
+            break
+        update_errors.append(str(err))
+
+    if not updated:
+        return {"ok": False, "error": "credit_deduction_failed", "message": "Credit deduction failed before Q5 could be unlocked.", "errors": update_errors[:2]}
+
+    reference = f"WEB-Q5-{uuid.uuid4().hex[:12].upper()}"
+    log = _insert_credit_log(
+        {
+            "account_id": account_id,
+            "reference": reference,
+            "action_code": "ai_quiz_explanation",
+            "description": "Q5 detailed saved quiz explanation",
+            "channel": _clean(body.get("channel") or "web") or "web",
+            "credits_delta": -1,
+            "balance_after": after,
+            "metadata": {
+                "source": "web_quiz_q5_saved_explanation",
+                "live_ai_called": False,
+                "question_code": _clean(question.get("question_code") or question.get("id")),
+                "question_id": _clean(question.get("db_id")),
+                "category": _clean(question.get("category") or "General"),
+                "balance_before": before,
+                "balance_after": after,
+            },
+            "created_at": _now_iso(),
+        }
+    )
+
+    return {
+        "ok": True,
+        "explanation": explanation,
+        "source_reference": question.get("source_reference") or "Naija Tax Guide quiz bank",
+        "credit": {
+            "deducted": True,
+            "credits_deducted": 1,
+            "balance_before": before,
+            "balance_after": after,
+            "reference": reference,
+            "live_ai_called": False,
+            "log": log,
+        },
     }
 
 
@@ -608,39 +851,20 @@ def get_quiz_score(account_id: str) -> Dict[str, Any]:
         return {"ok": False, "error": "account_required"}
     start, end = _today_bounds()
     rows: List[Dict[str, Any]] = []
-    try:
-        res = (
-            _sb()
-            .table("tax_quiz_attempts")
-            .select("id,is_correct,status,category,created_at")
-            .eq("account_id", account_id)
-            .eq("status", "answered")
-            .gte("created_at", start)
-            .lt("created_at", end)
-            .limit(500)
-            .execute()
-        )
-        rows = _rows(res)
-    except Exception:
+    for with_status in (True, False):
         try:
-            res = (
-                _sb()
-                .table("tax_quiz_attempts")
-                .select("id,is_correct,status,category,created_at")
-                .eq("account_id", account_id)
-                .gte("created_at", start)
-                .lt("created_at", end)
-                .limit(500)
-                .execute()
-            )
-            rows = _rows(res)
+            q = _sb().table("tax_quiz_attempts").select("id,is_correct,status,category,created_at").eq("account_id", account_id)
+            if with_status:
+                q = q.eq("status", "answered")
+            q = q.gte("created_at", start).lt("created_at", end).limit(500)
+            rows = _rows(q.execute())
+            break
         except Exception:
-            rows = []
+            continue
     attempts = len(rows)
     correct = len([r for r in rows if r.get("is_correct") is True])
     wrong = max(0, attempts - correct)
-    limit = _limit_state(account_id)
-    return {"ok": True, "score": {"attempts_today": attempts, "correct_today": correct, "wrong_today": wrong}, "limit": limit, "version": WEB_QUIZ_SERVICE_VERSION}
+    return {"ok": True, "score": {"attempts_today": attempts, "correct_today": correct, "wrong_today": wrong}, "limit": _limit_state(account_id), "version": WEB_QUIZ_SERVICE_VERSION}
 
 
 def format_quiz_question_for_channel(result: Dict[str, Any]) -> str:
