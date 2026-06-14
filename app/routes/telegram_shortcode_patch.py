@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import uuid
 from typing import Any, Optional
 
 from flask import Blueprint, jsonify
@@ -10,7 +11,7 @@ from app.routes import telegram as tg
 
 bp = Blueprint("telegram_shortcode_patch", __name__)
 
-TELEGRAM_SHORTCODE_PATCH_VERSION = "2026-06-14-v2-shortcodes-and-account-uuid-fix"
+TELEGRAM_SHORTCODE_PATCH_VERSION = "2026-06-14-v3-shortcodes-and-uuid-safe-fallback"
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", re.I)
 
 
@@ -23,6 +24,11 @@ def _clean(value: Any) -> str:
 
 def _is_uuid(value: Any) -> bool:
     return bool(UUID_RE.match(_clean(value)))
+
+
+def _fallback_uuid_for_tg_user_id(provider_user_id: str) -> str:
+    provider_user_id = _clean(provider_user_id)
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"naija-tax-guide:telegram:{provider_user_id}"))
 
 
 def _normalize_shortcode_text(value: Any) -> str:
@@ -51,6 +57,7 @@ _ORIGINAL_LOOKS_LIKE_BAD_COMMAND = tg._looks_like_bad_command
 _ORIGINAL_SELECT_CREDIT_PACKAGE_NUMBER = tg._select_credit_package_number
 _ORIGINAL_RESOLVE_TELEGRAM_ACCOUNT = tg._resolve_telegram_account
 _ORIGINAL_EFFECTIVE_ACCOUNT_ID_FROM_TG_ACCOUNT = tg._effective_account_id_from_tg_account
+_ORIGINAL_HAS_ACTIVE_SUBSCRIPTION = tg.has_active_subscription
 
 
 def _best_uuid_from_tg_account_row(row: Optional[dict[str, Any]]) -> str:
@@ -132,6 +139,86 @@ def _repair_identity_account_id(identity: Optional[dict[str, Any]], account_id: 
             continue
 
 
+def _ensure_uuid_safe_tg_shell(provider_user_id: str, display_name: Optional[str] = None, identity: Optional[dict[str, Any]] = None) -> str:
+    """
+    Last-resort repair path.
+
+    Telegram must not return System error just because legacy rows contain a raw
+    Telegram numeric ID. This creates/uses a deterministic valid UUID for the
+    Telegram shell account, then patches account/channel rows where possible.
+    Paid website access still depends on a clean website link/auth_user_id, but
+    free Telegram commands and quiz should continue instead of crashing.
+    """
+    provider_user_id = _clean(provider_user_id)
+    fallback_uuid = _fallback_uuid_for_tg_user_id(provider_user_id)
+    now = tg._utc_now_iso()  # type: ignore[attr-defined]
+
+    # Try to patch the existing Telegram provider row with a UUID-safe account_id.
+    row = _telegram_account_row(provider_user_id)
+    if isinstance(row, dict) and row:
+        row_id = _clean(row.get("id"))
+        payloads = [
+            {"account_id": fallback_uuid, "updated_at": now, "display_name": display_name},
+            {"account_id": fallback_uuid, "updated_at": now},
+            {"account_id": fallback_uuid},
+        ]
+        for payload in payloads:
+            payload = {k: v for k, v in payload.items() if v not in (None, "")}
+            try:
+                if row_id:
+                    tg.supabase.table("accounts").update(payload).eq("id", row_id).execute()  # type: ignore[attr-defined]
+                    break
+                tg.supabase.table("accounts").update(payload).eq("provider", "tg").eq("provider_user_id", provider_user_id).execute()  # type: ignore[attr-defined]
+                break
+            except Exception:
+                continue
+    else:
+        # If no Telegram row exists, try a minimal insert/upsert. Column-safe by retries.
+        payloads = [
+            {
+                "account_id": fallback_uuid,
+                "provider": "tg",
+                "provider_user_id": provider_user_id,
+                "display_name": display_name,
+                "created_at": now,
+                "updated_at": now,
+            },
+            {
+                "account_id": fallback_uuid,
+                "provider": "tg",
+                "provider_user_id": provider_user_id,
+                "updated_at": now,
+            },
+            {
+                "provider": "tg",
+                "provider_user_id": provider_user_id,
+                "account_id": fallback_uuid,
+            },
+        ]
+        for payload in payloads:
+            payload = {k: v for k, v in payload.items() if v not in (None, "")}
+            try:
+                tg.supabase.table("accounts").upsert(payload, on_conflict="provider,provider_user_id").execute()  # type: ignore[attr-defined]
+                break
+            except Exception:
+                continue
+
+    if isinstance(identity, dict) and identity:
+        _repair_identity_account_id(identity, fallback_uuid, display_name=display_name)
+
+    return fallback_uuid
+
+
+def _patched_has_active_subscription(account_id: str) -> bool:
+    account_id = _clean(account_id)
+    if not account_id or not _is_uuid(account_id):
+        return False
+    try:
+        return bool(_ORIGINAL_HAS_ACTIVE_SUBSCRIPTION(account_id))
+    except Exception:
+        return False
+
+
 def _patched_resolve_telegram_account(*, tg_user_id: str, display_name: Optional[str] = None) -> dict[str, Any]:
     tg_user_id = _clean(tg_user_id)
     if not tg_user_id:
@@ -161,8 +248,6 @@ def _patched_resolve_telegram_account(*, tg_user_id: str, display_name: Optional
                 "source": "channel_identities_uuid",
             }
 
-        # Repair old/bad rows where channel_identities.account_id was saved as
-        # the raw Telegram user ID, then continue using the real UUID.
         if row_uuid:
             _repair_identity_account_id(identity, row_uuid, display_name=display_name)
             try:
@@ -177,8 +262,6 @@ def _patched_resolve_telegram_account(*, tg_user_id: str, display_name: Optional
                 "source": "repaired_channel_identity_uuid",
             }
 
-    # No usable identity row. Let the original resolver create/fetch the tg row,
-    # then replace any non-UUID fallback with a UUID from accounts where possible.
     try:
         resolved = _ORIGINAL_RESOLVE_TELEGRAM_ACCOUNT(tg_user_id=tg_user_id, display_name=display_name)
     except Exception as exc:
@@ -200,14 +283,14 @@ def _patched_resolve_telegram_account(*, tg_user_id: str, display_name: Optional
             "previous_account_id": resolved_account_id,
         }
 
-    # Last safety net: do not allow raw Telegram numeric IDs to enter UUID-only
-    # subscription/credit paths. The webhook will handle this as unresolved.
+    fallback_uuid = _ensure_uuid_safe_tg_shell(tg_user_id, display_name=display_name, identity=identity)
     return {
-        "ok": False,
-        "reason": "telegram_account_uuid_not_found",
-        "provider_user_id": tg_user_id,
+        "ok": True,
+        "account_id": fallback_uuid,
+        "linked": False,
+        "identity": identity,
+        "source": "uuid_safe_telegram_shell_fallback",
         "previous_account_id": resolved_account_id,
-        "source": "uuid_guard",
     }
 
 
@@ -497,6 +580,7 @@ def _patched_send_all_commands(chat_id: str, *, linked: bool = False) -> None:
 def apply_patch() -> None:
     tg._effective_account_id_from_tg_account = _patched_effective_account_id_from_tg_account  # type: ignore[assignment]
     tg._resolve_telegram_account = _patched_resolve_telegram_account  # type: ignore[assignment]
+    tg.has_active_subscription = _patched_has_active_subscription  # type: ignore[assignment]
     tg._handle_master_command = _patched_handle_master_command  # type: ignore[assignment]
     tg._select_credit_package_number = _patched_select_credit_package_number  # type: ignore[assignment]
     tg._looks_like_bad_command = _patched_looks_like_bad_command  # type: ignore[assignment]
