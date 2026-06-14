@@ -320,6 +320,7 @@ def create_app() -> Flask:
     optional_modules = [
         "app.routes.cron",
         "app.routes.telegram",
+        "app.routes.telegram_shortcode_patch",
         "app.routes.web_ask",
         "app.routes.web_quiz",
         "app.routes.web_chat",
