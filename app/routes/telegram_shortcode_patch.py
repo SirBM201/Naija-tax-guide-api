@@ -10,7 +10,8 @@ from app.routes import telegram as tg
 
 bp = Blueprint("telegram_shortcode_patch", __name__)
 
-TELEGRAM_SHORTCODE_PATCH_VERSION = "2026-06-14-v1-shortcode-normalization"
+TELEGRAM_SHORTCODE_PATCH_VERSION = "2026-06-14-v2-shortcodes-and-account-uuid-fix"
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", re.I)
 
 
 def _clean(value: Any) -> str:
@@ -20,12 +21,11 @@ def _clean(value: Any) -> str:
         return str(value or "").strip()
 
 
+def _is_uuid(value: Any) -> bool:
+    return bool(UUID_RE.match(_clean(value)))
+
+
 def _normalize_shortcode_text(value: Any) -> str:
-    """
-    Telegram users often type short codes as slash commands, e.g. /q1, /cr1,
-    /pay1, or /q1@botname. The core Telegram route historically accepted Q1,
-    CR1, PAY1, etc. This normalizes slash forms into the same canonical text.
-    """
     raw = _clean(value)
     if not raw:
         return ""
@@ -39,7 +39,6 @@ def _normalize_shortcode_text(value: Any) -> str:
         if "@" in first:
             first = first.split("@", 1)[0]
 
-    # Keep arguments exactly as typed except for the command token.
     return f"{first} {rest}".strip()
 
 
@@ -50,6 +49,166 @@ def _normalize_lower(value: Any) -> str:
 _ORIGINAL_HANDLE_MASTER_COMMAND = tg._handle_master_command
 _ORIGINAL_LOOKS_LIKE_BAD_COMMAND = tg._looks_like_bad_command
 _ORIGINAL_SELECT_CREDIT_PACKAGE_NUMBER = tg._select_credit_package_number
+_ORIGINAL_RESOLVE_TELEGRAM_ACCOUNT = tg._resolve_telegram_account
+_ORIGINAL_EFFECTIVE_ACCOUNT_ID_FROM_TG_ACCOUNT = tg._effective_account_id_from_tg_account
+
+
+def _best_uuid_from_tg_account_row(row: Optional[dict[str, Any]]) -> str:
+    if not isinstance(row, dict):
+        return ""
+
+    # auth_user_id is the linked website workspace UUID. If absent, id is the
+    # standalone Telegram shell account UUID. Do not return provider_user_id or
+    # numeric account_id values because subscription/credit tables expect UUIDs.
+    for key in ("auth_user_id", "account_id", "id"):
+        value = _clean(row.get(key))
+        if _is_uuid(value):
+            return value
+    return ""
+
+
+def _patched_effective_account_id_from_tg_account(row: Optional[dict[str, Any]]) -> Optional[str]:
+    uuid_value = _best_uuid_from_tg_account_row(row)
+    if uuid_value:
+        return uuid_value
+    return None
+
+
+def _telegram_account_row(provider_user_id: str) -> Optional[dict[str, Any]]:
+    provider_user_id = _clean(provider_user_id)
+    if not provider_user_id:
+        return None
+
+    try:
+        row = tg._get_telegram_account_row(provider_user_id)  # type: ignore[attr-defined]
+        if isinstance(row, dict) and row:
+            return row
+    except Exception:
+        pass
+
+    try:
+        resp = (
+            tg.supabase.table("accounts")  # type: ignore[attr-defined]
+            .select("id,account_id,provider,provider_user_id,auth_user_id,display_name,email,updated_at,created_at")
+            .eq("provider", "tg")
+            .eq("provider_user_id", provider_user_id)
+            .limit(1)
+            .execute()
+        )
+        data = getattr(resp, "data", None)
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            return data[0]
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        return None
+
+    return None
+
+
+def _repair_identity_account_id(identity: Optional[dict[str, Any]], account_id: str, display_name: Optional[str] = None) -> None:
+    if not isinstance(identity, dict) or not _is_uuid(account_id):
+        return
+
+    identity_id = _clean(identity.get("id"))
+    if not identity_id:
+        return
+
+    metadata = identity.get("metadata") if isinstance(identity.get("metadata"), dict) else {}
+    if display_name and not metadata.get("display_name"):
+        metadata = {**metadata, "display_name": display_name}
+
+    payloads: list[dict[str, Any]] = [
+        {"account_id": account_id, "metadata": metadata, "updated_at": tg._utc_now_iso()},  # type: ignore[attr-defined]
+        {"account_id": account_id, "updated_at": tg._utc_now_iso()},  # type: ignore[attr-defined]
+        {"account_id": account_id},
+    ]
+
+    for payload in payloads:
+        try:
+            tg.supabase.table("channel_identities").update(payload).eq("id", identity_id).execute()  # type: ignore[attr-defined]
+            return
+        except Exception:
+            continue
+
+
+def _patched_resolve_telegram_account(*, tg_user_id: str, display_name: Optional[str] = None) -> dict[str, Any]:
+    tg_user_id = _clean(tg_user_id)
+    if not tg_user_id:
+        return {"ok": False, "reason": "missing_tg_user_id"}
+
+    identity = None
+    try:
+        identity = tg._get_telegram_identity(tg_user_id)  # type: ignore[attr-defined]
+    except Exception:
+        identity = None
+
+    row = _telegram_account_row(tg_user_id)
+    row_uuid = _best_uuid_from_tg_account_row(row)
+
+    if isinstance(identity, dict) and identity:
+        identity_account_id = _clean(identity.get("account_id"))
+        if _is_uuid(identity_account_id):
+            try:
+                tg._touch_telegram_identity(identity, display_name=display_name)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            return {
+                "ok": True,
+                "account_id": identity_account_id,
+                "linked": True,
+                "identity": identity,
+                "source": "channel_identities_uuid",
+            }
+
+        # Repair old/bad rows where channel_identities.account_id was saved as
+        # the raw Telegram user ID, then continue using the real UUID.
+        if row_uuid:
+            _repair_identity_account_id(identity, row_uuid, display_name=display_name)
+            try:
+                tg._touch_telegram_identity(identity, display_name=display_name)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            return {
+                "ok": True,
+                "account_id": row_uuid,
+                "linked": bool(_clean((row or {}).get("auth_user_id"))),
+                "identity": {**identity, "account_id": row_uuid},
+                "source": "repaired_channel_identity_uuid",
+            }
+
+    # No usable identity row. Let the original resolver create/fetch the tg row,
+    # then replace any non-UUID fallback with a UUID from accounts where possible.
+    try:
+        resolved = _ORIGINAL_RESOLVE_TELEGRAM_ACCOUNT(tg_user_id=tg_user_id, display_name=display_name)
+    except Exception as exc:
+        resolved = {"ok": False, "reason": "original_resolver_failed", "error": str(exc)}
+
+    resolved_account_id = _clean((resolved or {}).get("account_id"))
+    if _is_uuid(resolved_account_id):
+        return resolved
+
+    row = _telegram_account_row(tg_user_id)
+    row_uuid = _best_uuid_from_tg_account_row(row)
+    if row_uuid:
+        return {
+            "ok": True,
+            "account_id": row_uuid,
+            "linked": bool(_clean((row or {}).get("auth_user_id"))),
+            "identity": (resolved or {}).get("identity"),
+            "source": "accounts_uuid_patch",
+            "previous_account_id": resolved_account_id,
+        }
+
+    # Last safety net: do not allow raw Telegram numeric IDs to enter UUID-only
+    # subscription/credit paths. The webhook will handle this as unresolved.
+    return {
+        "ok": False,
+        "reason": "telegram_account_uuid_not_found",
+        "provider_user_id": tg_user_id,
+        "previous_account_id": resolved_account_id,
+        "source": "uuid_guard",
+    }
 
 
 def _quiz_state_for(chat_id: str, tg_user_id: str) -> dict[str, Any]:
@@ -86,8 +245,6 @@ def _patched_handle_master_command(
     normalized_upper = normalized.upper()
     normalized_lower = normalized.lower()
 
-    # Slash answer compatibility: /A, /B, /C, /D should behave like A-D only
-    # when an active quiz-answer state exists. Otherwise they remain normal text.
     if normalized_upper in {"A", "B", "C", "D", "CANCEL", "STOP", "END"}:
         state = _quiz_state_for(chat_id, tg_user_id)
         if state.get("quiz_mode") == "answer":
@@ -338,6 +495,8 @@ def _patched_send_all_commands(chat_id: str, *, linked: bool = False) -> None:
 
 
 def apply_patch() -> None:
+    tg._effective_account_id_from_tg_account = _patched_effective_account_id_from_tg_account  # type: ignore[assignment]
+    tg._resolve_telegram_account = _patched_resolve_telegram_account  # type: ignore[assignment]
     tg._handle_master_command = _patched_handle_master_command  # type: ignore[assignment]
     tg._select_credit_package_number = _patched_select_credit_package_number  # type: ignore[assignment]
     tg._looks_like_bad_command = _patched_looks_like_bad_command  # type: ignore[assignment]
