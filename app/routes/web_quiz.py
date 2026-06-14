@@ -80,7 +80,8 @@ def web_quiz_question():
         return error_response, status
 
     category = _safe_text(request.args.get('category'))
-    res = get_quiz_question(account_id=account_id, category=category)
+    exclude_codes = _safe_text(request.args.get('exclude') or request.args.get('seen') or '')
+    res = get_quiz_question(account_id=account_id, category=category, exclude_codes=exclude_codes)
     return jsonify(res), (200 if res.get('ok') else 400)
 
 
