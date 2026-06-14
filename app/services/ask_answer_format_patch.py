@@ -3,13 +3,18 @@ from __future__ import annotations
 import re
 
 
-ASK_ANSWER_FORMAT_PATCH_VERSION = "2026-06-14-v2-route-and-service-empty-section-cleanup"
+ASK_ANSWER_FORMAT_PATCH_VERSION = "2026-06-14-v3-unlist-section-labels"
 
 _EMPTY_LIST_LINE_RE = re.compile(r"^\s*(?:\d+[\.)]|[•\-])\s*$")
 _SECTION_LABEL_RE = re.compile(
     r"^\s*(Direct\s+answer|Short\s+answer|Answer|Key\s+points|What\s+to\s+do|Next\s+steps|Note)\s*:\s*$",
     re.IGNORECASE,
 )
+_LISTED_SECTION_LABEL_RE = re.compile(
+    r"(^|\n)\s*(?:\d+[\.)]|[•\-])\s*(Note|What\s+to\s+do|Next\s+steps)\s*:\s*",
+    re.IGNORECASE,
+)
+_DUP_DIRECT_RE = re.compile(r"Direct\s+answer\s*:\s*(?:Direct\s+answer\s*:\s*)+", re.IGNORECASE)
 
 
 def _is_empty_list_body(lines: list[str]) -> bool:
@@ -19,8 +24,15 @@ def _is_empty_list_body(lines: list[str]) -> bool:
     return all(_EMPTY_LIST_LINE_RE.match(line) for line in non_empty)
 
 
-def _clean_empty_answer_sections(text: str) -> str:
+def _preclean(text: str) -> str:
     clean = str(text or "").replace("\r\n", "\n")
+    clean = _DUP_DIRECT_RE.sub("Direct answer: ", clean)
+    clean = _LISTED_SECTION_LABEL_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}: ", clean)
+    return clean
+
+
+def _clean_empty_answer_sections(text: str) -> str:
+    clean = _preclean(text)
     if not clean.strip():
         return ""
 
@@ -73,10 +85,14 @@ def _patch_ask_service() -> None:
         return
 
     def patched(answer: str, question: str = "") -> str:
-        shaped = original(answer, question)
+        incoming = _preclean(answer)
+        lowered = incoming.lower()
+        if "direct answer:" in lowered or "short answer:" in lowered:
+            return _clean_empty_answer_sections(incoming)
+        shaped = original(incoming, question)
         return _clean_empty_answer_sections(shaped)
 
-    patched._ntg_format_patch_applied = True  # type: ignore[attr-defined]
+    patched._ntg_format_patch_applied = True
     svc._ensure_professional_answer_shape = patched
 
 
@@ -94,7 +110,7 @@ def _patch_ask_route() -> None:
         cleaned = original(value)
         return _clean_empty_answer_sections(cleaned)
 
-    patched._ntg_format_patch_applied = True  # type: ignore[attr-defined]
+    patched._ntg_format_patch_applied = True
     ask_route._clean_repeated_answer_labels = patched
 
 
