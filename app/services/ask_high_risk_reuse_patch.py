@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 
-ASK_HIGH_RISK_REUSE_PATCH_VERSION = "2026-06-14-v1-strong-note-reuse"
+ASK_HIGH_RISK_REUSE_PATCH_VERSION = "2026-06-14-v2-always-write-reusable-row"
 
 STRONG_NOTE = (
     "Important: This is high-risk general guidance only, not a final tax or legal opinion. Exact deadlines, "
@@ -15,13 +15,17 @@ STRONG_NOTE = (
 HIGH_MARKERS = (
     "appeal",
     "tribunal",
+    "court",
     "freeze",
     "bank account",
     "enforcement",
+    "investigation",
     "personal liability",
     "personally liable",
     "director",
+    "directors",
     "disputed tax assessment",
+    "refuse to pay",
     "waiver",
     "waive",
 )
@@ -50,20 +54,24 @@ def _with_strong_note(answer: str) -> str:
     return f"{clean}\n\n{STRONG_NOTE}"
 
 
-def _review_blocks_reuse(review: Any) -> bool:
+def _review_is_clear_reject(review: Any) -> bool:
+    """
+    Keep this deliberately narrow for MVP cost control.
+    High-risk answers should become reusable when saved with a strong disclaimer,
+    except where the second AI explicitly flags the answer as irrelevant or misleading.
+    """
     if not isinstance(review, dict) or not review:
         return False
-    risk = _low(review.get("risk"))
-    if risk == "reject":
-        return True
     if review.get("misleading") is True:
         return True
     if review.get("relevant") is False:
         return True
+    if _low(review.get("risk")) == "reject":
+        return True
     return False
 
 
-def _update_cache_row(svc: Any, *, row_id: Any, normalized: str, canonical: str, payload: Dict[str, Any]) -> str | None:
+def _try_update_cache_row(svc: Any, *, row_id: Any, normalized: str, canonical: str, payload: Dict[str, Any]) -> Optional[str]:
     try:
         q = svc._sb().table("qa_cache").update(payload)
         if row_id:
@@ -76,6 +84,18 @@ def _update_cache_row(svc: Any, *, row_id: Any, normalized: str, canonical: str,
         return None
     except Exception as exc:
         return f"{type(exc).__name__}: {str(exc)[:500]}"
+
+
+def _insert_reusable_cache_row(svc: Any, *, full_payload: Dict[str, Any], core_payload: Dict[str, Any]) -> Optional[str]:
+    """
+    Insert a reusable row even if an earlier update silently matched no rows.
+    This avoids repeated AI charges when a candidate row was not actually updated.
+    """
+    for payload in (full_payload, core_payload):
+        err = svc._safe_insert("qa_cache", payload)
+        if not err:
+            return None
+    return "qa_cache insert failed for reusable high-risk guidance"
 
 
 def apply_ask_high_risk_reuse_patch() -> None:
@@ -95,23 +115,33 @@ def apply_ask_high_risk_reuse_patch() -> None:
 
         review = result.get("second_ai_review") if isinstance(result.get("second_ai_review"), dict) else {}
         risk = _low(result.get("risk") or review.get("risk"))
-        if risk != "high" and not _looks_high_risk(question, answer):
+        high_risk = risk == "high" or _looks_high_risk(question, answer)
+        if not high_risk:
             return result
-        if _review_blocks_reuse(review):
+        if _review_is_clear_reject(review):
             return result
 
         normalized = svc._normalize_question(question)
         canonical = svc._canonical_key(question)
         now_iso = svc._now_iso()
         safe_answer = _with_strong_note(answer)
+        intent_type = metadata.get("intent_type") or "general"
+        topic = metadata.get("topic") or "general"
 
         full_payload = {
+            "normalized_question": normalized,
+            "canonical_key": canonical,
             "answer": safe_answer,
+            "tags": ["ai", "auto-reviewed", "risk-high", "strong-disclaimer"],
             "source": "ai",
             "enabled": True,
             "priority": 12,
+            "lang": lang or "en",
+            "intent_type": intent_type,
+            "topic": topic,
             "trust_score": 0.8,
             "review_status": "ai_reviewed_safe",
+            "jurisdiction": "nigeria",
             "last_used_at": now_iso,
             "risk_level": "high",
             "disclaimer_type": "strong",
@@ -121,40 +151,52 @@ def apply_ask_high_risk_reuse_patch() -> None:
             "reviewed_at": now_iso,
             "reviewed_by": "policy_after_second_ai",
             "review_notes": "High-risk answer approved for reuse only as general guidance with strong disclaimer.",
+            "question": question[:800],
         }
-        minimal_payload = {
+        core_payload = {
+            "normalized_question": normalized,
+            "canonical_key": canonical,
             "answer": safe_answer,
+            "tags": ["ai", "auto-reviewed", "risk-high"],
             "source": "ai",
             "enabled": True,
             "priority": 12,
+            "lang": lang or "en",
+            "intent_type": intent_type,
+            "topic": topic,
             "trust_score": 0.8,
             "review_status": "ai_reviewed_safe",
+            "jurisdiction": "nigeria",
             "last_used_at": now_iso,
         }
 
         row_id = result.get("id")
-        errors: list[str] = []
-        for payload in (full_payload, minimal_payload):
-            err = _update_cache_row(svc, row_id=row_id, normalized=normalized, canonical=canonical, payload=payload)
-            if not err:
-                updated = dict(result)
-                updated.update(
-                    {
-                        "schema_mode": "high_risk_strong_disclaimer_auto_reuse",
-                        "review_status": "ai_reviewed_safe",
-                        "enabled": True,
-                        "trust_score": 0.8,
-                        "risk": "high",
-                        "reusable_without_credit": True,
-                        "normalized_question": normalized,
-                        "canonical_key": canonical,
-                    }
-                )
-                return updated
-            errors.append(err)
+        update_errors: list[str] = []
+        for payload in (full_payload, core_payload):
+            err = _try_update_cache_row(svc, row_id=row_id, normalized=normalized, canonical=canonical, payload=payload)
+            if err:
+                update_errors.append(err)
+
+        insert_err = _insert_reusable_cache_row(svc, full_payload=full_payload, core_payload=core_payload)
 
         updated = dict(result)
-        updated["high_risk_reuse_patch_error"] = errors[:2]
+        updated.update(
+            {
+                "schema_mode": "high_risk_strong_disclaimer_auto_reuse",
+                "review_status": "ai_reviewed_safe",
+                "enabled": True,
+                "trust_score": 0.8,
+                "risk": "high",
+                "reusable_without_credit": True,
+                "normalized_question": normalized,
+                "canonical_key": canonical,
+                "high_risk_reuse_inserted": insert_err is None,
+            }
+        )
+        if update_errors:
+            updated["high_risk_reuse_update_warnings"] = update_errors[:2]
+        if insert_err:
+            updated["high_risk_reuse_insert_error"] = insert_err
         return updated
 
     patched._ntg_high_risk_reuse_patch_applied = True
