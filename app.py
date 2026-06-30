@@ -28,6 +28,13 @@ WHATSAPP_ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 WHATSAPP_API_URL = "https://graph.facebook.com/v18.0"
 
+GUIDANCE_NOTE = (
+    "\n\n⚠️ Guidance note: Naija Tax Guide provides general Nigerian tax information, "
+    "not official government advice or a formal tax opinion. For audits, disputes, "
+    "penalties, filings, or sensitive decisions, confirm with the relevant tax authority "
+    "or a qualified tax professional."
+)
+
 # ============ TAX CALCULATION ============
 def calculate_paye(monthly_gross):
     annual_gross = monthly_gross * 12
@@ -78,7 +85,7 @@ def get_plans_list_menu():
         plans = result.data or []
         
         if not plans:
-            return "📋 No plans available. Visit www.naijataxguides.com/plans"
+            return "📋 No plans available. Visit www.naijataxguides.com/pricing" + GUIDANCE_NOTE
         
         plans.sort(key=lambda x: x.get("price", 0))
         
@@ -103,10 +110,11 @@ def get_plans_list_menu():
             menu_lines.append(f"{num} - *{name}* - ₦{price:,}/{billing} - {credits} credits")
         
         menu_lines.append("\n💡 Send plan number to subscribe")
-        return "\n".join(menu_lines)
+        menu_lines.append("Public pricing: www.naijataxguides.com/pricing")
+        return "\n".join(menu_lines) + GUIDANCE_NOTE
     except Exception as e:
         logging.error(f"Error: {e}")
-        return "📋 Visit www.naijataxguides.com/plans"
+        return "📋 Visit www.naijataxguides.com/pricing" + GUIDANCE_NOTE
 
 # ============ SEND MESSAGE ============
 def send_whatsapp(to_phone, text):
@@ -127,6 +135,7 @@ def send_whatsapp(to_phone, text):
 def send_main_menu(phone):
     menu = (
         "*🤖 Naija Tax Guide*\n\n"
+        "General Nigerian tax guidance for individuals, freelancers, SMEs, and digital professionals.\n\n"
         "1️⃣ - Ask a tax question\n"
         "2️⃣ - Check AI credits\n"
         "3️⃣ - My subscription plan\n"
@@ -136,6 +145,7 @@ def send_main_menu(phone):
         "7️⃣ - Tax filing\n"
         "8️⃣ - Help\n\n"
         "Send a number to calculate PAYE tax"
+        f"{GUIDANCE_NOTE}"
     )
     send_whatsapp(phone, menu)
 
@@ -183,7 +193,7 @@ def webhook():
                     try:
                         salary = float(text.replace(',', ''))
                         data = calculate_paye(salary)
-                        result = f"""*PAYE RESULT*\n\nGross: ₦{data['gross']:,.0f}\nPension: ₦{data['pension']:,.0f}\nNHF: ₦{data['nhf']:,.0f}\nTax: ₦{data['tax']:,.0f}\nNet: *₦{data['net']:,.0f}*\nRate: {data['rate']}%"""
+                        result = f"""*PAYE RESULT*\n\nGross: ₦{data['gross']:,.0f}\nPension: ₦{data['pension']:,.0f}\nNHF: ₦{data['nhf']:,.0f}\nTax: ₦{data['tax']:,.0f}\nNet: *₦{data['net']:,.0f}*\nRate: {data['rate']}%{GUIDANCE_NOTE}"""
                         send_whatsapp(from_number, result)
                     except:
                         send_whatsapp(from_number, "Send a valid number")
