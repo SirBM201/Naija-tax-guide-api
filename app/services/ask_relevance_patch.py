@@ -51,6 +51,13 @@ def apply_ask_relevance_patch() -> None:
     except Exception:
         pass
 
+    try:
+        from app.services.billing_payment_patch import apply_billing_payment_patch
+
+        apply_billing_payment_patch()
+    except Exception:
+        pass
+
     def _row_rank(row: Dict[str, Any]) -> tuple:
         status = svc._lower(row.get("review_status") or row.get("status") or "")
         enabled = str(row.get("enabled") if row.get("enabled") is not None else "").strip().lower() in {"true", "1", "yes", "on"}
