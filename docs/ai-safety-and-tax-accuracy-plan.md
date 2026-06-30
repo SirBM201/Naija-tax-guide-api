@@ -2,7 +2,7 @@
 
 Last reviewed: 30 June 2026
 Product: Naija Tax Guide
-Owner: BMS Creative Concept
+Owner: BMS SparkVision Hub
 
 ## Purpose
 
