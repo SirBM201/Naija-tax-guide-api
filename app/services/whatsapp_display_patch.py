@@ -14,6 +14,13 @@ def apply_whatsapp_display_patch() -> None:
     after app.routes.whatsapp has been imported.
     """
     try:
+        from app.services.billing_payment_patch import apply_billing_payment_patch
+
+        apply_billing_payment_patch()
+    except Exception:
+        pass
+
+    try:
         from app.routes import whatsapp as w
     except Exception:
         return
