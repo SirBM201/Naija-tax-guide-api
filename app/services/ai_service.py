@@ -11,9 +11,69 @@ except Exception:
 
 _last_error: str = ""
 
+GUIDANCE_NOTE = (
+    "Guidance note: This is general Nigerian tax information, not a formal tax opinion. "
+    "Confirm important decisions with the relevant tax authority or a qualified tax professional."
+)
+
+UNSAFE_TAX_REQUEST_MARKERS = (
+    "hide income",
+    "hide my income",
+    "avoid detection",
+    "fake invoice",
+    "fake receipt",
+    "falsify",
+    "underreport",
+    "under report",
+    "evade tax",
+    "tax evasion",
+    "pay less tax illegally",
+    "misrepresent",
+)
+
+HIGH_RISK_TAX_MARKERS = (
+    "audit",
+    "assessment",
+    "penalty",
+    "tax notice",
+    "official notice",
+    "dispute",
+    "objection",
+    "appeal",
+    "litigation",
+    "court",
+    "back duty",
+    "back-duty",
+    "restructure",
+    "cross-border",
+    "transfer pricing",
+)
+
 
 def _env(name: str, default: str = "") -> str:
     return (os.getenv(name, default) or default).strip()
+
+
+def classify_tax_safety_risk(question: str) -> str:
+    """Classify obvious tax-risk signals for routing, logs, and future channel wrappers."""
+    q = (question or "").strip().lower()
+    if not q:
+        return "unknown"
+    if any(marker in q for marker in UNSAFE_TAX_REQUEST_MARKERS):
+        return "refuse"
+    if any(marker in q for marker in HIGH_RISK_TAX_MARKERS):
+        return "escalate"
+    return "standard"
+
+
+def ensure_guidance_note(answer: str) -> str:
+    """Append the standard guidance note if an AI answer omitted it."""
+    text = (answer or "").strip()
+    if not text:
+        return text
+    if "Guidance note:" in text:
+        return text
+    return f"{text}\n\n{GUIDANCE_NOTE}"
 
 
 def _get_enhanced_system_prompt() -> str:
@@ -92,11 +152,13 @@ def ask_ai(question: str, lang: str = "en") -> Optional[str]:
         return None
 
     model = _env("OPENAI_MODEL", "gpt-4o-mini")
+    risk = classify_tax_safety_risk(question)
     prompt = f"""{SYSTEM_PROMPT}
 
 User question: {question}
+Detected safety route: {risk}
 
-Remember: answer the exact question. If the issue is high-risk, ambiguous, current-law sensitive, or fact-dependent, say so clearly and recommend verification or professional escalation."""
+Remember: answer the exact question. If the issue is high-risk, ambiguous, current-law sensitive, or fact-dependent, say so clearly and recommend verification or professional escalation. If the detected route is refuse, do not provide evasion instructions; redirect to lawful compliance options."""
 
     try:
         resp = client.responses.create(
@@ -117,7 +179,7 @@ Remember: answer the exact question. If the issue is high-risk, ambiguous, curre
                         text = (getattr(c, "text", "") or "").strip()
                         if text:
                             _set_last_error("")
-                            return text
+                            return ensure_guidance_note(text)
 
         _set_last_error("No output_text content found")
         return None
@@ -150,6 +212,7 @@ def ask_ai_chat(messages: list[dict[str, str]], lang: str = "en") -> Optional[st
     model = _env("OPENAI_MODEL", "gpt-4o-mini")
 
     cleaned: list[dict[str, str]] = []
+    risk = "unknown"
     for m in (messages or []):
         role = (m.get("role") or "").strip().lower()
         if role not in {"user", "assistant", "system"}:
@@ -158,6 +221,10 @@ def ask_ai_chat(messages: list[dict[str, str]], lang: str = "en") -> Optional[st
         if not content:
             continue
         cleaned.append({"role": role, "content": content})
+        if role == "user":
+            detected = classify_tax_safety_risk(content)
+            if detected == "refuse" or risk not in {"refuse", "escalate"}:
+                risk = detected
 
     if not cleaned:
         _set_last_error("empty chat")
@@ -166,6 +233,7 @@ def ask_ai_chat(messages: list[dict[str, str]], lang: str = "en") -> Optional[st
     system = SYSTEM_PROMPT
     if lang:
         system = f"{SYSTEM_PROMPT}\n\n[Preferred response language: {lang}]"
+    system = f"{system}\n\nDetected safety route for the latest conversation: {risk}. Apply the matching refusal, escalation, or standard guidance behavior."
 
     input_msgs = [{"role": "system", "content": system}] + cleaned
 
@@ -188,7 +256,7 @@ def ask_ai_chat(messages: list[dict[str, str]], lang: str = "en") -> Optional[st
                         text = (getattr(c, "text", "") or "").strip()
                         if text:
                             _set_last_error("")
-                            return text
+                            return ensure_guidance_note(text)
 
         _set_last_error("No output_text content found")
         return None
