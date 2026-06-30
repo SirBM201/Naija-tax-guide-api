@@ -160,7 +160,7 @@ def generate_tax_receipt(filing: Dict[str, Any], calculation: Optional[Dict[str,
     )
     story.append(Paragraph("This is a computer-generated receipt. No signature is required.", footer_style))
     story.append(Paragraph("Guidance note: Naija Tax Guide provides general Nigerian tax information and does not replace a qualified tax professional for sensitive filing, audit, dispute, or penalty matters.", footer_style))
-    story.append(Paragraph("Naija Tax Guide - Powered by BMS Creative Concept", footer_style))
+    story.append(Paragraph("Naija Tax Guide - Powered by BMS SparkVision Hub", footer_style))
     
     # Build PDF
     doc.build(story)
