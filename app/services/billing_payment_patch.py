@@ -1,21 +1,24 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict
 
 from flask import has_request_context, request
 
 
-BILLING_PAYMENT_PATCH_VERSION = "2026-06-30-payment-context-recovery-v1"
+BILLING_PAYMENT_PATCH_VERSION = "2026-06-30-payment-context-recovery-v2"
 
 
 def apply_billing_payment_patch() -> None:
-    """Harden Paystack payment activation without replacing the billing blueprint.
+    """Harden payment activation and subscription entitlement recovery.
 
     The billing routes call module-level helper functions at request time. Patching
-    those helpers here lets callback, verify, and webhook paths recover subscription
-    context from more Paystack shapes while leaving the registered routes intact.
+    those helpers here lets callback, verify, webhook, and workspace entitlement
+    paths recover the same current subscription state without replacing blueprints.
     """
+    _patch_subscription_guard_latest_row()
+
     try:
         from app.routes import billing as b
     except Exception:
@@ -199,3 +202,65 @@ def apply_billing_payment_patch() -> None:
     b._normalize_metadata = _normalize_metadata
     b._extract_payment_context = _extract_payment_context
     b._apply_successful_payment = _apply_successful_payment
+
+
+def _patch_subscription_guard_latest_row() -> None:
+    try:
+        from app.services import subscription_guard as sg
+    except Exception:
+        return
+
+    def _safe_dt(value: Any) -> datetime:
+        try:
+            if not value:
+                return datetime.min.replace(tzinfo=timezone.utc)
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+        except Exception:
+            return datetime.min.replace(tzinfo=timezone.utc)
+
+    def _row_sort_key(row: Dict[str, Any]) -> tuple:
+        normalized = sg._normalize_sub_row(row or {})
+        active = 1 if sg._subscription_is_active_now(normalized) else 0
+        status = str(normalized.get("status") or "").strip().lower()
+        paid_plan = 1 if str(normalized.get("plan_code") or "").strip().lower() not in {"", "free", "free_forever"} else 0
+        status_rank = 1 if status in {"active", "trial", "grace", "past_due"} else 0
+        updated = _safe_dt(row.get("updated_at") or normalized.get("updated_at"))
+        created = _safe_dt(row.get("created_at") or normalized.get("created_at"))
+        period_end = _safe_dt(row.get("expires_at") or row.get("current_period_end") or normalized.get("expires_at") or normalized.get("current_period_end"))
+        return (active, paid_plan, status_rank, updated, created, period_end)
+
+    def _get_subscription_row_latest(account_id: str):
+        account_id = (account_id or "").strip()
+        if not account_id:
+            return None, {
+                "ok": False,
+                "error": "account_id_required",
+                "root_cause": "missing_account_id",
+                "fix": "Pass canonical account_id to the subscription guard.",
+            }
+
+        try:
+            query = sg._sb().table("user_subscriptions").select("*").eq("account_id", account_id)
+            try:
+                query = query.order("updated_at", desc=True)
+            except Exception:
+                pass
+            res = query.limit(25).execute()
+            rows = getattr(res, "data", None) or []
+            if not rows:
+                return None, None
+            best_row = sorted([r for r in rows if isinstance(r, dict)], key=_row_sort_key, reverse=True)[0]
+            return sg._normalize_sub_row(best_row or {}), None
+        except Exception as e:
+            return None, {
+                "ok": False,
+                "error": "subscription_lookup_failed",
+                "root_cause": f"{type(e).__name__}: {sg._clip(e)}",
+                "fix": "Check user_subscriptions table access and Supabase connectivity.",
+                "details": {"account_id": account_id},
+            }
+
+    sg._get_subscription_row = _get_subscription_row_latest
