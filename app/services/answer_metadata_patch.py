@@ -9,15 +9,30 @@ from app.services.answer_metadata_service import (
 )
 from app.services.ai_service import finalize_tax_answer
 
-ANSWER_METADATA_PATCH_VERSION = "2026-07-03-v2-wrap-active-ask-resolver"
+ANSWER_METADATA_PATCH_VERSION = "2026-07-03-v3-wrap-ask-guarded-result"
 
 _AI_PATCHED = False
 _CACHE_PATCHED = False
 _DB_WRAPPED_TARGET_ID: int | None = None
+_ASK_WRAPPED_TARGET_IDS: set[int] = set()
 
 
 def _clean(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _extract_question(args: tuple[Any, ...], kwargs: Dict[str, Any]) -> str:
+    payload = args[0] if args and isinstance(args[0], dict) else kwargs.get("payload")
+    if isinstance(payload, dict):
+        for key in ("question", "query", "text", "message", "user_message", "user_query"):
+            value = _clean(payload.get(key))
+            if value:
+                return value
+    for key in ("question", "query", "text", "message", "user_message", "user_query"):
+        value = _clean(kwargs.get(key))
+        if value:
+            return value
+    return ""
 
 
 def enrich_database_result(
@@ -70,6 +85,35 @@ def enrich_ai_result(result: Dict[str, Any], *, question: str) -> Dict[str, Any]
     if answer:
         answer = finalize_tax_answer(answer, question)
         out["answer"] = append_source_metadata_note(answer, metadata)
+
+    return out
+
+
+def enrich_ask_result(result: Dict[str, Any], *, question: str) -> Dict[str, Any]:
+    if not isinstance(result, dict):
+        return result
+
+    out = dict(result)
+    meta = dict(out.get("meta") or {}) if isinstance(out.get("meta"), dict) else {}
+
+    source_metadata = out.get("source_metadata") if isinstance(out.get("source_metadata"), dict) else None
+    if not source_metadata:
+        source_metadata = meta.get("source_metadata") if isinstance(meta.get("source_metadata"), dict) else None
+    if not source_metadata:
+        source_metadata = build_source_metadata(
+            row={},
+            source_kind=_clean(out.get("source") or meta.get("source_kind") or "answer"),
+            question=question,
+            mode=_clean(out.get("mode")),
+            ai_model=_clean(meta.get("model")),
+        )
+
+    meta["source_metadata"] = source_metadata
+    out["meta"] = meta
+
+    answer = _clean(out.get("answer"))
+    if answer:
+        out["answer"] = append_source_metadata_note(answer, source_metadata)
 
     return out
 
@@ -145,6 +189,41 @@ def _patch_database_resolver(svc: Any) -> None:
     _DB_WRAPPED_TARGET_ID = target_id
 
 
+def _wrap_ask_guarded_function(fn: Any):
+    if not callable(fn) or getattr(fn, "_ntg_answer_metadata_wrapped", False):
+        return fn
+    target_id = id(fn)
+    if target_id in _ASK_WRAPPED_TARGET_IDS:
+        return fn
+
+    def _ask_guarded_with_metadata(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+        result = fn(*args, **kwargs)
+        question = _extract_question(args, kwargs)
+        if isinstance(result, dict) and (result.get("answer") or result.get("message")):
+            return enrich_ask_result(result, question=question)
+        return result
+
+    _ask_guarded_with_metadata._ntg_answer_metadata_wrapped = True  # type: ignore[attr-defined]
+    _ASK_WRAPPED_TARGET_IDS.add(target_id)
+    return _ask_guarded_with_metadata
+
+
+def _patch_ask_guarded_refs(svc: Any) -> None:
+    wrapped = _wrap_ask_guarded_function(getattr(svc, "ask_guarded", None))
+    if callable(wrapped):
+        svc.ask_guarded = wrapped  # type: ignore[attr-defined]
+
+    for module_name in ("app.routes.ask", "app.routes.whatsapp", "app.routes.telegram", "app.routes.web_ask"):
+        try:
+            module = __import__(module_name, fromlist=["ask_guarded"])
+        except Exception:
+            continue
+        current = getattr(module, "ask_guarded", None)
+        wrapped_module_fn = _wrap_ask_guarded_function(current)
+        if callable(wrapped_module_fn):
+            setattr(module, "ask_guarded", wrapped_module_fn)
+
+
 def apply_answer_metadata_patch() -> None:
     try:
         from app.services import ask_service as svc
@@ -153,3 +232,4 @@ def apply_answer_metadata_patch() -> None:
 
     _patch_ai_callers(svc)
     _patch_database_resolver(svc)
+    _patch_ask_guarded_refs(svc)
