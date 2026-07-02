@@ -6,17 +6,20 @@ from typing import Any, Dict
 
 def apply_whatsapp_display_patch() -> None:
     """
-    Keep WhatsApp calculator display aligned with web/Telegram.
-
-    The original WhatsApp PAYE formatter rounded all monetary values to whole naira.
-    That made monthly PAYE look different from the web/Telegram result even though
-    the underlying calculation was correct. This patch is applied during app boot
-    after app.routes.whatsapp has been imported.
+    Keep WhatsApp calculator display aligned with web/Telegram and apply shared
+    runtime patches that must be available after routes are imported.
     """
     try:
         from app.services.billing_payment_patch import apply_billing_payment_patch
 
         apply_billing_payment_patch()
+    except Exception:
+        pass
+
+    try:
+        from app.services.answer_metadata_patch import apply_answer_metadata_patch
+
+        apply_answer_metadata_patch()
     except Exception:
         pass
 
