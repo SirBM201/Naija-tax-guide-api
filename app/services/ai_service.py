@@ -16,6 +16,12 @@ GUIDANCE_NOTE = (
     "Confirm important decisions with the relevant tax authority or a qualified tax professional."
 )
 
+SOURCE_FRESHNESS_NOTE = (
+    "Source/freshness note: Rates, thresholds, deadlines, penalties, filing procedures, "
+    "and current-law implementation can change. Verify the latest position with the relevant "
+    "tax authority or a qualified tax professional before acting."
+)
+
 UNSAFE_TAX_REQUEST_MARKERS = (
     "hide income",
     "hide my income",
@@ -49,6 +55,38 @@ HIGH_RISK_TAX_MARKERS = (
     "transfer pricing",
 )
 
+SOURCE_SENSITIVE_TAX_MARKERS = (
+    "rate",
+    "rates",
+    "threshold",
+    "thresholds",
+    "deadline",
+    "deadlines",
+    "due date",
+    "due dates",
+    "penalty",
+    "penalties",
+    "fine",
+    "fines",
+    "exemption",
+    "exemptions",
+    "zero rated",
+    "zero-rated",
+    "vat registration",
+    "withholding tax rate",
+    "paye rate",
+    "tax reform",
+    "finance act",
+    "new act",
+    "current law",
+    "latest rule",
+    "portal",
+    "file online",
+    "filing procedure",
+    "monthly filing",
+    "annual return",
+)
+
 
 def _env(name: str, default: str = "") -> str:
     return (os.getenv(name, default) or default).strip()
@@ -66,6 +104,16 @@ def classify_tax_safety_risk(question: str) -> str:
     return "standard"
 
 
+def classify_source_sensitivity(question: str) -> str:
+    """Identify questions where source/date freshness should be made explicit."""
+    q = (question or "").strip().lower()
+    if not q:
+        return "unknown"
+    if any(marker in q for marker in SOURCE_SENSITIVE_TAX_MARKERS):
+        return "source_sensitive"
+    return "standard"
+
+
 def ensure_guidance_note(answer: str) -> str:
     """Append the standard guidance note if an AI answer omitted it."""
     text = (answer or "").strip()
@@ -74,6 +122,25 @@ def ensure_guidance_note(answer: str) -> str:
     if "Guidance note:" in text:
         return text
     return f"{text}\n\n{GUIDANCE_NOTE}"
+
+
+def ensure_source_freshness_note(answer: str, question: str = "") -> str:
+    """Append source/freshness caution for answers involving high-change tax facts."""
+    text = (answer or "").strip()
+    if not text:
+        return text
+    if "Source/freshness note:" in text:
+        return text
+    if classify_source_sensitivity(question) != "source_sensitive":
+        return text
+    return f"{text}\n\n{SOURCE_FRESHNESS_NOTE}"
+
+
+def finalize_tax_answer(answer: str, question: str = "") -> str:
+    """Apply deterministic safety wrappers after model generation."""
+    text = ensure_guidance_note(answer)
+    text = ensure_source_freshness_note(text, question)
+    return text
 
 
 def _get_enhanced_system_prompt() -> str:
@@ -92,11 +159,13 @@ CRITICAL SAFETY RULES:
 6. Do not invent legal sections, thresholds, rates, deadlines, penalties, or official portals. If you are unsure, say so and tell the user to verify.
 7. Where possible, mention the likely source category behind the answer, such as PITA, CITA, VAT Act, Finance Act updates, FIRS/NRS guidance, or State Internal Revenue Service practice. Only cite a specific section if you are confident.
 8. Do not perform complex tax math by freehand. For simple estimates, show assumptions clearly and warn that final liability depends on records and current law.
+9. For rates, thresholds, deadlines, penalties, current reforms, filing procedures, official portals, or implementation dates, include a source/freshness caution and avoid presenting stale information as final.
 
 RESPONSE FORMAT:
 - Start with "Direct answer:" and answer the exact question first.
 - Then use "Key points:" with 2 to 5 concise points.
 - Add "What to do next:" when practical action is helpful.
+- Add a source/freshness note where the answer includes rates, deadlines, thresholds, penalties, procedures, or current-law implementation.
 - End substantive answers with: "Guidance note: This is general Nigerian tax information, not a formal tax opinion. Confirm important decisions with the relevant tax authority or a qualified tax professional."
 
 NIGERIAN TAX CONTEXT TO HANDLE CAREFULLY:
@@ -153,10 +222,12 @@ def ask_ai(question: str, lang: str = "en") -> Optional[str]:
 
     model = _env("OPENAI_MODEL", "gpt-4o-mini")
     risk = classify_tax_safety_risk(question)
+    source_sensitivity = classify_source_sensitivity(question)
     prompt = f"""{SYSTEM_PROMPT}
 
 User question: {question}
 Detected safety route: {risk}
+Detected source sensitivity: {source_sensitivity}
 
 Remember: answer the exact question. If the issue is high-risk, ambiguous, current-law sensitive, or fact-dependent, say so clearly and recommend verification or professional escalation. If the detected route is refuse, do not provide evasion instructions; redirect to lawful compliance options."""
 
@@ -179,7 +250,7 @@ Remember: answer the exact question. If the issue is high-risk, ambiguous, curre
                         text = (getattr(c, "text", "") or "").strip()
                         if text:
                             _set_last_error("")
-                            return ensure_guidance_note(text)
+                            return finalize_tax_answer(text, question)
 
         _set_last_error("No output_text content found")
         return None
@@ -213,6 +284,8 @@ def ask_ai_chat(messages: list[dict[str, str]], lang: str = "en") -> Optional[st
 
     cleaned: list[dict[str, str]] = []
     risk = "unknown"
+    latest_user_question = ""
+    source_sensitivity = "unknown"
     for m in (messages or []):
         role = (m.get("role") or "").strip().lower()
         if role not in {"user", "assistant", "system"}:
@@ -222,9 +295,13 @@ def ask_ai_chat(messages: list[dict[str, str]], lang: str = "en") -> Optional[st
             continue
         cleaned.append({"role": role, "content": content})
         if role == "user":
+            latest_user_question = content
             detected = classify_tax_safety_risk(content)
             if detected == "refuse" or risk not in {"refuse", "escalate"}:
                 risk = detected
+            sensitivity = classify_source_sensitivity(content)
+            if sensitivity == "source_sensitive":
+                source_sensitivity = sensitivity
 
     if not cleaned:
         _set_last_error("empty chat")
@@ -233,7 +310,7 @@ def ask_ai_chat(messages: list[dict[str, str]], lang: str = "en") -> Optional[st
     system = SYSTEM_PROMPT
     if lang:
         system = f"{SYSTEM_PROMPT}\n\n[Preferred response language: {lang}]"
-    system = f"{system}\n\nDetected safety route for the latest conversation: {risk}. Apply the matching refusal, escalation, or standard guidance behavior."
+    system = f"{system}\n\nDetected safety route for the latest conversation: {risk}. Detected source sensitivity: {source_sensitivity}. Apply the matching refusal, escalation, source/freshness, or standard guidance behavior."
 
     input_msgs = [{"role": "system", "content": system}] + cleaned
 
@@ -256,7 +333,7 @@ def ask_ai_chat(messages: list[dict[str, str]], lang: str = "en") -> Optional[st
                         text = (getattr(c, "text", "") or "").strip()
                         if text:
                             _set_last_error("")
-                            return ensure_guidance_note(text)
+                            return finalize_tax_answer(text, latest_user_question)
 
         _set_last_error("No output_text content found")
         return None
