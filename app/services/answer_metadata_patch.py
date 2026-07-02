@@ -9,7 +9,7 @@ from app.services.answer_metadata_service import (
 )
 from app.services.ai_service import finalize_tax_answer
 
-ANSWER_METADATA_PATCH_VERSION = "2026-07-03-v3-wrap-ask-guarded-result"
+ANSWER_METADATA_PATCH_VERSION = "2026-07-03-v4-success-only-ask-result-metadata"
 
 _AI_PATCHED = False
 _CACHE_PATCHED = False
@@ -199,7 +199,7 @@ def _wrap_ask_guarded_function(fn: Any):
     def _ask_guarded_with_metadata(*args: Any, **kwargs: Any) -> Dict[str, Any]:
         result = fn(*args, **kwargs)
         question = _extract_question(args, kwargs)
-        if isinstance(result, dict) and (result.get("answer") or result.get("message")):
+        if isinstance(result, dict) and result.get("ok") is True and _clean(result.get("answer")):
             return enrich_ask_result(result, question=question)
         return result
 
