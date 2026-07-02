@@ -32,6 +32,10 @@ def _safe_dt(v: Any) -> Optional[datetime]:
         return None
 
 
+def _sort_dt(v: Any) -> datetime:
+    return _safe_dt(v) or datetime.min.replace(tzinfo=timezone.utc)
+
+
 def _normalize_bool(v: Any) -> Optional[bool]:
     if v is None:
         return None
@@ -40,9 +44,9 @@ def _normalize_bool(v: Any) -> Optional[bool]:
     if isinstance(v, (int, float)):
         return bool(v)
     s = str(v).strip().lower()
-    if s in {"1", "true", "yes", "y", "on", "active"}:
+    if s in {"1", "true", "yes", "y", "on", "active", "paid"}:
         return True
-    if s in {"0", "false", "no", "n", "off", "inactive"}:
+    if s in {"0", "false", "no", "n", "off", "inactive", "expired"}:
         return False
     return bool(v)
 
@@ -67,39 +71,6 @@ def _normalize_sub_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "created_at": row.get("created_at"),
         "updated_at": row.get("updated_at"),
     }
-
-
-def _get_subscription_row(account_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
-    account_id = (account_id or "").strip()
-    if not account_id:
-        return None, {
-            "ok": False,
-            "error": "account_id_required",
-            "root_cause": "missing_account_id",
-            "fix": "Pass canonical account_id to the subscription guard.",
-        }
-
-    try:
-        res = (
-            _sb()
-            .table("user_subscriptions")
-            .select("*")
-            .eq("account_id", account_id)
-            .limit(1)
-            .execute()
-        )
-        rows = getattr(res, "data", None) or []
-        if not rows:
-            return None, None
-        return _normalize_sub_row(rows[0] or {}), None
-    except Exception as e:
-        return None, {
-            "ok": False,
-            "error": "subscription_lookup_failed",
-            "root_cause": f"{type(e).__name__}: {_clip(e)}",
-            "fix": "Check user_subscriptions table access and Supabase connectivity.",
-            "details": {"account_id": account_id},
-        }
 
 
 def _expiry_dt(sub: Optional[Dict[str, Any]]) -> Optional[datetime]:
@@ -130,7 +101,7 @@ def _subscription_is_active_now(sub: Optional[Dict[str, Any]]) -> bool:
     if status in {"cancelled", "canceled"}:
         return bool(expires_at and now < expires_at)
 
-    if status and status != "active":
+    if status and status not in {"active", "paid"}:
         return False
 
     if not is_active:
@@ -144,6 +115,64 @@ def _subscription_is_active_now(sub: Optional[Dict[str, Any]]) -> bool:
 
     # If the row is explicitly active and no expiry column exists, keep access enabled.
     return expires_at is None
+
+
+def _has_paid_plan(sub: Optional[Dict[str, Any]]) -> bool:
+    plan_code = str((sub or {}).get("plan_code") or "").strip().lower()
+    return bool(plan_code and plan_code not in {"free", "free_forever"})
+
+
+def _subscription_rank(sub: Dict[str, Any]) -> tuple:
+    """Rank subscriptions so stale/free rows cannot override the latest paid plan."""
+    return (
+        1 if _subscription_is_active_now(sub) else 0,
+        1 if _has_paid_plan(sub) else 0,
+        _sort_dt(sub.get("updated_at")),
+        _sort_dt(sub.get("created_at")),
+        _sort_dt(sub.get("expires_at") or sub.get("current_period_end") or sub.get("grace_until")),
+    )
+
+
+def _get_subscription_row(account_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    account_id = (account_id or "").strip()
+    if not account_id:
+        return None, {
+            "ok": False,
+            "error": "account_id_required",
+            "root_cause": "missing_account_id",
+            "fix": "Pass canonical account_id to the subscription guard.",
+        }
+
+    try:
+        query = (
+            _sb()
+            .table("user_subscriptions")
+            .select("*")
+            .eq("account_id", account_id)
+        )
+        try:
+            query = query.order("updated_at", desc=True)
+        except Exception:
+            pass
+        res = query.limit(50).execute()
+        rows = [_normalize_sub_row(row or {}) for row in (getattr(res, "data", None) or [])]
+        if not rows:
+            return None, None
+
+        ranked = sorted(rows, key=_subscription_rank, reverse=True)
+        for row in ranked:
+            if _has_paid_plan(row) and _subscription_is_active_now(row):
+                return row, None
+
+        return ranked[0], None
+    except Exception as e:
+        return None, {
+            "ok": False,
+            "error": "subscription_lookup_failed",
+            "root_cause": f"{type(e).__name__}: {_clip(e)}",
+            "fix": "Check user_subscriptions table access and Supabase connectivity.",
+            "details": {"account_id": account_id},
+        }
 
 
 def _build_access(sub: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -167,7 +196,7 @@ def _build_access(sub: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     allowed = False
     reason = "inactive_subscription"
 
-    if is_active and (status == "active" or not status):
+    if is_active and (status == "active" or status == "paid" or not status):
         if expires_at is None or now < expires_at:
             allowed = True
             reason = "active"
