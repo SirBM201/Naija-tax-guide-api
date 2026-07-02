@@ -314,6 +314,31 @@ def create_app() -> Flask:
             }
         )
 
+    try:
+        from app.services.answer_metadata_patch import apply_answer_metadata_patch
+
+        apply_answer_metadata_patch()
+        boot["registered"].append(
+            {
+                "module": "app.services.answer_metadata_patch",
+                "attr": "apply_answer_metadata_patch",
+                "alias_name": "answer_metadata_patch",
+                "url_prefix": None,
+                "required": False,
+            }
+        )
+    except Exception as e:
+        boot["failed"].append(
+            {
+                "module": "app.services.answer_metadata_patch",
+                "attr": "apply_answer_metadata_patch",
+                "alias_name": "answer_metadata_patch",
+                "url_prefix": None,
+                "required": False,
+                "error": repr(e),
+            }
+        )
+
     # ============================================================
     # OPTIONAL BLUEPRINTS (WON'T CRASH IF MISSING)
     # ============================================================
@@ -328,6 +353,7 @@ def create_app() -> Flask:
         "app.routes.referral_hub",
         "app.routes.promo",
         "app.routes.channel_promo",
+        "app.routes.expert_review",
     ]
 
     for dotted in optional_modules:
@@ -417,32 +443,5 @@ def create_app() -> Flask:
     @app.route(f"{api_prefix}/<path:_any>", methods=["OPTIONS"])
     def _api_preflight(_any: str):
         return ("", 204)
-
-    # ============================================================
-    # GLOBAL ERROR HANDLER
-    # ============================================================
-    @app.errorhandler(Exception)
-    def _handle_any_error(e: Exception):
-        status = getattr(e, "code", 500)
-        msg = str(e) or type(e).__name__
-
-        out: Dict[str, Any] = {
-            "ok": False,
-            "request_id": _rid(),
-            "error": type(e).__name__,
-            "message": msg[:800],
-        }
-
-        if _debug_enabled():
-            import traceback as _tb
-
-            out["debug"] = {
-                "path": request.path,
-                "method": request.method,
-                "content_type": request.content_type,
-            }
-            out["traceback"] = _tb.format_exc(limit=60)
-
-        return jsonify(out), status
 
     return app
