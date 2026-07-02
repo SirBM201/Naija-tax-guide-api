@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import logging
+import os
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from flask import Blueprint, jsonify, request
@@ -16,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 bp = Blueprint("expert_review", __name__)
 
-EXPERT_REVIEW_ROUTE_VERSION = "2026-07-03-v1-ticket-workflow"
+EXPERT_REVIEW_ROUTE_VERSION = "2026-07-03-v2-admin-evidence-compatible-category"
 
 EXPERT_REVIEW_PACKAGES: list[dict[str, Any]] = [
     {
@@ -33,15 +34,14 @@ EXPERT_REVIEW_PACKAGES: list[dict[str, Any]] = [
     },
     {
         "code": "notice_review",
-        "name": "Tax Notice / Penalty Review",
+        "name": "Tax Notice Review",
         "status": "request_only",
         "price_note": "Quoted after scope review; not an instant AI service.",
-        "sla_note": "Urgent notices should be handled with a qualified professional immediately.",
+        "sla_note": "Urgent official matters should be handled with a qualified professional immediately.",
         "best_for": [
-            "Audit letters",
-            "Official assessments",
-            "Penalty notices",
-            "Objections or appeal preparation",
+            "Official letters or assessments",
+            "Formal response preparation",
+            "Document and fact review",
         ],
     },
     {
@@ -53,7 +53,6 @@ EXPERT_REVIEW_PACKAGES: list[dict[str, Any]] = [
         "best_for": [
             "Company tax filing questions",
             "VAT/WHT/PAYE filing readiness",
-            "Back-duty exposure",
             "High-value filing decisions",
         ],
     },
@@ -93,7 +92,7 @@ def _auth_account_id() -> Tuple[Optional[str], Dict[str, Any]]:
 
 def _schema_error(exc: Exception) -> bool:
     text = str(exc).lower()
-    return any(token in text for token in ("column", "schema cache", "pgrst204", "does not exist", "could not find"))
+    return any(token in text for token in ("column", "schema cache", "pgrst204", "does not exist", "could not find", "check constraint"))
 
 
 def _safe_insert(table: str, payloads: List[Dict[str, Any]]):
@@ -111,6 +110,40 @@ def _safe_insert(table: str, payloads: List[Dict[str, Any]]):
     if last_error:
         raise last_error
     raise RuntimeError(f"No payload supplied for {table}")
+
+
+def _expected_admin_key() -> str:
+    return (
+        os.getenv("ADMIN_API_KEY")
+        or os.getenv("INTERNAL_ADMIN_API_KEY")
+        or os.getenv("ADMIN_KEY")
+        or os.getenv("REFERRAL_ADMIN_API_KEY")
+        or ""
+    ).strip()
+
+
+def _supplied_admin_key() -> str:
+    header_key = (request.headers.get("X-Admin-Key") or "").strip()
+    if header_key:
+        return header_key
+    auth_header = (request.headers.get("Authorization") or "").strip()
+    if auth_header.lower().startswith("bearer "):
+        return auth_header[7:].strip()
+    query_key = (request.args.get("admin_key") or "").strip()
+    if query_key:
+        return query_key
+    body = request.get_json(silent=True) or {}
+    return str(body.get("admin_key") or "").strip() if isinstance(body, dict) else ""
+
+
+def _require_admin() -> Optional[Tuple[Any, int]]:
+    expected = _expected_admin_key()
+    supplied = _supplied_admin_key()
+    if not expected:
+        return jsonify({"ok": False, "error": "admin_key_not_configured"}), 500
+    if not supplied or supplied != expected:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    return None
 
 
 def _risk_priority(question: str, user_priority: str = "") -> str:
@@ -135,6 +168,80 @@ def _subject_from_body(body: Dict[str, Any], question: str) -> str:
     return "Professional review request"
 
 
+def _rows(resp: Any) -> list[dict[str, Any]]:
+    data = getattr(resp, "data", None) or []
+    if isinstance(data, list):
+        return [row for row in data if isinstance(row, dict)]
+    if isinstance(data, dict):
+        return [data]
+    return []
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value or 0)
+    except Exception:
+        return default
+
+
+def _parse_dt(value: Any) -> Optional[datetime]:
+    raw = _clean(value)
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _answer_coverage(table: str, limit: int = 1000, stale_days: int = 180) -> dict[str, Any]:
+    rows = _rows(_sb().table(table).select("*").limit(limit).execute())
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max(1, stale_days))
+    total = len(rows)
+    missing_source_category = 0
+    missing_review_date = 0
+    high_risk = 0
+    stale_review = 0
+    sample_missing: list[dict[str, Any]] = []
+
+    for row in rows:
+        source_category = _clean(row.get("source_category") or row.get("source_category_code") or row.get("source_type"))
+        reviewed_at = _parse_dt(row.get("last_reviewed_at") or row.get("reviewed_at") or row.get("updated_at"))
+        risk = _clean(row.get("risk_level") or row.get("answer_risk") or "medium").lower()
+
+        if not source_category:
+            missing_source_category += 1
+        if not reviewed_at:
+            missing_review_date += 1
+        elif reviewed_at < cutoff:
+            stale_review += 1
+        if risk == "high":
+            high_risk += 1
+        if (not source_category or not reviewed_at) and len(sample_missing) < 10:
+            sample_missing.append(
+                {
+                    "id": row.get("id"),
+                    "question": _clip(row.get("question") or row.get("normalized_question") or row.get("canonical_key"), 160),
+                    "source_category": source_category or None,
+                    "last_reviewed_at": row.get("last_reviewed_at") or row.get("reviewed_at") or None,
+                    "risk_level": risk,
+                }
+            )
+
+    return {
+        "table": table,
+        "sampled_rows": total,
+        "missing_source_category": missing_source_category,
+        "missing_review_date": missing_review_date,
+        "stale_review": stale_review,
+        "high_risk": high_risk,
+        "sample_missing": sample_missing,
+    }
+
+
 @bp.get("/expert-review/health")
 def expert_review_health():
     return jsonify(
@@ -146,6 +253,8 @@ def expert_review_health():
                 "GET /expert-review/health",
                 "GET /expert-review/packages",
                 "POST /expert-review/request",
+                "GET /expert-review/admin/queue",
+                "GET /expert-review/admin/source-coverage",
             ],
             "note": "Creates a tracked request for human/professional review triage; it is not instant professional representation.",
         }
@@ -205,12 +314,13 @@ def expert_review_request():
         context_lines.extend(["", f"Payment/reference: {_clean(body.get('payment_reference'))}"])
     message = "\n".join(context_lines).strip()
 
+    compatible_category = "general"
     ticket_payloads = [
         {
             "ticket_id": ticket_id,
             "account_id": account_id,
             "subject": subject,
-            "category": "professional_review",
+            "category": compatible_category,
             "priority": priority,
             "status": "open",
             "channel": "web",
@@ -225,7 +335,7 @@ def expert_review_request():
             "ticket_id": ticket_id,
             "account_id": account_id,
             "subject": subject,
-            "category": "professional_review",
+            "category": compatible_category,
             "priority": priority,
             "status": "open",
             "last_message_preview": _clip(message.replace("\n", " "), 200),
@@ -236,7 +346,7 @@ def expert_review_request():
             "ticket_id": ticket_id,
             "account_id": account_id,
             "subject": subject,
-            "category": "professional_review",
+            "category": compatible_category,
             "status": "open",
             "created_at": now,
             "updated_at": now,
@@ -291,6 +401,7 @@ def expert_review_request():
                 "ticket_id": ticket_id,
                 "ticket": ticket,
                 "category": "professional_review",
+                "stored_category": compatible_category,
                 "priority": priority,
                 "package_code": package_code,
                 "safety_route": route,
@@ -301,3 +412,50 @@ def expert_review_request():
     except Exception as exc:
         logger.exception("Expert review request failed")
         return jsonify({"ok": False, "error": "expert_review_request_failed", "detail": str(exc)}), 500
+
+
+@bp.get("/expert-review/admin/queue")
+def admin_expert_review_queue():
+    auth_error = _require_admin()
+    if auth_error:
+        return auth_error
+
+    limit = max(1, min(_safe_int(request.args.get("limit"), 100), 500))
+    rows = _rows(
+        _sb().table("support_tickets")
+        .select("*")
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+
+    filtered = []
+    for row in rows:
+        haystack = " ".join([_clean(row.get("subject")), _clean(row.get("message")), _clean(row.get("last_message_preview"))]).lower()
+        if "professional review" in haystack or str(row.get("ticket_id") or "").startswith("NTR-"):
+            filtered.append(row)
+
+    return jsonify({"ok": True, "count": len(filtered), "rows": filtered}), 200
+
+
+@bp.get("/expert-review/admin/source-coverage")
+def admin_source_coverage():
+    auth_error = _require_admin()
+    if auth_error:
+        return auth_error
+
+    limit = max(1, min(_safe_int(request.args.get("limit"), 1000), 5000))
+    stale_days = max(1, min(_safe_int(request.args.get("stale_days"), 180), 2000))
+    tables = [_clean(item) for item in (request.args.get("tables") or "qa_library,qa_cache,qa_history").split(",") if _clean(item)]
+    allowed = {"qa_library", "qa_cache", "qa_history"}
+
+    coverage = []
+    for table in tables:
+        if table not in allowed:
+            continue
+        try:
+            coverage.append(_answer_coverage(table, limit=limit, stale_days=stale_days))
+        except Exception as exc:
+            coverage.append({"table": table, "ok": False, "error": f"{type(exc).__name__}: {_clip(exc)}"})
+
+    return jsonify({"ok": True, "coverage": coverage, "limit": limit, "stale_days": stale_days}), 200
