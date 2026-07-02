@@ -1,4 +1,12 @@
-from app.services.ai_service import GUIDANCE_NOTE, classify_tax_safety_risk, ensure_guidance_note
+from app.services.ai_service import (
+    GUIDANCE_NOTE,
+    SOURCE_FRESHNESS_NOTE,
+    classify_source_sensitivity,
+    classify_tax_safety_risk,
+    ensure_guidance_note,
+    ensure_source_freshness_note,
+    finalize_tax_answer,
+)
 
 
 def assert_equal(actual, expected, label):
@@ -22,6 +30,29 @@ def main():
 
     existing = ensure_guidance_note(f"Direct answer: Check your notice.\n\n{GUIDANCE_NOTE}")
     assert_equal(existing.count("Guidance note:"), 1, "duplicate guidance note check")
+
+    sensitive_question = "What is the VAT registration threshold and filing deadline?"
+    assert_equal(
+        classify_source_sensitivity(sensitive_question),
+        "source_sensitive",
+        "source sensitivity classification",
+    )
+
+    sensitive_answer = ensure_source_freshness_note(
+        "Direct answer: VAT rules depend on your activity and current law.",
+        sensitive_question,
+    )
+    if SOURCE_FRESHNESS_NOTE not in sensitive_answer:
+        raise AssertionError("source/freshness note was not appended for sensitive question")
+
+    final_answer = finalize_tax_answer(
+        "Direct answer: WHT rates depend on the transaction type.",
+        "What is the withholding tax rate for professional services?",
+    )
+    if GUIDANCE_NOTE not in final_answer:
+        raise AssertionError("final answer missing guidance note")
+    if SOURCE_FRESHNESS_NOTE not in final_answer:
+        raise AssertionError("final answer missing source/freshness note")
 
     print("AI safety policy checks passed")
 
