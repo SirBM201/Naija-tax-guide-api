@@ -19,7 +19,27 @@ NTG_ACCOUNT_ID=<account_id> python scripts/check_channel_plan_consistency.py
 
 These scripts do not require OpenAI or Paystack calls. The channel plan consistency script requires Supabase admin credentials and a real account ID.
 
-## 2. Confirm health endpoints
+## 2. Apply metadata migration before expecting stored metadata
+
+Run the Supabase migration:
+
+```bash
+supabase/migrations/20260703_answer_source_metadata.sql
+```
+
+Then dry-run the backfill:
+
+```bash
+DRY_RUN=1 LIMIT=500 TABLES=qa_library,qa_cache python scripts/backfill_answer_source_metadata.py
+```
+
+Apply when satisfied:
+
+```bash
+DRY_RUN=0 LIMIT=500 TABLES=qa_library,qa_cache python scripts/backfill_answer_source_metadata.py
+```
+
+## 3. Confirm health endpoints
 
 Check:
 
@@ -37,7 +57,7 @@ Expected:
 - A paid account must not show `plan_code=free` in workspace limits.
 - Expert review packages should return `triage`, `notice_review`, and `filing_review`.
 
-## 3. Confirm subscription-row selection in logs
+## 4. Confirm subscription-row selection
 
 For paid users with older free rows in `user_subscriptions`, backend code must select the latest active paid subscription.
 
@@ -48,13 +68,7 @@ Expected Supabase pattern for core subscription guard:
 - ordered lookup where possible: `order=updated_at.desc`
 - enough rows to rank locally, not only the first unordered row
 
-Why this matters:
-
-An unordered `.limit(1)` query can return an old Free row even when a paid subscription exists. That causes Dashboard, Channels, Workspace, sidebar badges, and other workspace-limit consumers to show Free after successful Paystack payment.
-
-## 4. Payment activation retest
-
-Use a safe test payment path or a low-risk live checkout.
+## 5. Payment activation retest
 
 Expected flow:
 
@@ -64,14 +78,9 @@ Expected flow:
 4. `/api/billing/me` shows the paid plan.
 5. `/api/workspace/limits` shows the same paid plan and paid limits.
 
-## 5. Source metadata and AI safety retest
+## 6. Source metadata and AI safety retest
 
-Ask these as a logged-in paid user through web Ask, then repeat at least one through WhatsApp and Telegram:
-
-- A simple PAYE question.
-- A VAT filing deadline question.
-- A question involving an official tax document, notice, assessment, or penalty.
-- A question involving a rate, threshold, due date, portal, or filing procedure.
+Use logged-in Ask on web, then repeat at least one question through WhatsApp and Telegram.
 
 Expected:
 
@@ -79,9 +88,9 @@ Expected:
 - Source-sensitive answers include a source/freshness note.
 - Successful answers include `Source details:` in the rendered answer text.
 - API response `meta.source_metadata` should be present on successful Ask answers.
-- High-risk cases should recommend professional review or a qualified tax professional.
+- Sensitive cases should recommend professional review or a qualified professional.
 
-## 6. Expert review workflow retest
+## 7. Expert review workflow retest
 
 While logged in, test:
 
@@ -92,10 +101,33 @@ While logged in, test:
 Expected:
 
 - A professional-review request creates a tracked support ticket.
-- The ticket category should be `professional_review` where the live table supports it.
+- The ticket stores a schema-compatible support category while the subject/message preserve professional-review routing.
 - The user should receive a ticket ID and can track the request from Support.
 
-## 7. WhatsApp and Telegram state retest
+## 8. Admin evidence checks
+
+Requires backend admin key through `X-Admin-Key`.
+
+Check:
+
+```bash
+curl -H "X-Admin-Key: <admin_key>" "https://<api-host>/api/expert-review/admin/queue?limit=100"
+curl -H "X-Admin-Key: <admin_key>" "https://<api-host>/api/expert-review/admin/source-coverage?limit=1000&stale_days=180"
+```
+
+Frontend admin page:
+
+```text
+/admin/expert-review
+```
+
+Expected:
+
+- Queue endpoint returns professional-review requests.
+- Coverage endpoint returns source metadata coverage for `qa_library`, `qa_cache`, and `qa_history`.
+- Frontend admin page can load both after entering the admin key.
+
+## 9. WhatsApp and Telegram state retest
 
 After a successful plan activation:
 
@@ -105,7 +137,7 @@ After a successful plan activation:
 - Subscription payment should activate or extend the plan according to billing rules.
 - Ask answers through both channels should include guidance and source/freshness language where relevant.
 
-## 8. Stable deployment criteria
+## 10. Stable deployment criteria
 
 A backend deployment is stable when:
 
@@ -116,3 +148,4 @@ A backend deployment is stable when:
 - Web, WhatsApp, and Telegram do not contradict billing state.
 - Source metadata appears in successful Ask answers.
 - Expert review request creation works and creates a trackable ticket.
+- Admin evidence endpoints work with the backend admin key.
