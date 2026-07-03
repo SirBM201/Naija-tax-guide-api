@@ -1,6 +1,12 @@
 import os
+import sys
 from datetime import datetime, timezone
+from pathlib import Path
 from pprint import pprint
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
 from app.core.supabase_client import get_supabase_client
 from app.services.answer_metadata_service import build_source_metadata
