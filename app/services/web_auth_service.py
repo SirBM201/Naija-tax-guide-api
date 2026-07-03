@@ -34,7 +34,10 @@ BEARER_FALLBACK_TO_COOKIE = str(__import__("os").getenv("WEB_BEARER_FALLBACK_TO_
     "1", "true", "yes", "y", "on"
 }
 
-SESSION_ROTATE_AFTER_MINUTES = int((__import__("os").getenv("WEB_SESSION_ROTATE_AFTER_MINUTES", "30") or "30"))
+# Keep automatic rotation disabled until authenticated responses can send the
+# replacement cookie/token back to the browser. Otherwise a normal page load can
+# revoke the active cookie and make the next POST return 401.
+SESSION_ROTATE_AFTER_MINUTES = int((__import__("os").getenv("WEB_SESSION_ROTATE_AFTER_MINUTES", "0") or "0"))
 SESSION_FINGERPRINT_MODE = ((__import__("os").getenv("WEB_SESSION_FINGERPRINT_MODE", "soft") or "soft").strip().lower())
 # off | soft | strict
 
