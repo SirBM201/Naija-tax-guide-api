@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request, session
 
 from app.core.supabase_client import get_supabase_client
 from app.services.ai_service import classify_tax_safety_risk, classify_source_sensitivity
@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 bp = Blueprint("expert_review", __name__)
 
-EXPERT_REVIEW_ROUTE_VERSION = "2026-07-03-v2-admin-evidence-compatible-category"
+EXPERT_REVIEW_ROUTE_VERSION = "2026-07-03-v3-web-session-compatible"
 
 EXPERT_REVIEW_PACKAGES: list[dict[str, Any]] = [
     {
@@ -86,6 +86,10 @@ def _json_error(message: str, status: int = 400, **extra: Any):
 
 
 def _auth_account_id() -> Tuple[Optional[str], Dict[str, Any]]:
+    session_account_id = str(session.get("account_id") or session.get("user_id") or "").strip()
+    if session_account_id:
+        return session_account_id, {"ok": True, "token_source": "flask_session"}
+
     account_id, auth_debug = get_account_id_from_request(request)
     return account_id, (auth_debug or {})
 
