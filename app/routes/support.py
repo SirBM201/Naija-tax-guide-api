@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 bp = Blueprint("support", __name__)
 
-SUPPORT_ROUTE_VERSION = "2026-07-04-v3-web-session-compatible"
+SUPPORT_ROUTE_VERSION = "2026-07-04-v4-ticket-message-fk"
 
 
 def _sb():
@@ -185,7 +185,7 @@ def _rows(resp: Any) -> list[dict[str, Any]]:
 
 def _public_ticket(ticket: Dict[str, Any]) -> Dict[str, Any]:
     public = dict(ticket or {})
-    public["ticket_id"] = public.get("ticket_id") or str(public.get("id") or "")
+    public["ticket_id"] = public.get("ticket_id") or str(public.get("id") or public.get("support_ticket_id") or "")
     public["status"] = public.get("status") or "open"
     public["category"] = public.get("category") or "general"
     public["priority"] = public.get("priority") or "normal"
@@ -217,10 +217,40 @@ def _load_ticket_for_account(ticket_id: str, account_id: str) -> Optional[Dict[s
     return rows[0] if rows else None
 
 
+def _ticket_message_fk(ticket: Dict[str, Any], ticket_id: str, account_id: str) -> Optional[Any]:
+    for key in ("support_ticket_id", "id", "ticket_pk", "pk"):
+        value = ticket.get(key)
+        if value is not None and str(value).strip():
+            return value
+
+    for column in ("support_ticket_id", "id"):
+        try:
+            result = (
+                _sb()
+                .table("support_tickets")
+                .select(column)
+                .eq("ticket_id", ticket_id)
+                .eq("account_id", account_id)
+                .limit(1)
+                .execute()
+            )
+            rows = _rows(result)
+            if rows and rows[0].get(column) is not None:
+                return rows[0].get(column)
+        except Exception as exc:
+            if not _schema_error(exc):
+                raise
+            logger.warning("Support ticket FK lookup via %s failed: %s", column, exc)
+    return None
+
+
 def _ticket_update_key(ticket: Dict[str, Any], ticket_id: str) -> Tuple[str, Any]:
     ticket_pk = ticket.get("id")
     if ticket_pk is not None:
         return "id", ticket_pk
+    support_ticket_id = ticket.get("support_ticket_id")
+    if support_ticket_id is not None:
+        return "support_ticket_id", support_ticket_id
     return "ticket_id", ticket_id
 
 
@@ -286,7 +316,7 @@ def get_ticket(ticket_id: str):
             return jsonify({"ok": False, "error": "ticket_not_found"}), 404
 
         ticket = _public_ticket(raw_ticket)
-        ticket_pk = ticket.get("id")
+        ticket_pk = _ticket_message_fk(raw_ticket, ticket_id, account_id)
         messages: List[Dict[str, Any]] = []
 
         try:
@@ -396,33 +426,30 @@ def submit_support():
         if not rows:
             return jsonify({"ok": False, "error": "failed_to_create_ticket"}), 500
 
-        ticket = _public_ticket(rows[0])
-        ticket_pk = ticket.get("id")
-        message_payloads: List[Dict[str, Any]] = []
+        raw_ticket = rows[0]
+        ticket = _public_ticket(raw_ticket)
+        ticket_pk = _ticket_message_fk(raw_ticket, new_ticket_id, account_id)
         if ticket_pk is not None:
-            message_payloads.append(
-                {
-                    "support_ticket_id": ticket_pk,
-                    "ticket_id": new_ticket_id,
-                    "account_id": account_id,
-                    "message": message,
-                    "sender_type": "user",
-                    "sender_name": full_name or None,
-                    "is_staff": False,
-                    "is_internal_note": False,
-                    "created_at": now,
-                }
-            )
-        message_payloads.extend(
-            [
-                {"ticket_id": new_ticket_id, "account_id": account_id, "message": message, "sender_type": "user", "is_internal_note": False, "created_at": now},
-                {"ticket_id": new_ticket_id, "account_id": account_id, "message": message, "created_at": now},
-            ]
-        )
-        try:
-            _safe_insert("support_ticket_messages", message_payloads)
-        except Exception as msg_exc:
-            logger.warning("Support message insert failed after ticket creation: %s", msg_exc)
+            try:
+                _safe_insert(
+                    "support_ticket_messages",
+                    [
+                        {
+                            "support_ticket_id": ticket_pk,
+                            "ticket_id": new_ticket_id,
+                            "account_id": account_id,
+                            "message": message,
+                            "sender_type": "user",
+                            "sender_name": full_name or None,
+                            "is_internal_note": False,
+                            "created_at": now,
+                        }
+                    ],
+                )
+            except Exception as msg_exc:
+                logger.warning("Support message insert failed after ticket creation: %s", msg_exc)
+        else:
+            logger.warning("Support message insert skipped: missing ticket FK for %s", new_ticket_id)
 
         support_email = _support_to_email()
         if support_email:
@@ -484,12 +511,25 @@ def reply_ticket(ticket_id: str):
         if not ticket:
             return jsonify({"ok": False, "error": "ticket_not_found"}), 404
 
-        ticket_pk = ticket.get("id")
         now = _now()
         preview = _message_preview(message)
-        message_payloads: List[Dict[str, Any]] = []
-        if ticket_pk is not None:
-            message_payloads.append(
+        ticket_pk = _ticket_message_fk(ticket, ticket_id, account_id)
+        if ticket_pk is None:
+            logger.warning("Support reply message insert skipped: missing ticket FK for %s", ticket_id)
+            _safe_update(
+                "support_tickets",
+                _ticket_update_key(ticket, ticket_id),
+                [
+                    {"status": "open", "updated_at": now, "last_message_preview": preview, "last_reply_at": now, "last_reply_by": "user"},
+                    {"status": "open", "updated_at": now, "last_message_preview": preview},
+                    {"status": "open", "updated_at": now},
+                ],
+            )
+            return jsonify({"ok": True, "message": "Reply noted on ticket", "ticket_id": ticket_id, "message_saved": False}), 200
+
+        _safe_insert(
+            "support_ticket_messages",
+            [
                 {
                     "support_ticket_id": ticket_pk,
                     "ticket_id": ticket_id,
@@ -497,18 +537,11 @@ def reply_ticket(ticket_id: str):
                     "message": message,
                     "sender_type": "user",
                     "sender_name": sender_name or None,
-                    "is_staff": False,
                     "is_internal_note": False,
                     "created_at": now,
                 }
-            )
-        message_payloads.extend(
-            [
-                {"ticket_id": ticket_id, "account_id": account_id, "message": message, "sender_type": "user", "is_internal_note": False, "created_at": now},
-                {"ticket_id": ticket_id, "account_id": account_id, "message": message, "created_at": now},
-            ]
+            ],
         )
-        _safe_insert("support_ticket_messages", message_payloads)
         _safe_update(
             "support_tickets",
             _ticket_update_key(ticket, ticket_id),
@@ -518,7 +551,7 @@ def reply_ticket(ticket_id: str):
                 {"status": "open", "updated_at": now},
             ],
         )
-        return jsonify({"ok": True, "message": "Reply added successfully", "ticket_id": ticket_id}), 200
+        return jsonify({"ok": True, "message": "Reply added successfully", "ticket_id": ticket_id, "message_saved": True}), 200
     except Exception as exc:
         logger.exception("Reply ticket error")
         return jsonify({"ok": False, "error": "support_reply_failed", "detail": str(exc)}), 500
