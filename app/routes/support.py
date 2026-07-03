@@ -8,7 +8,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request, session
 
 from app.core.supabase_client import get_supabase_client
 from app.services.mail_service import send_email
@@ -18,22 +18,10 @@ logger = logging.getLogger(__name__)
 
 bp = Blueprint("support", __name__)
 
-SUPPORT_ROUTE_VERSION = "2026-05-23-v2-web-support-schema-safe"
-
-
-# ============================================================
-# Helpers
-# ============================================================
+SUPPORT_ROUTE_VERSION = "2026-07-04-v3-web-session-compatible"
 
 
 def _sb():
-    """
-    Return the backend Supabase admin client.
-
-    The current backend exports Supabase clients as objects. Using the canonical
-    getter avoids the old error:
-        'SyncClient' object is not callable
-    """
     return get_supabase_client(admin=True)
 
 
@@ -62,32 +50,33 @@ def _support_to_email() -> str:
 
 
 def _clean_text(value: Any, default: str = "") -> str:
-    if value is None:
-        return default
-    text = str(value).strip()
+    text = str(value or "").strip()
     return text if text else default
 
 
 def _clean_short(value: Any, default: str = "", limit: int = 250) -> str:
-    text = _clean_text(value, default)
-    return text[:limit]
+    return _clean_text(value, default)[:limit]
+
+
+def _clip(value: Any, limit: int = 800) -> str:
+    text = str(value or "")
+    return text if len(text) <= limit else text[:limit] + "...<truncated>"
 
 
 def _json_error(message: str, status: int = 400, **extra: Any):
-    payload = {"ok": False, "error": message, **extra}
-    return jsonify(payload), status
+    return jsonify({"ok": False, "error": message, **extra}), status
 
 
 def _auth_account_id() -> Tuple[Optional[str], Dict[str, Any]]:
+    session_account_id = _clean_text(session.get("account_id") or session.get("user_id"))
+    if session_account_id:
+        return session_account_id, {"ok": True, "token_source": "flask_session"}
+
     account_id, auth_debug = get_account_id_from_request(request)
     return account_id, (auth_debug or {})
 
 
-def _is_schema_shape_error(exc: Exception) -> bool:
-    """
-    Detect common Supabase/PostgREST schema-shape errors so we can fall back to
-    smaller payloads when live tables do not yet have every optional column.
-    """
+def _schema_error(exc: Exception) -> bool:
     text = str(exc).lower()
     return any(
         token in text
@@ -100,40 +89,23 @@ def _is_schema_shape_error(exc: Exception) -> bool:
             "pgrst205",
             "relation",
             "table",
-        )
-    ) and any(
-        token in text
-        for token in (
-            "does not exist",
-            "could not find",
-            "schema cache",
-            "pgrst204",
-            "pgrst205",
-            "not found",
+            "check constraint",
         )
     )
 
 
 def _safe_insert(table: str, payloads: List[Dict[str, Any]]):
-    """
-    Insert using the richest payload first, then progressively smaller payloads.
-
-    This keeps the support route resilient if the live Supabase table has fewer
-    columns than the frontend expects.
-    """
     last_error: Optional[Exception] = None
-
     for payload in payloads:
         clean_payload = {k: v for k, v in payload.items() if v is not None}
         try:
             return _sb().table(table).insert(clean_payload).execute()
         except Exception as exc:
             last_error = exc
-            if _is_schema_shape_error(exc):
-                logger.warning("Insert fallback for %s after schema error: %s", table, exc)
+            if _schema_error(exc):
+                logger.warning("Support insert fallback for %s: %s", table, exc)
                 continue
             raise
-
     if last_error:
         raise last_error
     raise RuntimeError(f"No insert payload supplied for table {table}")
@@ -142,18 +114,16 @@ def _safe_insert(table: str, payloads: List[Dict[str, Any]]):
 def _safe_update(table: str, where: Tuple[str, Any], payloads: List[Dict[str, Any]]):
     last_error: Optional[Exception] = None
     column, value = where
-
     for payload in payloads:
         clean_payload = {k: v for k, v in payload.items() if v is not None}
         try:
             return _sb().table(table).update(clean_payload).eq(column, value).execute()
         except Exception as exc:
             last_error = exc
-            if _is_schema_shape_error(exc):
-                logger.warning("Update fallback for %s after schema error: %s", table, exc)
+            if _schema_error(exc):
+                logger.warning("Support update fallback for %s: %s", table, exc)
                 continue
             raise
-
     if last_error:
         raise last_error
     raise RuntimeError(f"No update payload supplied for table {table}")
@@ -184,6 +154,7 @@ def _normalize_category(value: Any) -> str:
         "login issue": "login",
         "technical issue": "technical",
         "bug": "technical",
+        "professional_review": "general",
     }
     raw = aliases.get(raw, raw)
     allowed = {"general", "billing", "credits", "channels", "login", "technical"}
@@ -203,30 +174,29 @@ def _message_preview(message: str) -> str:
     return compact[:200]
 
 
+def _rows(resp: Any) -> list[dict[str, Any]]:
+    data = getattr(resp, "data", None) or []
+    if isinstance(data, list):
+        return [row for row in data if isinstance(row, dict)]
+    if isinstance(data, dict):
+        return [data]
+    return []
+
+
 def _public_ticket(ticket: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Return ticket fields in a frontend-friendly shape.
-    """
     public = dict(ticket or {})
     public["ticket_id"] = public.get("ticket_id") or str(public.get("id") or "")
     public["status"] = public.get("status") or "open"
     public["category"] = public.get("category") or "general"
     public["priority"] = public.get("priority") or "normal"
     public["subject"] = public.get("subject") or "Support request"
-    public["last_message_preview"] = (
-        public.get("last_message_preview")
-        or public.get("message")
-        or None
-    )
+    public["last_message_preview"] = public.get("last_message_preview") or public.get("message") or None
     return public
 
 
 def _public_message(message: Dict[str, Any], ticket_id: str) -> Dict[str, Any]:
     public = dict(message or {})
-    sender_type = public.get("sender_type")
-    if not sender_type:
-        sender_type = "admin" if public.get("is_staff") else "user"
-
+    sender_type = public.get("sender_type") or ("admin" if public.get("is_staff") else "user")
     public["ticket_id"] = public.get("ticket_id") or ticket_id
     public["sender_type"] = sender_type
     public["message"] = public.get("message") or ""
@@ -243,9 +213,8 @@ def _load_ticket_for_account(ticket_id: str, account_id: str) -> Optional[Dict[s
         .limit(1)
         .execute()
     )
-    if not result.data:
-        return None
-    return result.data[0]
+    rows = _rows(result)
+    return rows[0] if rows else None
 
 
 def _ticket_update_key(ticket: Dict[str, Any], ticket_id: str) -> Tuple[str, Any]:
@@ -255,24 +224,15 @@ def _ticket_update_key(ticket: Dict[str, Any], ticket_id: str) -> Tuple[str, Any
     return "ticket_id", ticket_id
 
 
-# ============================================================
-# Routes
-# ============================================================
-
-
 @bp.get("/support/health")
 def support_health():
-    to_email = _support_to_email()
     return jsonify(
         {
             "ok": True,
-            "route_group": "support",
             "service": "support",
             "version": SUPPORT_ROUTE_VERSION,
-            "mail_ready": bool(to_email),
-            "support_to_email": to_email or None,
-            "auth_resolver": "web_auth_service.get_account_id_from_request",
-            "supabase_client": "get_supabase_client(admin=True)",
+            "mail_ready": bool(_support_to_email()),
+            "auth_resolver": "flask_session_then_web_token",
             "endpoints": [
                 "GET /support/health",
                 "GET /support/stats",
@@ -292,9 +252,7 @@ def list_tickets():
     if not account_id:
         return jsonify({"ok": False, "error": "unauthorized", "debug": auth_debug}), 401
 
-    limit = request.args.get("limit", 50, type=int) or 50
-    limit = max(1, min(limit, 100))
-
+    limit = max(1, min(request.args.get("limit", 50, type=int) or 50, 100))
     try:
         result = (
             _sb()
@@ -305,16 +263,8 @@ def list_tickets():
             .limit(limit)
             .execute()
         )
-
-        tickets = [_public_ticket(row) for row in (result.data or [])]
-        return jsonify(
-            {
-                "ok": True,
-                "tickets": tickets,
-                "count": len(tickets),
-                "account_id": account_id,
-            }
-        ), 200
+        tickets = [_public_ticket(row) for row in _rows(result)]
+        return jsonify({"ok": True, "tickets": tickets, "count": len(tickets), "account_id": account_id}), 200
     except Exception as exc:
         logger.exception("List tickets error")
         return jsonify({"ok": False, "error": "support_tickets_load_failed", "detail": str(exc)}), 500
@@ -337,10 +287,8 @@ def get_ticket(ticket_id: str):
 
         ticket = _public_ticket(raw_ticket)
         ticket_pk = ticket.get("id")
-
         messages: List[Dict[str, Any]] = []
 
-        # Preferred schema: messages store ticket_id and account_id.
         try:
             msg_result = (
                 _sb()
@@ -351,13 +299,12 @@ def get_ticket(ticket_id: str):
                 .order("created_at", desc=False)
                 .execute()
             )
-            messages = msg_result.data or []
+            messages = _rows(msg_result)
         except Exception as exc:
-            if not _is_schema_shape_error(exc):
+            if not _schema_error(exc):
                 raise
             logger.warning("ticket_id message lookup fallback: %s", exc)
 
-        # Fallback schema: messages store support_ticket_id.
         if not messages and ticket_pk is not None:
             try:
                 msg_result = (
@@ -368,20 +315,13 @@ def get_ticket(ticket_id: str):
                     .order("created_at", desc=False)
                     .execute()
                 )
-                messages = msg_result.data or []
+                messages = _rows(msg_result)
             except Exception as exc:
-                if not _is_schema_shape_error(exc):
+                if not _schema_error(exc):
                     raise
                 logger.warning("support_ticket_id message lookup fallback failed: %s", exc)
 
-        return jsonify(
-            {
-                "ok": True,
-                "ticket": ticket,
-                "messages": [_public_message(row, ticket_id) for row in messages],
-                "count": len(messages),
-            }
-        ), 200
+        return jsonify({"ok": True, "ticket": ticket, "messages": [_public_message(row, ticket_id) for row in messages], "count": len(messages)}), 200
     except Exception as exc:
         logger.exception("Get ticket error")
         return jsonify({"ok": False, "error": "support_ticket_load_failed", "detail": str(exc)}), 500
@@ -394,80 +334,71 @@ def submit_support():
         return jsonify({"ok": False, "error": "unauthorized", "debug": auth_debug}), 401
 
     body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        body = {}
 
     subject = _clean_short(body.get("subject"), limit=180)
     message = _clean_text(body.get("message"))
-
-    # Frontend can send issueType, older backend expected category.
     category = _normalize_category(body.get("category") or body.get("issueType") or "general")
     priority = _normalize_priority(body.get("priority") or "normal")
     channel = _clean_short(body.get("channel"), "web", limit=80)
-
     full_name = _clean_short(body.get("fullName") or body.get("name"), limit=120)
     contact_email = _clean_short(body.get("contactEmail") or body.get("email"), limit=180)
 
     if not subject or not message:
-        return jsonify({"ok": False, "error": "subject_and_message_required"}), 400
-
+        return _json_error("subject_and_message_required", 400)
     if len(message) < 10:
-        return jsonify({"ok": False, "error": "message_too_short"}), 400
+        return _json_error("message_too_short", 400)
 
     try:
         now = _now()
         new_ticket_id = _ticket_id()
         preview = _message_preview(message)
-
-        rich_ticket_payload = {
-            "ticket_id": new_ticket_id,
-            "account_id": account_id,
-            "subject": subject,
-            "category": category,
-            "priority": priority,
-            "status": "open",
-            "channel": channel,
-            "message": message,
-            "last_message_preview": preview,
-            "last_reply_at": now,
-            "last_reply_by": "user",
-            "created_at": now,
-            "updated_at": now,
-        }
-
-        mid_ticket_payload = {
-            "ticket_id": new_ticket_id,
-            "account_id": account_id,
-            "subject": subject,
-            "category": category,
-            "priority": priority,
-            "status": "open",
-            "last_message_preview": preview,
-            "created_at": now,
-            "updated_at": now,
-        }
-
-        minimal_ticket_payload = {
-            "ticket_id": new_ticket_id,
-            "account_id": account_id,
-            "subject": subject,
-            "category": category,
-            "status": "open",
-            "created_at": now,
-            "updated_at": now,
-        }
-
-        ticket_result = _safe_insert(
-            "support_tickets",
-            [rich_ticket_payload, mid_ticket_payload, minimal_ticket_payload],
-        )
-
-        if not ticket_result.data:
+        ticket_payloads = [
+            {
+                "ticket_id": new_ticket_id,
+                "account_id": account_id,
+                "subject": subject,
+                "category": category,
+                "priority": priority,
+                "status": "open",
+                "channel": channel,
+                "message": message,
+                "last_message_preview": preview,
+                "last_reply_at": now,
+                "last_reply_by": "user",
+                "created_at": now,
+                "updated_at": now,
+            },
+            {
+                "ticket_id": new_ticket_id,
+                "account_id": account_id,
+                "subject": subject,
+                "category": category,
+                "priority": priority,
+                "status": "open",
+                "last_message_preview": preview,
+                "created_at": now,
+                "updated_at": now,
+            },
+            {
+                "ticket_id": new_ticket_id,
+                "account_id": account_id,
+                "subject": subject,
+                "category": category,
+                "status": "open",
+                "created_at": now,
+                "updated_at": now,
+            },
+        ]
+        ticket_result = _safe_insert("support_tickets", ticket_payloads)
+        rows = _rows(ticket_result)
+        if not rows:
             return jsonify({"ok": False, "error": "failed_to_create_ticket"}), 500
 
-        ticket = _public_ticket(ticket_result.data[0])
+        ticket = _public_ticket(rows[0])
         ticket_pk = ticket.get("id")
-
         message_payloads: List[Dict[str, Any]] = []
-
         if ticket_pk is not None:
             message_payloads.append(
                 {
@@ -482,32 +413,15 @@ def submit_support():
                     "created_at": now,
                 }
             )
-
         message_payloads.extend(
             [
-                {
-                    "ticket_id": new_ticket_id,
-                    "account_id": account_id,
-                    "message": message,
-                    "sender_type": "user",
-                    "is_internal_note": False,
-                    "created_at": now,
-                },
-                {
-                    "ticket_id": new_ticket_id,
-                    "account_id": account_id,
-                    "message": message,
-                    "created_at": now,
-                },
+                {"ticket_id": new_ticket_id, "account_id": account_id, "message": message, "sender_type": "user", "is_internal_note": False, "created_at": now},
+                {"ticket_id": new_ticket_id, "account_id": account_id, "message": message, "created_at": now},
             ]
         )
-
         try:
             _safe_insert("support_ticket_messages", message_payloads)
         except Exception as msg_exc:
-            # Ticket creation should not be rolled back just because the message
-            # table schema is not yet aligned. The frontend still receives the
-            # created ticket and can display the ticket-level message/preview.
             logger.warning("Support message insert failed after ticket creation: %s", msg_exc)
 
         support_email = _support_to_email()
@@ -521,16 +435,10 @@ def submit_support():
                 safe_name = html.escape(full_name or "Not provided")
                 safe_email = html.escape(contact_email or "Not provided")
                 safe_message = html.escape(message).replace("\n", "<br>")
-
                 text_body = (
                     f"New support ticket from account {account_id}\n\n"
-                    f"Ticket ID: {new_ticket_id}\n"
-                    f"Subject: {subject}\n"
-                    f"Category: {category}\n"
-                    f"Priority: {priority}\n"
-                    f"Name: {full_name or 'Not provided'}\n"
-                    f"Email: {contact_email or 'Not provided'}\n\n"
-                    f"Message:\n{message}"
+                    f"Ticket ID: {new_ticket_id}\nSubject: {subject}\nCategory: {category}\nPriority: {priority}\n"
+                    f"Name: {full_name or 'Not provided'}\nEmail: {contact_email or 'Not provided'}\n\nMessage:\n{message}"
                 )
                 html_body = (
                     "<h3>New Support Ticket</h3>"
@@ -543,23 +451,11 @@ def submit_support():
                     f"<p><strong>Email:</strong> {safe_email}</p>"
                     f"<p><strong>Message:</strong></p><p>{safe_message}</p>"
                 )
-                send_email(
-                    to_email=support_email,
-                    subject=f"[Naija Tax Guide Support] {new_ticket_id}: {subject}",
-                    html_body=html_body,
-                    text_body=text_body,
-                )
+                send_email(to_email=support_email, subject=f"[Naija Tax Guide Support] {new_ticket_id}: {subject}", html_body=html_body, text_body=text_body)
             except Exception as mail_error:
                 logger.warning("Support email notification failed: %s", mail_error)
 
-        return jsonify(
-            {
-                "ok": True,
-                "message": "Support ticket created successfully",
-                "ticket_id": new_ticket_id,
-                "ticket": ticket,
-            }
-        ), 201
+        return jsonify({"ok": True, "message": "Support ticket created successfully", "ticket_id": new_ticket_id, "ticket": ticket}), 201
     except Exception as exc:
         logger.exception("Submit support error")
         return jsonify({"ok": False, "error": "support_submit_failed", "detail": str(exc)}), 500
@@ -572,15 +468,16 @@ def reply_ticket(ticket_id: str):
         return jsonify({"ok": False, "error": "unauthorized", "debug": auth_debug}), 401
 
     body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        body = {}
     message = _clean_text(body.get("message"))
     sender_name = _clean_short(body.get("senderName") or body.get("fullName"), limit=120)
-
-    if not message:
-        return jsonify({"ok": False, "error": "message_required"}), 400
-
     ticket_id = _clean_text(ticket_id)
+
     if not ticket_id:
-        return jsonify({"ok": False, "error": "ticket_id_required"}), 400
+        return _json_error("ticket_id_required", 400)
+    if not message:
+        return _json_error("message_required", 400)
 
     try:
         ticket = _load_ticket_for_account(ticket_id, account_id)
@@ -590,7 +487,6 @@ def reply_ticket(ticket_id: str):
         ticket_pk = ticket.get("id")
         now = _now()
         preview = _message_preview(message)
-
         message_payloads: List[Dict[str, Any]] = []
         if ticket_pk is not None:
             message_payloads.append(
@@ -606,56 +502,23 @@ def reply_ticket(ticket_id: str):
                     "created_at": now,
                 }
             )
-
         message_payloads.extend(
             [
-                {
-                    "ticket_id": ticket_id,
-                    "account_id": account_id,
-                    "message": message,
-                    "sender_type": "user",
-                    "is_internal_note": False,
-                    "created_at": now,
-                },
-                {
-                    "ticket_id": ticket_id,
-                    "account_id": account_id,
-                    "message": message,
-                    "created_at": now,
-                },
+                {"ticket_id": ticket_id, "account_id": account_id, "message": message, "sender_type": "user", "is_internal_note": False, "created_at": now},
+                {"ticket_id": ticket_id, "account_id": account_id, "message": message, "created_at": now},
             ]
         )
-
         _safe_insert("support_ticket_messages", message_payloads)
-
-        update_payloads = [
-            {
-                "status": "open",
-                "updated_at": now,
-                "last_message_preview": preview,
-                "last_reply_at": now,
-                "last_reply_by": "user",
-            },
-            {
-                "status": "open",
-                "updated_at": now,
-                "last_message_preview": preview,
-            },
-            {
-                "status": "open",
-                "updated_at": now,
-            },
-        ]
-
-        _safe_update("support_tickets", _ticket_update_key(ticket, ticket_id), update_payloads)
-
-        return jsonify(
-            {
-                "ok": True,
-                "message": "Reply added successfully",
-                "ticket_id": ticket_id,
-            }
-        ), 200
+        _safe_update(
+            "support_tickets",
+            _ticket_update_key(ticket, ticket_id),
+            [
+                {"status": "open", "updated_at": now, "last_message_preview": preview, "last_reply_at": now, "last_reply_by": "user"},
+                {"status": "open", "updated_at": now, "last_message_preview": preview},
+                {"status": "open", "updated_at": now},
+            ],
+        )
+        return jsonify({"ok": True, "message": "Reply added successfully", "ticket_id": ticket_id}), 200
     except Exception as exc:
         logger.exception("Reply ticket error")
         return jsonify({"ok": False, "error": "support_reply_failed", "detail": str(exc)}), 500
@@ -669,26 +532,20 @@ def close_ticket(ticket_id: str):
 
     ticket_id = _clean_text(ticket_id)
     if not ticket_id:
-        return jsonify({"ok": False, "error": "ticket_id_required"}), 400
+        return _json_error("ticket_id_required", 400)
 
     try:
         ticket = _load_ticket_for_account(ticket_id, account_id)
         if not ticket:
             return jsonify({"ok": False, "error": "ticket_not_found"}), 404
-
         now = _now()
         result = _safe_update(
             "support_tickets",
             _ticket_update_key(ticket, ticket_id),
-            [
-                {"status": "closed", "closed_at": now, "updated_at": now},
-                {"status": "closed", "updated_at": now},
-            ],
+            [{"status": "closed", "closed_at": now, "updated_at": now}, {"status": "closed", "updated_at": now}],
         )
-
-        if not result.data:
+        if not _rows(result):
             return jsonify({"ok": False, "error": "ticket_close_failed"}), 500
-
         return jsonify({"ok": True, "message": "Ticket closed successfully", "ticket_id": ticket_id}), 200
     except Exception as exc:
         logger.exception("Close ticket error")
@@ -702,29 +559,12 @@ def support_stats():
         return jsonify({"ok": False, "error": "unauthorized", "debug": auth_debug}), 401
 
     try:
-        result = (
-            _sb()
-            .table("support_tickets")
-            .select("status")
-            .eq("account_id", account_id)
-            .execute()
-        )
-
-        tickets = result.data or []
-        stats = {
-            "total": len(tickets),
-            "open": 0,
-            "in_progress": 0,
-            "awaiting_user": 0,
-            "in_review": 0,
-            "resolved": 0,
-            "closed": 0,
-        }
-
+        result = _sb().table("support_tickets").select("status").eq("account_id", account_id).execute()
+        tickets = _rows(result)
+        stats = {"total": len(tickets), "open": 0, "in_progress": 0, "awaiting_user": 0, "in_review": 0, "resolved": 0, "closed": 0}
         for ticket in tickets:
             status = _normalize_status(ticket.get("status") or "open")
             stats[status] = stats.get(status, 0) + 1
-
         return jsonify({"ok": True, "stats": stats}), 200
     except Exception as exc:
         logger.exception("Support stats error")
