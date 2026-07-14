@@ -4,6 +4,96 @@ import re
 from typing import Any, Dict
 
 
+def _apply_topup_pricing_patch() -> None:
+    """
+    Keep credit top-up pricing aligned with the approved public pricing ladder.
+
+    This runtime patch is intentionally applied after route modules are imported.
+    app.routes.billing reads TOPUP_PACKAGES at request time, so mutating the
+    module-level dictionaries here updates package listing, checkout amount,
+    callback metadata, and aliases without touching payment secrets or Paystack
+    service logic.
+    """
+    try:
+        from app.routes import billing
+    except Exception:
+        return
+
+    restored_packages: Dict[str, Dict[str, Any]] = {
+        "TOPUP_10": {
+            "code": "TOPUP_10",
+            "name": "10 Usage Credits",
+            "description": "Add 10 AI/usage credits to an active paid account.",
+            "credits": 10,
+            "amount_ngn": 500,
+            "amount_kobo": 500 * 100,
+            "currency": "NGN",
+            "paid_plan_required": True,
+        },
+        "TOPUP_50": {
+            "code": "TOPUP_50",
+            "name": "50 Usage Credits",
+            "description": "Add 50 AI/usage credits to an active paid account.",
+            "credits": 50,
+            "amount_ngn": 2000,
+            "amount_kobo": 2000 * 100,
+            "currency": "NGN",
+            "paid_plan_required": True,
+        },
+        "TOPUP_100": {
+            "code": "TOPUP_100",
+            "name": "100 Usage Credits",
+            "description": "Add 100 AI/usage credits to an active paid account.",
+            "credits": 100,
+            "amount_ngn": 3500,
+            "amount_kobo": 3500 * 100,
+            "currency": "NGN",
+            "paid_plan_required": True,
+        },
+        "TOPUP_500": {
+            "code": "TOPUP_500",
+            "name": "500 Usage Credits",
+            "description": "Add 500 AI/usage credits to an active paid account.",
+            "credits": 500,
+            "amount_ngn": 15000,
+            "amount_kobo": 15000 * 100,
+            "currency": "NGN",
+            "paid_plan_required": True,
+        },
+    }
+
+    aliases = {
+        "10": "TOPUP_10",
+        "50": "TOPUP_50",
+        "100": "TOPUP_100",
+        "500": "TOPUP_500",
+        "T10": "TOPUP_10",
+        "T50": "TOPUP_50",
+        "T100": "TOPUP_100",
+        "T500": "TOPUP_500",
+        "TOPUP10": "TOPUP_10",
+        "TOPUP50": "TOPUP_50",
+        "TOPUP100": "TOPUP_100",
+        "TOPUP500": "TOPUP_500",
+        "TOPUP_10": "TOPUP_10",
+        "TOPUP_50": "TOPUP_50",
+        "TOPUP_100": "TOPUP_100",
+        "TOPUP_500": "TOPUP_500",
+    }
+
+    try:
+        billing.TOPUP_PACKAGES.clear()
+        billing.TOPUP_PACKAGES.update(restored_packages)
+    except Exception:
+        billing.TOPUP_PACKAGES = restored_packages  # type: ignore[attr-defined]
+
+    try:
+        billing.TOPUP_CODE_ALIASES.clear()
+        billing.TOPUP_CODE_ALIASES.update(aliases)
+    except Exception:
+        billing.TOPUP_CODE_ALIASES = aliases  # type: ignore[attr-defined]
+
+
 def apply_whatsapp_display_patch() -> None:
     """
     Keep WhatsApp calculator display aligned with web/Telegram and apply shared
@@ -15,6 +105,8 @@ def apply_whatsapp_display_patch() -> None:
         apply_billing_payment_patch()
     except Exception:
         pass
+
+    _apply_topup_pricing_patch()
 
     try:
         from app.services.answer_metadata_patch import apply_answer_metadata_patch
