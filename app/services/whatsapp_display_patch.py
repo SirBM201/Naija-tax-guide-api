@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Dict
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
 
 
 def _apply_topup_pricing_patch() -> None:
@@ -94,6 +95,152 @@ def _apply_topup_pricing_patch() -> None:
         billing.TOPUP_CODE_ALIASES = aliases  # type: ignore[attr-defined]
 
 
+def _safe_dt(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _apply_subscription_expiry_patch() -> None:
+    """
+    Never let a stale DB status='active' override an expired billing period.
+
+    Some older subscription rows can still have status='active' after expires_at
+    is already in the past. The billing page and workspace state consume the
+    response payload, so the payload itself must be normalized, not only the
+    internal active-check helper.
+    """
+    try:
+        from app.routes import billing
+    except Exception:
+        return
+
+    if getattr(billing, "_ntg_expiry_payload_patch_applied", False):
+        return
+
+    original_is_active = getattr(billing, "_subscription_is_active", None)
+    original_payload = getattr(billing, "_subscription_payload", None)
+
+    def _expiry_dt(row: Optional[Dict[str, Any]]) -> Optional[datetime]:
+        if not row:
+            return None
+        try:
+            raw = billing._subscription_expiry(row)  # type: ignore[attr-defined]
+        except Exception:
+            raw = (
+                row.get("expires_at")
+                or row.get("current_period_end")
+                or row.get("ends_at")
+                or row.get("period_end")
+                or row.get("grace_until")
+                or row.get("trial_until")
+            )
+        try:
+            parsed = billing._parse_dt(raw)  # type: ignore[attr-defined]
+            return parsed
+        except Exception:
+            return _safe_dt(raw)
+
+    def _now() -> datetime:
+        try:
+            return billing._now()  # type: ignore[attr-defined]
+        except Exception:
+            return datetime.now(timezone.utc)
+
+    def _raw_status(row: Optional[Dict[str, Any]]) -> str:
+        try:
+            return billing._lower((row or {}).get("status"))  # type: ignore[attr-defined]
+        except Exception:
+            return str((row or {}).get("status") or "").strip().lower()
+
+    def _is_expired(row: Optional[Dict[str, Any]]) -> bool:
+        expiry = _expiry_dt(row)
+        return bool(expiry and expiry <= _now())
+
+    def _derived_status(row: Optional[Dict[str, Any]], active: bool) -> str:
+        raw = _raw_status(row)
+        if _is_expired(row):
+            return "expired"
+        if active:
+            return raw or "active"
+        if raw in {"inactive", "expired", "cancelled", "canceled", "disabled", "paused", "failed"}:
+            return raw
+        return "inactive"
+
+    if callable(original_is_active):
+        def patched_subscription_is_active(row: Optional[Dict[str, Any]]) -> bool:
+            if _is_expired(row):
+                return False
+            return bool(original_is_active(row))
+
+        billing._subscription_is_active = patched_subscription_is_active  # type: ignore[attr-defined]
+
+    if callable(original_payload):
+        def patched_subscription_payload(
+            account_id: str,
+            sub: Optional[Dict[str, Any]],
+            account: Optional[Dict[str, Any]] = None,
+        ) -> Dict[str, Any]:
+            payload = original_payload(account_id, sub, account)
+            if not sub:
+                return payload
+
+            active = bool(billing._subscription_is_active(sub))  # type: ignore[attr-defined]
+            status = _derived_status(sub, active)
+
+            payload["active"] = active
+            payload["is_active"] = active
+            payload["status"] = status
+            payload["expired"] = status == "expired"
+
+            if status == "expired":
+                payload["topup_allowed"] = False
+                payload["topup_eligibility_reason"] = "subscription_expired"
+
+            subscription = payload.get("subscription")
+            if isinstance(subscription, dict):
+                subscription["active"] = active
+                subscription["is_active"] = active
+                subscription["status"] = status
+                subscription["expired"] = status == "expired"
+
+            summary = payload.get("subscription_summary")
+            if isinstance(summary, dict):
+                summary["is_active_now"] = active
+                summary["status"] = status
+
+            return payload
+
+        billing._subscription_payload = patched_subscription_payload  # type: ignore[attr-defined]
+
+    try:
+        from app.services import subscription_guard
+
+        original_build_access = getattr(subscription_guard, "_build_access", None)
+        if callable(original_build_access) and not getattr(subscription_guard, "_ntg_expiry_access_patch_applied", False):
+            def patched_build_access(sub: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+                access = original_build_access(sub)
+                if _is_expired(sub):
+                    access["allowed"] = False
+                    access["reason"] = "expired"
+                    access["status"] = "expired"
+                    access["upgrade_required"] = True
+                return access
+
+            subscription_guard._build_access = patched_build_access  # type: ignore[attr-defined]
+            subscription_guard._ntg_expiry_access_patch_applied = True  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+    billing._ntg_expiry_payload_patch_applied = True  # type: ignore[attr-defined]
+
+
 def apply_whatsapp_display_patch() -> None:
     """
     Keep WhatsApp calculator display aligned with web/Telegram and apply shared
@@ -107,6 +254,7 @@ def apply_whatsapp_display_patch() -> None:
         pass
 
     _apply_topup_pricing_patch()
+    _apply_subscription_expiry_patch()
 
     try:
         from app.services.answer_metadata_patch import apply_answer_metadata_patch
