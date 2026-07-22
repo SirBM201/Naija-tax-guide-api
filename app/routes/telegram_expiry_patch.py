@@ -10,8 +10,12 @@ from app.routes import telegram as tg
 
 bp = Blueprint("telegram_expiry_patch", __name__)
 
-TELEGRAM_EXPIRY_PATCH_VERSION = "2026-07-22-v1-final-expired-plan-guard"
+TELEGRAM_EXPIRY_PATCH_VERSION = "2026-07-23-v2-expired-plan-copy-and-guard"
 PAID_FAMILIES = {"starter", "professional", "business"}
+BLOCKED_AI_GUIDANCE = (
+    "\n\nNo credit was charged for this blocked request. "
+    "Reply 4 to renew or choose a paid plan. Reply CR1 to check your credit balance."
+)
 EXPIRED_TOPUP_MESSAGE = (
     "⚠️ *Active paid plan required*\n\n"
     "Usage Credit add-ons are available only while a paid subscription is active. "
@@ -19,9 +23,13 @@ EXPIRED_TOPUP_MESSAGE = (
     "Reply 4 to renew or choose a subscription plan."
 )
 
-_ORIGINAL_TG_GET_CREDIT_BALANCE = tg.get_credit_balance
-_ORIGINAL_TG_CREATE_CREDIT_PAYMENT = tg.create_credit_payment
-_ORIGINAL_TG_SEND_CREDIT_PACKAGE_MENU = getattr(tg, "_send_credit_package_menu", None)
+_ORIGINAL_SUBSCRIPTION_ROW = getattr(tg, "_subscription_row", None)
+_ORIGINAL_BILLING_SUMMARY_TEXT = getattr(tg, "_billing_summary_text", None)
+_ORIGINAL_RENEWAL_EXPIRY = getattr(tg, "_send_renewal_expiry", None)
+_ORIGINAL_GET_CREDIT_BALANCE = getattr(tg, "get_credit_balance", None)
+_ORIGINAL_CREATE_CREDIT_PAYMENT = getattr(tg, "create_credit_payment", None)
+_ORIGINAL_SEND_CREDIT_PACKAGE_MENU = getattr(tg, "_send_credit_package_menu", None)
+_ORIGINAL_TELEGRAM_ANSWER_CREDIT_NOTE = getattr(tg, "_telegram_answer_credit_note", None)
 
 
 def _clean(value: Any) -> str:
@@ -76,6 +84,21 @@ def _is_expired(row: Optional[Dict[str, Any]]) -> bool:
     return bool(expiry and expiry <= _now())
 
 
+def _truthy(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value > 0
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on", "active", "paid", "enabled"}:
+        return True
+    if text in {"0", "false", "no", "n", "off", "inactive", "expired", "disabled"}:
+        return False
+    return default
+
+
 def _plan_family(value: Any) -> str:
     text = _lower(value)
     if "business" in text:
@@ -94,21 +117,6 @@ def _is_paid_identity(row: Optional[Dict[str, Any]]) -> bool:
     return _plan_family(code) in PAID_FAMILIES
 
 
-def _truthy(value: Any, default: bool = False) -> bool:
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return value > 0
-    text = str(value).strip().lower()
-    if text in {"1", "true", "yes", "y", "on", "active", "paid", "enabled"}:
-        return True
-    if text in {"0", "false", "no", "n", "off", "inactive", "expired", "disabled"}:
-        return False
-    return default
-
-
 def _is_active(row: Optional[Dict[str, Any]]) -> bool:
     if not row or _is_expired(row):
         return False
@@ -124,10 +132,6 @@ def _is_active(row: Optional[Dict[str, Any]]) -> bool:
     return status in {"active", "paid", "trial", "trialing", "grace", "past_due", "successful", "success"}
 
 
-def _is_active_paid(row: Optional[Dict[str, Any]]) -> bool:
-    return bool(_is_active(row) and _is_paid_identity(row))
-
-
 def _row_sort_dt(row: Dict[str, Any]) -> datetime:
     for key in ("current_period_end", "expires_at", "updated_at", "created_at", "paid_at"):
         dt = _safe_dt(row.get(key))
@@ -136,26 +140,19 @@ def _row_sort_dt(row: Dict[str, Any]) -> datetime:
     return datetime.min.replace(tzinfo=timezone.utc)
 
 
-def _rows(resp: Any) -> list[Dict[str, Any]]:
-    data = getattr(resp, "data", None)
-    if isinstance(data, list):
-        return [row for row in data if isinstance(row, dict)]
-    if isinstance(data, dict):
-        return [data]
-    return []
-
-
 def _subscription_rows(account_id: str) -> list[Dict[str, Any]]:
     account_id = _clean(account_id)
     if not account_id:
         return []
     try:
-        q = tg.supabase.table("user_subscriptions").select("*").eq("account_id", account_id)
+        query = tg.supabase.table("user_subscriptions").select("*").eq("account_id", account_id)  # type: ignore[attr-defined]
         try:
-            q = q.order("current_period_end", desc=True).order("updated_at", desc=True).order("created_at", desc=True)
+            query = query.order("current_period_end", desc=True).order("updated_at", desc=True).order("created_at", desc=True)
         except Exception:
             pass
-        return _rows(q.limit(50).execute())
+        response = query.limit(50).execute()
+        data = getattr(response, "data", None) or []
+        return [row for row in data if isinstance(row, dict)]
     except Exception:
         return []
 
@@ -163,205 +160,165 @@ def _subscription_rows(account_id: str) -> list[Dict[str, Any]]:
 def _effective_subscription(account_id: str) -> Optional[Dict[str, Any]]:
     rows = _subscription_rows(account_id)
     if not rows:
+        if callable(_ORIGINAL_SUBSCRIPTION_ROW):
+            try:
+                row = _ORIGINAL_SUBSCRIPTION_ROW(account_id)
+                return dict(row) if isinstance(row, dict) else None
+            except Exception:
+                return None
         return None
     rows.sort(
         key=lambda row: (
-            1 if _is_active_paid(row) else 0,
+            1 if _is_active(row) and _is_paid_identity(row) else 0,
             1 if _is_active(row) else 0,
             1 if _is_paid_identity(row) else 0,
             _row_sort_dt(row),
         ),
         reverse=True,
     )
-    return rows[0]
+    return dict(rows[0])
 
 
 def _active_subscription(account_id: str) -> Optional[Dict[str, Any]]:
     row = _effective_subscription(account_id)
-    return row if _is_active_paid(row) else None
+    return row if row and _is_active(row) and _is_paid_identity(row) else None
 
 
-def _expired_subscription(account_id: str) -> Optional[Dict[str, Any]]:
+def _expired_paid_subscription(account_id: str) -> Optional[Dict[str, Any]]:
     row = _effective_subscription(account_id)
-    return row if row and _is_paid_identity(row) and not _is_active_paid(row) else None
+    return row if row and _is_paid_identity(row) and not (_is_active(row) and not _is_expired(row)) else None
 
 
-def _credit_value(balance: Any) -> int:
-    try:
-        if hasattr(tg, "_credit_balance_value"):
-            return int(tg._credit_balance_value(balance))  # type: ignore[attr-defined]
-    except Exception:
-        pass
+def _credit_balance_value(balance: Any) -> int:
     if isinstance(balance, (int, float)):
         return int(balance)
     if isinstance(balance, dict):
-        for key in ("balance", "credits", "credit_balance", "available_credits", "remaining_credits"):
-            try:
-                if balance.get(key) not in (None, ""):
+        for key in ("balance", "credits", "credit_balance", "available_credits", "remaining_credits", "usage_credits"):
+            if balance.get(key) not in (None, ""):
+                try:
                     return int(float(str(balance.get(key)).replace(",", "")))
-            except Exception:
-                continue
+                except Exception:
+                    continue
     return 0
 
 
-def _patched_has_active_subscription(account_id: str) -> bool:
-    return bool(_active_subscription(account_id))
-
-
-def _patched_subscription_row(account_id: str) -> Optional[Dict[str, Any]]:
+def patched_subscription_row(account_id: str) -> Optional[Dict[str, Any]]:
     return _active_subscription(account_id)
 
 
-def _patched_get_credit_balance(account_id: str) -> int:
-    if _expired_subscription(account_id):
-        return 0
-    try:
-        return int(_ORIGINAL_TG_GET_CREDIT_BALANCE(account_id))
-    except Exception:
-        return 0
+def patched_has_active_subscription(account_id: str) -> bool:
+    return bool(_active_subscription(account_id))
 
 
-def _patched_create_credit_payment(account_id: str, package_num: int, channel_type: str, provider_user_id: str) -> Dict[str, Any]:
-    if not _patched_has_active_subscription(account_id):
+def patched_get_credit_balance(account_id: str) -> int:
+    if _expired_paid_subscription(account_id):
+        return 0
+    if callable(_ORIGINAL_GET_CREDIT_BALANCE):
+        return _credit_balance_value(_ORIGINAL_GET_CREDIT_BALANCE(account_id))
+    return 0
+
+
+def patched_create_credit_payment(account_id: str, package_num: int, channel_type: str, provider_user_id: str) -> Dict[str, Any]:
+    if not patched_has_active_subscription(account_id):
         return {"ok": False, "error": "active_paid_subscription_required", "message": EXPIRED_TOPUP_MESSAGE}
-    return _ORIGINAL_TG_CREATE_CREDIT_PAYMENT(account_id, package_num, channel_type, provider_user_id)
+    if callable(_ORIGINAL_CREATE_CREDIT_PAYMENT):
+        return _ORIGINAL_CREATE_CREDIT_PAYMENT(account_id, package_num, channel_type, provider_user_id)
+    return {"ok": False, "error": "credit_payment_unavailable", "message": "Payment checkout is not available right now."}
 
 
-def _active_plan_name(sub: Dict[str, Any]) -> str:
-    code = _clean(sub.get("plan_code") or sub.get("plan") or "")
-    try:
-        from app.services import channel_subscription_service as css
-        plan = css.validate_plan_code(code)  # type: ignore[attr-defined]
-        if isinstance(plan, dict) and plan.get("full_name"):
-            return _clean(plan.get("full_name"))
-    except Exception:
-        pass
-    return _clean(sub.get("plan_name") or sub.get("name") or code.replace("_", " ").title() or "Paid plan")
-
-
-def _billing_summary_text(account_id: str) -> str:
+def patched_billing_summary_text(account_id: str) -> str:
     active = _active_subscription(account_id)
-    expired = _expired_subscription(account_id)
+    expired = _expired_paid_subscription(account_id)
 
-    if active:
-        balance = _credit_value(_patched_get_credit_balance(account_id))
-        plan_name = _active_plan_name(active)
-        status = _clean(active.get("status") or "active")
-        expiry = _expiry_value(active)
-        body = (
-            "💳 *Billing Summary*\n\n"
-            f"Plan: {plan_name}\n"
-            f"Status: {status}\n"
-            f"Usage Credits: {balance}\n"
-        )
-        if expiry:
-            body += f"Renewal/expiry: {_date_label(expiry)}\n"
-        body += "\nReply PAY2 for payment history, PAY6 for renewal/expiry, or 0 for main menu."
-        return body
+    if active and callable(_ORIGINAL_BILLING_SUMMARY_TEXT):
+        try:
+            return _ORIGINAL_BILLING_SUMMARY_TEXT(account_id)
+        except Exception:
+            pass
 
     if expired:
-        previous = _clean(expired.get("plan_code") or expired.get("plan_name") or "previous paid plan")
+        plan = _clean(expired.get("plan_name") or expired.get("plan_code") or "previous paid plan")
+        expiry = _date_label(_expiry_value(expired))
         return (
             "💳 *Billing Summary*\n\n"
-            f"Plan: {previous} (expired)\n"
+            f"Plan: {plan} (expired)\n"
             "Status: expired\n"
             "Usage Credits: 0\n"
-            f"Expired: {_date_label(_expiry_value(expired))}\n\n"
+            f"Expired: {expiry}\n\n"
             "Paid access is not active. Renew before using paid AI answers, top-ups, custom deadlines, or paid workspace features.\n\n"
             "Reply 4 to view subscription plans or 0 for main menu."
         )
 
-    balance = _credit_value(_ORIGINAL_TG_GET_CREDIT_BALANCE(account_id))
+    if callable(_ORIGINAL_BILLING_SUMMARY_TEXT):
+        try:
+            return _ORIGINAL_BILLING_SUMMARY_TEXT(account_id)
+        except Exception:
+            pass
+
     return (
         "💳 *Billing Summary*\n\n"
         "Current plan: Free Forever\n"
-        f"Usage Credits: {balance}\n"
+        "Usage Credits: 0\n"
         "Status: Free access\n\n"
-        "Reply 4 to view subscription plans, PAY2 for payment history, or 0 for main menu."
+        "Reply 4 to view subscription plans or 0 for main menu."
     )
 
 
-def _format_subscription_message(account_id: str) -> str:
+def patched_send_renewal_expiry(chat_id: str, account_id: str) -> None:
     active = _active_subscription(account_id)
-    expired = _expired_subscription(account_id)
-    if expired and not active:
-        previous = _clean(expired.get("plan_code") or expired.get("plan_name") or "previous paid plan")
-        return (
-            "📋 *NO ACTIVE SUBSCRIPTION*\n\n"
-            f"Previous plan: {previous}\n"
-            f"Expired: {_date_label(_expiry_value(expired))}\n"
-            "Status: expired\n\n"
-            "Renew before using paid AI answers, top-ups, custom deadlines, or paid workspace features.\n\n"
-            "Reply with 4 to see available plans and renew."
-        )
-    if active:
-        return _billing_summary_text(account_id).replace("💳 *Billing Summary*", "📋 *YOUR SUBSCRIPTION*")
-    return (
-        "📋 *NO ACTIVE SUBSCRIPTION*\n\n"
-        "You are currently on free access.\n"
-        "Reply with 4 to see available plans and upgrade."
+    expired = _expired_paid_subscription(account_id)
+    row = active or expired
+    if not row:
+        tg.send_telegram_text(chat_id, "📅 *Renewal / Expiry Date*\n\nNo active paid subscription found.\n\nReply 4 to view subscription plans.")  # type: ignore[attr-defined]
+        return
+
+    plan = _clean(row.get("plan_name") or row.get("plan_code") or "Current plan")
+    expiry = _date_label(_expiry_value(row))
+    status = "active" if active else "expired"
+    tg.send_telegram_text(  # type: ignore[attr-defined]
+        chat_id,
+        "📅 *Renewal / Expiry Date*\n\n"
+        f"Plan: {plan}\n"
+        f"Status: {status}\n"
+        f"Renewal/expiry: {expiry}\n\n"
+        + ("Reply PAY1 for billing summary or 0 for main menu." if active else "Reply 4 to renew or 0 for main menu."),
     )
 
 
-def _send_renewal_expiry(chat_id: str, account_id: str) -> None:
-    active = _active_subscription(account_id)
-    expired = _expired_subscription(account_id)
-    if active:
-        tg.send_telegram_text(
-            chat_id,
-            "📅 *Renewal / Expiry Date*\n\n"
-            f"Plan: {_active_plan_name(active)}\n"
-            f"Renewal/expiry: {_date_label(_expiry_value(active))}\n\n"
-            "Reply PAY1 for billing summary or PAY2 for payment history.",
-        )
+def patched_send_credit_package_menu(chat_id: str, account_id: str, *, has_subscription: bool) -> None:
+    if not patched_has_active_subscription(account_id):
+        tg.send_telegram_text(chat_id, EXPIRED_TOPUP_MESSAGE)  # type: ignore[attr-defined]
         return
-    if expired:
-        previous = _clean(expired.get("plan_code") or expired.get("plan_name") or "previous paid plan")
-        tg.send_telegram_text(
-            chat_id,
-            "📅 *Renewal / Expiry Date*\n\n"
-            f"Plan: {previous}\n"
-            "Status: expired\n"
-            f"Expired: {_date_label(_expiry_value(expired))}\n\n"
-            "Reply 4 to renew or choose a subscription plan.",
-        )
-        return
-    tg.send_telegram_text(chat_id, "📅 *Renewal / Expiry Date*\n\nNo active paid subscription found.\n\nReply 4 to view subscription plans.")
+    if callable(_ORIGINAL_SEND_CREDIT_PACKAGE_MENU):
+        return _ORIGINAL_SEND_CREDIT_PACKAGE_MENU(chat_id, account_id, has_subscription=True)
+    tg.send_telegram_text(chat_id, "Reply T10, T50, T100, or T500 to buy Usage Credit add-ons.")  # type: ignore[attr-defined]
 
 
-def _send_credit_package_menu(chat_id: str, account_id: str, *, has_subscription: bool) -> None:
-    if not _patched_has_active_subscription(account_id):
-        tg.send_telegram_text(chat_id, EXPIRED_TOPUP_MESSAGE)
-        return
-    if callable(_ORIGINAL_TG_SEND_CREDIT_PACKAGE_MENU):
-        return _ORIGINAL_TG_SEND_CREDIT_PACKAGE_MENU(chat_id, account_id, has_subscription=True)
-    tg.send_telegram_text(chat_id, tg._topup_menu_text())  # type: ignore[attr-defined]
+def patched_telegram_answer_credit_note(result: Dict[str, Any]) -> str:
+    if not isinstance(result, dict):
+        return ""
+    result_ok = bool(result.get("ok") is True)
+    error_code = _clean(result.get("error"))
+    if not result_ok and error_code in {"paid_plan_required", "insufficient_credits", "no_credits", "credit_balance_empty"}:
+        return BLOCKED_AI_GUIDANCE
+    if callable(_ORIGINAL_TELEGRAM_ANSWER_CREDIT_NOTE):
+        try:
+            return _ORIGINAL_TELEGRAM_ANSWER_CREDIT_NOTE(result)
+        except Exception:
+            return ""
+    return ""
 
 
 def apply_patch() -> None:
-    tg.has_active_subscription = _patched_has_active_subscription  # type: ignore[assignment]
-    tg.get_credit_balance = _patched_get_credit_balance  # type: ignore[assignment]
-    tg.create_credit_payment = _patched_create_credit_payment  # type: ignore[assignment]
-    tg.format_subscription_message = _format_subscription_message  # type: ignore[assignment]
-    tg._subscription_row = _patched_subscription_row  # type: ignore[attr-defined]
-    tg._billing_summary_text = _billing_summary_text  # type: ignore[attr-defined]
-    tg._send_renewal_expiry = _send_renewal_expiry  # type: ignore[attr-defined]
-    tg._send_credit_package_menu = _send_credit_package_menu  # type: ignore[attr-defined]
-
-    try:
-        from app.services import channel_subscription_service as css
-        css.has_active_subscription = _patched_has_active_subscription  # type: ignore[attr-defined]
-        css.get_user_subscription = _patched_subscription_row  # type: ignore[attr-defined]
-        css.format_subscription_message = _format_subscription_message  # type: ignore[attr-defined]
-    except Exception:
-        pass
-
-    try:
-        from app.services import channel_credit_service as ccs
-        ccs.get_credit_balance = _patched_get_credit_balance  # type: ignore[attr-defined]
-        ccs.create_credit_payment = _patched_create_credit_payment  # type: ignore[attr-defined]
-    except Exception:
-        pass
+    tg._subscription_row = patched_subscription_row  # type: ignore[attr-defined]
+    tg.has_active_subscription = patched_has_active_subscription  # type: ignore[attr-defined]
+    tg.get_credit_balance = patched_get_credit_balance  # type: ignore[attr-defined]
+    tg.create_credit_payment = patched_create_credit_payment  # type: ignore[attr-defined]
+    tg._billing_summary_text = patched_billing_summary_text  # type: ignore[attr-defined]
+    tg._send_renewal_expiry = patched_send_renewal_expiry  # type: ignore[attr-defined]
+    tg._send_credit_package_menu = patched_send_credit_package_menu  # type: ignore[attr-defined]
+    tg._telegram_answer_credit_note = patched_telegram_answer_credit_note  # type: ignore[attr-defined]
+    tg._ntg_telegram_expiry_patch_applied = TELEGRAM_EXPIRY_PATCH_VERSION  # type: ignore[attr-defined]
 
 
 apply_patch()
