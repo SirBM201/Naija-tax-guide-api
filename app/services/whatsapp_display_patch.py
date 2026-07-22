@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
@@ -11,6 +10,12 @@ EXPIRED_TOPUP_MESSAGE = (
     "Usage Credit add-ons are available only while a paid subscription is active. "
     "Your paid plan appears to be expired, so top-up checkout cannot start.\n\n"
     "Reply 4 to renew or choose a subscription plan."
+)
+EXPIRED_PLAN_MESSAGE = (
+    "📌 *Current Plan*\n\n"
+    "No active paid subscription is currently available on this account.\n"
+    "If your previous paid plan has expired, please renew before using paid AI answers, top-ups, custom deadlines, or paid workspace features.\n\n"
+    "Reply 4 to view subscription plans or 0 for main menu."
 )
 
 
@@ -111,6 +116,11 @@ def _is_active_paid_subscription(row: Optional[Dict[str, Any]]) -> bool:
     return _plan_family_from_code(code) in PAID_FAMILIES
 
 
+def _is_paid_subscription_identity(row: Optional[Dict[str, Any]]) -> bool:
+    code = _lower((row or {}).get("plan_code") or (row or {}).get("plan") or (row or {}).get("tier"))
+    return _plan_family_from_code(code) in PAID_FAMILIES
+
+
 def _row_sort_dt(row: Dict[str, Any]) -> datetime:
     for key in ("current_period_end", "expires_at", "updated_at", "created_at", "paid_at"):
         dt = _safe_dt(row.get(key))
@@ -129,12 +139,36 @@ def _select_effective_subscription(rows: list[Dict[str, Any]]) -> Optional[Dict[
         key=lambda row: (
             1 if _is_active_paid_subscription(row) else 0,
             1 if _is_subscription_active(row) else 0,
-            1 if _plan_family_from_code(row.get("plan_code") or row.get("plan") or row.get("tier")) in PAID_FAMILIES else 0,
+            1 if _is_paid_subscription_identity(row) else 0,
             _row_sort_dt(row),
         ),
         reverse=True,
     )
     return ranked[0]
+
+
+def _normalize_subscription_row(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not row:
+        return None
+    out = dict(row)
+    active = _is_subscription_active(out)
+    expired = _is_expired(out)
+
+    out["active"] = active
+    out["is_active"] = active
+    if expired:
+        out["status"] = "expired"
+        out["expired"] = True
+        out["expired_plan_code"] = out.get("plan_code")
+        out["expired_plan_name"] = out.get("plan_name") or out.get("name")
+    elif not active and _is_paid_subscription_identity(out):
+        raw_status = _lower(out.get("status"))
+        out["status"] = raw_status if raw_status in {"inactive", "cancelled", "canceled", "disabled", "paused", "failed"} else "inactive"
+        out["expired"] = False
+    else:
+        out["status"] = _lower(out.get("status")) or ("active" if active else "inactive")
+        out["expired"] = False
+    return out
 
 
 def _expired_payload(row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -149,6 +183,72 @@ def _expired_payload(row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "expired_plan_code": (row or {}).get("plan_code"),
         "expired_plan_name": (row or {}).get("plan_name") or (row or {}).get("name"),
     }
+
+
+def _date_label(value: Any) -> str:
+    dt = _safe_dt(value)
+    if dt:
+        return dt.strftime("%Y-%m-%d")
+    raw = _clean(value)
+    return raw[:10] if raw else "not shown"
+
+
+def _channel_db_clients():
+    clients = []
+    for module_name in (
+        "app.services.channel_subscription_service",
+        "app.routes.whatsapp",
+        "app.routes.telegram",
+    ):
+        try:
+            module = __import__(module_name, fromlist=["*"])
+            sb_func = getattr(module, "_sb", None)
+            if callable(sb_func):
+                clients.append(sb_func())
+        except Exception:
+            pass
+    try:
+        from app.core.supabase_client import supabase
+
+        clients.append(supabase() if callable(supabase) else supabase)
+    except Exception:
+        pass
+    return [client for client in clients if client is not None]
+
+
+def _subscription_rows_for_account(account_id: str) -> list[Dict[str, Any]]:
+    account_id = _clean(account_id)
+    if not account_id:
+        return []
+
+    for client in _channel_db_clients():
+        try:
+            q = client.table("user_subscriptions").select("*").eq("account_id", account_id)
+            try:
+                q = q.order("current_period_end", desc=True).order("updated_at", desc=True).order("created_at", desc=True)
+            except Exception:
+                pass
+            res = q.limit(50).execute()
+            rows = [r for r in (getattr(res, "data", None) or []) if isinstance(r, dict)]
+            if rows:
+                return rows
+        except Exception:
+            continue
+    return []
+
+
+def _effective_subscription_for_account(account_id: str) -> Optional[Dict[str, Any]]:
+    return _normalize_subscription_row(_select_effective_subscription(_subscription_rows_for_account(account_id)))
+
+
+def _active_subscription_for_account(account_id: str) -> Optional[Dict[str, Any]]:
+    row = _effective_subscription_for_account(account_id)
+    return row if _is_active_paid_subscription(row) else None
+
+
+def _expired_paid_subscription_for_account(account_id: str) -> Optional[Dict[str, Any]]:
+    row = _effective_subscription_for_account(account_id)
+    return row if row and _is_paid_subscription_identity(row) and not _is_active_paid_subscription(row) else None
 
 
 def _apply_topup_pricing_patch() -> None:
@@ -196,31 +296,16 @@ def _apply_subscription_expiry_patch() -> None:
     original_is_active = getattr(billing, "_subscription_is_active", None)
     original_payload = getattr(billing, "_subscription_payload", None)
 
-    def billing_expiry_dt(row: Optional[Dict[str, Any]]) -> Optional[datetime]:
-        if not row:
-            return None
+    def billing_is_expired(row: Optional[Dict[str, Any]]) -> bool:
         try:
             raw = billing._subscription_expiry(row)  # type: ignore[attr-defined]
         except Exception:
             raw = _subscription_expiry_value(row)
         try:
-            return billing._parse_dt(raw)  # type: ignore[attr-defined]
+            expiry = billing._parse_dt(raw)  # type: ignore[attr-defined]
         except Exception:
-            return _safe_dt(raw)
-
-    def billing_is_expired(row: Optional[Dict[str, Any]]) -> bool:
-        expiry = billing_expiry_dt(row)
+            expiry = _safe_dt(raw)
         return bool(expiry and expiry <= _now_utc())
-
-    def derived_status(row: Optional[Dict[str, Any]], active: bool) -> str:
-        raw = _lower((row or {}).get("status"))
-        if billing_is_expired(row):
-            return "expired"
-        if active:
-            return raw or "active"
-        if raw in {"inactive", "expired", "cancelled", "canceled", "disabled", "paused", "failed"}:
-            return raw
-        return "inactive"
 
     if callable(original_is_active):
         def patched_subscription_is_active(row: Optional[Dict[str, Any]]) -> bool:
@@ -236,11 +321,12 @@ def _apply_subscription_expiry_patch() -> None:
             if not sub:
                 return payload
 
-            active = bool(billing._subscription_is_active(sub))  # type: ignore[attr-defined]
-            status = derived_status(sub, active)
-            expired = status == "expired"
-            original_plan_code = _clean(payload.get("plan_code") or (sub or {}).get("plan_code"))
-            original_plan_name = _clean(payload.get("plan_name") or (sub or {}).get("plan_name") or (sub or {}).get("name"))
+            normalized = _normalize_subscription_row(sub) or {}
+            active = bool(normalized.get("active"))
+            expired = bool(normalized.get("expired"))
+            status = _clean(normalized.get("status") or ("active" if active else "inactive"))
+            original_plan_code = _clean(payload.get("plan_code") or sub.get("plan_code"))
+            original_plan_name = _clean(payload.get("plan_name") or sub.get("plan_name") or sub.get("name"))
 
             payload["active"] = active
             payload["is_active"] = active
@@ -258,10 +344,7 @@ def _apply_subscription_expiry_patch() -> None:
 
             subscription = payload.get("subscription")
             if isinstance(subscription, dict):
-                subscription["active"] = active
-                subscription["is_active"] = active
-                subscription["status"] = status
-                subscription["expired"] = expired
+                subscription.update(normalized)
                 if expired:
                     subscription.update(_expired_payload({**subscription, "plan_name": original_plan_name}))
                     subscription["included_credits"] = 0
@@ -279,6 +362,7 @@ def _apply_subscription_expiry_patch() -> None:
 
     try:
         from app.services import subscription_guard
+
         original_build_access = getattr(subscription_guard, "_build_access", None)
         if callable(original_build_access) and not getattr(subscription_guard, "_ntg_expiry_access_patch_applied", False):
             def patched_build_access(sub: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -297,6 +381,7 @@ def _apply_subscription_expiry_patch() -> None:
 
     try:
         from app.services import account_entitlements_service as entitlements
+
         original_entitlements_from_subscription = getattr(entitlements, "_entitlements_from_subscription", None)
         if callable(original_entitlements_from_subscription) and not getattr(entitlements, "_ntg_expiry_entitlements_patch_applied", False):
             def patched_entitlements_from_subscription(account_id: str, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -315,71 +400,47 @@ def _apply_subscription_expiry_patch() -> None:
 def _apply_channel_expiry_patch() -> None:
     """Apply the same expiry rules to WhatsApp/Telegram services and route imports."""
 
-    try:
-        from app.services import channel_subscription_service as css
-    except Exception:
-        css = None  # type: ignore
-
-    def get_rows_for_account(account_id: str) -> list[Dict[str, Any]]:
-        rows: list[Dict[str, Any]] = []
-        if css is None:
-            return rows
-        try:
-            res = (
-                css._sb().table("user_subscriptions")  # type: ignore[attr-defined]
-                .select("*")
-                .eq("account_id", account_id)
-                .order("current_period_end", desc=True)
-                .order("updated_at", desc=True)
-                .limit(50)
-                .execute()
-            )
-            rows.extend([r for r in (getattr(res, "data", None) or []) if isinstance(r, dict)])
-        except Exception:
-            try:
-                res = css._sb().table("user_subscriptions").select("*").eq("account_id", account_id).limit(50).execute()  # type: ignore[attr-defined]
-                rows.extend([r for r in (getattr(res, "data", None) or []) if isinstance(r, dict)])
-            except Exception:
-                pass
-        return rows
-
     def patched_get_user_subscription(account_id: str) -> Optional[Dict[str, Any]]:
-        account_id = _clean(account_id)
-        if not account_id:
-            return None
-        selected = _select_effective_subscription(get_rows_for_account(account_id))
-        return selected if _is_active_paid_subscription(selected) else None
+        return _active_subscription_for_account(account_id)
 
     def patched_has_active_subscription(account_id: str) -> bool:
-        return bool(patched_get_user_subscription(account_id))
+        return bool(_active_subscription_for_account(account_id))
 
     def patched_format_subscription_message(account_id: str) -> str:
-        sub = patched_get_user_subscription(account_id)
+        sub = _active_subscription_for_account(account_id)
+        expired = _expired_paid_subscription_for_account(account_id)
         if not sub:
+            if expired:
+                expiry = _date_label(_subscription_expiry_value(expired))
+                previous = _clean(expired.get("plan_code") or expired.get("plan_name") or "previous paid plan")
+                return (
+                    "📋 *NO ACTIVE SUBSCRIPTION*\n\n"
+                    f"Previous plan: {previous}\n"
+                    f"Expired: {expiry}\n"
+                    "Status: expired\n\n"
+                    "Renew before using paid AI answers, top-ups, custom deadlines, or paid workspace features.\n\n"
+                    "Reply with 4 to see available plans and renew."
+                )
             return (
                 "📋 *NO ACTIVE SUBSCRIPTION*\n\n"
-                "Your paid plan is not currently active. If it has expired, please renew before using paid AI answers or buying top-ups.\n\n"
-                "Free access still supports basic calculators, database/library answers, and non-AI quiz attempts.\n\n"
-                "Reply with 4 to see available plans and renew."
+                "You are currently on free access.\n"
+                "Free access supports basic calculators, database/library answers, and non-AI quiz attempts.\n\n"
+                "Reply with 4 to see available plans and upgrade."
             )
 
         plan_code = _clean(sub.get("plan_code") or "unknown")
         plan = None
-        if css is not None:
-            try:
-                plan = css.validate_plan_code(plan_code)  # type: ignore[attr-defined]
-            except Exception:
-                plan = None
+        try:
+            from app.services import channel_subscription_service as css
+            plan = css.validate_plan_code(plan_code)  # type: ignore[attr-defined]
+        except Exception:
+            plan = None
 
         plan_name = _clean((plan or {}).get("full_name") or sub.get("plan_name") or plan_code.replace("_", " ").title())
         credits = (plan or {}).get("credits") or sub.get("included_credits") or sub.get("ai_credits_total") or "?"
         monthly_credits = (plan or {}).get("monthly_credits") or credits
         billing_cycle = (plan or {}).get("billing_cycle") or ("yearly" if "yearly" in plan_code else "quarterly" if "quarterly" in plan_code else "monthly")
-        expiry_raw = _subscription_expiry_value(sub)
-        expiry_text = ""
-        if expiry_raw:
-            dt = _safe_dt(expiry_raw)
-            expiry_text = f"\n📅 Next billing/expiry: {dt.strftime('%b %d, %Y') if dt else str(expiry_raw)[:10]}"
+        expiry = _date_label(_subscription_expiry_value(sub))
 
         if billing_cycle == "monthly":
             credit_display = f"{credits} AI credits per month"
@@ -395,8 +456,8 @@ def _apply_channel_expiry_patch() -> None:
             "📋 *YOUR SUBSCRIPTION*\n\n"
             f"✅ Plan: {plan_name}\n"
             f"🎯 Credits: {credit_display}\n"
-            "📊 Daily limit: Unlimited ✨"
-            f"{expiry_text}\n\n"
+            "📊 Daily limit: Unlimited ✨\n"
+            f"📅 Next billing/expiry: {expiry}\n\n"
             f"{access_text}\n"
             f"🔄 Billing cycle: {billing_cycle}\n\n"
             "To cancel or fix billing issues, contact support."
@@ -404,28 +465,45 @@ def _apply_channel_expiry_patch() -> None:
 
     def patched_get_credit_balance_with_subscription(account_id: str, base_balance: int):
         if patched_has_active_subscription(account_id):
-            sub = patched_get_user_subscription(account_id)
+            sub = _active_subscription_for_account(account_id)
             plan = None
-            if css is not None and sub:
-                try:
-                    plan = css.validate_plan_code(sub.get("plan_code", ""))  # type: ignore[attr-defined]
-                except Exception:
-                    plan = None
+            try:
+                from app.services import channel_subscription_service as css
+                plan = css.validate_plan_code((sub or {}).get("plan_code", ""))  # type: ignore[attr-defined]
+            except Exception:
+                plan = None
             if plan:
                 return plan.get("credits", 0), "subscription"
-        return base_balance, "free_or_expired"
+        if _expired_paid_subscription_for_account(account_id):
+            return 0, "expired"
+        return base_balance, "free"
 
-    if css is not None and not getattr(css, "_ntg_channel_expiry_patch_applied", False):
+    try:
+        from app.services import channel_subscription_service as css
+
         css.get_user_subscription = patched_get_user_subscription  # type: ignore[attr-defined]
         css.has_active_subscription = patched_has_active_subscription  # type: ignore[attr-defined]
         css.format_subscription_message = patched_format_subscription_message  # type: ignore[attr-defined]
         css.get_credit_balance_with_subscription = patched_get_credit_balance_with_subscription  # type: ignore[attr-defined]
         css._ntg_channel_expiry_patch_applied = True  # type: ignore[attr-defined]
+    except Exception:
+        pass
 
     try:
         from app.services import channel_credit_service as ccs
+
         original_create_credit_payment = getattr(ccs, "create_credit_payment", None)
-        if callable(original_create_credit_payment) and not getattr(ccs, "_ntg_topup_active_plan_guard_applied", False):
+        original_get_credit_balance = getattr(ccs, "get_credit_balance", None)
+
+        def patched_channel_credit_balance(account_id: str) -> int:
+            if _expired_paid_subscription_for_account(account_id):
+                return 0
+            return int(original_get_credit_balance(account_id)) if callable(original_get_credit_balance) else 0
+
+        if callable(original_get_credit_balance):
+            ccs.get_credit_balance = patched_channel_credit_balance  # type: ignore[attr-defined]
+
+        if callable(original_create_credit_payment):
             def patched_create_credit_payment(account_id: str, package_num: int, channel_type: str, provider_user_id: str) -> Dict[str, Any]:
                 if not patched_has_active_subscription(account_id):
                     return {
@@ -436,63 +514,58 @@ def _apply_channel_expiry_patch() -> None:
                 return original_create_credit_payment(account_id, package_num, channel_type, provider_user_id)
 
             ccs.create_credit_payment = patched_create_credit_payment  # type: ignore[attr-defined]
-            ccs._ntg_topup_active_plan_guard_applied = True  # type: ignore[attr-defined]
+        ccs._ntg_topup_active_plan_guard_applied = True  # type: ignore[attr-defined]
     except Exception:
         pass
 
     try:
         from app.services import credit_usage_service as cus
-        original_get_subscription = getattr(cus, "get_subscription", None)
-        if callable(original_get_subscription) and not getattr(cus, "_ntg_credit_usage_expiry_patch_applied", False):
-            def patched_credit_usage_get_subscription(account_id: str) -> Optional[Dict[str, Any]]:
-                selected = _select_effective_subscription(get_rows_for_account(account_id))
-                if selected:
-                    return selected
-                return original_get_subscription(account_id)
 
-            def patched_credit_usage_get_effective_plan(account_id: str) -> Dict[str, Any]:
-                sub = patched_credit_usage_get_subscription(account_id)
-                active = _is_subscription_active(sub)
-                raw_code = _lower((sub or {}).get("plan_code") or (sub or {}).get("plan") or (sub or {}).get("tier") or "free")
-                if sub and _is_expired(sub):
-                    plan_code = "expired"
-                    family = "expired"
-                else:
-                    plan_code = raw_code or "free"
-                    family = cus.plan_family_from_code(plan_code)  # type: ignore[attr-defined]
-                return {
-                    "subscription": sub,
-                    "plan_code": plan_code,
-                    "plan_family": family,
-                    "active": active,
-                    "is_paid": bool(active and cus.is_paid_plan_code(plan_code)),  # type: ignore[attr-defined]
-                }
+        def patched_credit_usage_get_subscription(account_id: str) -> Optional[Dict[str, Any]]:
+            return _effective_subscription_for_account(account_id)
 
-            cus.get_subscription = patched_credit_usage_get_subscription  # type: ignore[attr-defined]
-            cus.get_effective_plan = patched_credit_usage_get_effective_plan  # type: ignore[attr-defined]
-            cus._ntg_credit_usage_expiry_patch_applied = True  # type: ignore[attr-defined]
+        def patched_credit_usage_get_effective_plan(account_id: str) -> Dict[str, Any]:
+            sub = patched_credit_usage_get_subscription(account_id)
+            active = _is_subscription_active(sub)
+            raw_code = _lower((sub or {}).get("plan_code") or (sub or {}).get("plan") or (sub or {}).get("tier") or "free")
+            if sub and _is_expired(sub):
+                plan_code = "expired"
+                family = "expired"
+            else:
+                plan_code = raw_code or "free"
+                family = cus.plan_family_from_code(plan_code)  # type: ignore[attr-defined]
+            return {
+                "subscription": sub,
+                "plan_code": plan_code,
+                "plan_family": family,
+                "active": active,
+                "is_paid": bool(active and cus.is_paid_plan_code(plan_code)),  # type: ignore[attr-defined]
+            }
+
+        cus.get_subscription = patched_credit_usage_get_subscription  # type: ignore[attr-defined]
+        cus.get_effective_plan = patched_credit_usage_get_effective_plan  # type: ignore[attr-defined]
+        cus._ntg_credit_usage_expiry_patch_applied = True  # type: ignore[attr-defined]
     except Exception:
         pass
 
     try:
         from app.routes import telegram as tg
+
         tg.has_active_subscription = patched_has_active_subscription  # type: ignore[attr-defined]
         tg.format_subscription_message = patched_format_subscription_message  # type: ignore[attr-defined]
         tg.get_credit_balance_with_subscription = patched_get_credit_balance_with_subscription  # type: ignore[attr-defined]
         try:
             from app.services import channel_credit_service as ccs2
+            tg.get_credit_balance = ccs2.get_credit_balance  # type: ignore[attr-defined]
             tg.create_credit_payment = ccs2.create_credit_payment  # type: ignore[attr-defined]
         except Exception:
             pass
 
-        original_subscription_row = getattr(tg, "_subscription_row", None)
-        if callable(original_subscription_row) and not getattr(tg, "_ntg_telegram_subscription_row_patch_applied", False):
-            def patched_telegram_subscription_row(account_id: str) -> Optional[Dict[str, Any]]:
-                row = patched_get_user_subscription(account_id)
-                return row if _is_active_paid_subscription(row) else None
+        def patched_telegram_subscription_row(account_id: str) -> Optional[Dict[str, Any]]:
+            return _active_subscription_for_account(account_id)
 
-            tg._subscription_row = patched_telegram_subscription_row  # type: ignore[attr-defined]
-            tg._ntg_telegram_subscription_row_patch_applied = True  # type: ignore[attr-defined]
+        tg._subscription_row = patched_telegram_subscription_row  # type: ignore[attr-defined]
+        tg._ntg_telegram_subscription_row_patch_applied = True  # type: ignore[attr-defined]
     except Exception:
         pass
 
@@ -504,8 +577,75 @@ def _apply_channel_expiry_patch() -> None:
 
     try:
         from app.routes import whatsapp as w
+
         original_init_checkout = getattr(w, "_init_paystack_checkout", None)
-        if callable(original_init_checkout) and not getattr(w, "_ntg_whatsapp_topup_guard_applied", False):
+        original_credit_balance = getattr(w, "_credit_balance", None)
+
+        def whatsapp_effective_subscription(account_id: str) -> Optional[Dict[str, Any]]:
+            return _effective_subscription_for_account(account_id)
+
+        def whatsapp_active_subscription(account_id: str) -> Optional[Dict[str, Any]]:
+            return _active_subscription_for_account(account_id)
+
+        def whatsapp_expired_subscription(account_id: str) -> Optional[Dict[str, Any]]:
+            return _expired_paid_subscription_for_account(account_id)
+
+        def patched_whatsapp_get_subscription(account_id: str) -> Optional[Dict[str, Any]]:
+            return whatsapp_effective_subscription(account_id)
+
+        def patched_whatsapp_is_active_paid_subscription(account_id: str) -> bool:
+            return bool(whatsapp_active_subscription(account_id))
+
+        def patched_whatsapp_subscription_status(account_id: str) -> str:
+            sub = whatsapp_effective_subscription(account_id)
+            if not sub:
+                return "inactive"
+            if _is_expired(sub):
+                return "expired"
+            return _lower(sub.get("status") or ("active" if _is_subscription_active(sub) else "inactive"))
+
+        def patched_whatsapp_subscription_expiry(account_id: str) -> str:
+            sub = whatsapp_effective_subscription(account_id)
+            return _clean(_subscription_expiry_value(sub)) if sub else ""
+
+        def patched_whatsapp_current_plan_code(account_id: str) -> str:
+            sub = whatsapp_effective_subscription(account_id)
+            if not sub:
+                return "free"
+            if _is_expired(sub):
+                return "expired"
+            return _lower(sub.get("plan_code") or sub.get("plan") or "free")
+
+        def patched_whatsapp_same_active_plan(account_id: str, selected_plan_code: str) -> bool:
+            sub = whatsapp_active_subscription(account_id)
+            return bool(sub and _lower(sub.get("plan_code")) == _lower(selected_plan_code))
+
+        def patched_whatsapp_plan_label(account_id: str) -> str:
+            active_sub = whatsapp_active_subscription(account_id)
+            expired_sub = whatsapp_expired_subscription(account_id)
+            if active_sub:
+                name = _clean(active_sub.get("plan_name") or active_sub.get("plan_code") or "Paid plan")
+                status = _clean(active_sub.get("status") or "active")
+                expires = _subscription_expiry_value(active_sub)
+                if expires:
+                    return f"{name} ({status})\nExpires: {_date_label(expires)}"
+                return f"{name} ({status})"
+            if expired_sub:
+                previous = _clean(expired_sub.get("plan_code") or expired_sub.get("plan_name") or "previous paid plan")
+                expires = _subscription_expiry_value(expired_sub)
+                return (
+                    f"{previous} (expired)\n"
+                    f"Expired: {_date_label(expires)}\n"
+                    "Paid access is not active. Reply 4 to renew."
+                )
+            return "Free Forever"
+
+        def patched_whatsapp_credit_balance(account_id: str) -> int:
+            if whatsapp_expired_subscription(account_id):
+                return 0
+            return int(original_credit_balance(account_id)) if callable(original_credit_balance) else 0
+
+        if callable(original_init_checkout):
             def patched_whatsapp_init_checkout(account: Optional[Dict[str, Any]], account_id: str, item: Dict[str, Any], payment_type: str, wa_id: str = "") -> Dict[str, Any]:
                 if _lower(payment_type) == "topup" and not patched_has_active_subscription(account_id):
                     return {
@@ -516,7 +656,16 @@ def _apply_channel_expiry_patch() -> None:
                 return original_init_checkout(account, account_id, item, payment_type, wa_id)
 
             w._init_paystack_checkout = patched_whatsapp_init_checkout  # type: ignore[attr-defined]
-            w._ntg_whatsapp_topup_guard_applied = True  # type: ignore[attr-defined]
+
+        w._get_subscription = patched_whatsapp_get_subscription  # type: ignore[attr-defined]
+        w._is_active_paid_subscription = patched_whatsapp_is_active_paid_subscription  # type: ignore[attr-defined]
+        w._subscription_status = patched_whatsapp_subscription_status  # type: ignore[attr-defined]
+        w._subscription_expiry = patched_whatsapp_subscription_expiry  # type: ignore[attr-defined]
+        w._current_plan_code = patched_whatsapp_current_plan_code  # type: ignore[attr-defined]
+        w._same_active_plan = patched_whatsapp_same_active_plan  # type: ignore[attr-defined]
+        w._plan_label = patched_whatsapp_plan_label  # type: ignore[attr-defined]
+        w._credit_balance = patched_whatsapp_credit_balance  # type: ignore[attr-defined]
+        w._ntg_whatsapp_expired_plan_helpers_applied = True  # type: ignore[attr-defined]
     except Exception:
         pass
 
