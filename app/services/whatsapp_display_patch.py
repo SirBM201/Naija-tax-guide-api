@@ -112,9 +112,9 @@ def _apply_subscription_expiry_patch() -> None:
     Never let a stale DB status='active' override an expired billing period.
 
     Some older subscription rows can still have status='active' after expires_at
-    is already in the past. The billing page and workspace state consume the
-    response payload, so the payload itself must be normalized, not only the
-    internal active-check helper.
+    is already in the past. The billing page, workspace state, and entitlement
+    routes consume response payloads, so expired paid-plan identity must be
+    normalized before the frontend can treat it as usable access.
     """
     try:
         from app.routes import billing
@@ -193,13 +193,24 @@ def _apply_subscription_expiry_patch() -> None:
 
             active = bool(billing._subscription_is_active(sub))  # type: ignore[attr-defined]
             status = _derived_status(sub, active)
+            expired = status == "expired"
+
+            original_plan_code = str(payload.get("plan_code") or (sub or {}).get("plan_code") or "").strip()
+            original_plan_name = str(payload.get("plan_name") or "").strip()
 
             payload["active"] = active
             payload["is_active"] = active
             payload["status"] = status
-            payload["expired"] = status == "expired"
+            payload["expired"] = expired
 
-            if status == "expired":
+            if expired:
+                payload["expired_plan_code"] = original_plan_code or None
+                payload["expired_plan_name"] = original_plan_name or None
+                payload["plan_code"] = "expired"
+                payload["plan_family"] = "expired"
+                payload["plan_name"] = "Expired Plan"
+                payload["included_credits"] = 0
+                payload["credit_balance"] = 0
                 payload["topup_allowed"] = False
                 payload["topup_eligibility_reason"] = "subscription_expired"
 
@@ -208,12 +219,21 @@ def _apply_subscription_expiry_patch() -> None:
                 subscription["active"] = active
                 subscription["is_active"] = active
                 subscription["status"] = status
-                subscription["expired"] = status == "expired"
+                subscription["expired"] = expired
+                if expired:
+                    subscription["expired_plan_code"] = original_plan_code or subscription.get("plan_code")
+                    subscription["expired_plan_name"] = original_plan_name or subscription.get("plan_name")
+                    subscription["plan_code"] = "expired"
+                    subscription["plan_family"] = "expired"
+                    subscription["plan_name"] = "Expired Plan"
+                    subscription["included_credits"] = 0
 
             summary = payload.get("subscription_summary")
             if isinstance(summary, dict):
                 summary["is_active_now"] = active
                 summary["status"] = status
+                if expired:
+                    summary["current_plan_code"] = "expired"
 
             return payload
 
@@ -235,6 +255,26 @@ def _apply_subscription_expiry_patch() -> None:
 
             subscription_guard._build_access = patched_build_access  # type: ignore[attr-defined]
             subscription_guard._ntg_expiry_access_patch_applied = True  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+    try:
+        from app.services import account_entitlements_service as entitlements
+
+        original_entitlements_from_subscription = getattr(entitlements, "_entitlements_from_subscription", None)
+        if callable(original_entitlements_from_subscription) and not getattr(entitlements, "_ntg_expiry_entitlements_patch_applied", False):
+            def patched_entitlements_from_subscription(account_id: str, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+                try:
+                    if _is_expired(row):
+                        return None
+                    if not bool(entitlements._subscription_is_active(row)):  # type: ignore[attr-defined]
+                        return None
+                except Exception:
+                    pass
+                return original_entitlements_from_subscription(account_id, row)
+
+            entitlements._entitlements_from_subscription = patched_entitlements_from_subscription  # type: ignore[attr-defined]
+            entitlements._ntg_expiry_entitlements_patch_applied = True  # type: ignore[attr-defined]
     except Exception:
         pass
 
