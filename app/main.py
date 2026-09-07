@@ -5,10 +5,12 @@ from flask import jsonify
 from werkzeug.exceptions import HTTPException
 
 from app import create_app
+from app.routes.channel_activation import bp as channel_activation_bp
 from app.services.v1_security_guard import install_v1_security_guard
 from app.services.v1_subscription_reconciliation import install_v1_subscription_reconciliation
 
 app = create_app()
+app.register_blueprint(channel_activation_bp, url_prefix="/api")
 install_v1_security_guard(app)
 install_v1_subscription_reconciliation()
 
