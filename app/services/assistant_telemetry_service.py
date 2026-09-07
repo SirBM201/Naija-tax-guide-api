@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-"""V1 assistant usage telemetry, cost ceilings and lightweight abuse controls.
+"""V1 assistant usage telemetry and lightweight abuse controls.
 
-Deterministic guidance is never blocked. Paid-AI candidates are constrained
-before inference by message-size, per-account RPM and a process-wide daily
-estimated-cost ceiling. Telemetry persistence is best-effort and is not relied
-upon for the hard budget guard.
+Individual plan/credit entitlements remain authoritative for paid AI access.
+This module enforces message-size and per-account request-rate controls, while
+app-wide estimated spend thresholds are monitoring signals only and never deny
+a valid user request. Deterministic guidance is never blocked here.
 """
 
 import logging
@@ -21,7 +21,7 @@ from app.core.supabase_client import supabase
 _LOCK = threading.Lock()
 _REQUESTS: dict[str, deque[float]] = defaultdict(deque)
 _BUDGET_DAY = ""
-_RESERVED_DAILY_COST_USD = 0.0
+_ESTIMATED_DAILY_COST_USD = 0.0
 
 
 def _int_env(name: str, default: int) -> int:
@@ -40,7 +40,11 @@ def _float_env(name: str, default: float) -> float:
 
 ASSISTANT_AI_REQUESTS_PER_MINUTE = _int_env("NTG_ASSISTANT_AI_REQUESTS_PER_MINUTE", 12)
 ASSISTANT_MAX_MESSAGE_CHARS = _int_env("NTG_ASSISTANT_MAX_MESSAGE_CHARS", 6000)
-ASSISTANT_DAILY_COST_USD = _float_env("NTG_ASSISTANT_DAILY_COST_USD", 5.0)
+# Backward-compatible env name. This is now an alert threshold, not a hard cap.
+ASSISTANT_DAILY_COST_ALERT_USD = _float_env(
+    "NTG_ASSISTANT_DAILY_COST_ALERT_USD",
+    _float_env("NTG_ASSISTANT_DAILY_COST_USD", 5.0),
+)
 ASSISTANT_ESTIMATED_AI_CALL_USD = _float_env("NTG_ASSISTANT_ESTIMATED_AI_CALL_USD", 0.01)
 
 
@@ -48,47 +52,32 @@ def _utc_day() -> str:
     return datetime.now(timezone.utc).date().isoformat()
 
 
-def _reserve_daily_budget_locked() -> Dict[str, Any]:
-    global _BUDGET_DAY, _RESERVED_DAILY_COST_USD
+def _record_estimated_spend_locked() -> Dict[str, Any]:
+    """Record estimated app-wide spend without blocking entitled customers."""
+    global _BUDGET_DAY, _ESTIMATED_DAILY_COST_USD
 
     today = _utc_day()
     if _BUDGET_DAY != today:
         _BUDGET_DAY = today
-        _RESERVED_DAILY_COST_USD = 0.0
+        _ESTIMATED_DAILY_COST_USD = 0.0
 
     estimate = ASSISTANT_ESTIMATED_AI_CALL_USD
-    ceiling = ASSISTANT_DAILY_COST_USD
+    _ESTIMATED_DAILY_COST_USD += estimate
+    threshold = ASSISTANT_DAILY_COST_ALERT_USD
+    alert = bool(threshold > 0.0 and _ESTIMATED_DAILY_COST_USD >= threshold)
 
-    # A zero ceiling deliberately disables paid AI. A zero estimate means the
-    # configured provider is treated as no-cost for this guard.
-    if ceiling <= 0.0 and estimate > 0.0:
-        return {
-            "ok": False,
-            "error": "assistant_daily_budget_exhausted",
-            "daily_cost_ceiling_usd": ceiling,
-            "estimated_daily_cost_usd": round(_RESERVED_DAILY_COST_USD, 6),
-        }
-
-    projected = _RESERVED_DAILY_COST_USD + estimate
-    if estimate > 0.0 and projected > ceiling + 1e-9:
-        return {
-            "ok": False,
-            "error": "assistant_daily_budget_exhausted",
-            "daily_cost_ceiling_usd": ceiling,
-            "estimated_daily_cost_usd": round(_RESERVED_DAILY_COST_USD, 6),
-        }
-
-    _RESERVED_DAILY_COST_USD = projected
     return {
         "ok": True,
-        "daily_cost_ceiling_usd": ceiling,
-        "estimated_daily_cost_usd": round(_RESERVED_DAILY_COST_USD, 6),
-        "reserved_call_cost_usd": estimate,
+        "estimated_daily_cost_usd": round(_ESTIMATED_DAILY_COST_USD, 6),
+        "estimated_call_cost_usd": estimate,
+        "daily_cost_alert_threshold_usd": threshold,
+        "daily_cost_alert": alert,
+        "budget_policy": "monitor_only",
     }
 
 
 def preflight_paid_ai(*, account_id: str, message: str) -> Dict[str, Any]:
-    """Hard local guard before a request is allowed to reach paid inference."""
+    """Per-user abuse guard plus non-blocking app-wide spend monitoring."""
     if ASSISTANT_MAX_MESSAGE_CHARS and len(message) > ASSISTANT_MAX_MESSAGE_CHARS:
         return {"ok": False, "error": "assistant_message_too_long", "retryable": True}
 
@@ -104,14 +93,19 @@ def preflight_paid_ai(*, account_id: str, message: str) -> Dict[str, Any]:
             if len(bucket) >= ASSISTANT_AI_REQUESTS_PER_MINUTE:
                 return {"ok": False, "error": "assistant_rate_limited", "retry_after_seconds": 60}
 
-        budget = _reserve_daily_budget_locked()
-        if not budget.get("ok"):
-            return budget
+        spend = _record_estimated_spend_locked()
 
         if ASSISTANT_AI_REQUESTS_PER_MINUTE > 0:
             _REQUESTS[key].append(now)
 
-    return budget
+    if spend.get("daily_cost_alert"):
+        logging.warning(
+            "NTG assistant estimated daily AI spend reached monitoring threshold: estimated=%s threshold=%s",
+            spend.get("estimated_daily_cost_usd"),
+            spend.get("daily_cost_alert_threshold_usd"),
+        )
+
+    return spend
 
 
 def record_assistant_event(
@@ -143,6 +137,7 @@ def record_assistant_event(
 
 
 def budget_fallback(*, account_id: str, channel: str) -> Dict[str, Any]:
+    """Compatibility fallback; normal spend thresholds no longer invoke it."""
     return {
         "ok": False,
         "error": "assistant_budget_unavailable",
@@ -156,7 +151,7 @@ def budget_fallback(*, account_id: str, channel: str) -> Dict[str, Any]:
         "meta": {
             "account_id": account_id,
             "channel": channel,
-            "cost_route": "budget_guard",
+            "cost_route": "emergency_guard",
             "ai_called": False,
             "usage_charged": False,
             "credits_consumed": 0,
