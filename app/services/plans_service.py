@@ -4,24 +4,31 @@ from typing import Any, Dict, List, Optional
 
 
 def _tier_channel_limits(tier: str) -> Dict[str, int]:
+    """External messaging-channel limits.
+
+    The authenticated web app is the account's primary channel and is not
+    counted in these values.  A Starter account therefore means web + one
+    linked external channel (WhatsApp OR Telegram), matching the locked V1
+    product policy.
+    """
     tier = str(tier or "").strip().lower()
     if tier == "starter":
         return {
-            "max_total_channels": 2,
+            "max_total_channels": 1,
             "max_whatsapp_channels": 1,
             "max_telegram_channels": 1,
         }
     if tier == "professional":
         return {
-            "max_total_channels": 4,
-            "max_whatsapp_channels": 2,
-            "max_telegram_channels": 2,
+            "max_total_channels": 2,
+            "max_whatsapp_channels": 1,
+            "max_telegram_channels": 1,
         }
     if tier == "business":
         return {
-            "max_total_channels": 8,
-            "max_whatsapp_channels": 4,
-            "max_telegram_channels": 4,
+            "max_total_channels": 4,
+            "max_whatsapp_channels": 2,
+            "max_telegram_channels": 2,
         }
     return {
         "max_total_channels": 0,
@@ -31,178 +38,26 @@ def _tier_channel_limits(tier: str) -> Dict[str, int]:
 
 
 def _tier_user_limits(tier: str) -> Dict[str, int]:
-    """
-    User/account entitlement is defined by plan family, not billing cycle.
-    These values are now part of the plan payload and can be enforced anywhere
-    the app later supports workspace members or linked web accounts.
-    """
     tier = str(tier or "").strip().lower()
     if tier == "starter":
-        return {
-            "max_workspace_users": 1,
-            "max_linked_web_accounts": 1,
-        }
+        return {"max_workspace_users": 1, "max_linked_web_accounts": 1}
     if tier == "professional":
-        return {
-            "max_workspace_users": 3,
-            "max_linked_web_accounts": 3,
-        }
+        return {"max_workspace_users": 3, "max_linked_web_accounts": 3}
     if tier == "business":
-        return {
-            "max_workspace_users": 10,
-            "max_linked_web_accounts": 10,
-        }
-    return {
-        "max_workspace_users": 0,
-        "max_linked_web_accounts": 0,
-    }
+        return {"max_workspace_users": 10, "max_linked_web_accounts": 10}
+    return {"max_workspace_users": 0, "max_linked_web_accounts": 0}
 
 
 PLAN_DEFINITIONS: List[Dict[str, Any]] = [
-    {
-        "code": "starter_monthly",
-        "name": "Starter Monthly",
-        "tier": "starter",
-        "cycle": "monthly",
-        "price": 5000,
-        "currency": "NGN",
-        "duration_days": 30,
-        "credits": 100,
-        "support_level": "Standard support",
-        "recommended": False,
-        "active": True,
-        "description": "Simple AI-guided tax help for lighter personal tax questions and early-stage users.",
-        "audience": "Best for individuals, salary earners, and first-time users.",
-        "sort_order": 10,
-    },
-    {
-        "code": "starter_quarterly",
-        "name": "Starter Quarterly",
-        "tier": "starter",
-        "cycle": "quarterly",
-        "price": 14000,
-        "currency": "NGN",
-        "duration_days": 90,
-        "credits": 300,
-        "support_level": "Standard support",
-        "recommended": False,
-        "active": True,
-        "description": "Simple AI-guided tax help for lighter personal tax questions and early-stage users.",
-        "audience": "Best for individuals, salary earners, and first-time users.",
-        "sort_order": 20,
-    },
-    {
-        "code": "starter_yearly",
-        "name": "Starter Yearly",
-        "tier": "starter",
-        "cycle": "yearly",
-        "price": 51000,
-        "currency": "NGN",
-        "duration_days": 365,
-        "credits": 1200,
-        "support_level": "Standard support",
-        "recommended": False,
-        "active": True,
-        "description": "Simple AI-guided tax help for lighter personal tax questions and early-stage users.",
-        "audience": "Best for individuals, salary earners, and first-time users.",
-        "sort_order": 30,
-    },
-    {
-        "code": "professional_monthly",
-        "name": "Professional Monthly",
-        "tier": "professional",
-        "cycle": "monthly",
-        "price": 12000,
-        "currency": "NGN",
-        "duration_days": 30,
-        "credits": 300,
-        "support_level": "Priority support",
-        "recommended": True,
-        "active": True,
-        "description": "Stronger monthly usage capacity for users who need more regular tax guidance and compliance support.",
-        "audience": "Best for freelancers, consultants, creators, and SMEs.",
-        "sort_order": 40,
-    },
-    {
-        "code": "professional_quarterly",
-        "name": "Professional Quarterly",
-        "tier": "professional",
-        "cycle": "quarterly",
-        "price": 33600,
-        "currency": "NGN",
-        "duration_days": 90,
-        "credits": 900,
-        "support_level": "Priority support",
-        "recommended": True,
-        "active": True,
-        "description": "Stronger monthly usage capacity for users who need more regular tax guidance and compliance support.",
-        "audience": "Best for freelancers, consultants, creators, and SMEs.",
-        "sort_order": 50,
-    },
-    {
-        "code": "professional_yearly",
-        "name": "Professional Yearly",
-        "tier": "professional",
-        "cycle": "yearly",
-        "price": 122400,
-        "currency": "NGN",
-        "duration_days": 365,
-        "credits": 3600,
-        "support_level": "Priority support",
-        "recommended": True,
-        "active": True,
-        "description": "Stronger monthly usage capacity for users who need more regular tax guidance and compliance support.",
-        "audience": "Best for freelancers, consultants, creators, and SMEs.",
-        "sort_order": 60,
-    },
-    {
-        "code": "business_monthly",
-        "name": "Business Monthly",
-        "tier": "business",
-        "cycle": "monthly",
-        "price": 25000,
-        "currency": "NGN",
-        "duration_days": 30,
-        "credits": 800,
-        "support_level": "Priority support + account review",
-        "recommended": False,
-        "active": True,
-        "description": "Higher usage capacity and stronger support for businesses or users who expect more continuous activity.",
-        "audience": "Best for heavier usage, business support, and ongoing tax guidance needs.",
-        "sort_order": 70,
-    },
-    {
-        "code": "business_quarterly",
-        "name": "Business Quarterly",
-        "tier": "business",
-        "cycle": "quarterly",
-        "price": 70000,
-        "currency": "NGN",
-        "duration_days": 90,
-        "credits": 2400,
-        "support_level": "Priority support + account review",
-        "recommended": False,
-        "active": True,
-        "description": "Higher usage capacity and stronger support for businesses or users who expect more continuous activity.",
-        "audience": "Best for heavier usage, business support, and ongoing tax guidance needs.",
-        "sort_order": 80,
-    },
-    {
-        "code": "business_yearly",
-        "name": "Business Yearly",
-        "tier": "business",
-        "cycle": "yearly",
-        "price": 255000,
-        "currency": "NGN",
-        "duration_days": 365,
-        "credits": 9600,
-        "support_level": "Priority support + account review",
-        "recommended": False,
-        "active": True,
-        "description": "Higher usage capacity and stronger support for businesses or users who expect more continuous activity.",
-        "audience": "Best for heavier usage, business support, and ongoing tax guidance needs.",
-        "sort_order": 90,
-    },
+    {"code": "starter_monthly", "name": "Starter Monthly", "tier": "starter", "cycle": "monthly", "price": 5000, "currency": "NGN", "duration_days": 30, "credits": 100, "support_level": "Standard support", "recommended": False, "active": True, "description": "Simple AI-guided tax help for lighter personal tax questions and early-stage users.", "audience": "Best for individuals, salary earners, and first-time users.", "sort_order": 10},
+    {"code": "starter_quarterly", "name": "Starter Quarterly", "tier": "starter", "cycle": "quarterly", "price": 14000, "currency": "NGN", "duration_days": 90, "credits": 300, "support_level": "Standard support", "recommended": False, "active": True, "description": "Simple AI-guided tax help for lighter personal tax questions and early-stage users.", "audience": "Best for individuals, salary earners, and first-time users.", "sort_order": 20},
+    {"code": "starter_yearly", "name": "Starter Yearly", "tier": "starter", "cycle": "yearly", "price": 51000, "currency": "NGN", "duration_days": 365, "credits": 1200, "support_level": "Standard support", "recommended": False, "active": True, "description": "Simple AI-guided tax help for lighter personal tax questions and early-stage users.", "audience": "Best for individuals, salary earners, and first-time users.", "sort_order": 30},
+    {"code": "professional_monthly", "name": "Professional Monthly", "tier": "professional", "cycle": "monthly", "price": 12000, "currency": "NGN", "duration_days": 30, "credits": 300, "support_level": "Priority support", "recommended": True, "active": True, "description": "Stronger monthly usage capacity for users who need more regular tax guidance and compliance support.", "audience": "Best for freelancers, consultants, creators, and SMEs.", "sort_order": 40},
+    {"code": "professional_quarterly", "name": "Professional Quarterly", "tier": "professional", "cycle": "quarterly", "price": 33600, "currency": "NGN", "duration_days": 90, "credits": 900, "support_level": "Priority support", "recommended": True, "active": True, "description": "Stronger monthly usage capacity for users who need more regular tax guidance and compliance support.", "audience": "Best for freelancers, consultants, creators, and SMEs.", "sort_order": 50},
+    {"code": "professional_yearly", "name": "Professional Yearly", "tier": "professional", "cycle": "yearly", "price": 122400, "currency": "NGN", "duration_days": 365, "credits": 3600, "support_level": "Priority support", "recommended": True, "active": True, "description": "Stronger monthly usage capacity for users who need more regular tax guidance and compliance support.", "audience": "Best for freelancers, consultants, creators, and SMEs.", "sort_order": 60},
+    {"code": "business_monthly", "name": "Business Monthly", "tier": "business", "cycle": "monthly", "price": 25000, "currency": "NGN", "duration_days": 30, "credits": 800, "support_level": "Priority support + account review", "recommended": False, "active": True, "description": "Higher usage capacity and stronger support for businesses or users who expect more continuous activity.", "audience": "Best for heavier usage, business support, and ongoing tax guidance needs.", "sort_order": 70},
+    {"code": "business_quarterly", "name": "Business Quarterly", "tier": "business", "cycle": "quarterly", "price": 70000, "currency": "NGN", "duration_days": 90, "credits": 2400, "support_level": "Priority support + account review", "recommended": False, "active": True, "description": "Higher usage capacity and stronger support for businesses or users who expect more continuous activity.", "audience": "Best for heavier usage, business support, and ongoing tax guidance needs.", "sort_order": 80},
+    {"code": "business_yearly", "name": "Business Yearly", "tier": "business", "cycle": "yearly", "price": 255000, "currency": "NGN", "duration_days": 365, "credits": 9600, "support_level": "Priority support + account review", "recommended": False, "active": True, "description": "Higher usage capacity and stronger support for businesses or users who expect more continuous activity.", "audience": "Best for heavier usage, business support, and ongoing tax guidance needs.", "sort_order": 90},
 ]
 
 
@@ -216,6 +71,8 @@ def _enriched_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
     out["plan_family"] = tier or None
     out.update(_tier_channel_limits(tier))
     out.update(_tier_user_limits(tier))
+    out["web_channel_included"] = True
+    out["channel_limit_scope"] = "external_messaging_channels"
     return out
 
 
@@ -230,21 +87,17 @@ def get_plan(plan_code: str | None) -> Optional[Dict[str, Any]]:
     code = _normalize_code(plan_code)
     if not code:
         return None
-
     for plan in PLAN_DEFINITIONS:
         if _normalize_code(plan.get("code")) == code:
             return _enriched_plan(plan)
-
     return None
 
 
 def list_plans_by_cycle(cycle: str, active_only: bool = True) -> List[Dict[str, Any]]:
     cycle = _normalize_code(cycle)
-    plans = list_plans(active_only=active_only)
-    return [plan for plan in plans if _normalize_code(plan.get("cycle")) == cycle]
+    return [plan for plan in list_plans(active_only=active_only) if _normalize_code(plan.get("cycle")) == cycle]
 
 
 def list_plans_by_tier(tier: str, active_only: bool = True) -> List[Dict[str, Any]]:
     tier = _normalize_code(tier)
-    plans = list_plans(active_only=active_only)
-    return [plan for plan in plans if _normalize_code(plan.get("tier")) == tier]
+    return [plan for plan in list_plans(active_only=active_only) if _normalize_code(plan.get("tier")) == tier]
