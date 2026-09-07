@@ -12,6 +12,7 @@ from app.services.paystack_service import initialize_transaction
 from app.core.config import PAYSTACK_CURRENCY
 
 logger = logging.getLogger(__name__)
+SERVICE_VERSION = "2026-09-07-v1-paid-subscriber-topups"
 
 CREDIT_PACKAGES = {
     1: {"credits": 10, "amount_ngn": 500, "amount_kobo": 50000, "description": "10 AI Credits"},
@@ -64,7 +65,31 @@ def get_or_create_account_id(channel_type: str, provider_user_id: str) -> str:
         return provider_user_id
 
 
+def _require_paid_topup_entitlement(account_id: str) -> Dict[str, Any]:
+    """Top-ups are an add-on for active paid subscribers only."""
+    try:
+        from app.services.account_entitlements_service import get_account_entitlements
+        ent = get_account_entitlements(account_id)
+    except Exception as exc:
+        logger.error("Could not resolve top-up entitlement account=%s: %s", account_id, exc)
+        return {"ok": False, "error": "topup_entitlement_unavailable"}
+
+    plan_code = str((ent or {}).get("plan_code") or "").strip().lower()
+    subscription = (ent or {}).get("subscription")
+    if not (ent or {}).get("ok") or not subscription or plan_code in {"", "free", "free_forever"}:
+        return {
+            "ok": False,
+            "error": "active_paid_plan_required",
+            "message": "Credit top-ups are available only to active paid subscribers. Please subscribe to a paid plan first.",
+        }
+    return {"ok": True, "plan_code": plan_code}
+
+
 def create_credit_payment(account_id: str, package_num: int, channel_type: str, provider_user_id: str) -> Dict[str, Any]:
+    entitlement = _require_paid_topup_entitlement(account_id)
+    if not entitlement.get("ok"):
+        return entitlement
+
     package = CREDIT_PACKAGES.get(package_num)
     if not package:
         return {"ok": False, "error": "invalid_package", "message": "Invalid package number. Please select 1-4."}
@@ -81,7 +106,7 @@ def create_credit_payment(account_id: str, package_num: int, channel_type: str, 
     try:
         result = initialize_transaction(amount_kobo=amount_kobo, email=None, reference=reference, metadata={"account_id": account_id, "credits": credits, "package": package_num, "type": "credit_purchase", "channel_type": channel_type, "provider_user_id": provider_user_id, "amount_ngn": amount_ngn}, callback_url=callback_url)
         if result.get("status") and result.get("data", {}).get("authorization_url"):
-            return {"ok": True, "payment_link": result["data"]["authorization_url"], "reference": reference, "amount_ngn": amount_ngn, "credits": credits, "message": f"💰 *Payment Link*\n\nClick to pay ₦{amount_ngn:,} for {credits} AI credits:\n\n{result['data']['authorization_url']}\n\n✅ After payment, your credits will be added automatically.\n\n💡 No email needed - we'll identify you via WhatsApp!"}
+            return {"ok": True, "payment_link": result["data"]["authorization_url"], "reference": reference, "amount_ngn": amount_ngn, "credits": credits, "message": f"💰 *Payment Link*\n\nClick to pay ₦{amount_ngn:,} for {credits} AI credits:\n\n{result['data']['authorization_url']}\n\n✅ After payment, your credits will be added automatically.\n\n💡 No email needed - we'll identify you via your linked channel."}
         error_msg = result.get("message", "Payment initialization failed")
         return {"ok": False, "error": "payment_link_failed", "message": f"Could not generate payment link: {error_msg}\n\nPlease try again later."}
     except Exception as e:
@@ -93,8 +118,9 @@ def add_credits_to_account(account_id: str, credits: int, reference: str) -> boo
     """Atomically fulfill a verified Paystack credit purchase.
 
     Requires migration 20260907_paystack_atomic_credit_fulfillment.sql.
-    There is intentionally no legacy read/update fallback: falling back would
-    reintroduce the duplicate-credit race this V1 hardening closes.
+    Paid subscribers intentionally receive purchased add-on credits.  The
+    purchase-creation path enforces the paid-plan requirement; fulfillment is
+    reference-idempotent and must not silently discard a verified purchase.
     """
     account_id = str(account_id or "").strip()
     reference = str(reference or "").strip()
@@ -105,14 +131,6 @@ def add_credits_to_account(account_id: str, credits: int, reference: str) -> boo
     if not account_id or not reference or credits <= 0:
         logger.error("Invalid atomic credit fulfillment arguments")
         return False
-
-    try:
-        from app.services.channel_subscription_service import has_active_subscription
-        if has_active_subscription(account_id):
-            logger.info("Account %s has active subscription; no add-on credit mutation required", account_id)
-            return True
-    except Exception:
-        pass
 
     try:
         response = _sb().rpc("ntg_fulfill_credit_purchase", {"p_account_id": account_id, "p_credits": credits, "p_reference": reference}).execute()
