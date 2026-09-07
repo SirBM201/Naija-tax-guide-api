@@ -49,8 +49,9 @@ def _valid_ip(value: str) -> str:
 def _client_key() -> str:
     remote = _valid_ip(request.remote_addr or "") or "unknown"
     # X-Forwarded-For is attacker-controlled unless the deployment explicitly
-    # declares its reverse proxy trustworthy.
-    if _truthy(os.getenv("NTG_TRUST_PROXY_HEADERS", "1")):
+    # opts in after confirming the request reaches Flask only through a trusted
+    # reverse proxy. Secure default: ignore forwarded client-IP headers.
+    if _truthy(os.getenv("NTG_TRUST_PROXY_HEADERS", "0")):
         forwarded = (request.headers.get("X-Forwarded-For") or "").split(",", 1)[0].strip()
         forwarded_ip = _valid_ip(forwarded)
         if forwarded_ip:
