@@ -10,7 +10,7 @@ from app.services.assistant_telemetry_service import preflight_paid_ai, record_a
 from app.services.answer_metadata_service import build_source_metadata
 from app.services.source_integrity_guard import assess_source_integrity, integrity_fallback
 
-GUIDED_TAX_ASSISTANT_VERSION = "2026-09-07-v1-05-source-integrity"
+GUIDED_TAX_ASSISTANT_VERSION = "2026-09-07-v1-10-cache-first-budget-guard"
 
 _GUIDANCE = {
     "menu": {"answer": "I can guide you through Naija Tax Guide.\n\nYou can ask a Nigeria tax question, use a tax calculator, check your plan or credits, review deadlines, take the quiz, or get help with your account. Tell me what you want to do.", "next_action": "Choose: tax question, calculator, deadlines, quiz, plan/credits, or account help."},
@@ -85,11 +85,10 @@ def guide_or_answer(*, account_id: str, message: str, lang: str = "en", channel:
     if intent:
         return _record(account_id, channel, _deterministic_response(intent, account_id=account_id, channel=channel))
 
-    guard = preflight_paid_ai(account_id=account_id, message=message)
-    if not guard.get("ok"):
-        result = {"ok": False, "error": guard.get("error") or "assistant_rate_limited", "message": "This assistant request is temporarily limited. Free calculators, approved database guidance, deadlines, quiz and account help remain available.", "source": "guided_assistant", "mode": "deterministic_fallback", "next_action": "Use a free workflow or retry shortly.", "meta": {"assistant_version": GUIDED_TAX_ASSISTANT_VERSION, "cost_route": "preflight_guard", "ai_called": False, "usage_charged": False, "credits_consumed": 0, "retry_after_seconds": guard.get("retry_after_seconds")}}
-        return _record(account_id, channel, result)
-
+    # Important: ask_guarded is cache/library-first. Do not reserve paid-AI
+    # budget here because a database/library/cache answer may satisfy the
+    # request without inference. The hard paid-AI budget guard is injected
+    # into ask_guarded's actual AI-call boundary by guided_channel_patch.
     result = ask_guarded(account_id=account_id, question=message, lang=lang, channel=channel, provider=channel, provider_user_id=provider_user_id, action_code=action_code, **extra)
     if not isinstance(result, dict):
         result = {"ok": False, "error": "assistant_invalid_result", "message": "I could not generate an answer right now."}
