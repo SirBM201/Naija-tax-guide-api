@@ -5,8 +5,10 @@ from flask import jsonify
 from werkzeug.exceptions import HTTPException
 
 from app import create_app
+from app.services.v1_security_guard import install_v1_security_guard
 
 app = create_app()
+install_v1_security_guard(app)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
