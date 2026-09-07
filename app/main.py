@@ -9,12 +9,14 @@ from app.routes.channel_activation import bp as channel_activation_bp
 from app.services.v1_security_guard import install_v1_security_guard
 from app.services.v1_subscription_reconciliation import install_v1_subscription_reconciliation
 from app.services.channel_runtime_http_guard import install_channel_runtime_http_guard
+from app.services.billing_atomic_subscription_patch import install as install_billing_atomic_subscription_patch
 
 app = create_app()
 app.register_blueprint(channel_activation_bp, url_prefix="/api")
 install_v1_security_guard(app)
 install_channel_runtime_http_guard(app)
 install_v1_subscription_reconciliation()
+install_billing_atomic_subscription_patch()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
