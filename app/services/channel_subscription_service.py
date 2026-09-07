@@ -331,64 +331,48 @@ def create_subscription_payment(
 
 
 def activate_subscription(account_id: str, plan_code: str, reference: str) -> Dict[str, Any]:
-    """
-    Activate a subscription for a channel user.
+    """Atomically fulfill a verified channel subscription payment.
 
-    Batch 36F:
-    After the subscription row is activated, add the paid plan credits to any
-    existing unused balance. This preserves old credits during upgrades/renewals
-    and prevents duplicate crediting by using the Paystack reference.
+    The database RPC owns period mutation and Paystack-reference idempotency.
+    Included credits remain independently idempotent by the same reference.
     """
     try:
-        now = datetime.now(timezone.utc)
+        plan = validate_plan_code(plan_code)
+        duration_days = int((plan or {}).get("duration_days") or 0)
+        if duration_days <= 0:
+            if "yearly" in plan_code:
+                duration_days = 365
+            elif "quarterly" in plan_code:
+                duration_days = 90
+            else:
+                duration_days = 30
 
-        if "yearly" in plan_code:
-            duration_days = 365
+        if "yearly" in plan_code or duration_days >= 365:
             billing_cycle = "yearly"
-        elif "quarterly" in plan_code:
-            duration_days = 90
+        elif "quarterly" in plan_code or duration_days >= 90:
             billing_cycle = "quarterly"
         else:
-            duration_days = 30
             billing_cycle = "monthly"
 
-        current_period_end = (now + timedelta(days=duration_days)).isoformat()
-        now_iso = now.isoformat()
-
-        _sb().table("user_subscriptions") \
-            .update({"is_active": False, "status": "inactive", "updated_at": now_iso}) \
-            .eq("account_id", account_id) \
-            .eq("is_active", True) \
-            .execute()
-
-        existing = _sb().table("user_subscriptions") \
-            .select("*") \
-            .eq("account_id", account_id) \
-            .order("created_at", desc=True) \
-            .limit(1) \
-            .execute()
-
-        if existing.data:
-            _sb().table("user_subscriptions") \
-                .update({
-                    "plan_code": plan_code,
-                    "status": "active",
-                    "is_active": True,
-                    "current_period_end": current_period_end,
-                    "updated_at": now_iso,
-                }) \
-                .eq("id", existing.data[0]["id"]) \
-                .execute()
-        else:
-            _sb().table("user_subscriptions").insert({
-                "account_id": account_id,
-                "plan_code": plan_code,
-                "status": "active",
-                "is_active": True,
-                "current_period_end": current_period_end,
-                "created_at": now_iso,
-                "updated_at": now_iso,
-            }).execute()
+        rpc = _sb().rpc(
+            "ntg_fulfill_subscription_payment",
+            {
+                "p_account_id": account_id,
+                "p_plan_code": plan_code,
+                "p_reference": reference,
+                "p_duration_days": duration_days,
+            },
+        ).execute()
+        fulfillment = getattr(rpc, "data", None)
+        if isinstance(fulfillment, list):
+            fulfillment = fulfillment[0] if fulfillment else None
+        if not isinstance(fulfillment, dict) or not fulfillment.get("ok"):
+            return {
+                "ok": False,
+                "error": "subscription_fulfillment_failed",
+                "fulfillment": fulfillment,
+                "route_version": "2026-09-07-v2-atomic-subscription-fulfillment",
+            }
 
         credit_initialization: Dict[str, Any] = {}
         try:
@@ -412,35 +396,37 @@ def activate_subscription(account_id: str, plan_code: str, reference: str) -> Di
                 "root_cause": f"{type(credit_exc).__name__}: {credit_exc}",
             }
 
-        if credit_initialization.get("ok"):
-            logger.info(
-                f"Subscription activated and credits applied for account {account_id}: "
-                f"{plan_code}, balance={credit_initialization.get('balance')}, "
-                f"added={credit_initialization.get('credits_added')}"
-            )
-        else:
-            logger.error(
-                f"Subscription activated but credit application failed for account {account_id}: "
-                f"{plan_code}, result={credit_initialization}"
-            )
-
-        logger.info(f"Subscription activated for account {account_id}: {plan_code} until {current_period_end}")
-
+        period_end = fulfillment.get("period_end")
+        logger.info(
+            "Atomic subscription fulfillment account=%s plan=%s reference=%s applied=%s duplicate=%s period_end=%s",
+            account_id,
+            plan_code,
+            reference,
+            fulfillment.get("applied"),
+            fulfillment.get("duplicate"),
+            period_end,
+        )
         return {
             "ok": True,
             "plan_code": plan_code,
-            "expires_at": current_period_end,
-            "current_period_end": current_period_end,
+            "expires_at": period_end,
+            "current_period_end": period_end,
             "duration_days": duration_days,
             "billing_cycle": billing_cycle,
+            "applied": bool(fulfillment.get("applied")),
+            "duplicate": bool(fulfillment.get("duplicate")),
+            "fulfillment": fulfillment,
             "credits": credit_initialization,
             "credit_balance": credit_initialization.get("balance"),
-            "route_version": "2026-06-01-batch36F-additive-idempotent-credit-init",
+            "route_version": "2026-09-07-v2-atomic-subscription-fulfillment",
         }
-
     except Exception as e:
-        logger.error(f"Error activating subscription: {e}")
-        return {"ok": False, "error": str(e)}
+        logger.exception("Atomic channel subscription fulfillment failed")
+        return {
+            "ok": False,
+            "error": str(e),
+            "route_version": "2026-09-07-v2-atomic-subscription-fulfillment",
+        }
 
 
 def get_user_subscription(account_id: str) -> Optional[Dict[str, Any]]:
