@@ -8,10 +8,12 @@ from app import create_app
 from app.routes.channel_activation import bp as channel_activation_bp
 from app.services.v1_security_guard import install_v1_security_guard
 from app.services.v1_subscription_reconciliation import install_v1_subscription_reconciliation
+from app.services.channel_runtime_http_guard import install_channel_runtime_http_guard
 
 app = create_app()
 app.register_blueprint(channel_activation_bp, url_prefix="/api")
 install_v1_security_guard(app)
+install_channel_runtime_http_guard(app)
 install_v1_subscription_reconciliation()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
