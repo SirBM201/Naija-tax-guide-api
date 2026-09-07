@@ -1,21 +1,16 @@
 from __future__ import annotations
 
-"""Naija Tax Guide V1 Guided AI Tax Assistant.
-
-Cost-routing order:
-    deterministic guidance -> approved database/library -> paid low-cost AI
-
-Deterministic product guidance never spends AI credits. Tax questions continue
-through ask_guarded(), with preflight abuse protection and best-effort telemetry.
-"""
+"""Naija Tax Guide V1 Guided AI Tax Assistant with cost and source-integrity guards."""
 
 import re
 from typing import Any, Dict, Optional
 
 from app.services.ask_service import ask_guarded
 from app.services.assistant_telemetry_service import preflight_paid_ai, record_assistant_event
+from app.services.answer_metadata_service import build_source_metadata
+from app.services.source_integrity_guard import assess_source_integrity, integrity_fallback
 
-GUIDED_TAX_ASSISTANT_VERSION = "2026-09-07-v1-04c-telemetry-abuse-guard"
+GUIDED_TAX_ASSISTANT_VERSION = "2026-09-07-v1-05-source-integrity"
 
 _GUIDANCE = {
     "menu": {"answer": "I can guide you through Naija Tax Guide.\n\nYou can ask a Nigeria tax question, use a tax calculator, check your plan or credits, review deadlines, take the quiz, or get help with your account. Tell me what you want to do.", "next_action": "Choose: tax question, calculator, deadlines, quiz, plan/credits, or account help."},
@@ -47,16 +42,7 @@ def _guidance_intent(message: str) -> Optional[str]:
     question_terms = {"what", "when", "who", "which", "why", "how much", "rate", "due", "calculate my"}
     if any(term in q for term in tax_terms) and any(term in q for term in question_terms):
         return None
-    rules = (
-        ("calculator", ("calculator", "calculate", "estimate")),
-        ("credits", ("credit", "balance", "top up", "topup")),
-        ("plan", ("plan", "subscription", "upgrade", "pricing")),
-        ("deadlines", ("deadline", "calendar", "due date")),
-        ("quiz", ("quiz", "test my knowledge", "practice question")),
-        ("account", ("account", "sign in", "login", "link whatsapp", "link telegram", "unlink")),
-        ("help", ("help", "stuck", "confused", "what can you do", "guide me")),
-        ("menu", ("menu", "start", "home")),
-    )
+    rules = (("calculator", ("calculator", "calculate", "estimate")), ("credits", ("credit", "balance", "top up", "topup")), ("plan", ("plan", "subscription", "upgrade", "pricing")), ("deadlines", ("deadline", "calendar", "due date")), ("quiz", ("quiz", "test my knowledge", "practice question")), ("account", ("account", "sign in", "login", "link whatsapp", "link telegram", "unlink")), ("help", ("help", "stuck", "confused", "what can you do", "guide me")), ("menu", ("menu", "start", "home")))
     for intent, terms in rules:
         if any(term in q for term in terms):
             return intent
@@ -73,32 +59,35 @@ def _record(account_id: str, channel: str, result: Dict[str, Any]) -> Dict[str, 
     return result
 
 
+def _apply_source_integrity(result: Dict[str, Any], question: str) -> Dict[str, Any]:
+    meta = dict(result.get("meta") or {})
+    source_meta = meta.get("source_metadata") if isinstance(meta.get("source_metadata"), dict) else None
+    if not source_meta:
+        source_meta = build_source_metadata(source_kind=_clean(result.get("source") or result.get("mode") or "answer"), question=question, mode=_clean(result.get("mode")), ai_model=_clean(meta.get("ai_model") or meta.get("model")))
+    assessment = assess_source_integrity(source_meta)
+    meta["source_metadata"] = source_meta
+    meta["source_integrity"] = assessment
+    result["meta"] = meta
+    if assessment.get("blocked"):
+        return integrity_fallback(source_meta, assessment)
+    return result
+
+
 def guide_or_answer(*, account_id: str, message: str, lang: str = "en", channel: str = "web", provider_user_id: str = "", action_code: str = "ai_tax_answer", **extra: Any) -> Dict[str, Any]:
-    """Route a user message through the cheapest safe V1 assistant path."""
     account_id = _clean(account_id)
     message = _clean(message)
     channel = _clean(channel).lower() or "web"
-
     if not account_id:
         return {"ok": False, "error": "account_id_required", "message": "A signed-in account is required."}
     if not message:
         return _record(account_id, channel, _deterministic_response("menu", account_id=account_id, channel=channel))
-
     intent = _guidance_intent(message)
     if intent:
         return _record(account_id, channel, _deterministic_response(intent, account_id=account_id, channel=channel))
 
     guard = preflight_paid_ai(account_id=account_id, message=message)
     if not guard.get("ok"):
-        result = {
-            "ok": False,
-            "error": guard.get("error") or "assistant_rate_limited",
-            "message": "This assistant request is temporarily limited. Free calculators, approved database guidance, deadlines, quiz and account help remain available.",
-            "source": "guided_assistant",
-            "mode": "deterministic_fallback",
-            "next_action": "Use a free workflow or retry shortly.",
-            "meta": {"assistant_version": GUIDED_TAX_ASSISTANT_VERSION, "cost_route": "preflight_guard", "ai_called": False, "usage_charged": False, "credits_consumed": 0, "retry_after_seconds": guard.get("retry_after_seconds")},
-        }
+        result = {"ok": False, "error": guard.get("error") or "assistant_rate_limited", "message": "This assistant request is temporarily limited. Free calculators, approved database guidance, deadlines, quiz and account help remain available.", "source": "guided_assistant", "mode": "deterministic_fallback", "next_action": "Use a free workflow or retry shortly.", "meta": {"assistant_version": GUIDED_TAX_ASSISTANT_VERSION, "cost_route": "preflight_guard", "ai_called": False, "usage_charged": False, "credits_consumed": 0, "retry_after_seconds": guard.get("retry_after_seconds")}}
         return _record(account_id, channel, result)
 
     result = ask_guarded(account_id=account_id, question=message, lang=lang, channel=channel, provider=channel, provider_user_id=provider_user_id, action_code=action_code, **extra)
@@ -106,16 +95,11 @@ def guide_or_answer(*, account_id: str, message: str, lang: str = "en", channel:
         result = {"ok": False, "error": "assistant_invalid_result", "message": "I could not generate an answer right now."}
     else:
         result = dict(result)
-
     meta = dict(result.get("meta") or {})
     source = _clean(result.get("source")).lower()
-    if source in {"database", "library", "cache"}:
-        cost_route = "approved_knowledge"
-    elif source == "ai":
-        cost_route = "paid_ai"
-    else:
-        cost_route = source or "guarded_ask"
+    cost_route = "approved_knowledge" if source in {"database", "library", "cache"} else "paid_ai" if source == "ai" else source or "guarded_ask"
     meta.update({"assistant_version": GUIDED_TAX_ASSISTANT_VERSION, "cost_route": cost_route, "ai_called": source == "ai"})
     result["meta"] = meta
     result.setdefault("next_action", "Ask a follow-up tax question or choose another Naija Tax Guide workflow.")
+    result = _apply_source_integrity(result, message)
     return _record(account_id, channel, result)
