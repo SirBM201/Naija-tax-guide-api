@@ -1,17 +1,11 @@
 from __future__ import annotations
 
-"""Version and provenance metadata for deterministic V1 tax calculators.
-
-This module deliberately separates calculation mechanics from legal-rule
-provenance. Calculator execution remains free/non-AI. A rule pack must be
-reviewed before its freshness window expires; stale packs are disclosed in the
-result instead of silently presenting hard-coded values as timeless law.
-"""
+"""Version and provenance metadata for deterministic V1 tax calculators."""
 
 from datetime import date, datetime, timezone
 from typing import Any, Dict
 
-CALCULATOR_RULE_PACK_VERSION = "ng-v1-legacy-rules-2026-09-07"
+CALCULATOR_RULE_PACK_VERSION = "ng-nta-2025-effective-2026-v1"
 CALCULATOR_RULES_LAST_REVIEWED = "2026-09-07"
 CALCULATOR_RULES_REVIEW_BY = "2026-12-31"
 
@@ -19,26 +13,26 @@ _RULES: Dict[str, Dict[str, Any]] = {
     "paye": {
         "jurisdiction": "Nigeria",
         "rule_family": "Personal Income Tax / PAYE",
-        "source_reference": "Naija Tax Guide approved calculator rule pack",
-        "effective_period": "legacy PITA rule set; verify applicability for the taxpayer period",
+        "source_reference": "Nigeria Tax Act 2025, Fourth Schedule / section 58",
+        "effective_period": "effective from 1 January 2026",
         "values": {
-            "cra": "higher of NGN 200,000 or 1% of annual gross income, plus 20% of annual gross income",
-            "bands": ["NGN 300,000 @ 7%", "next NGN 300,000 @ 11%", "next NGN 500,000 @ 15%", "next NGN 500,000 @ 19%", "next NGN 1,600,000 @ 21%", "remainder @ 24%"],
+            "cra": "CRA removed under the 2026 regime; applicable statutory deductions/reliefs are handled separately",
+            "bands": ["first NGN 800,000 @ 0%", "next NGN 2,200,000 @ 15%", "next NGN 9,000,000 @ 18%", "next NGN 13,000,000 @ 21%", "next NGN 25,000,000 @ 23%", "remainder above NGN 50,000,000 @ 25%"],
         },
     },
     "vat": {
         "jurisdiction": "Nigeria",
         "rule_family": "Value Added Tax",
-        "source_reference": "Naija Tax Guide approved calculator rule pack",
-        "effective_period": "rule-pack period shown by this calculator; verify special/exempt supplies separately",
+        "source_reference": "Nigeria Tax Act 2025, section 148",
+        "effective_period": "effective from 1 January 2026",
         "values": {"standard_rate_percent": 7.5},
     },
     "cit": {
         "jurisdiction": "Nigeria",
         "rule_family": "Companies Income Tax",
-        "source_reference": "Naija Tax Guide approved calculator rule pack",
-        "effective_period": "legacy Finance Act turnover bands; verify applicability for the company accounting period",
-        "values": {"small_company_max_revenue_ngn": 25000000, "medium_company_max_revenue_ngn": 100000000, "small_rate_percent": 0, "medium_rate_percent": 20, "large_rate_percent": 30},
+        "source_reference": "Nigeria Tax Act 2025 company income tax provisions and small-company definition",
+        "effective_period": "effective from 1 January 2026",
+        "values": {"small_company_max_revenue_ngn": 50000000, "small_company_max_fixed_assets_ngn": 250000000, "small_rate_percent": 0, "large_rate_percent": 30, "professional_services_small_company_exclusion": True},
     },
 }
 
@@ -64,7 +58,7 @@ def calculator_rule_metadata(tax_type: str) -> Dict[str, Any]:
         "ai_called": False,
         "usage_charged": False,
         "credits_consumed": 0,
-        "disclaimer": "Estimate only. Confirm the applicable tax law, taxpayer classification, exemptions and effective period before filing or payment.",
+        "disclaimer": "Estimate only. Confirm taxpayer classification, allowable deductions, exemptions and the applicable assessment period before filing or payment.",
     }
 
 
