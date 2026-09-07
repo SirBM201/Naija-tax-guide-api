@@ -5,12 +5,12 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, Optional
 
-from app.services.ask_service import ask_guarded
-from app.services.assistant_telemetry_service import preflight_paid_ai, record_assistant_event
+from app.services import ask_service as _ask_service
+from app.services.assistant_telemetry_service import record_assistant_event
 from app.services.answer_metadata_service import build_source_metadata
 from app.services.source_integrity_guard import assess_source_integrity, integrity_fallback
 
-GUIDED_TAX_ASSISTANT_VERSION = "2026-09-07-v1-10-cache-first-budget-guard"
+GUIDED_TAX_ASSISTANT_VERSION = "2026-09-07-v1-11-precharge-source-integrity"
 
 _GUIDANCE = {
     "menu": {"answer": "I can guide you through Naija Tax Guide.\n\nYou can ask a Nigeria tax question, use a tax calculator, check your plan or credits, review deadlines, take the quiz, or get help with your account. Tell me what you want to do.", "next_action": "Choose: tax question, calculator, deadlines, quiz, plan/credits, or account help."},
@@ -59,18 +59,50 @@ def _record(account_id: str, channel: str, result: Dict[str, Any]) -> Dict[str, 
     return result
 
 
-def _apply_source_integrity(result: Dict[str, Any], question: str) -> Dict[str, Any]:
+def _source_metadata(result: Dict[str, Any], question: str) -> Dict[str, Any]:
     meta = dict(result.get("meta") or {})
     source_meta = meta.get("source_metadata") if isinstance(meta.get("source_metadata"), dict) else None
-    if not source_meta:
-        source_meta = build_source_metadata(source_kind=_clean(result.get("source") or result.get("mode") or "answer"), question=question, mode=_clean(result.get("mode")), ai_model=_clean(meta.get("ai_model") or meta.get("model")))
+    if source_meta:
+        return source_meta
+    row = result.get("_source_row") if isinstance(result.get("_source_row"), dict) else {}
+    if row:
+        return build_source_metadata(source_kind=_clean(result.get("source") or result.get("mode") or "answer"), question=question, mode=_clean(result.get("mode")), row=row, ai_model=_clean(meta.get("ai_model") or meta.get("model")))
+    return build_source_metadata(source_kind=_clean(result.get("source") or result.get("mode") or "answer"), question=question, mode=_clean(result.get("mode")), ai_model=_clean(meta.get("ai_model") or meta.get("model")))
+
+
+def _apply_source_integrity(result: Dict[str, Any], question: str) -> Dict[str, Any]:
+    result = dict(result)
+    meta = dict(result.get("meta") or {})
+    source_meta = _source_metadata(result, question)
     assessment = assess_source_integrity(source_meta)
     meta["source_metadata"] = source_meta
     meta["source_integrity"] = assessment
     result["meta"] = meta
+    result.pop("_source_row", None)
     if assessment.get("blocked"):
         return integrity_fallback(source_meta, assessment)
     return result
+
+
+def _precharge_integrity_find(original_find):
+    """Wrap the cache/library boundary so blocked source material is never
+    allowed to fall through to a paid AI call and subsequent credit debit.
+    """
+    def wrapped(question: str, lang: str = "en"):
+        found = original_find(question, lang=lang)
+        if not isinstance(found, dict) or not found.get("found") or not found.get("answer"):
+            return found
+        row = found.get("row") if isinstance(found.get("row"), dict) else {}
+        source_meta = build_source_metadata(source_kind=_clean(found.get("source") or found.get("mode") or "database"), question=question, mode=_clean(found.get("mode")), row=row)
+        assessment = assess_source_integrity(source_meta)
+        if assessment.get("blocked"):
+            fallback = integrity_fallback(source_meta, assessment)
+            return {"ok": True, "found": True, "answer": fallback.get("answer"), "source": "source_integrity_guard", "mode": "safe_escalation", "table": found.get("table"), "row": row, "normalized_question": found.get("normalized_question"), "canonical_key": found.get("canonical_key"), "source_metadata": source_meta, "source_integrity": assessment}
+        found = dict(found)
+        found["source_metadata"] = source_meta
+        found["source_integrity"] = assessment
+        return found
+    return wrapped
 
 
 def guide_or_answer(*, account_id: str, message: str, lang: str = "en", channel: str = "web", provider_user_id: str = "", action_code: str = "ai_tax_answer", **extra: Any) -> Dict[str, Any]:
@@ -85,11 +117,13 @@ def guide_or_answer(*, account_id: str, message: str, lang: str = "en", channel:
     if intent:
         return _record(account_id, channel, _deterministic_response(intent, account_id=account_id, channel=channel))
 
-    # Important: ask_guarded is cache/library-first. Do not reserve paid-AI
-    # budget here because a database/library/cache answer may satisfy the
-    # request without inference. The hard paid-AI budget guard is injected
-    # into ask_guarded's actual AI-call boundary by guided_channel_patch.
-    result = ask_guarded(account_id=account_id, question=message, lang=lang, channel=channel, provider=channel, provider_user_id=provider_user_id, action_code=action_code, **extra)
+    original_find = _ask_service._find_database_answer
+    _ask_service._find_database_answer = _precharge_integrity_find(original_find)
+    try:
+        result = _ask_service.ask_guarded(account_id=account_id, question=message, lang=lang, channel=channel, provider=channel, provider_user_id=provider_user_id, action_code=action_code, **extra)
+    finally:
+        _ask_service._find_database_answer = original_find
+
     if not isinstance(result, dict):
         result = {"ok": False, "error": "assistant_invalid_result", "message": "I could not generate an answer right now."}
     else:
