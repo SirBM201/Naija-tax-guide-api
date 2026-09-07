@@ -6,9 +6,11 @@ from werkzeug.exceptions import HTTPException
 
 from app import create_app
 from app.services.v1_security_guard import install_v1_security_guard
+from app.services.v1_subscription_reconciliation import install_v1_subscription_reconciliation
 
 app = create_app()
 install_v1_security_guard(app)
+install_v1_subscription_reconciliation()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
