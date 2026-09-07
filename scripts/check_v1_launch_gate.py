@@ -27,6 +27,9 @@ def main() -> None:
     webhook = text("app/routes/paystack_webhook.py")
     credit = text("app/services/channel_credit_service.py")
     atomic_sql = text("supabase/migrations/20260907_paystack_atomic_credit_fulfillment.sql")
+    subscription_atomic_sql = text("supabase/migrations/20260907_atomic_subscription_fulfillment.sql")
+    channel_subscription = text("app/services/channel_subscription_service.py")
+    billing_subscription_patch = text("app/services/billing_atomic_subscription_patch.py")
     payout = text("app/services/payout_service.py")
     payout_window = text("app/services/payout_window_service.py")
     assistant = text("app/services/guided_tax_assistant_service.py")
@@ -58,7 +61,18 @@ def main() -> None:
     require(credit, 'rpc("ntg_fulfill_credit_purchase"', "atomic Paystack credit fulfillment RPC")
     require(credit, "There is intentionally no legacy read/update fallback", "no unsafe credit fallback")
     require(atomic_sql, "pg_advisory_xact_lock", "Paystack reference serialization")
-    require(atomic_sql, "ntg_fulfill_credit_purchase", "atomic fulfillment migration")
+    require(atomic_sql, "ntg_fulfill_credit_purchase", "atomic credit fulfillment migration")
+
+    require(subscription_atomic_sql, "reference text primary key", "subscription reference uniqueness")
+    require(subscription_atomic_sql, "pg_advisory_xact_lock(hashtextextended(p_reference, 0))", "subscription reference serialization")
+    require(subscription_atomic_sql, "pg_advisory_xact_lock(hashtextextended(p_account_id::text, 1))", "subscription account serialization")
+    require(subscription_atomic_sql, "'applied', false", "duplicate subscription replay is no-op")
+    require(subscription_atomic_sql, "'duplicate', true", "duplicate subscription replay is explicit")
+    require(subscription_atomic_sql, "v_period_start := v_current_end", "renewal extends from existing paid period")
+    require(channel_subscription, '"ntg_fulfill_subscription_payment"', "channel subscription uses atomic RPC")
+    require(billing_subscription_patch, '"ntg_fulfill_subscription_payment"', "website subscription uses atomic RPC")
+    require(billing_subscription_patch, "add_plan_credits_for_payment", "website subscription credits use reference-idempotent fulfillment")
+    require(main_py, "install_billing_atomic_subscription_patch()", "atomic website subscription patch activated")
 
     require(link, "channel_entitlement", "channel entitlement enforcement")
     require(plans, '"max_total_channels": 1', "Starter external-channel limit")
@@ -80,8 +94,8 @@ def main() -> None:
     require(payout_window, "15th_and_30th", "referral payout schedule")
 
     print("NTG V1 final launch gate: STATIC PASS")
-    print("Verified statically: auth/cookie/CORS controls, provider-webhook security, atomic Paystack credit fulfillment, channel limits, source integrity, cache review safety, AI monitoring policy, free calculator/quiz accounting, and payout duplicate/schedule controls.")
-    print("Remaining live acceptance: web auth journey, Paystack verified webhook/duplicate replay, Telegram delivery, WhatsApp delivery, and authoritative 2026 Nigerian tax-rule review.")
+    print("Verified statically: auth/cookie/CORS controls, provider-webhook security, atomic Paystack credit and subscription fulfillment, subscription replay safety, channel limits, source integrity, cache review safety, AI monitoring policy, free calculator/quiz accounting, and payout duplicate/schedule controls.")
+    print("Remaining live acceptance: web auth journey, live duplicate Paystack webhook replay, Telegram delivery, WhatsApp delivery, and authoritative 2026 Nigerian tax-rule review.")
 
 
 if __name__ == "__main__":
