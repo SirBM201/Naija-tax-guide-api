@@ -3,11 +3,11 @@ from __future__ import annotations
 from typing import Any, Dict
 
 
-ASK_RELEVANCE_PATCH_VERSION = "2026-09-07-v6-guided-channel-assistant"
+ASK_RELEVANCE_PATCH_VERSION = "2026-09-07-v7-safe-keyword-cache-reuse"
 
 
 def apply_ask_relevance_patch() -> None:
-    """Enforce exact reusable knowledge and activate the V1 guided channel assistant."""
+    """Enforce safe reusable knowledge and activate the V1 guided channel assistant."""
     try:
         from app.services import ask_service as svc
     except Exception:
@@ -81,10 +81,21 @@ def apply_ask_relevance_patch() -> None:
             "mode": "no_high_confidence_match", "errors": errors[:8],
             "normalized_question": normalized, "canonical_key": canonical,
             "strict_relevance": True,
-            "policy": "exact_cache_or_library_only_then_ai_fallback",
+            "policy": "exact_then_reviewed_keyword_then_ai_fallback",
         }
 
     svc._find_database_answer = _find_database_answer_strict
+
+    # Extend the strict exact path with the existing database keyword RPC and
+    # prevent fresh AI answers from being auto-promoted as approved tax facts.
+    # Semantic/vector matching remains dormant until qa_embeddings is populated
+    # and validated; this avoids paying for query embeddings against an empty
+    # vector table.
+    try:
+        from app.services.v1_cache_reuse_patch import apply_v1_cache_reuse_patch
+        apply_v1_cache_reuse_patch()
+    except Exception:
+        pass
 
     # Apply last so Telegram/WhatsApp/inbound keep all established commands but
     # their natural-language fallback is now the cost-guarded V1 assistant.
