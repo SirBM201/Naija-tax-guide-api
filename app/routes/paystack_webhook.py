@@ -1,6 +1,7 @@
 # app/routes/paystack_webhook.py
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -21,7 +22,7 @@ except Exception:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 bp = Blueprint("paystack_webhook", __name__)
-PAYSTACK_WEBHOOK_ROUTE_VERSION = "2026-09-07-v1-03-verified-idempotent-webhook"
+PAYSTACK_WEBHOOK_ROUTE_VERSION = "2026-09-07-v1-03b-charge-success-only"
 
 
 def _sb():
@@ -39,6 +40,21 @@ def _lower(value: Any) -> str:
 def _clip(value: Any, limit: int = 900) -> str:
     text = str(value or "")
     return text if len(text) <= limit else text[:limit] + "...<truncated>"
+
+
+def _normalize_metadata(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+            return dict(parsed) if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
 
 
 def _to_int(value: Any, default: int = 0) -> int:
@@ -115,42 +131,31 @@ def _expected_amount_kobo(row: Dict[str, Any]) -> int:
 
 
 def _verify_payment(reference: str, webhook_data: Dict[str, Any]) -> Dict[str, Any]:
-    """Server-side verification is mandatory before any entitlement/credit fulfillment."""
     if not reference:
         return {"ok": False, "error": "missing_reference"}
-
     tx = _transaction_row(reference)
     if not tx:
         return {"ok": False, "error": "unknown_payment_reference", "reference": reference}
-
     try:
         verified = verify_transaction(reference)
     except Exception as exc:
         return {"ok": False, "error": "paystack_verification_failed", "root_cause": f"{type(exc).__name__}: {_clip(exc)}"}
-
     verified_data = verified.get("data") if isinstance(verified, dict) and isinstance(verified.get("data"), dict) else {}
     if _lower(verified_data.get("status")) != "success":
         return {"ok": False, "error": "payment_not_successful", "paystack_status": verified_data.get("status")}
     if _clean(verified_data.get("reference")) != reference:
         return {"ok": False, "error": "reference_mismatch"}
-
     expected_amount = _expected_amount_kobo(tx)
     verified_amount = _to_int(verified_data.get("amount"), 0)
     if expected_amount <= 0 or verified_amount != expected_amount:
         return {"ok": False, "error": "amount_mismatch", "expected_amount_kobo": expected_amount, "verified_amount_kobo": verified_amount}
-
     expected_currency = _clean(tx.get("currency") or "NGN").upper()
     verified_currency = _clean(verified_data.get("currency") or "NGN").upper()
     if expected_currency != verified_currency:
         return {"ok": False, "error": "currency_mismatch", "expected_currency": expected_currency, "verified_currency": verified_currency}
-
-    # Stored server-side transaction identity is authoritative. Paystack metadata is useful
-    # only after the reference/amount/currency have matched the transaction we created.
-    stored_metadata = tx.get("metadata") if isinstance(tx.get("metadata"), dict) else {}
-    verified_metadata = verified_data.get("metadata") if isinstance(verified_data.get("metadata"), dict) else {}
-    merged_metadata = {**verified_metadata, **stored_metadata}
-
-    return {"ok": True, "transaction": tx, "data": verified_data, "metadata": merged_metadata}
+    stored_metadata = _normalize_metadata(tx.get("metadata"))
+    verified_metadata = _normalize_metadata(verified_data.get("metadata"))
+    return {"ok": True, "transaction": tx, "data": verified_data, "metadata": {**verified_metadata, **stored_metadata}}
 
 
 def _already_fulfilled(tx: Dict[str, Any]) -> bool:
@@ -162,7 +167,7 @@ def _update_transaction(reference: str, *, status: str, paystack_status: str, me
         return {"ok": False, "updated": False, "reason": "missing_reference"}
     try:
         current = _transaction_row(reference) or {}
-        metadata = current.get("metadata") if isinstance(current.get("metadata"), dict) else {}
+        metadata = _normalize_metadata(current.get("metadata"))
         if metadata_patch:
             metadata = {**metadata, **metadata_patch}
         payload: Dict[str, Any] = {"status": status, "paystack_status": paystack_status, "updated_at": datetime.now(timezone.utc).isoformat()}
@@ -181,12 +186,7 @@ def _qualify_promo_safely(*, account_id: str, reference: str, plan_code: str, me
     if not account_id or not reference or not plan_code:
         return {"ok": True, "qualified": False, "reason": "missing_account_reference_or_plan"}
     try:
-        result = qualify_promo_after_successful_payment(
-            paying_account_id=account_id,
-            payment_reference=reference,
-            plan_code=plan_code,
-            metadata={**metadata, "paid_at": paystack_data.get("paid_at") or paystack_data.get("created_at"), "amount_kobo": paystack_data.get("amount"), "gateway_response": paystack_data.get("gateway_response"), "source": "verified_paystack_webhook", "paystack_webhook_route_version": PAYSTACK_WEBHOOK_ROUTE_VERSION},
-        )
+        result = qualify_promo_after_successful_payment(paying_account_id=account_id, payment_reference=reference, plan_code=plan_code, metadata={**metadata, "paid_at": paystack_data.get("paid_at") or paystack_data.get("created_at"), "amount_kobo": paystack_data.get("amount"), "gateway_response": paystack_data.get("gateway_response"), "source": "verified_paystack_webhook", "paystack_webhook_route_version": PAYSTACK_WEBHOOK_ROUTE_VERSION})
         return result if isinstance(result, dict) else {"ok": True, "qualified": False, "raw": result}
     except Exception as exc:
         logger.exception("Promo qualification failed")
@@ -195,7 +195,7 @@ def _qualify_promo_safely(*, account_id: str, reference: str, plan_code: str, me
 
 @bp.get("/paystack/webhook/health")
 def paystack_webhook_health():
-    return jsonify({"ok": True, "route_version": PAYSTACK_WEBHOOK_ROUTE_VERSION, "expected_webhook_url": "/api/paystack/webhook", "signature_verification": "required", "server_side_transaction_verification": "required", "idempotency": "transaction_reference"}), 200
+    return jsonify({"ok": True, "route_version": PAYSTACK_WEBHOOK_ROUTE_VERSION, "expected_webhook_url": "/api/paystack/webhook", "signature_verification": "required", "server_side_transaction_verification": "required", "idempotency": "transaction_reference", "value_fulfillment_event": "charge.success"}), 200
 
 
 @bp.post("/paystack/webhook")
@@ -209,11 +209,17 @@ def paystack_webhook():
     payload: Dict[str, Any] = request.get_json(silent=True) or {}
     event_type = _clean(payload.get("event"))
     webhook_data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+
+    # Paystack documents charge.success as the successful transaction event for
+    # both initial plan transactions and subsequent successful subscription
+    # billing cycles. Lifecycle/invoice events are acknowledged but never
+    # fulfill customer value here, preventing two event families from applying
+    # one economic transaction.
+    if event_type != "charge.success":
+        return jsonify({"ok": True, "ignored": True, "reason": "non_charge_success_event", "event": event_type, "route_version": PAYSTACK_WEBHOOK_ROUTE_VERSION}), 200
+
     reference = _clean(webhook_data.get("reference"))
     status = _lower(webhook_data.get("status"))
-
-    if event_type not in {"charge.success", "subscription.create", "invoice.payment_succeeded"}:
-        return jsonify({"ok": True, "ignored": True, "reason": "event_type_not_processed", "event": event_type, "route_version": PAYSTACK_WEBHOOK_ROUTE_VERSION}), 200
     if status != "success":
         return jsonify({"ok": True, "ignored": True, "reason": "status_not_success", "status": status, "route_version": PAYSTACK_WEBHOOK_ROUTE_VERSION}), 200
 
@@ -225,7 +231,6 @@ def paystack_webhook():
     tx = verification.get("transaction") or {}
     verified_data = verification.get("data") or {}
     metadata = verification.get("metadata") or {}
-
     if _already_fulfilled(tx):
         return jsonify({"ok": True, "processed": False, "duplicate": True, "reason": "reference_already_fulfilled", "reference": reference, "route_version": PAYSTACK_WEBHOOK_ROUTE_VERSION}), 200
 
@@ -237,14 +242,12 @@ def paystack_webhook():
     provider_user_id = _clean(metadata.get("provider_user_id"))
     amount_ngn_decimal = _amount_ngn_from_payload(metadata, verified_data)
     amount_ngn_display = _decimal_to_money(amount_ngn_decimal)
-
     if not account_id:
         return jsonify({"ok": False, "error": "missing_account_id", "reference": reference, "route_version": PAYSTACK_WEBHOOK_ROUTE_VERSION}), 400
 
     activation_result: Dict[str, Any]
     notification_result: Dict[str, Any] = {}
     promo_result: Dict[str, Any] = {}
-
     try:
         if transaction_type == "credit_purchase" and credits > 0:
             success = add_credits_to_account(account_id, credits, reference)
@@ -266,5 +269,5 @@ def paystack_webhook():
         _update_transaction(reference, status="verified_unfulfilled", paystack_status="success", metadata_patch={"fulfillment_error": activation_result.get("error"), "verified_at": datetime.now(timezone.utc).isoformat()})
         return jsonify({"ok": False, "error": "payment_verified_but_fulfillment_failed", "reference": reference, "activation": activation_result, "route_version": PAYSTACK_WEBHOOK_ROUTE_VERSION}), 500
 
-    tx_update = _update_transaction(reference, status="success", paystack_status="success", metadata_patch={"verified_at": datetime.now(timezone.utc).isoformat(), "fulfilled_at": datetime.now(timezone.utc).isoformat(), "fulfillment_version": PAYSTACK_WEBHOOK_ROUTE_VERSION})
+    tx_update = _update_transaction(reference, status="success", paystack_status="success", metadata_patch={"verified_at": datetime.now(timezone.utc).isoformat(), "fulfilled_at": datetime.now(timezone.utc).isoformat(), "fulfillment_event": "charge.success", "fulfillment_version": PAYSTACK_WEBHOOK_ROUTE_VERSION})
     return jsonify({"ok": True, "processed": True, "reference": reference, "status": "success", "account_id": account_id, "plan_code": plan_code or None, "transaction_type": transaction_type, "amount_ngn": str(amount_ngn_decimal), "activation": activation_result, "promo": promo_result or None, "notification": notification_result or None, "transaction_update": tx_update, "route_version": PAYSTACK_WEBHOOK_ROUTE_VERSION}), 200
