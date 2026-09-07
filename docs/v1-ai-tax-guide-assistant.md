@@ -23,6 +23,24 @@ Users should be able to ask what they are trying to do in ordinary language and 
 
 **User ↔ Guided Tax Assistant ↔ NTG knowledge/calculator/account engines ↔ result/next step**
 
+## V1 AI cost guardrail
+
+NTG must use the least expensive reliable answer path:
+
+**Database/rules → cached/approved knowledge → low-cost AI → advanced AI**
+
+- Free calculators, database answers, navigation/help and other deterministic free functionality must not trigger unnecessary paid AI calls.
+- Preserve the approved Free Forever and paid credit/top-up rules.
+- Prefer approved tax knowledge/rules before generative reasoning.
+- Cache safe reusable explanations where freshness and privacy permit.
+- Keep AI context focused and use economical models for simple guidance; reserve advanced models for genuinely complex paid AI tasks.
+- Enforce plan/credit-aware quotas, rate limits and abuse controls before inference.
+- Record model/task/token/credit/cost telemetry and support configurable cost ceilings.
+- Gracefully return deterministic/database guidance when AI entitlement or budget is unavailable rather than breaking the user journey.
+- Cost optimization must never weaken tax-source integrity or user safety.
+
+This cost-routing layer is a **V1 requirement** and must be implemented without changing the approved free feature policy.
+
 ## V1 acceptance
 
-NTG V1 should provide a clear guided path for users who do not already know which feature or tax workflow they need, while retaining the approved calculator/free-tier/credit model.
+NTG V1 should provide a clear guided path for users who do not already know which feature or tax workflow they need, while retaining the approved calculator/free-tier/credit model. V1 also requires AI cost routing, entitlement controls and measurable inference-cost telemetry.
