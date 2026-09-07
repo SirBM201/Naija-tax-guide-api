@@ -2,10 +2,13 @@ from __future__ import annotations
 
 """NTG V1 application-level security, privacy and abuse guard.
 
-Designed as a dependency-free last-mile guard around the existing Flask app.
-It does not replace provider/webhook verification or account authorization.
+Webhook authenticity is enforced by each provider route.  This layer avoids
+accidentally throttling legitimate Paystack/Meta retries while retaining
+application abuse controls for user-facing endpoints.
 """
 
+import hmac
+import ipaddress
 import os
 import threading
 import time
@@ -18,15 +21,11 @@ _LOCK = threading.Lock()
 _BUCKETS: Dict[Tuple[str, str], Deque[float]] = defaultdict(deque)
 
 SENSITIVE_RESPONSE_PREFIXES = (
-    "/api/web/auth/",
-    "/api/referrals/",
-    "/api/billing/",
-    "/api/payments/",
-    "/api/accounts/",
-    "/api/profile/",
+    "/api/web/auth/", "/api/referrals/", "/api/billing/", "/api/payments/",
+    "/api/accounts/", "/api/profile/",
 )
-
 PUBLIC_DIAGNOSTICS = {"/api/_boot", "/api/_diag", "/api/_debug_routes"}
+WEBHOOK_PATH_MARKERS = ("/paystack/webhook", "/webhooks/paystack", "/whatsapp/webhook", "/telegram/webhook")
 
 
 def _int_env(name: str, default: int) -> int:
@@ -36,15 +35,41 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
+def _truthy(value: Any) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _valid_ip(value: str) -> str:
+    try:
+        return str(ipaddress.ip_address(str(value or "").strip()))
+    except Exception:
+        return ""
+
+
 def _client_key() -> str:
-    forwarded = (request.headers.get("X-Forwarded-For") or "").split(",", 1)[0].strip()
-    return forwarded or request.remote_addr or "unknown"
+    remote = _valid_ip(request.remote_addr or "") or "unknown"
+    # X-Forwarded-For is attacker-controlled unless the deployment explicitly
+    # declares its reverse proxy trustworthy.
+    if _truthy(os.getenv("NTG_TRUST_PROXY_HEADERS", "1")):
+        forwarded = (request.headers.get("X-Forwarded-For") or "").split(",", 1)[0].strip()
+        forwarded_ip = _valid_ip(forwarded)
+        if forwarded_ip:
+            return forwarded_ip
+    return remote
+
+
+def _is_provider_webhook() -> bool:
+    path = request.path.lower()
+    return any(marker in path for marker in WEBHOOK_PATH_MARKERS)
 
 
 def _rate_policy() -> tuple[str, int, int] | None:
     path = request.path
     method = request.method.upper()
-    if method == "OPTIONS":
+    if method == "OPTIONS" or _is_provider_webhook():
+        # Provider routes perform cryptographic/token verification and must be
+        # able to receive legitimate retry bursts. Do not apply per-IP user
+        # throttling to them here.
         return None
     if "/web/auth/" in path:
         return "auth", _int_env("NTG_AUTH_RATE_LIMIT", 20), 60
@@ -73,11 +98,11 @@ def _limited(bucket: str, limit: int, window_seconds: int) -> tuple[bool, int]:
 def _diagnostic_allowed() -> bool:
     if request.path not in PUBLIC_DIAGNOSTICS:
         return True
-    if str(os.getenv("ENABLE_PUBLIC_DIAGNOSTICS", "0")).strip().lower() in {"1", "true", "yes", "on"}:
+    if _truthy(os.getenv("ENABLE_PUBLIC_DIAGNOSTICS", "0")):
         return True
     supplied = (request.headers.get("X-Admin-Key") or "").strip()
     expected = (os.getenv("ADMIN_KEY") or "").strip()
-    return bool(expected and supplied and supplied == expected)
+    return bool(expected and supplied and hmac.compare_digest(supplied, expected))
 
 
 def install_v1_security_guard(app: Any) -> None:
@@ -85,7 +110,6 @@ def install_v1_security_guard(app: Any) -> None:
     def _ntg_v1_security_before_request():
         if not _diagnostic_allowed():
             return jsonify({"ok": False, "error": "not_found"}), 404
-
         policy = _rate_policy()
         if policy:
             bucket, limit, window = policy
@@ -104,7 +128,10 @@ def install_v1_security_guard(app: Any) -> None:
         response.headers.setdefault("Referrer-Policy", "no-referrer")
         response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
         response.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
-        response.headers.setdefault("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; base-uri 'none'")
+        # API responses default to no active content. HTML callback/return pages
+        # may render their own stricter CSP instead of being broken globally.
+        if response.mimetype != "text/html":
+            response.headers.setdefault("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; base-uri 'none'")
         if request.is_secure or (request.headers.get("X-Forwarded-Proto") or "").lower() == "https":
             response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
         if any(request.path.startswith(prefix) for prefix in SENSITIVE_RESPONSE_PREFIXES):
