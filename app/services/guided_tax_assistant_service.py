@@ -10,7 +10,7 @@ from app.services.assistant_telemetry_service import record_assistant_event
 from app.services.answer_metadata_service import build_source_metadata
 from app.services.source_integrity_guard import assess_source_integrity, integrity_fallback
 
-GUIDED_TAX_ASSISTANT_VERSION = "2026-09-08-v1-12-reviewed-source-recovery"
+GUIDED_TAX_ASSISTANT_VERSION = "2026-09-08-v1-13-preserve-validated-source"
 
 _GUIDANCE = {
     "menu": {"answer": "I can guide you through Naija Tax Guide.\n\nYou can ask a Nigeria tax question, use a tax calculator, check your plan or credits, review deadlines, take the quiz, or get help with your account. Tell me what you want to do.", "next_action": "Choose: tax question, calculator, deadlines, quiz, plan/credits, or account help."},
@@ -64,23 +64,7 @@ def _source_metadata(result: Dict[str, Any], question: str) -> Dict[str, Any]:
     source_meta = meta.get("source_metadata") if isinstance(meta.get("source_metadata"), dict) else None
     if source_meta:
         return source_meta
-
     row = result.get("_source_row") if isinstance(result.get("_source_row"), dict) else {}
-
-    # ask_guarded intentionally returns a compact public result and does not
-    # carry the matched cache/library row forward. Recover the exact reviewed
-    # row here before the post-answer integrity check so current review dates
-    # and authority metadata are not discarded. This does not bypass the
-    # integrity guard: the recovered row is assessed by the same guard below.
-    source = _clean(result.get("source")).lower()
-    if not row and source in {"database", "library", "cache"}:
-        try:
-            recovered = _ask_service._find_database_answer(question)
-            if isinstance(recovered, dict) and recovered.get("found") and isinstance(recovered.get("row"), dict):
-                row = recovered["row"]
-        except Exception:
-            row = {}
-
     if row:
         return build_source_metadata(source_kind=_clean(result.get("source") or result.get("mode") or "answer"), question=question, mode=_clean(result.get("mode")), row=row, ai_model=_clean(meta.get("ai_model") or meta.get("model")))
     return build_source_metadata(source_kind=_clean(result.get("source") or result.get("mode") or "answer"), question=question, mode=_clean(result.get("mode")), ai_model=_clean(meta.get("ai_model") or meta.get("model")))
@@ -100,9 +84,10 @@ def _apply_source_integrity(result: Dict[str, Any], question: str) -> Dict[str, 
     return result
 
 
-def _precharge_integrity_find(original_find):
-    """Wrap the cache/library boundary so blocked source material is never
-    allowed to fall through to a paid AI call and subsequent credit debit.
+def _precharge_integrity_find(original_find, evidence: Dict[str, Any]):
+    """Validate cache/library material before charging and retain that exact
+    validated evidence for the final public response. This avoids rebuilding
+    source metadata after ask_guarded intentionally compacts its result.
     """
     def wrapped(question: str, lang: str = "en"):
         found = original_find(question, lang=lang)
@@ -111,6 +96,8 @@ def _precharge_integrity_find(original_find):
         row = found.get("row") if isinstance(found.get("row"), dict) else {}
         source_meta = build_source_metadata(source_kind=_clean(found.get("source") or found.get("mode") or "database"), question=question, mode=_clean(found.get("mode")), row=row)
         assessment = assess_source_integrity(source_meta)
+        evidence.clear()
+        evidence.update({"source_metadata": source_meta, "source_integrity": assessment, "row": row})
         if assessment.get("blocked"):
             fallback = integrity_fallback(source_meta, assessment)
             return {"ok": True, "found": True, "answer": fallback.get("answer"), "source": "source_integrity_guard", "mode": "safe_escalation", "table": found.get("table"), "row": row, "normalized_question": found.get("normalized_question"), "canonical_key": found.get("canonical_key"), "source_metadata": source_meta, "source_integrity": assessment}
@@ -133,8 +120,9 @@ def guide_or_answer(*, account_id: str, message: str, lang: str = "en", channel:
     if intent:
         return _record(account_id, channel, _deterministic_response(intent, account_id=account_id, channel=channel))
 
+    validated_evidence: Dict[str, Any] = {}
     original_find = _ask_service._find_database_answer
-    _ask_service._find_database_answer = _precharge_integrity_find(original_find)
+    _ask_service._find_database_answer = _precharge_integrity_find(original_find, validated_evidence)
     try:
         result = _ask_service.ask_guarded(account_id=account_id, question=message, lang=lang, channel=channel, provider=channel, provider_user_id=provider_user_id, action_code=action_code, **extra)
     finally:
@@ -146,6 +134,15 @@ def guide_or_answer(*, account_id: str, message: str, lang: str = "en", channel:
         result = dict(result)
     meta = dict(result.get("meta") or {})
     source = _clean(result.get("source")).lower()
+
+    # If the free knowledge boundary already validated the exact source used
+    # for this answer, carry that evidence forward instead of reconstructing it.
+    validated_meta = validated_evidence.get("source_metadata")
+    validated_assessment = validated_evidence.get("source_integrity")
+    if source in {"database", "library", "cache"} and isinstance(validated_meta, dict) and isinstance(validated_assessment, dict):
+        meta["source_metadata"] = validated_meta
+        meta["source_integrity"] = validated_assessment
+
     cost_route = "approved_knowledge" if source in {"database", "library", "cache"} else "paid_ai" if source == "ai" else source or "guarded_ask"
     meta.update({"assistant_version": GUIDED_TAX_ASSISTANT_VERSION, "cost_route": cost_route, "ai_called": source == "ai"})
     result["meta"] = meta
