@@ -10,7 +10,7 @@ from app.services.assistant_telemetry_service import record_assistant_event
 from app.services.answer_metadata_service import build_source_metadata
 from app.services.source_integrity_guard import assess_source_integrity, integrity_fallback
 
-GUIDED_TAX_ASSISTANT_VERSION = "2026-09-07-v1-11-precharge-source-integrity"
+GUIDED_TAX_ASSISTANT_VERSION = "2026-09-08-v1-12-reviewed-source-recovery"
 
 _GUIDANCE = {
     "menu": {"answer": "I can guide you through Naija Tax Guide.\n\nYou can ask a Nigeria tax question, use a tax calculator, check your plan or credits, review deadlines, take the quiz, or get help with your account. Tell me what you want to do.", "next_action": "Choose: tax question, calculator, deadlines, quiz, plan/credits, or account help."},
@@ -64,7 +64,23 @@ def _source_metadata(result: Dict[str, Any], question: str) -> Dict[str, Any]:
     source_meta = meta.get("source_metadata") if isinstance(meta.get("source_metadata"), dict) else None
     if source_meta:
         return source_meta
+
     row = result.get("_source_row") if isinstance(result.get("_source_row"), dict) else {}
+
+    # ask_guarded intentionally returns a compact public result and does not
+    # carry the matched cache/library row forward. Recover the exact reviewed
+    # row here before the post-answer integrity check so current review dates
+    # and authority metadata are not discarded. This does not bypass the
+    # integrity guard: the recovered row is assessed by the same guard below.
+    source = _clean(result.get("source")).lower()
+    if not row and source in {"database", "library", "cache"}:
+        try:
+            recovered = _ask_service._find_database_answer(question)
+            if isinstance(recovered, dict) and recovered.get("found") and isinstance(recovered.get("row"), dict):
+                row = recovered["row"]
+        except Exception:
+            row = {}
+
     if row:
         return build_source_metadata(source_kind=_clean(result.get("source") or result.get("mode") or "answer"), question=question, mode=_clean(result.get("mode")), row=row, ai_model=_clean(meta.get("ai_model") or meta.get("model")))
     return build_source_metadata(source_kind=_clean(result.get("source") or result.get("mode") or "answer"), question=question, mode=_clean(result.get("mode")), ai_model=_clean(meta.get("ai_model") or meta.get("model")))
