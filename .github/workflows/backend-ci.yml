@@ -27,3 +27,7 @@ jobs:
       - name: Syntax check
         run: |
           python -m compileall -q app
+
+      - name: Supabase Data API grant regression tests
+        run: |
+          python -m unittest discover -s tests -p 'test_*.py'
