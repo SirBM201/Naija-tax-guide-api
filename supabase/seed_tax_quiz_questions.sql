@@ -6,44 +6,53 @@ create extension if not exists pgcrypto;
 
 create table if not exists public.tax_quiz_questions (
   id uuid primary key default gen_random_uuid(),
-  question_code text,
-  category text,
-  difficulty text default 'basic',
+  question_code text not null,
+  category text not null default 'General',
+  difficulty text not null default 'basic',
   question text not null,
   short_explanation text,
   premium_explanation text,
   source_reference text,
-  is_active boolean default true,
-  created_at timestamptz default now(),
-  updated_at timestamptz default now()
+  law_year text,
+  is_active boolean not null default true,
+  metadata jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
 );
 
 create table if not exists public.tax_quiz_options (
   id uuid primary key default gen_random_uuid(),
-  question_id uuid references public.tax_quiz_questions(id) on delete cascade,
-  option_code text,
+  question_id uuid not null references public.tax_quiz_questions(id) on delete cascade,
+  option_code text not null,
   option_text text not null,
-  is_correct boolean default false,
-  created_at timestamptz default now(),
-  updated_at timestamptz default now()
+  is_correct boolean not null default false,
+  metadata jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
 );
 
 create table if not exists public.tax_quiz_attempts (
   id uuid primary key default gen_random_uuid(),
-  account_id text,
-  question_id uuid,
+  account_id text not null,
+  wa_id text,
+  question_id uuid references public.tax_quiz_questions(id) on delete set null,
   question_code text,
   category text,
-  status text,
-  channel text,
-  selected_answer text,
-  selected_option_id text,
+  displayed_option_order jsonb not null default '{}'::jsonb,
   correct_option_id text,
+  selected_label text,
+  selected_option_id text,
   is_correct boolean,
+  status text not null default 'started',
+  q5_explanation_used boolean not null default false,
+  credits_charged integer not null default 0,
   answered_at timestamptz,
-  metadata jsonb default '{}'::jsonb,
-  created_at timestamptz default now(),
-  updated_at timestamptz default now()
+  q5_explained_at timestamptz,
+  metadata jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  channel text,
+  selected_answer text
 );
 
 alter table public.tax_quiz_questions add column if not exists question_code text;
@@ -65,6 +74,16 @@ alter table public.tax_quiz_attempts add column if not exists is_correct boolean
 alter table public.tax_quiz_attempts add column if not exists answered_at timestamptz;
 alter table public.tax_quiz_attempts add column if not exists metadata jsonb default '{}'::jsonb;
 alter table public.tax_quiz_attempts add column if not exists updated_at timestamptz default now();
+-- Keep older manually provisioned quiz schemas aligned with the current backend fields.
+alter table public.tax_quiz_questions add column if not exists law_year text;
+alter table public.tax_quiz_questions add column if not exists metadata jsonb not null default '{}'::jsonb;
+alter table public.tax_quiz_options add column if not exists metadata jsonb not null default '{}'::jsonb;
+alter table public.tax_quiz_attempts add column if not exists wa_id text;
+alter table public.tax_quiz_attempts add column if not exists displayed_option_order jsonb not null default '{}'::jsonb;
+alter table public.tax_quiz_attempts add column if not exists selected_label text;
+alter table public.tax_quiz_attempts add column if not exists q5_explanation_used boolean not null default false;
+alter table public.tax_quiz_attempts add column if not exists credits_charged integer not null default 0;
+alter table public.tax_quiz_attempts add column if not exists q5_explained_at timestamptz;
 
 create unique index if not exists uq_tax_quiz_questions_code on public.tax_quiz_questions(question_code);
 create unique index if not exists uq_tax_quiz_options_question_code on public.tax_quiz_options(question_id, option_code);
@@ -77,7 +96,7 @@ alter table public.tax_quiz_questions enable row level security;
 alter table public.tax_quiz_options enable row level security;
 alter table public.tax_quiz_attempts enable row level security;
 
-do $
+do $ntg$
 begin
   if not exists (select 1 from pg_policies where schemaname = 'public' and tablename = 'tax_quiz_questions' and policyname = 'tax_quiz_questions_service_role_all') then
     execute 'create policy tax_quiz_questions_service_role_all on public.tax_quiz_questions for all to service_role using (true) with check (true)';
@@ -89,7 +108,7 @@ begin
     execute 'create policy tax_quiz_attempts_service_role_all on public.tax_quiz_attempts for all to service_role using (true) with check (true)';
   end if;
 end
-$;
+$ntg$;
 
 revoke all privileges on table public.tax_quiz_questions from public, anon, authenticated, service_role;
 revoke all privileges on table public.tax_quiz_options from public, anon, authenticated, service_role;
