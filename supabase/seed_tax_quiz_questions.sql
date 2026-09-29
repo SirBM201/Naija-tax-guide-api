@@ -88,7 +88,9 @@ alter table public.tax_quiz_attempts add column if not exists q5_explained_at ti
 create unique index if not exists uq_tax_quiz_questions_code on public.tax_quiz_questions(question_code);
 create unique index if not exists uq_tax_quiz_options_question_code on public.tax_quiz_options(question_id, option_code);
 create index if not exists idx_tax_quiz_questions_active_category on public.tax_quiz_questions(is_active, category);
-create index if not exists idx_tax_quiz_attempts_account_created on public.tax_quiz_attempts(account_id, created_at);
+create index if not exists idx_tax_quiz_options_question_id on public.tax_quiz_options(question_id);
+create index if not exists idx_tax_quiz_attempts_account_created on public.tax_quiz_attempts(account_id, created_at desc);
+create index if not exists idx_tax_quiz_attempts_wa_created on public.tax_quiz_attempts(wa_id, created_at desc);
 
 -- The backend accesses quiz tables with the service-role key. Keep browser roles
 -- revoked and declare the exact PostgREST table contract explicitly.
