@@ -80,13 +80,13 @@ alter table public.tax_quiz_attempts enable row level security;
 do $
 begin
   if not exists (select 1 from pg_policies where schemaname = 'public' and tablename = 'tax_quiz_questions' and policyname = 'tax_quiz_questions_service_role_all') then
-    create policy tax_quiz_questions_service_role_all on public.tax_quiz_questions for all to service_role using (true) with check (true);
+    execute 'create policy tax_quiz_questions_service_role_all on public.tax_quiz_questions for all to service_role using (true) with check (true)';
   end if;
   if not exists (select 1 from pg_policies where schemaname = 'public' and tablename = 'tax_quiz_options' and policyname = 'tax_quiz_options_service_role_all') then
-    create policy tax_quiz_options_service_role_all on public.tax_quiz_options for all to service_role using (true) with check (true);
+    execute 'create policy tax_quiz_options_service_role_all on public.tax_quiz_options for all to service_role using (true) with check (true)';
   end if;
   if not exists (select 1 from pg_policies where schemaname = 'public' and tablename = 'tax_quiz_attempts' and policyname = 'tax_quiz_attempts_service_role_all') then
-    create policy tax_quiz_attempts_service_role_all on public.tax_quiz_attempts for all to service_role using (true) with check (true);
+    execute 'create policy tax_quiz_attempts_service_role_all on public.tax_quiz_attempts for all to service_role using (true) with check (true)';
   end if;
 end
 $;
