@@ -43,6 +43,29 @@ class SupabaseDataApiGrantTests(unittest.TestCase):
                         "PUBLIC, anon, authenticated, and service_role before grants.",
                     )
 
+    def test_seed_declares_columns_used_by_current_backend(self) -> None:
+        sql = SEED_SQL.read_text(encoding="utf-8").lower()
+        required_columns = {
+            "tax_quiz_questions": ("law_year text", "metadata jsonb"),
+            "tax_quiz_options": ("metadata jsonb",),
+            "tax_quiz_attempts": (
+                "wa_id text",
+                "displayed_option_order jsonb",
+                "selected_label text",
+                "q5_explanation_used boolean",
+                "credits_charged integer",
+                "q5_explained_at timestamptz",
+            ),
+        }
+        for table, columns in required_columns.items():
+            for column in columns:
+                with self.subTest(table=table, column=column):
+                    self.assertIn(
+                        f"add column if not exists {column}",
+                        sql,
+                        "Seed SQL must include the deployed fields used by current NTG runtime code.",
+                    )
+
     def test_runtime_quiz_grants_match_backend_operations(self) -> None:
         sql = (
             SEED_SQL.read_text(encoding="utf-8")
