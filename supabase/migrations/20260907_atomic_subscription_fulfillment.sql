@@ -14,8 +14,9 @@ create table if not exists public.ntg_subscription_fulfillments (
 
 alter table public.ntg_subscription_fulfillments enable row level security;
 
-revoke all on table public.ntg_subscription_fulfillments from anon, authenticated;
-grant select, insert on table public.ntg_subscription_fulfillments to service_role;
+-- Direct table access is unnecessary: the payment RPC is SECURITY DEFINER and
+-- runs as the table owner. Only service_role may execute that RPC.
+revoke all privileges on table public.ntg_subscription_fulfillments from public, anon, authenticated, service_role;
 
 create or replace function public.ntg_fulfill_subscription_payment(
     p_account_id uuid,
