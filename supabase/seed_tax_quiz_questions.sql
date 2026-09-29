@@ -71,6 +71,33 @@ create unique index if not exists uq_tax_quiz_options_question_code on public.ta
 create index if not exists idx_tax_quiz_questions_active_category on public.tax_quiz_questions(is_active, category);
 create index if not exists idx_tax_quiz_attempts_account_created on public.tax_quiz_attempts(account_id, created_at);
 
+-- The backend accesses quiz tables with the service-role key. Keep browser roles
+-- revoked and declare the exact PostgREST table contract explicitly.
+alter table public.tax_quiz_questions enable row level security;
+alter table public.tax_quiz_options enable row level security;
+alter table public.tax_quiz_attempts enable row level security;
+
+do $
+begin
+  if not exists (select 1 from pg_policies where schemaname = 'public' and tablename = 'tax_quiz_questions' and policyname = 'tax_quiz_questions_service_role_all') then
+    create policy tax_quiz_questions_service_role_all on public.tax_quiz_questions for all to service_role using (true) with check (true);
+  end if;
+  if not exists (select 1 from pg_policies where schemaname = 'public' and tablename = 'tax_quiz_options' and policyname = 'tax_quiz_options_service_role_all') then
+    create policy tax_quiz_options_service_role_all on public.tax_quiz_options for all to service_role using (true) with check (true);
+  end if;
+  if not exists (select 1 from pg_policies where schemaname = 'public' and tablename = 'tax_quiz_attempts' and policyname = 'tax_quiz_attempts_service_role_all') then
+    create policy tax_quiz_attempts_service_role_all on public.tax_quiz_attempts for all to service_role using (true) with check (true);
+  end if;
+end
+$;
+
+revoke all privileges on table public.tax_quiz_questions from public, anon, authenticated, service_role;
+revoke all privileges on table public.tax_quiz_options from public, anon, authenticated, service_role;
+revoke all privileges on table public.tax_quiz_attempts from public, anon, authenticated, service_role;
+grant select on table public.tax_quiz_questions to service_role;
+grant select on table public.tax_quiz_options to service_role;
+grant select, insert, update on table public.tax_quiz_attempts to service_role;
+
 with q(question_code, category, difficulty, question, short_explanation, premium_explanation) as (
   values
   ('NTG-PAYE-001','PAYE','basic','For PAYE purposes in Nigeria, who is normally responsible for deducting tax from employee salaries?','PAYE is normally deducted by the employer from payroll and remitted to the relevant State Internal Revenue Service.','PAYE means Pay-As-You-Earn. The employer deducts the tax from employment income and remits it to the relevant State IRS.'),
